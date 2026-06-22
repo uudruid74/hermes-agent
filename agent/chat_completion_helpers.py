@@ -1042,7 +1042,7 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
 
 
 
-def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool:
+def try_activate_fallback(agent, reason: "FailoverReason | None" = None, retry_after_seconds: "float | None" = None) -> bool:
     """Switch to the next fallback model/provider in the chain.
 
     Called when the current model is failing after retries.  Swaps the
@@ -1062,7 +1062,8 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         current_provider = (getattr(agent, "provider", "") or "").strip().lower()
         primary_provider = ((agent._primary_runtime or {}).get("provider") or "").strip().lower()
         if (not fallback_already_active) or (primary_provider and current_provider == primary_provider):
-            agent._rate_limited_until = time.monotonic() + 60
+            cooldown_seconds = retry_after_seconds if retry_after_seconds and retry_after_seconds > 0 else 60
+            agent._rate_limited_until = time.monotonic() + cooldown_seconds
     if agent._fallback_index >= len(agent._fallback_chain):
         return False
 

@@ -4301,10 +4301,10 @@ class AIAgent:
         from agent.chat_completion_helpers import interruptible_streaming_api_call
         return interruptible_streaming_api_call(self, api_kwargs, on_first_delta=on_first_delta)
 
-    def _try_activate_fallback(self, reason: "FailoverReason | None" = None) -> bool:
+    def _try_activate_fallback(self, reason: "FailoverReason | None" = None, retry_after_seconds: "float | None" = None) -> bool:
         """Forwarder — see ``agent.chat_completion_helpers.try_activate_fallback``."""
         from agent.chat_completion_helpers import try_activate_fallback
-        return try_activate_fallback(self, reason)
+        return try_activate_fallback(self, reason, retry_after_seconds=retry_after_seconds)
 
     def _has_pending_fallback(self) -> bool:
         """Whether a fallback provider is actually available to switch to.

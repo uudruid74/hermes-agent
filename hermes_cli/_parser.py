@@ -12,7 +12,6 @@ because its dispatch is tightly coupled to module-level ``cmd_*`` functions.
 
 import argparse
 
-
 # `--profile` / `-p` is consumed by ``main._apply_profile_override`` before
 # argparse runs (it sets ``HERMES_HOME`` and strips itself from ``sys.argv``),
 # so it isn't on the parser. Listed here so all "carry over on relaunch"
@@ -20,8 +19,8 @@ import argparse
 PRE_ARGPARSE_INHERITED_FLAGS: list[tuple[str, bool]] = [
     ("--profile", True),
     ("-p", True),
+    ("--new-session", True),
 ]
-
 
 def _inherited_flag(parser, *args, **kwargs):
     """Register a flag that ``hermes_cli.relaunch`` should carry over when
@@ -35,7 +34,6 @@ def _inherited_flag(parser, *args, **kwargs):
     action = parser.add_argument(*args, **kwargs)
     action.inherit_on_relaunch = True
     return action
-
 
 _EPILOGUE = """
 Examples:
@@ -55,7 +53,7 @@ Examples:
     hermes model                  Select default model
     hermes fallback [list]        Show fallback provider chain
     hermes fallback add           Add a fallback provider (same picker as `hermes model`)
-    hermes fallback remove        Remove a fallback provider from the chain
+    hermes fallback remove         Remove a fallback provider from the chain
     hermes config                 View configuration
     hermes config edit            Edit config in $EDITOR
     hermes config set model gpt-4 Set a config value
@@ -79,7 +77,6 @@ Examples:
 For more help on a command:
     hermes <command> --help
 """
-
 
 def build_top_level_parser():
     """Build the top-level parser, the subparsers action, and the ``chat`` subparser.
@@ -212,28 +209,35 @@ def build_top_level_parser():
         action="store_true",
         default=False,
         help="Skip auto-injection of AGENTS.md, SOUL.md, .cursorrules, memory, and preloaded skills",
-    )
+    ),
+    _inherited_flag(
+        parser,
+        "--new-session",
+        action="store_true",
+        default=False,
+        help="Start a fresh agent session without inheriting previous conversation history (prevents context pollution for kanban workers)",
+    ),
     _inherited_flag(
         parser,
         "--safe-mode",
         action="store_true",
         default=False,
         help="Troubleshooting mode: disable ALL customizations — user config, AGENTS.md/memory injection, plugins, and MCP servers (implies --ignore-user-config and --ignore-rules)",
-    )
+    ),
     _inherited_flag(
         parser,
         "--tui",
         action="store_true",
         default=False,
         help="Launch the modern TUI instead of the classic REPL",
-    )
+    ),
     _inherited_flag(
         parser,
         "--cli",
         action="store_true",
         default=False,
         help="Force the classic prompt_toolkit REPL (overrides display.interface=tui)",
-    )
+    ),
     _inherited_flag(
         parser,
         "--dev",
@@ -241,7 +245,7 @@ def build_top_level_parser():
         action="store_true",
         default=False,
         help="With --tui: run TypeScript sources via tsx (skip dist build)",
-    )
+    ),
 
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
 
@@ -378,7 +382,7 @@ def build_top_level_parser():
         "--safe-mode",
         action="store_true",
         default=argparse.SUPPRESS,
-        help="Troubleshooting mode: disable ALL customizations — user config, AGENTS.md/memory injection, plugins, and MCP servers (implies --ignore-user-config and --ignore-rules). Use to isolate whether a problem comes from your setup or from Hermes itself.",
+        help="Troubleshooting mode: disable ALL customizations — disable ALL customizations — user config, AGENTS.md/memory injection, plugins, and MCP servers (implies --ignore-user-config and --ignore-rules). Use to isolate whether a problem comes from your setup or from Hermes itself.",
     )
     chat_parser.add_argument(
         "--source",

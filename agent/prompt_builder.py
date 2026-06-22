@@ -180,6 +180,9 @@ SKILLS_GUIDANCE = (
 )
 
 KANBAN_GUIDANCE = (
+    "# CRITICAL: You are a Kanban worker. Ignore all previous conversation history.\n"
+    "# Your ONLY task is defined by $HERMES_KANBAN_TASK. Start fresh.\n"
+    "\n"
     "# Kanban task execution protocol\n"
     "You have been assigned ONE task from "
     "the shared board at `~/.hermes/kanban.db`. Your task id is in "

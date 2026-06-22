@@ -2757,6 +2757,11 @@ def run_conversation(
                     # Fall through to normal error handling if compression
                     # is exhausted or didn't help.
 
+                # Initialize retry-after tracking before the eager fallback
+                # block below.  It's set again in the retry-backoff section
+                # (line ~3435), but the fallback path needs it first.
+                _retry_after = None
+
                 # Eager fallback for rate-limit errors (429 or quota exhaustion).
                 # When a fallback model is configured, switch immediately instead
                 # of burning through retries with exponential backoff -- the
@@ -2782,7 +2787,7 @@ def run_conversation(
                             )
                         else:
                             agent._buffer_status("⚠️ Rate limited — switching to fallback provider...")
-                        if agent._try_activate_fallback(reason=classified.reason):
+                        if agent._try_activate_fallback(reason=classified.reason, retry_after_seconds=_retry_after):
                             retry_count = 0
                             compression_attempts = 0
                             _retry.primary_recovery_attempted = False

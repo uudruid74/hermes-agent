@@ -996,6 +996,13 @@ def restore_primary_runtime(agent) -> bool:
         return False
 
     if getattr(agent, "_rate_limited_until", 0) > time.monotonic():
+        _remaining = getattr(agent, "_rate_limited_until", 0) - time.monotonic()
+        _primary_provider = (agent._primary_runtime or {}).get("provider", "?")
+        logger.debug(
+            "Restore skipped: primary rate-limit cooldown active "
+            "(%.0fs remaining, provider=%s)",
+            _remaining, _primary_provider,
+        )
         return False  # primary still in rate-limit cooldown, stay on fallback
 
     rt = agent._primary_runtime
@@ -2193,10 +2200,12 @@ def copy_reasoning_content_for_api(agent, source_msg: dict, api_msg: dict) -> No
     # doesn't 400 the user on the next turn.
     existing = source_msg.get("reasoning_content")
     if isinstance(existing, str):
-        if existing == "" and agent._needs_thinking_reasoning_pad():
-            api_msg["reasoning_content"] = " "
-        else:
-            api_msg["reasoning_content"] = existing
+        if agent._needs_thinking_reasoning_pad():
+            if existing == "":
+                api_msg["reasoning_content"] = " "
+            else:
+                api_msg["reasoning_content"] = existing
+        # else: non-thinking provider — leave reasoning_content unset to avoid 422
         return
 
     needs_thinking_pad = agent._needs_thinking_reasoning_pad()
@@ -2228,7 +2237,8 @@ def copy_reasoning_content_for_api(agent, source_msg: dict, api_msg: dict) -> No
     # genuine reasoning content is not overwritten (#15812 regression in
     # PR #15478).
     if isinstance(normalized_reasoning, str) and normalized_reasoning:
-        api_msg["reasoning_content"] = normalized_reasoning
+        if needs_thinking_pad:
+            api_msg["reasoning_content"] = normalized_reasoning
         return
 
     # 4. DeepSeek / Kimi thinking mode: all assistant messages need

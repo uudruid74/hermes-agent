@@ -6902,6 +6902,14 @@ def _default_spawn(
         # dispatcher's root allowlist. Pass --accept-hooks explicitly so
         # profile-local worker sessions still register configured hooks.
         "--accept-hooks",
+        # Start a fresh session for each worker so the worker does not
+        # inherit the dispatcher's conversation history, which can cause
+        # protocol violations and false "pid not alive" errors. The
+        # dispatcher is a long-lived gateway process whose in-memory
+        # session state is unrelated to the task the worker is about to
+        # execute — reusing it pollutes the worker's context with
+        # dispatcher-side turns and tool results.
+        "--new-session",
     ]
     # Auto-load the kanban-worker skill so every dispatched worker
     # has the pattern library (good summary/metadata shapes, retry
