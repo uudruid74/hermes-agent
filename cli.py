@@ -5600,7 +5600,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 if _profile and _profile not in ("default", "custom"):
                     # Use profile icon if set, otherwise fall back to Hermes caduceus
                     _icon = _get_profile_icon() or "⚕"
-                    label = f"{_icon} {_profile.title()} "
+                    label = f" {_icon} {_profile.title()} "
             except Exception:
                 pass
             # Override accent color with profile agentcolor if set
