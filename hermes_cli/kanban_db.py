@@ -3314,7 +3314,7 @@ def recompute_ready(
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status, consecutive_failures, max_retries "
+            "SELECT id, status, assignee, consecutive_failures, max_retries "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
         ).fetchall()
         for row in todo_rows:
@@ -3356,6 +3356,14 @@ def recompute_ready(
                         (task_id,),
                     )
                 else:
+                    # Only promote todo→ready if the task has an
+                    # assignee.  Unassigned tasks stay in Todo
+                    # until a profile is named for them — this keeps
+                    # Ready clean (only tasks that can actually be
+                    # claimed by a dispatcher).
+                    assignee = row["assignee"]
+                    if not assignee or not assignee.strip():
+                        continue
                     conn.execute(
                         "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'todo'",
                         (task_id,),

@@ -177,11 +177,13 @@ def _load_config() -> dict:
         return {}
 
 
-def _resolve_orchestrator_profile(cfg: dict) -> str:
+def _resolve_orchestrator_profile(cfg: dict) -> Optional[str]:
     """Resolve which profile owns the root/orchestration task after fan-out.
 
-    Falls back to the active default profile when ``kanban.orchestrator_profile``
-    is unset, so a task is never stranded for lack of an orchestrator.
+    Returns ``None`` when ``kanban.orchestrator_profile`` is unset or empty,
+    meaning the root task is promoted to ``todo`` without an assignee. No
+    orchestrator wakes when the children complete — the decomposed children
+    run independently with their own assignees.
     """
     kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
     explicit = (kanban_cfg.get("orchestrator_profile") or "").strip()
@@ -191,11 +193,7 @@ def _resolve_orchestrator_profile(cfg: dict) -> str:
                 return explicit
         except Exception:
             pass
-    # Fall back to the active default profile.
-    try:
-        return profiles_mod.get_active_profile_name() or "default"
-    except Exception:
-        return "default"
+    return None
 
 
 def _resolve_default_assignee(cfg: dict) -> str:
@@ -208,10 +206,7 @@ def _resolve_default_assignee(cfg: dict) -> str:
                 return explicit
         except Exception:
             pass
-    try:
-        return profiles_mod.get_active_profile_name() or "default"
-    except Exception:
-        return "default"
+    return ""
 
 
 def _build_roster() -> tuple[list[dict], set[str]]:
