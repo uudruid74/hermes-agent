@@ -1064,8 +1064,11 @@ def apply_memory_pending(payload: Dict[str, Any], store: "MemoryStore") -> Dict[
 MEMORY_SCHEMA = {
     "name": "memory",
     "description": (
-        "Save durable facts to persistent memory that survive across sessions. Memory is "
-        "injected into every future turn, so keep entries compact and high-signal.\n\n"
+        "MEMORY.md is a ROUTER — NOT a fact store. Every entry is injected into EVERY turn "
+        "and costs context tokens. Keep entries SHORT: path pointers only (where facts live, "
+        "not the facts themselves). For durable facts: use fabric_write() — on-demand retrieval "
+        "with no per-turn overhead. For procedures: use skill_manage. For entity/device info: "
+        "use the wiki. Load the memory-usage-rules skill for the full storage hierarchy.\n\n"
         "HOW: make ALL your changes in ONE call via an 'operations' array (each item: "
         "{action, content?, old_text?}). The batch applies atomically and the char limit is "
         "checked only on the FINAL result — so a single call can remove/replace stale entries "
@@ -1073,17 +1076,17 @@ MEMORY_SCHEMA = {
         "reports current/limit chars and confirms completion; one batch call finishes the "
         "update, so don't repeat it. Use the bare action/content/old_text fields only for a "
         "single lone change.\n\n"
-        "WHEN: save proactively when the user states a preference, correction, or personal "
-        "detail, or you learn a stable fact about their environment, conventions, or workflow. "
-        "Priority: user preferences & corrections > environment facts > procedures. The best "
-        "memory stops the user repeating themselves.\n\n"
+        "WHEN: save when the user states a preference, correction, or personal detail you "
+        "will need to reference in later sessions. Priority: routing hints & corrections that "
+        "prevent the user repeating themselves > everything else.\n\n"
         "IF FULL: an add is rejected with the current entries shown. Reissue as ONE batch that "
         "removes or shortens enough stale entries and adds the new one together.\n\n"
-        "TARGETS: 'user' = who the user is (name, role, preferences, style). 'memory' = your "
-        "notes (environment, conventions, tool quirks, lessons).\n\n"
-        "SKIP: trivial/obvious info, easily re-discovered facts, raw data dumps, task progress, "
-        "completed-work logs, temporary TODO state (use session_search for those). Reusable "
-        "procedures belong in a skill, not memory."
+        "TARGETS: 'user' = who the user is (name, role, preferences, style) — short pointers. "
+        "'memory' = SHORT path pointers only (where facts live in fabric/skills/wiki, not the "
+        "facts).\n\n"
+        "SKIP: anything retrievable via fabric, session_search, or wiki. Do NOT store: raw "
+        "data dumps, task progress, completed-work logs, temporary TODO state. If it belongs "
+        "in a skill or fabric, put it there — not here."
     ),
     "parameters": {
         "type": "object",
@@ -1096,7 +1099,7 @@ MEMORY_SCHEMA = {
             "target": {
                 "type": "string",
                 "enum": ["memory", "user"],
-                "description": "Which memory store: 'memory' for personal notes, 'user' for user profile."
+                "description": "Which memory store: 'user' for user profile (short pointers), 'memory' for routing hints (path pointers to fabric/skills/wiki entries)."
             },
             "content": {
                 "type": "string",

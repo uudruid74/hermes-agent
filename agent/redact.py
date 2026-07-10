@@ -300,9 +300,12 @@ _FORM_BODY_RE = re.compile(
     r"^[A-Za-z_][A-Za-z0-9_.-]*=[^&\s]*(?:&[A-Za-z_][A-Za-z0-9_.-]*=[^&\s]*)+$"
 )
 
-# Compile known prefix patterns into one alternation
+# Compile known prefix patterns into one alternation.
+# The negative lookahead excludes '@' so tokens in URL userinfo
+# (e.g. https://ghp_...@github.com) are not redacted — these are
+# legitimate authentication credentials, not leaked secrets.
 _PREFIX_RE = re.compile(
-    r"(?<![A-Za-z0-9_-])(" + "|".join(_PREFIX_PATTERNS) + r")(?![A-Za-z0-9_-])"
+    r"(?<![A-Za-z0-9_-])(" + "|".join(_PREFIX_PATTERNS) + r")(?![A-Za-z0-9_@-])"
 )
 
 

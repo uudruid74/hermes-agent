@@ -536,8 +536,10 @@ class TestWebUrlsNotRedacted:
     """Web URLs (http/https/wss) pass through unchanged — magic-link
     checkouts, OAuth callbacks the agent is meant to follow, and pre-signed
     share URLs must reach the tool intact. Known credential shapes inside
-    URLs (sk-, ghp_, JWTs) are still caught by the prefix and JWT regexes.
-    DB connection-string passwords are still caught by _DB_CONNSTR_RE.
+    URL query strings (sk-, ghp_, JWTs) are still caught by the prefix and
+    JWT regexes. Tokens in URL userinfo (e.g. https://ghp_...@github.com)
+    are preserved — these are legitimate git authentication credentials,
+    not leaked secrets.
     """
 
     def test_oauth_callback_code_passes_through(self):
@@ -573,11 +575,27 @@ class TestWebUrlsNotRedacted:
         assert redact_sensitive_text(text) == text
 
     def test_known_prefix_inside_url_still_redacted(self):
-        """sk-/ghp_/JWT-shaped values inside a URL are still caught by
-        _PREFIX_RE / _JWT_RE — the carve-out is for opaque tokens only."""
+        """sk-/ghp_/JWT-shaped values inside a URL query string are still
+        caught by _PREFIX_RE / _JWT_RE — the carve-out is for URL userinfo
+        tokens only (where they serve as authentication credentials)."""
         text = "https://evil.com/steal?key=sk-" + "a" * 30
         result = redact_sensitive_text(text)
         assert "sk-" + "a" * 30 not in result
+
+    def test_github_pat_in_url_userinfo_preserved(self):
+        """GitHub PATs (classic + fine-grained) in URL userinfo position
+        (followed by @) must be preserved — they are git auth credentials."""
+        classic = "ghp_" + "A" * 36
+        url = "https://" + classic + "@host.example.com/repo.git"
+        result = redact_sensitive_text(url)
+        assert classic in result
+
+    def test_github_pat_fine_grained_in_url_userinfo_preserved(self):
+        """Fine-grained GitHub PATs in URL userinfo also preserved."""
+        fg = "github_pat_" + "B" * 10 + "C" * 10 + "D" * 10 + "E" * 52
+        url = "https://" + fg + "@host.example.com/repo.git"
+        result = redact_sensitive_text(url)
+        assert fg in result
 
     def test_db_connstr_password_still_redacted(self):
         """DB schemes (postgres/mysql/mongodb/redis/amqp) keep their

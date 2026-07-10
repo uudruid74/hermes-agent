@@ -600,19 +600,22 @@ def repair_message_sequence_with_cursor(agent, messages: List[Dict]) -> int:
 def strip_think_blocks(agent, content: str) -> str:
     """Remove reasoning/thinking blocks from content, returning only visible text.
 
-    Handles four cases:
-      1. Closed tag pairs (``<think>…</think>``) — the common path when
-         the provider emits complete reasoning blocks.
-      2. Unterminated open tag at a block boundary (start of text or
-         after a newline) — e.g. MiniMax M2.7 / NIM endpoints where the
-         closing tag is dropped.  Everything from the open tag to end
-         of string is stripped.  The block-boundary check mirrors
-         ``gateway/stream_consumer.py``'s filter so models that mention
-         ``<think>`` in prose aren't over-stripped.
-      3. Stray orphan open/close tags that slip through.
-      4. Tag variants: ``<think>``, ``<thinking>``, ``<reasoning>``,
-         ``<REASONING_SCRATCHPAD>``, ``<thought>`` (Gemma 4), all
-         case-insensitive.
+Handles five cases:
+  1. Closed tag pairs (``<think>...</think>``) — the common path when
+     the provider emits complete reasoning blocks.
+  1a. Gemma 4 closed tag pairs (``<|turn|>thinking...<|turn|>``) —
+      Gemma 4 uses a unique delimiter format documented at
+      ai.google.dev/gemma/docs/core/prompt-formatting-gemma4.
+  2. Unterminated open tag at a block boundary (start of text or
+     after a newline) — e.g. MiniMax M2.7 / NIM endpoints where the
+     closing tag is dropped.  Everything from the open tag to end
+     of string is stripped.  The block-boundary check mirrors
+     ``gateway/stream_consumer.py``'s filter so models that mention
+     ``<think>`` in prose aren't over-stripped.
+  3. Stray orphan open/close tags that slip through.
+  4. Tag variants: ``<think>``, ``<thinking>``, ``<reasoning>``,
+     ``<REASONING_SCRATCHPAD>``, ``<thought>``, all
+     case-insensitive.
 
     Additionally strips standalone tool-call XML blocks that some open
     models (notably Gemma variants on OpenRouter) emit inside assistant
@@ -638,6 +641,9 @@ def strip_think_blocks(agent, content: str) -> str:
     content = re.sub(r'<reasoning>.*?</reasoning>', '', content, flags=re.DOTALL | re.IGNORECASE)
     content = re.sub(r'<REASONING_SCRATCHPAD>.*?</REASONING_SCRATCHPAD>', '', content, flags=re.DOTALL | re.IGNORECASE)
     content = re.sub(r'<thought>.*?</thought>', '', content, flags=re.DOTALL | re.IGNORECASE)
+    # 1a. Gemma 4 thinking tokens — <|turn|>thinking\\n...<|turn|>
+    #     (matches the format documented in ai.google.dev/gemma/docs/core/prompt-formatting-gemma4)
+    content = re.sub(r'<\\|turn\\|>thinking\\n.*?<\\|turn\\|>', '', content, flags=re.DOTALL | re.IGNORECASE)
     # 1b. Tool-call XML blocks (openclaw/openclaw#67318). Handle the
     #     generic tag names first — they have no attribute gating since
     #     a literal <tool_call> in prose is already vanishingly rare.
@@ -667,14 +673,30 @@ def strip_think_blocks(agent, content: str) -> str:
     #    Strip from the tag to end of string.  Fixes #8878 / #9568
     #    (MiniMax M2.7 leaking raw reasoning into assistant content).
     content = re.sub(
-        r'(?:^|\n)[ \t]*<(?:think|thinking|reasoning|thought|REASONING_SCRATCHPAD)\b[^>]*>.*$',
+        r'(?:^|\\n)[ \\t]*<(?:think|thinking|reasoning|thought|REASONING_SCRATCHPAD)\\b[^>]*>.*$',
+        '',
+        content,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    # 2a. Unterminated Gemma 4 thinking block — <|turn|>thinking...<|turn|>
+    #     The open tag delimiter doesn't use word boundaries, so it needs
+    #     a separate pattern.
+    content = re.sub(
+        r'(?:^|\\n)[ \\t]*<\\|turn\\|>thinking\\n.*$',
         '',
         content,
         flags=re.DOTALL | re.IGNORECASE,
     )
     # 3. Stray orphan open/close tags that slipped through.
     content = re.sub(
-        r'</?(?:think|thinking|reasoning|thought|REASONING_SCRATCHPAD)>\s*',
+        r'</?(?:think|thinking|reasoning|thought|REASONING_SCRATCHPAD)>\\s*',
+        '',
+        content,
+        flags=re.IGNORECASE,
+    )
+    # 3a. Stray Gemma 4 <|turn|> orphan tags.
+    content = re.sub(
+        r'<\\|turn\\|>\\s*',
         '',
         content,
         flags=re.IGNORECASE,
