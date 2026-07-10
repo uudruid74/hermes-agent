@@ -177,12 +177,12 @@ def _check_dispatcher_presence() -> tuple[bool, str]:
         )
     return (
         False,
-        "No gateway is running — the task will sit in 'ready' until you "
-        "start it. Run:\n"
-        "    hermes gateway start\n"
-        "The gateway hosts an embedded dispatcher (tick interval 60s by "
-        "default); your task will be picked up on the next tick after "
-        "the gateway comes up."
+        "No kanban dispatcher is running — the task will sit in 'ready' "
+        "until a dispatcher picks it up.\n"
+        "Run one of:\n"
+        "    hermes kanban daemon --force    # Standalone dispatcher (no Telegram)\n"
+        "    hermes kanban dispatch          # One-shot dispatch pass\n"
+        "The dispatcher checks for ready tasks every 60s by default."
     )
 
 

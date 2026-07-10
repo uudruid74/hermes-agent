@@ -2378,6 +2378,54 @@ def _d(s: str) -> str:
         return str(s)
 
 
+def _get_profile_color() -> str | None:
+    """Read agentcolor from the active profile's config.yaml, if set."""
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+        profile = get_active_profile_name()
+        if profile and profile not in ("default", "custom"):
+            import os
+            from hermes_constants import get_hermes_home
+            cfg_path = os.path.join(str(get_hermes_home()), "config.yaml")
+            if os.path.exists(cfg_path):
+                import yaml
+                with open(cfg_path) as f:
+                    cfg = yaml.safe_load(f)
+                color = cfg.get("agentcolor")
+                if color and isinstance(color, str) and color.startswith("#"):
+                    return color
+    except Exception:
+        pass
+    return None
+
+
+def _get_profile_icon() -> str | None:
+    """Read agenticon from the active profile's config.yaml, if set."""
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+        profile = get_active_profile_name()
+        if profile and profile not in ("default", "custom"):
+            import os
+            from hermes_constants import get_hermes_home
+            cfg_path = os.path.join(str(get_hermes_home()), "config.yaml")
+            if os.path.exists(cfg_path):
+                import yaml
+                with open(cfg_path) as f:
+                    cfg = yaml.safe_load(f)
+                icon = cfg.get("agenticon")
+                if icon and isinstance(icon, str) and icon.strip():
+                    return icon.strip()
+    except Exception:
+        pass
+    return None
+
+
+def _ansi_hex(hex_color: str) -> str:
+    """Convert '#RRGGBB' to ANSI 24-bit foreground escape."""
+    r, g, b = int(hex_color[1:3], 16), int(hex_color[3:5], 16), int(hex_color[5:7], 16)
+    return f"\x1b[38;2;{r};{g};{b}m"
+
+
 def _accent_hex() -> str:
     """Return the active skin accent color for legacy CLI output lines."""
     try:
@@ -5795,6 +5843,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             except Exception:
                 label = "⚕ Hermes"
                 _text_hex = "#FFF8DC"
+            # Override label with active profile name and icon if not default
+            try:
+                from hermes_cli.profiles import get_active_profile_name
+                _profile = get_active_profile_name()
+                if _profile and _profile not in ("default", "custom"):
+                    _icon = _get_profile_icon() or "⚕"
+                    label = f"{_icon} {_profile.title()} "
+            except Exception:
+                pass
+            # Override accent color with profile agentcolor if set
+            _profile_color = _get_profile_color()
+            _accent_override = _ansi_hex(_profile_color) if _profile_color else _ACCENT
+            self._stream_accent = _accent_override  # Save for close box
             # Build a true-color ANSI escape for the response text color
             # so streamed content matches the Rich Panel appearance.
             try:
@@ -5805,10 +5866,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             except (ValueError, IndexError):
                 self._stream_text_ansi = ""
             if self.show_timestamps:
-                label = f"{label} {datetime.now().strftime(getattr(self, 'timestamp_format', '%H:%M'))}"
-            w = self._scrollback_box_width()
-            fill = w - 2 - HermesCLI._status_bar_display_width(label)
-            _cprint(f"\n{_ACCENT}╭─{label}{'─' * max(fill - 1, 0)}╮{_RST}")
+                now = datetime.now()
+                label_ts = f" {now.strftime('%a')} {now.strftime('%I:%M')}{now.strftime('%p')[0].lower()} "
+                w = self._scrollback_box_width()
+                name_width = HermesCLI._status_bar_display_width(label)
+                ts_width = len(label_ts)
+                fill = w - 2 - name_width - ts_width
+                _cprint(f"\n{_accent_override}╭─ {label}{'─' * max(fill - 2, 0)}{label_ts}╮{_RST}")
+            else:
+                w = self._scrollback_box_width()
+                fill = w - 2 - HermesCLI._status_bar_display_width(label)
+                _cprint(f"\n{_accent_override}╭─ {label}{'─' * max(fill - 2, 0)}╮{_RST}")
 
         self._stream_buf += text
 
@@ -5935,7 +6003,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         # Close the response box
         if self._stream_box_opened:
             w = self._scrollback_box_width()
-            _cprint(f"{_ACCENT}╰{'─' * (w - 2)}╯{_RST}")
+            _close_accent = getattr(self, "_stream_accent", _ACCENT)
+            _cprint(f"{_close_accent}╰{'─' * (w - 2)}╯{_RST}")
 
     def _reset_stream_state(self) -> None:
         """Reset streaming state before each agent invocation."""
@@ -5944,6 +6013,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         self._stream_box_opened = False
         self._stream_text_ansi = ""
         self._stream_prefilt = ""
+        self._stream_accent = _ACCENT
         self._in_reasoning_block = False
         self._stream_last_was_newline = True
         self._reasoning_box_opened = False
@@ -12275,11 +12345,24 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     if not _streaming_box_opened:
                         _streaming_box_opened = True
                         w = self._scrollback_box_width(getattr(self.console, "width", 80))
-                        label = " ⚕ Hermes "
+                        # Override label with active profile name and icon if not default
+                        try:
+                            from hermes_cli.profiles import get_active_profile_name
+                            _profile = get_active_profile_name()
+                            if _profile and _profile not in ("default", "custom"):
+                                _icon = _get_profile_icon() or "⚕"
+                                label = f" {_icon} {_profile.title()} "
+                            else:
+                                label = " ⚕ Hermes "
+                        except Exception:
+                            label = " ⚕ Hermes "
+                        # Override accent color with profile agentcolor if set
+                        _profile_color = _get_profile_color()
+                        _ts_accent = _ansi_hex(_profile_color) if _profile_color else _ACCENT
                         if self.show_timestamps:
                             label = f"{label}{datetime.now().strftime(getattr(self, 'timestamp_format', '%H:%M'))} "
                         fill = w - 2 - HermesCLI._status_bar_display_width(label)
-                        _cprint(f"\n{_ACCENT}╭─{label}{'─' * max(fill - 1, 0)}╮{_RST}")
+                        _cprint(f"\n{_ts_accent}╭─{label}{'─' * max(fill - 1, 0)}╮{_RST}")
                     _cprint(f"{_STREAM_PAD}{sentence.rstrip()}")
 
                 tts_thread = threading.Thread(
@@ -12678,13 +12761,27 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     label = "⚕ Hermes"
                     _resp_color = _maybe_remap_for_light_mode("#CD7F32")
                     _resp_text = _maybe_remap_for_light_mode("#FFF8DC")
+                # Override label with active profile name and icon if not default
+                try:
+                    from hermes_cli.profiles import get_active_profile_name
+                    _profile = get_active_profile_name()
+                    if _profile and _profile not in ("default", "custom"):
+                        _icon = _get_profile_icon() or "⚕"
+                        label = f"{_icon} {_profile.title()} "
+                except Exception:
+                    pass
+                # Override response color with profile agentcolor if set
+                _profile_color = _get_profile_color()
+                if _profile_color:
+                    _resp_color = _profile_color
 
                 is_error_response = result and (result.get("failed") or result.get("partial"))
                 already_streamed = self._stream_started and self._stream_box_opened and not is_error_response
                 if use_streaming_tts and _streaming_box_opened and not is_error_response:
                     # Text was already printed sentence-by-sentence; just close the box
                     w = self._scrollback_box_width()
-                    _cprint(f"\n{_ACCENT}╰{'─' * (w - 2)}╯{_RST}")
+                    _close_accent = getattr(self, "_stream_accent", _ACCENT)
+                    _cprint(f"\n{_close_accent}╰{'─' * (w - 2)}╯{_RST}")
                 elif already_streamed:
                     # Response was already streamed token-by-token with box framing;
                     # _flush_stream() already closed the box. Skip Rich Panel.
@@ -13474,6 +13571,30 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
             # --- Normal input routing ---
             text = event.app.current_buffer.text.strip()
+            # Handle ! prefix for direct shell command execution (bypass LLM)
+            if text.startswith("!"):
+                cmd_text = text[1:].strip()
+                if cmd_text:
+                    import subprocess
+                    try:
+                        result = subprocess.run(
+                            cmd_text, shell=True, capture_output=True,
+                            text=True, timeout=120
+                        )
+                        output = result.stdout + result.stderr
+                        if output.strip():
+                            self._console_print(_rich_text_from_ansi(output.strip()))
+                        if result.returncode != 0:
+                            self._console_print(
+                                f"[bold red]Command exited with code {result.returncode}[/]"
+                            )
+                    except subprocess.TimeoutExpired:
+                        self._console_print("[bold red]Command timed out (120s)[/]")
+                    except Exception as e:
+                        self._console_print(f"[bold red]Command error: {e}[/]")
+                event.app.current_buffer.reset(append_to_history=True)
+                event.app.invalidate()
+                return
             has_images = bool(self._attached_images)
             if text or has_images:
                 # Handle /model directly on the UI thread so interactive pickers
