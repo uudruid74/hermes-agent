@@ -473,6 +473,11 @@ def set_current_board(slug: str) -> Path:
     path = current_board_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(normed + "\n", encoding="utf-8")
+    # Update the process env var so that get_current_board() resolves
+    # to the new board immediately — otherwise a previously-pinned
+    # HERMES_KANBAN_BOARD (set at chat bootstrap) would shadow the
+    # fresh current file and the switch would appear to have no effect.
+    os.environ["HERMES_KANBAN_BOARD"] = normed
     return path
 
 
