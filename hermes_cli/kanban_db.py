@@ -532,7 +532,7 @@ def kanban_db_path(board: Optional[str] = None) -> Path:
        Other boards → ``<root>/kanban/boards/<slug>/kanban.db``.
     """
     override = os.environ.get("HERMES_KANBAN_DB", "").strip()
-    if override:
+    if override and board is None:
         return Path(override).expanduser()
     slug = _normalize_board_slug(board)
     if slug is None:
@@ -3501,6 +3501,15 @@ def claim_task(
         assignee=claimed.assignee if claimed else None,
         run_id=run_id,
     )
+    # Notify via Telegram on claim (ready→running) — catches both CLI and dispatcher paths
+    try:
+        from hermes_cli.kanban import _notify_kanban_status_change
+        _notify_kanban_status_change(
+            task_id, "running",
+            title=claimed.title if claimed else None,
+        )
+    except Exception:
+        pass
     return claimed
 
 
