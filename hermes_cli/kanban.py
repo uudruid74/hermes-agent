@@ -28,6 +28,109 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_swarm as ks
 from hermes_cli.profiles import get_active_profile_name
 
+import logging
+_log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Status-change notification hook
+# ---------------------------------------------------------------------------
+
+_STATUS_NOTIFY_ENABLED = not os.environ.get("KANBAN_NOTIFY_OFF", "").strip()
+
+
+def _notify_kanban_status_change(
+    task_id: str,
+    new_status: str,
+    *,
+    summary: Optional[str] = None,
+    title: Optional[str] = None,
+) -> None:
+    """Send a best-effort notification about a kanban task state change.
+
+    Pure code — no LLM, no agent invocation.  Tries every configured
+    gateway platform's home channel.  Fails silently on all errors so a
+    broken notification can never block a task transition.
+    """
+    if not _STATUS_NOTIFY_ENABLED:
+        return
+
+    # Build the message payload.
+    emoji = _NOTIFY_EMOJI.get(new_status, "❓")
+    parts = [f"{emoji} {task_id}"]
+    if title:
+        parts.append(f": {title}")
+    parts.append(f" — {new_status}")
+    if summary:
+        first_line = summary.splitlines()[0][:300]
+        parts.append(f" ({first_line})")
+    message = "".join(parts)
+
+    try:
+        _notify_via_gateway(message)
+    except Exception:
+        # Telemetry-free silent fallback — a broken notifier is not a
+        # broken command.  The user can still inspect the board directly.
+        pass
+
+
+def _notify_via_gateway(message: str) -> None:
+    """Send *message* to every enabled gateway platform's home channel.
+
+    Falls back to direct Telegram send via ``TELEGRAM_BOT_TOKEN`` +
+    ``TELEGRAM_HOME_CHANNEL`` env vars when the gateway config does not
+    have Telegram enabled (e.g. the bot token lives on another profile).
+    """
+    try:
+        from gateway.config import load_gateway_config
+        cfg = load_gateway_config()
+    except Exception:
+        cfg = None
+
+    sent_any = False
+    if cfg is not None:
+        for platform, pconfig in cfg.platforms.items():
+            if not pconfig or not pconfig.enabled:
+                continue
+            home = cfg.get_home_channel(platform)
+            if not home:
+                continue
+            try:
+                _notify_one_platform(platform, pconfig, home.chat_id, message)
+                sent_any = True
+            except Exception:
+                pass
+
+    if not sent_any:
+        # Fallback — direct Telegram send without the gateway.
+        _notify_via_env_telegram(message)
+
+
+def _notify_via_env_telegram(message: str) -> None:
+    """Send via ``TELEGRAM_BOT_TOKEN`` + ``TELEGRAM_HOME_CHANNEL`` env vars."""
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.environ.get("TELEGRAM_HOME_CHANNEL", "").strip()
+    if not token or not chat_id:
+        return
+    # Build a minimal synthetic PlatformConfig so _send_to_platform works.
+    from gateway.config import PlatformConfig
+    pconfig = PlatformConfig(enabled=True, token=token)
+    from gateway.config import Platform
+    try:
+        _notify_one_platform(Platform.TELEGRAM, pconfig, chat_id, message)
+    except Exception:
+        pass
+
+
+def _notify_one_platform(platform, pconfig, chat_id: str, message: str) -> None:
+    """Send via the standalone platform sender (same path cron uses)."""
+    from tools.send_message_tool import _send_to_platform
+    from model_tools import _run_async
+
+    _run_async(
+        _send_to_platform(platform, pconfig, chat_id, message)
+    )
+
 
 # ---------------------------------------------------------------------------
 # Small formatting helpers
@@ -41,6 +144,17 @@ _STATUS_ICONS = {
     "blocked":  "⊘",
     "done":     "✓",
     "archived": "—",
+}
+
+# Notification emojis — richer glyphs for platform delivery (Telegram etc.)
+_NOTIFY_EMOJI = {
+    "todo":     "⬜",
+    "ready":    "▶️",
+    "running":  "🔄",
+    "scheduled":"⏳",
+    "blocked":  "🔴",
+    "done":     "✅",
+    "archived": "📦",
 }
 
 
@@ -1365,6 +1479,10 @@ def _cmd_create(args: argparse.Namespace) -> int:
             running, message = _check_dispatcher_presence()
             if not running and message:
                 print(f"\n⚠  {message}", file=sys.stderr)
+    _notify_kanban_status_change(
+        task.id, task.status,
+        title=task.title,
+    )
     return 0
 
 
@@ -1403,8 +1521,7 @@ def _cmd_list(args: argparse.Namespace) -> int:
     assignee = args.assignee
     if args.mine and not assignee:
         assignee = _profile_author()
-    with kb.connect_closing() as conn:
-        # Cheap "mini-dispatch": recompute ready so list output reflects
+    with kb.connect_closing(board=args.board) as conn:
         # dependencies that may have cleared since the last dispatcher tick.
         kb.recompute_ready(conn)
         tasks = kb.list_tasks(
@@ -1452,7 +1569,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
-    with kb.connect_closing() as conn:
+    with kb.connect_closing(board=args.board) as conn:
         task = kb.get_task(conn, args.task_id)
         if not task:
             print(f"no such task: {args.task_id}", file=sys.stderr)
@@ -1814,7 +1931,10 @@ def _cmd_unlink(args: argparse.Namespace) -> int:
 
 
 def _cmd_claim(args: argparse.Namespace) -> int:
+    title_before = None
     with kb.connect_closing() as conn:
+        task_before = kb.get_task(conn, args.task_id)
+        title_before = task_before.title if task_before else None
         task = kb.claim_task(conn, args.task_id, ttl_seconds=args.ttl)
         if task is None:
             # Report why
@@ -1832,6 +1952,10 @@ def _cmd_claim(args: argparse.Namespace) -> int:
         kb.set_workspace_path(conn, task.id, str(workspace))
     print(f"Claimed {task.id}")
     print(f"Workspace: {workspace}")
+    _notify_kanban_status_change(
+        task.id, "running",
+        title=title_before,
+    )
     return 0
 
 
@@ -1894,6 +2018,9 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
+            # Capture task info before completing for notification
+            task_before = kb.get_task(conn, tid)
+            title_before = task_before.title if task_before else None
             if not kb.complete_task(
                 conn, tid,
                 result=args.result,
@@ -1905,6 +2032,11 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
             else:
                 print(f"Completed {tid}")
+                _notify_kanban_status_change(
+                    tid, "done",
+                    summary=summary or args.result,
+                    title=title_before,
+                )
     return 0 if not failed else 1
 
 
@@ -1944,6 +2076,9 @@ def _cmd_block(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
+            # Capture task info before blocking for notification
+            task_before = kb.get_task(conn, tid)
+            title_before = task_before.title if task_before else None
             if reason:
                 kb.add_comment(conn, tid, author, f"BLOCKED: {reason}")
             if not kb.block_task(
@@ -1970,6 +2105,11 @@ def _cmd_block(args: argparse.Namespace) -> int:
                     )
                 else:
                     print(f"Blocked {tid}{suffix}")
+                _notify_kanban_status_change(
+                    tid, where,
+                    summary=reason,
+                    title=title_before,
+                )
     return 0 if not failed else 1
 
 
@@ -1980,6 +2120,9 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
+            # Capture task info before scheduling for notification
+            task_before = kb.get_task(conn, tid)
+            title_before = task_before.title if task_before else None
             if reason:
                 kb.add_comment(conn, tid, author, f"SCHEDULED: {reason}")
             if not kb.schedule_task(
@@ -1992,6 +2135,11 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
                 print(f"cannot schedule {tid}", file=sys.stderr)
             else:
                 print(f"Scheduled {tid}" + (f": {reason}" if reason else ""))
+                _notify_kanban_status_change(
+                    tid, "scheduled",
+                    summary=reason,
+                    title=title_before,
+                )
     return 0 if not failed else 1
 
 
@@ -2007,6 +2155,9 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
+            # Capture task info before unblocking for notification
+            task_before = kb.get_task(conn, tid)
+            title_before = task_before.title if task_before else None
             if reason:
                 kb.add_comment(conn, tid, author, f"UNBLOCK: {reason}")
             if not kb.unblock_task(conn, tid):
@@ -2014,6 +2165,11 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
                 print(f"cannot unblock {tid} (not blocked/scheduled?)", file=sys.stderr)
             else:
                 print(f"Unblocked {tid}" + (f": {reason}" if reason else ""))
+                _notify_kanban_status_change(
+                    tid, "ready",
+                    summary=reason,
+                    title=title_before,
+                )
     return 0 if not failed else 1
 
 
@@ -2033,6 +2189,9 @@ def _cmd_promote(args: argparse.Namespace) -> int:
     results: list[dict[str, object]] = []
     with kb.connect_closing() as conn:
         for tid in ids:
+            # Capture task info before promoting for notification
+            task_before = kb.get_task(conn, tid)
+            title_before = task_before.title if task_before else None
             ok, err = kb.promote_task(
                 conn,
                 tid,
@@ -2049,6 +2208,12 @@ def _cmd_promote(args: argparse.Namespace) -> int:
                 "reason": reason,
                 "error": err,
             })
+            if ok and not args.dry_run:
+                _notify_kanban_status_change(
+                    tid, "ready",
+                    summary=reason,
+                    title=title_before,
+                )
 
     failed = [r for r in results if not r["promoted"]]
     if as_json:
