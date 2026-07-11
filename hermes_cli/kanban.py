@@ -1931,10 +1931,7 @@ def _cmd_unlink(args: argparse.Namespace) -> int:
 
 
 def _cmd_claim(args: argparse.Namespace) -> int:
-    title_before = None
     with kb.connect_closing() as conn:
-        task_before = kb.get_task(conn, args.task_id)
-        title_before = task_before.title if task_before else None
         task = kb.claim_task(conn, args.task_id, ttl_seconds=args.ttl)
         if task is None:
             # Report why
@@ -1952,10 +1949,6 @@ def _cmd_claim(args: argparse.Namespace) -> int:
         kb.set_workspace_path(conn, task.id, str(workspace))
     print(f"Claimed {task.id}")
     print(f"Workspace: {workspace}")
-    _notify_kanban_status_change(
-        task.id, "running",
-        title=title_before,
-    )
     return 0
 
 
@@ -2032,11 +2025,6 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
             else:
                 print(f"Completed {tid}")
-                _notify_kanban_status_change(
-                    tid, "done",
-                    summary=summary or args.result,
-                    title=title_before,
-                )
     return 0 if not failed else 1
 
 
@@ -2105,11 +2093,6 @@ def _cmd_block(args: argparse.Namespace) -> int:
                     )
                 else:
                     print(f"Blocked {tid}{suffix}")
-                _notify_kanban_status_change(
-                    tid, where,
-                    summary=reason,
-                    title=title_before,
-                )
     return 0 if not failed else 1
 
 

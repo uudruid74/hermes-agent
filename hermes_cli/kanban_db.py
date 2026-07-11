@@ -4209,6 +4209,15 @@ def complete_task(
         run_id=run_id,
         summary=(summary if summary is not None else result),
     )
+    try:
+        from hermes_cli.kanban import _notify_kanban_status_change
+        _notify_kanban_status_change(
+            task_id, "done",
+            summary=summary or result,
+            title=_done_task.title if _done_task else None,
+        )
+    except Exception:
+        pass
     return True
 
 
@@ -4884,6 +4893,15 @@ def block_task(
                 run_id=run_id,
                 reason=reason,
             )
+            try:
+                from hermes_cli.kanban import _notify_kanban_status_change
+                _notify_kanban_status_change(
+                    task_id, "todo",
+                    summary=reason,
+                    title=_blocked_task.title if _blocked_task else None,
+                )
+            except Exception:
+                pass
             return True
 
         # Truly-blocked kinds. Increment the unblock-loop counter when this is a
@@ -4996,6 +5014,15 @@ def block_task(
         run_id=run_id,
         reason=reason,
     )
+    try:
+        from hermes_cli.kanban import _notify_kanban_status_change
+        _notify_kanban_status_change(
+            task_id, "blocked",
+            summary=reason,
+            title=_blocked_task.title if _blocked_task else None,
+        )
+    except Exception:
+        pass
     return True
 
 
