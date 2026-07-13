@@ -1072,33 +1072,10 @@ def _profile_cache_roots() -> List[Path]:
     return roots
 
 
-def _kanban_attachment_roots() -> List[Path]:
-    """Return durable Kanban attachment roots without importing kanban_db."""
-    override = os.environ.get("HERMES_KANBAN_ATTACHMENTS_ROOT", "").strip()
-    if override:
-        return [Path(override).expanduser()]
-    home_override = os.environ.get("HERMES_KANBAN_HOME", "").strip()
-    root = Path(home_override).expanduser() if home_override else _HERMES_ROOT
-    roots = [root / "kanban" / "attachments"]
-    boards_root = root / "kanban" / "boards"
-    try:
-        board_dirs = [
-            path for path in boards_root.iterdir()
-            if path.is_dir() and not path.is_symlink()
-            and re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", path.name)
-            and (path / "kanban.db").is_file()
-        ]
-    except OSError:
-        return roots
-    roots.extend(path / "attachments" for path in board_dirs)
-    return roots
-
-
 def _media_delivery_allowed_roots() -> List[Path]:
     """Return roots from which model-emitted local media may be delivered."""
     roots = [Path(root) for root in MEDIA_DELIVERY_SAFE_ROOTS]
     roots.extend(_profile_cache_roots())
-    roots.extend(_kanban_attachment_roots())
     extra_roots = os.environ.get(MEDIA_DELIVERY_ALLOW_DIRS_ENV, "")
     for chunk in extra_roots.split(os.pathsep):
         for raw_root in chunk.split(","):
@@ -2389,6 +2366,10 @@ class BasePlatformAdapter(ABC):
         # Gateway shutdown cancels these so an old gateway instance doesn't keep
         # working on a task after --replace or manual restarts.
         self._background_tasks: set[asyncio.Task] = set()
+        # Active fd watchers registered via watch_fd(). Maps opaque handle →
+        # (fd, callback, on_close, owned).  owned=True means the fd was
+        # created by watch_unix_socket() and should be os.close()d on unwatch.
+        self._watched_fds: dict[str, tuple[int, Callable, Callable | None, bool]] = {}
         # One-shot callbacks to fire after the main response is delivered.
         # Keyed by session_key. Values are either a bare callback (legacy) or
         # a ``(generation, callback)`` tuple so GatewayRunner can make deferred
@@ -2421,6 +2402,102 @@ class BasePlatformAdapter(ABC):
         # Chats where typing indicator is paused (e.g. during approval waits).
         # _keep_typing skips send_typing when the chat_id is in this set.
         self._typing_paused: set = set()
+
+    # ── fd watcher API ──────────────────────────────────────────────
+    # Plugin push-channel: plugins register a file descriptor (Unix
+    # socket, FIFO, pipe) and a callback. The gateway watches it via
+    # loop.add_reader(). On data the callback fires — plugins can then
+    # construct MessageEvent(internal=True) and call handle_message()
+    # to inject data into the agent mid-run.
+
+    def watch_fd(
+        self, fd: int, callback: Callable[[bytes], None]
+    ) -> str:
+        """Register a watched file descriptor.
+
+        Returns an opaque handle for later ``unwatch_fd()``.
+        *callback* receives raw bytes read from the fd.
+        """
+        import uuid
+        handle = uuid.uuid4().hex[:12]
+        loop = asyncio.get_running_loop()
+        loop.add_reader(fd, self._make_fd_reader(handle, fd, callback))
+        self._watched_fds[handle] = (fd, callback, None, False)
+        return handle
+
+    def unwatch_fd(self, handle: str) -> None:
+        """Remove a watched file descriptor.
+
+        Closes the fd if it was created by watch_unix_socket() (owned=True).
+        """
+        entry = self._watched_fds.pop(handle, None)
+        if entry is None:
+            return
+        fd, _callback, _on_close, owned = entry
+        try:
+            loop = asyncio.get_running_loop()
+            loop.remove_reader(fd)
+        except Exception:
+            pass
+        if owned:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def watch_unix_socket(
+        self,
+        path: str,
+        callback: Callable[[bytes], None],
+        on_close: Callable[[], None] | None = None,
+    ) -> str:
+        """Connect to a Unix domain socket and watch it for data.
+
+        The gateway opens the connection, sets it non-blocking, and
+        registers it with the event loop.  *callback* fires on data.
+        *on_close* fires when the peer disconnects or an error occurs.
+        Returns an opaque handle for ``unwatch_fd()``, which will also
+        close the socket fd.
+
+        Only ``unix://`` URLs are supported.  Pass the path directly
+        (e.g. ``/tmp/prometheus/sess.sock``).
+        """
+        import socket as _socket
+        sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        sock.setblocking(False)
+        try:
+            sock.connect(path)
+        except BlockingIOError:
+            pass  # non-blocking connect — expected
+        fd = sock.fileno()
+        import uuid as _uuid
+        handle = _uuid.uuid4().hex[:12]
+        loop = asyncio.get_running_loop()
+        loop.add_reader(fd, self._make_fd_reader(handle, fd, callback, on_close))
+        self._watched_fds[handle] = (fd, callback, on_close, True)
+        return handle
+
+    def _make_fd_reader(
+        self, handle: str, fd: int, callback: Callable[[bytes], None],
+        on_close: Callable[[], None] | None = None,
+    ):
+        def _reader() -> None:
+            try:
+                data = os.read(fd, 65536)
+            except (BlockingIOError, InterruptedError):
+                return
+            except OSError:
+                self.unwatch_fd(handle)
+                if on_close:
+                    on_close()
+                return
+            if not data:  # EOF — peer closed
+                self.unwatch_fd(handle)
+                if on_close:
+                    on_close()
+                return
+            callback(data)
+        return _reader
 
     @property
     def message_len_fn(self) -> Callable[[str], int]:

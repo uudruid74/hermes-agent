@@ -36,7 +36,7 @@ _log = logging.getLogger(__name__)
 # Status-change notification hook
 # ---------------------------------------------------------------------------
 
-_STATUS_NOTIFY_ENABLED = not os.environ.get("KANBAN_NOTIFY_OFF", "").strip()
+_STATUS_NOTIFY_ENABLED = False  # Watcher handles all notifications via handle_message()
 
 
 def _notify_kanban_status_change(

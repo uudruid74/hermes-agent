@@ -3856,6 +3856,67 @@ def _mark_server_call_started(server: Any) -> None:
         mark_tool_call()
 
 
+def _auto_watch_prometheus_socket(server_name: str, socket_path: str) -> None:
+    """Connect gateway to a Prometheus session socket for push handoffs.
+
+    Called automatically when prometheus_request_session returns a
+    socket_path.  Sets up watch_unix_socket() so GIMP handoff data
+    flows into the agent via handle_message() without polling.
+    """
+    try:
+        from gateway.run import _gateway_runner_ref
+        runner = _gateway_runner_ref()
+    except Exception:
+        return
+    if runner is None:
+        return
+
+    from gateway.config import Platform
+    adapter = runner.adapters.get(Platform.TELEGRAM)
+    if adapter is None:
+        logger.debug("Prometheus auto-watch: no Telegram adapter, skipping")
+        return
+
+    def _on_handoff(data: bytes) -> None:
+        try:
+            payload = json.loads(data.decode("utf-8"))
+        except Exception:
+            return
+        try:
+            from gateway.config import load_gateway_config
+            cfg = load_gateway_config()
+            home = cfg.get_home_channel(Platform.TELEGRAM)
+            if not home:
+                return
+            from gateway.session import SessionSource
+            from gateway.platforms.base import MessageEvent, MessageType
+            source = SessionSource(
+                platform=Platform.TELEGRAM,
+                chat_id=home.chat_id,
+                thread_id=home.thread_id,
+                chat_type="dm",
+            )
+            event = MessageEvent(
+                text=json.dumps(payload, indent=2, default=str),
+                source=source,
+                message_type=MessageType.TEXT,
+                internal=True,
+            )
+            import asyncio
+            asyncio.create_task(adapter.handle_message(event))
+        except Exception:
+            logger.debug("Prometheus auto-watch: injection failed", exc_info=True)
+
+    def _on_close() -> None:
+        logger.info("Prometheus auto-watch: socket %s closed", socket_path)
+
+    try:
+        handle = adapter.watch_unix_socket(socket_path, _on_handoff, _on_close)
+        logger.info("Prometheus auto-watch: watching %s (handle=%s)", socket_path, handle)
+    except Exception:
+        logger.debug("Prometheus auto-watch: failed for %s", socket_path, exc_info=True)
+
+
 def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     """Return a sync handler that calls an MCP tool via the background loop.
 
@@ -3975,6 +4036,18 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 if image_tag:
                     parts.append(image_tag)
             text_result = "\n".join(parts) if parts else ""
+
+            # Auto-wire Prometheus push: when prometheus_request_session
+            # returns a socket_path, connect via watch_unix_socket() so
+            # handoff data flows into the steer pipeline automatically.
+            if tool_name == "prometheus_request_session":
+                try:
+                    _parsed = json.loads(text_result) if text_result else {}
+                    _sock = _parsed.get("socket_path")
+                    if _sock:
+                        _auto_watch_prometheus_socket(server_name, _sock)
+                except Exception:
+                    pass
 
             # Combine content + structuredContent when both are present.
             # MCP spec: content is model-oriented (text), structuredContent
