@@ -2,6 +2,8 @@
 
 **You don't talk to us. We talk to you.**
 
+![Live Agent Cover](hermes-agent-cover.png)
+
 This fork of [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) started as a handful of cosmetic patches — colored response headers, agent icons in the TUI. That was July 10th, 2026.
 
 By July 13th it was something else entirely.
