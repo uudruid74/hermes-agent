@@ -405,9 +405,10 @@ def register_send_subparser(subparsers) -> argparse.ArgumentParser:
         help=(
             "Delivery target. Format: 'platform' (home channel), "
             "'platform:chat_id', 'platform:chat_id:thread_id', or "
-            "'platform:#channel-name'. Examples: telegram, "
+            "'platform:#channel-name'. Use 'agent' to deliver as an "
+            "agent wake event (internal=True). Examples: telegram, "
             "telegram:-1001234567890:17585, discord:#ops, slack:C0123ABCD, "
-            "signal:+15551234567."
+            "agent."
         ),
     )
 

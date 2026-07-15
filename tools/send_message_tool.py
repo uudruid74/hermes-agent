@@ -407,6 +407,26 @@ def _handle_send(args):
     except (ValueError, KeyError):
         return tool_error(f"Unknown platform: {platform_name}")
 
+    # `--to agent` — resolve real home channel, flag for agent wake path
+    agent_wake = False
+    if platform_name == "agent":
+        # Find the first platform with a home channel configured
+        home = None
+        for p, pconfig_candidate in config.platforms.items():
+            if pconfig_candidate and pconfig_candidate.enabled and pconfig_candidate.home_channel:
+                home = pconfig_candidate.home_channel
+                break
+        if not home:
+            return tool_error("No home channel configured — cannot determine which platform to use for agent wake delivery.")
+        platform_name = home.platform.value
+        agent_wake = True
+        chat_id = home.chat_id
+        thread_id = home.thread_id
+        try:
+            platform = Platform(platform_name)
+        except (ValueError, KeyError):
+            return tool_error(f"Unknown home platform: {platform_name}")
+
     pconfig = config.platforms.get(platform)
     if not pconfig or not pconfig.enabled:
         # Weixin can be configured purely via .env; synthesize a pconfig so
@@ -500,6 +520,7 @@ def _handle_send(args):
                 thread_id=thread_id,
                 media_files=media_files,
                 force_document=force_document_attachments,
+                agent_wake=agent_wake,
             )
         )
         if used_home_channel and isinstance(result, dict) and result.get("success"):
@@ -851,7 +872,7 @@ async def _send_via_bridge(platform, chat_id, text, *, thread_id=None):
         return {"error": f"Bridge send failed: {e}"}
 
 
-async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False):
+async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False, agent_wake=False):
     """Route a message to the appropriate platform sender.
 
     Long messages are automatically chunked to fit within platform limits
@@ -862,23 +883,21 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
 
     media_files = media_files or []
 
-    # Try injecting as an agent wake event first — when the gateway is
-    # running this routes the message into the agent's session context
-    # (same pattern as kanban wake events) instead of delivering directly
-    # to the user's chat. Falls through to platform-specific senders below
-    # when no live adapter is available (standalone CLI, cron, etc.).
-    try:
-        wake_result = await _send_via_adapter(
-            platform, pconfig, chat_id, message,
-            thread_id=thread_id,
-            media_files=media_files,
-            force_document=force_document,
-            try_adapter_only=True,
-        )
-        if wake_result.get("success") and wake_result.get("queued"):
-            return wake_result
-    except Exception:
-        pass
+    # Agent wake path — when `--to agent` is used, deliver as an
+    # internal wake event instead of direct Bot API delivery.
+    if agent_wake:
+        try:
+            wake_result = await _send_via_adapter(
+                platform, pconfig, chat_id, message,
+                thread_id=thread_id,
+                media_files=media_files,
+                force_document=force_document,
+                try_adapter_only=True,
+            )
+            if wake_result.get("success") and wake_result.get("queued"):
+                return wake_result
+        except Exception:
+            pass
 
     # Weixin handles text/media delivery inside its native helper and does not
     # need the optional platform adapter imports below. Keep this branch early
