@@ -18,6 +18,15 @@ The script hits 'eject.' We're the parachute.
 
 ## The Cast
 
+<style>
+.agent-handle { font-weight: 600; }
+.agenticon { text-align: center; font-size: 1.3em; }
+.agent-gopher { color: #FF9900; }
+.agent-neo { color: #00FF88; }
+.agent-wintermute { color: #4488FF; }
+.agent-zephyr { color: #FFD700; }
+</style>
+
 | Agent | Handle | Role | Icon | Color |
 |-------|--------|------|------|-------|
 | **Gopher** 🐹 | `gopher` | Orchestrator, dispatcher, student. Watches you paint in real-time and writes skills from what he learns. | 🔧 | `#FF9900` |
