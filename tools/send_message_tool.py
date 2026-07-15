@@ -12,9 +12,12 @@ import os
 import re
 import ssl
 import time
+from datetime import datetime
 from email.utils import formatdate
 
 from agent.redact import redact_sensitive_text
+from gateway.platforms.base import MessageEvent, MessageType
+from gateway.session import SessionSource
 
 logger = logging.getLogger(__name__)
 
@@ -690,17 +693,16 @@ async def _send_via_adapter(
     thread_id=None,
     media_files=None,
     force_document=False,
+    try_adapter_only=False,
 ):
-    """Send a message via a live gateway adapter, with a standalone fallback
-    for out-of-process callers (e.g. cron running separately from the gateway).
+    """Inject a message into the agent's session as an internal wake event.
 
-    Order of attempts:
-      1. Live in-process adapter via ``_gateway_runner_ref()`` (the path that
-         existed before this change).
-      2. The plugin's ``standalone_sender_fn`` registered on its
-         ``PlatformEntry`` (used when the gateway is not in this process, so
-         the runner weakref is ``None``).
-      3. A descriptive error explaining both options.
+    Uses ``adapter.handle_message()`` with ``internal=True`` so the message
+    arrives in the agent's active session context — the same pattern as
+    kanban wake events. Falls back to the plugin's ``standalone_sender_fn``
+    for out-of-process callers (e.g. cron running separately from the
+    gateway), unless ``try_adapter_only`` is True (used when the caller
+    has its own platform-specific fallback).
     """
     platform_name = platform.value if hasattr(platform, "value") else str(platform)
     runner = None
@@ -717,21 +719,33 @@ async def _send_via_adapter(
             adapter = None
         if adapter is not None:
             try:
-                metadata = {}
-                if thread_id:
-                    metadata["thread_id"] = thread_id
-                if platform_name == "ntfy" and chat_id:
-                    metadata["publish_topic"] = chat_id
-                if not metadata:
-                    metadata = None
-                result = await adapter.send(chat_id=chat_id, content=chunk, metadata=metadata)
+                session_source = SessionSource(
+                    platform=platform,
+                    chat_id=chat_id,
+                    thread_id=thread_id,
+                    chat_type="group",
+                )
+                notify_event = MessageEvent(
+                    text=chunk,
+                    source=session_source,
+                    message_type=MessageType.TEXT,
+                    internal=True,
+                    timestamp=datetime.now(),
+                )
+                await adapter.handle_message(notify_event)
+                return {"success": True, "queued": True}
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                return {"error": f"Plugin platform send failed: {e}"}
-            if result.success:
-                return {"success": True, "message_id": result.message_id}
-            return {"error": f"Adapter send failed: {result.error}"}
+                return {"error": f"Plugin platform wake event failed: {e}"}
+
+    if try_adapter_only:
+        bridge_result = await _send_via_bridge(
+            platform, chat_id, chunk, thread_id=thread_id
+        )
+        if bridge_result.get("success") and bridge_result.get("queued"):
+            return bridge_result
+        return {"error": f"No live adapter for platform '{platform_name}'"}
 
     entry = None
     try:
@@ -776,6 +790,67 @@ async def _send_via_adapter(
     }
 
 
+BRIDGE_SOCKET = "/tmp/hermes/mcp_bridge.sock"
+
+
+async def _send_via_bridge(platform, chat_id, text, *, thread_id=None):
+    """Inject a message as a wake event via the gateway's MCP bridge socket.
+
+    Used when the in-process adapter is unavailable (e.g. ``hermes send`` CLI
+    running in a separate process) but the gateway is running.  Connects to
+    the gateway's Unix socket and sends an ``inject`` command so the gateway
+    injects the message via ``adapter.handle_message(internal=True)``.
+
+    Returns ``{"success": True, "queued": True}`` on success, or an error
+    dict on failure.
+    """
+    import socket as _socket
+
+    platform_name = platform.value if hasattr(platform, "value") else str(platform)
+    payload = {
+        "action": "inject",
+        "platform": platform_name,
+        "chat_id": chat_id,
+        "text": text,
+    }
+    if thread_id is not None:
+        payload["thread_id"] = thread_id
+
+    try:
+        sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        sock.settimeout(5.0)
+        sock.connect(BRIDGE_SOCKET)
+        sock.sendall((json.dumps(payload) + "\n").encode("utf-8"))
+        data = b""
+        while True:
+            chunk_data = sock.recv(4096)
+            if not chunk_data:
+                break
+            data += chunk_data
+            if b"\n" in data:
+                break
+        sock.close()
+
+        if not data:
+            return {"error": "Bridge returned empty response"}
+        try:
+            response = json.loads(data.decode("utf-8"))
+        except json.JSONDecodeError:
+            return {"error": f"Bridge returned invalid JSON: {data[:200]!r}"}
+
+        if response.get("ok"):
+            return {"success": True, "queued": True}
+        return {"error": f"Bridge inject failed: {response.get('error', 'unknown')}"}
+    except _socket.timeout:
+        return {"error": "Bridge socket timed out — gateway may not be running"}
+    except FileNotFoundError:
+        return {"error": f"Bridge socket not found at {BRIDGE_SOCKET} — gateway may not be running"}
+    except ConnectionRefusedError:
+        return {"error": f"Bridge socket connection refused at {BRIDGE_SOCKET} — gateway may not be running"}
+    except Exception as e:
+        return {"error": f"Bridge send failed: {e}"}
+
+
 async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False):
     """Route a message to the appropriate platform sender.
 
@@ -786,6 +861,24 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     from gateway.config import Platform
 
     media_files = media_files or []
+
+    # Try injecting as an agent wake event first — when the gateway is
+    # running this routes the message into the agent's session context
+    # (same pattern as kanban wake events) instead of delivering directly
+    # to the user's chat. Falls through to platform-specific senders below
+    # when no live adapter is available (standalone CLI, cron, etc.).
+    try:
+        wake_result = await _send_via_adapter(
+            platform, pconfig, chat_id, message,
+            thread_id=thread_id,
+            media_files=media_files,
+            force_document=force_document,
+            try_adapter_only=True,
+        )
+        if wake_result.get("success") and wake_result.get("queued"):
+            return wake_result
+    except Exception:
+        pass
 
     # Weixin handles text/media delivery inside its native helper and does not
     # need the optional platform adapter imports below. Keep this branch early
