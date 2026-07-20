@@ -400,17 +400,10 @@ def _handle_send(args):
     except Exception as e:
         return json.dumps(_error(f"Failed to load gateway config: {e}"))
 
-    # Accept any platform name — built-in names resolve to their enum
-    # member, plugin platform names create dynamic members via _missing_().
-    try:
-        platform = Platform(platform_name)
-    except (ValueError, KeyError):
-        return tool_error(f"Unknown platform: {platform_name}")
-
-    # `--to agent` — resolve real home channel, flag for agent wake path
+    # `--to agent` — intercept BEFORE Platform() parsing: "agent" is not a
+    # platform enum member. Resolve the real home channel and redirect to it.
     agent_wake = False
     if platform_name == "agent":
-        # Find the first platform with a home channel configured
         home = None
         for p, pconfig_candidate in config.platforms.items():
             if pconfig_candidate and pconfig_candidate.enabled and pconfig_candidate.home_channel:
@@ -422,10 +415,13 @@ def _handle_send(args):
         agent_wake = True
         chat_id = home.chat_id
         thread_id = home.thread_id
-        try:
-            platform = Platform(platform_name)
-        except (ValueError, KeyError):
-            return tool_error(f"Unknown home platform: {platform_name}")
+
+    # Accept any platform name — built-in names resolve to their enum
+    # member, plugin platform names create dynamic members via _missing_().
+    try:
+        platform = Platform(platform_name)
+    except (ValueError, KeyError):
+        return tool_error(f"Unknown platform: {platform_name}")
 
     pconfig = config.platforms.get(platform)
     if not pconfig or not pconfig.enabled:
