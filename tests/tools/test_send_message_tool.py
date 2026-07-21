@@ -317,6 +317,7 @@ class TestSendMessageTool:
             thread_id=None,
             media_files=[],
             force_document=False,
+            agent_wake=False,
         )
 
     def test_cron_duplicate_target_is_skipped_and_explained(self):
@@ -382,6 +383,7 @@ class TestSendMessageTool:
             thread_id="17585",
             media_files=[],
             force_document=False,
+            agent_wake=False,
         )
 
     def test_display_label_target_resolves_via_channel_directory(self, tmp_path):
@@ -421,6 +423,7 @@ class TestSendMessageTool:
             thread_id="17585",
             media_files=[],
             force_document=False,
+            agent_wake=False,
         )
 
     def test_resolved_slack_thread_name_preserves_thread_id(self):
@@ -455,6 +458,7 @@ class TestSendMessageTool:
             thread_id="171.000001",
             media_files=[],
             force_document=False,
+            agent_wake=False,
         )
 
     def test_resolved_matrix_thread_name_preserves_thread_id(self):
@@ -496,6 +500,7 @@ class TestSendMessageTool:
             thread_id="$thread123:matrix.example.org",
             media_files=[],
             force_document=False,
+            agent_wake=False,
         )
 
     def test_mirror_receives_current_session_user_id(self):
@@ -567,6 +572,7 @@ class TestSendMessageTool:
             thread_id=None,
             media_files=[],
             force_document=False,
+            agent_wake=False,
         )
 
     def test_top_level_send_failure_redacts_query_token(self):
@@ -3014,18 +3020,15 @@ class TestSendViaAdapterStandaloneFallback:
         )
 
     @pytest.mark.asyncio
-    async def test_live_ntfy_adapter_receives_explicit_publish_topic(self, monkeypatch):
+    async def test_live_ntfy_adapter_injects_via_handle_message(self, monkeypatch):
         from tools.send_message_tool import _send_via_adapter
 
         platform = Platform("ntfy")
         recorded = {}
 
         class Adapter:
-            async def send(self, *, chat_id, content, metadata=None):
-                recorded["chat_id"] = chat_id
-                recorded["content"] = content
-                recorded["metadata"] = metadata
-                return SimpleNamespace(success=True, message_id="ntfy-id")
+            async def handle_message(self, event):
+                recorded["event"] = event
 
         runner = SimpleNamespace(adapters={platform: Adapter()})
         fake_gateway_run = ModuleType("gateway.run")
@@ -3039,10 +3042,11 @@ class TestSendViaAdapterStandaloneFallback:
             "done",
         )
 
-        assert result == {"success": True, "message_id": "ntfy-id"}
-        assert recorded["chat_id"] == "alerts-channel"
-        assert recorded["content"] == "done"
-        assert recorded["metadata"] == {"publish_topic": "alerts-channel"}
+        assert result == {"success": True, "queued": True}
+        assert recorded["event"].text == "done"
+        assert recorded["event"].internal is True
+        assert recorded["event"].source.chat_id == "alerts-channel"
+        assert recorded["event"].source.platform == platform
 
     @pytest.mark.asyncio
     async def test_standalone_sender_fn_called_when_no_adapter(self, monkeypatch):
@@ -3186,6 +3190,105 @@ class TestSendViaAdapterStandaloneFallback:
         assert result["success"] is True
         assert result["message_id"] == "abc-123"
         assert result["extra_field"] == "preserved"
+
+    @pytest.mark.asyncio
+    async def test_send_to_platform_tries_adapter_first(self, monkeypatch):
+        """When a live adapter exists, _send_to_platform injects via
+        handle_message() and returns immediately without calling the
+        platform-specific sender."""
+        from tools.send_message_tool import _send_to_platform, _send_via_adapter
+        from gateway.platform_registry import platform_registry
+
+        # Register a Discord standalone sender — it must NOT be called
+        discord_called = False
+        async def discord_send(pconfig, chat_id, message, **kwargs):
+            nonlocal discord_called
+            discord_called = True
+            return {"success": True}
+
+        from gateway.platform_registry import PlatformEntry
+        platform_registry.register(PlatformEntry(
+            name="discord",
+            label="Discord",
+            adapter_factory=lambda cfg: None,
+            check_fn=lambda: True,
+            standalone_sender_fn=discord_send,
+            max_message_length=2000,
+        ))
+        try:
+            # Set up a live runner with a Discord adapter whose
+            # handle_message records the call
+            recorded = {}
+
+            class Adapter:
+                async def handle_message(self, event):
+                    recorded["event"] = event
+
+            runner = SimpleNamespace(adapters={Platform.DISCORD: Adapter()})
+            fake_gateway_run = ModuleType("gateway.run")
+            fake_gateway_run._gateway_runner_ref = lambda: runner
+            monkeypatch.setitem(sys.modules, "gateway.run", fake_gateway_run)
+
+            result = await _send_to_platform(
+                Platform.DISCORD,
+                SimpleNamespace(extra={}),
+                "123456",
+                "hello from hermes send",
+                agent_wake=True,
+            )
+
+            # Must return the wake result, not the Discord sender result
+            assert result == {"success": True, "queued": True}
+            assert recorded["event"].text == "hello from hermes send"
+            assert recorded["event"].internal is True
+            assert recorded["event"].source.chat_id == "123456"
+            assert not discord_called, (
+                "Discord standalone sender was called — "
+                "wake event path should have returned first"
+            )
+        finally:
+            platform_registry.unregister("discord")
+
+    @pytest.mark.asyncio
+    async def test_send_to_platform_falls_through_when_no_adapter(self, monkeypatch):
+        """When no live adapter exists, _send_to_platform falls through to
+        the platform-specific sender after _send_via_adapter returns an error."""
+        from tools.send_message_tool import _send_to_platform
+        from gateway.platform_registry import platform_registry, PlatformEntry
+
+        recorded = {}
+        async def discord_send(pconfig, chat_id, message, **kwargs):
+            recorded["called"] = True
+            recorded["message"] = message
+            return {"success": True, "message_id": "msg-99"}
+
+        platform_registry.register(PlatformEntry(
+            name="discord",
+            label="Discord",
+            adapter_factory=lambda cfg: None,
+            check_fn=lambda: True,
+            standalone_sender_fn=discord_send,
+            max_message_length=2000,
+        ))
+        try:
+            # No live runner — _gateway_runner_ref returns None
+            monkeypatch.setattr(
+                "gateway.run._gateway_runner_ref", lambda: None
+            )
+
+            result = await _send_to_platform(
+                Platform.DISCORD,
+                SimpleNamespace(extra={}),
+                "123456",
+                "hello from cron",
+            )
+
+            # Must reach the Discord standalone sender
+            assert recorded["called"] is True
+            assert recorded["message"] == "hello from cron"
+            assert result["success"] is True
+        finally:
+            platform_registry.unregister("discord")
 
 
 # ---------------------------------------------------------------------------

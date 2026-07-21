@@ -9,12 +9,10 @@ metadata:
   hermes:
     tags: [FindMy, AirTag, location, tracking, macOS, Apple]
 ---
-
 # Find My (Apple)
 
 Track Apple devices and AirTags via the FindMy.app on macOS. Since Apple doesn't
 provide a CLI for FindMy, this skill uses AppleScript to open the app and
-screen capture to read device locations.
 
 ## Prerequisites
 
@@ -90,14 +88,11 @@ peekaboo click --on B3 --app "FindMy"
 peekaboo image --app "FindMy" --path /tmp/findmy-detail.png
 ```
 
-Then analyze with vision:
 ```
 vision_analyze(image_url="/tmp/findmy-detail.png", question="What is the location shown for this device/item? Include address and coordinates if visible.")
 ```
 
 ## Workflow: Track AirTag Location Over Time
-
-For monitoring an AirTag (e.g., tracking a cat's patrol route):
 
 ```bash
 # 1. Open FindMy to Items tab

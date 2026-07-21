@@ -12,7 +12,6 @@ metadata:
     related_skills: [excalidraw]
 
 ---
-
 # ASCII Art Skill
 
 Multiple tools for different ASCII art needs. All tools are local CLI programs or free REST APIs — no API keys required.
@@ -231,13 +230,9 @@ Large collection of classic ASCII art organized by subject. Art is inside HTML `
 
 **URL pattern:** `https://ascii.co.uk/art/{subject}`
 
-**Step 1 — Fetch the page:**
-
 ```bash
 curl -s 'https://ascii.co.uk/art/cat' -o /tmp/ascii_art.html
 ```
-
-**Step 2 — Extract art from pre tags:**
 
 ```python
 import re, html
@@ -259,7 +254,6 @@ for art in arts:
 - Characters: `skull`, `robot`, `angel`, `wizard`, `pirate`, `ninja`, `alien`
 - Holidays: `christmas`, `halloween`, `valentine`
 
-**Tips:**
 - Preserve artist signatures/initials — important etiquette
 - Multiple art pieces per page — pick the best one for the user
 - Works reliably via curl, no JavaScript needed

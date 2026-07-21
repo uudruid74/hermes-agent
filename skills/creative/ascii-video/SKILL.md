@@ -3,7 +3,6 @@ name: ascii-video
 description: "ASCII video: convert video/audio to colored ASCII MP4/GIF."
 platforms: [linux, macos, windows]
 ---
-
 # ASCII Video Production Pipeline
 
 ## When to use
@@ -21,8 +20,6 @@ This is visual art. ASCII characters are the medium; cinema is the standard.
 **Before writing a single line of code**, articulate the creative concept. What is the mood? What visual story does this tell? What makes THIS project different from every other ASCII video? The user's prompt is a starting point — interpret it with creative ambition, not literal transcription.
 
 **First-render excellence is non-negotiable.** The output must be visually striking without requiring revision rounds. If something looks generic, flat, or like "AI-generated ASCII art," it is wrong — rethink the creative concept before shipping.
-
-**Go beyond the reference vocabulary.** The effect catalogs, shader presets, and palette libraries in the references are a starting vocabulary. For every project, combine, modify, and invent new patterns. The catalog is a palette of paints — you write the painting.
 
 **Be proactively creative.** Extend the skill's vocabulary when the project calls for it. If the references don't have what the vision demands, build it. Include at least one visual moment the user didn't ask for but will appreciate — a transition, an effect, a color choice that elevates the whole piece.
 
@@ -56,8 +53,6 @@ Single self-contained Python script per project. No GPU required.
 | Optional | OpenCV | Video frame sampling, edge detection |
 
 ## Pipeline Architecture
-
-Every mode follows the same 6-stage pipeline:
 
 ```
 INPUT → ANALYZE → SCENE_FN → TONEMAP → SHADE → ENCODE
@@ -99,20 +94,15 @@ Never use the same config for the entire video. For each section/scene:
 
 ### Project-Specific Invention
 
-For every project, invent at least one of:
 - A custom character palette matching the theme
 - A custom background effect (combine/modify existing building blocks)
 - A custom color palette (discrete RGB set matching the brand/mood)
 - A custom particle character set
 - A novel scene transition or visual moment
 
-Don't just pick from the catalog. The catalog is vocabulary — you write the poem.
-
 ## Workflow
 
 ### Step 1: Creative Vision
-
-Before any code, articulate the creative concept:
 
 - **Mood/atmosphere**: What should the viewer feel? Energetic, meditative, chaotic, elegant, ominous?
 - **Visual story**: What happens over the duration? Build tension? Transform? Dissolve?
@@ -120,8 +110,6 @@ Before any code, articulate the creative concept:
 - **Character texture**: Dense data? Sparse stars? Organic dots? Geometric blocks?
 - **What makes THIS different**: What's the one thing that makes this project unique?
 - **Emotional arc**: How do scenes progress? Open with energy, build to climax, resolve?
-
-Map the user's prompt to aesthetic choices. A "chill lo-fi visualizer" demands different everything from a "glitch cyberpunk data stream."
 
 ### Step 2: Technical Design
 

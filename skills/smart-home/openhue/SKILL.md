@@ -12,10 +12,7 @@ metadata:
 prerequisites:
   commands: [openhue]
 ---
-
 # OpenHue CLI
-
-Control Philips Hue lights and scenes via a Hue Bridge from the terminal.
 
 ## Prerequisites
 

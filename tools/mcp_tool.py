@@ -3910,11 +3910,39 @@ def _auto_watch_prometheus_socket(server_name: str, socket_path: str) -> None:
     def _on_close() -> None:
         logger.info("Prometheus auto-watch: socket %s closed", socket_path)
 
-    try:
-        handle = adapter.watch_unix_socket(socket_path, _on_handoff, _on_close)
-        logger.info("Prometheus auto-watch: watching %s (handle=%s)", socket_path, handle)
-    except Exception:
-        logger.debug("Prometheus auto-watch: failed for %s", socket_path, exc_info=True)
+    # Retry with backoff — the plugin's handoff_server thread polls
+    # current_session every 0.5s and may not have bound the socket yet
+    # when request_session() returns.  Unix socket connect() raises
+    # ConnectionRefusedError immediately if no listener is bound.
+    import time as _time
+    _retry_delays = [0.1, 0.3, 0.5, 1.0, 2.0]
+    _last_err = None
+    for _attempt, _delay in enumerate(_retry_delays):
+        try:
+            handle = adapter.watch(
+                f"unix://{socket_path}", _on_handoff, _on_close,
+            )
+            logger.info(
+                "Prometheus auto-watch: watching %s (handle=%s, attempt=%d)",
+                socket_path, handle, _attempt + 1,
+            )
+            return  # success — done
+        except (ConnectionRefusedError, FileNotFoundError) as e:
+            _last_err = e
+            logger.debug(
+                "Prometheus auto-watch: %s not ready (attempt %d/%d), "
+                "retrying in %.1fs",
+                socket_path, _attempt + 1, len(_retry_delays), _delay,
+            )
+            _time.sleep(_delay)
+        except Exception as e:
+            _last_err = e
+            break  # non-retryable error (permissions, etc.)
+
+    logger.warning(
+        "Prometheus auto-watch: failed for %s after %d attempts: %s",
+        socket_path, len(_retry_delays) + 1, _last_err,
+    )
 
 
 def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
@@ -4037,10 +4065,10 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     parts.append(image_tag)
             text_result = "\n".join(parts) if parts else ""
 
-            # Auto-wire Prometheus push: when prometheus_request_session
+            # Auto-wire Prometheus/GIMP push: when request_session
             # returns a socket_path, connect via watch_unix_socket() so
             # handoff data flows into the steer pipeline automatically.
-            if tool_name == "prometheus_request_session":
+            if tool_name in ("prometheus_request_session", "request_session"):
                 try:
                     _parsed = json.loads(text_result) if text_result else {}
                     _sock = _parsed.get("socket_path")

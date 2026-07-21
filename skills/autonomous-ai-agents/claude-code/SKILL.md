@@ -10,7 +10,6 @@ metadata:
     tags: [Coding-Agent, Claude, Anthropic, Code-Review, Refactoring, PTY, Automation]
     related_skills: [codex, hermes-agent, opencode]
 ---
-
 # Claude Code — Hermes Orchestration Guide
 
 Delegate coding tasks to [Claude Code](https://code.claude.com/docs/en/cli-reference) (Anthropic's autonomous coding agent CLI) via the Hermes terminal. Claude Code v2.x can read files, write code, run shell commands, spawn subagents, and manage git workflows autonomously.
@@ -28,8 +27,6 @@ Delegate coding tasks to [Claude Code](https://code.claude.com/docs/en/cli-refer
 
 ## Two Orchestration Modes
 
-Hermes interacts with Claude Code in two fundamentally different ways. Choose based on the task.
-
 ### Mode 1: Print Mode (`-p`) — Non-Interactive (PREFERRED for most tasks)
 
 Print mode runs a one-shot task, returns the result, and exits. No PTY needed. No interactive prompts. This is the cleanest integration path.
@@ -38,7 +35,6 @@ Print mode runs a one-shot task, returns the result, and exits. No PTY needed. N
 terminal(command="claude -p 'Add error handling to all API calls in src/' --allowedTools 'Read,Edit' --max-turns 10", workdir="/path/to/project", timeout=120)
 ```
 
-**When to use print mode:**
 - One-shot coding tasks (fix a bug, add a feature, refactor)
 - CI/CD automation and scripting
 - Structured data extraction with `--json-schema`
@@ -72,7 +68,6 @@ terminal(command="tmux send-keys -t claude-work 'Now add unit tests for the new 
 terminal(command="tmux send-keys -t claude-work '/exit' Enter")
 ```
 
-**When to use interactive mode:**
 - Multi-turn iterative work (refactor → review → fix → test cycle)
 - Tasks requiring human-in-the-loop decisions
 - Exploratory coding sessions
@@ -228,7 +223,6 @@ terminal(command="claude --bare -p 'Run all tests and report failures' --allowed
 
 `--bare` skips hooks, plugins, MCP discovery, and CLAUDE.md loading. Fastest startup. Requires `ANTHROPIC_API_KEY` (skips OAuth).
 
-To selectively load context in bare mode:
 | To load | Flag |
 |---------|------|
 | System prompt additions | `--append-system-prompt "text"` or `--append-system-prompt-file path` |
@@ -495,8 +489,6 @@ Creates an isolated git worktree at `.claude/worktrees/feature-x` AND a tmux ses
 
 ## Parallel Claude Instances
 
-Run multiple independent Claude tasks simultaneously:
-
 ```
 # Task 1: Fix backend
 terminal(command="tmux new-session -d -s task1 -x 140 -y 40 && tmux send-keys -t task1 'cd ~/project && claude -p \"Fix the auth bug in src/auth.py\" --allowedTools \"Read,Edit\" --max-turns 10' Enter")
@@ -678,7 +670,6 @@ Reference MCP resources in chat: `@github:issue://123`
 terminal(command="tmux capture-pane -t dev -p -S -10")
 ```
 
-Look for these indicators:
 - `❯` at bottom = waiting for your input (Claude is done or asking a question)
 - `●` lines = Claude is actively using tools (reading, writing, running commands)
 - `⏵⏵ bypass permissions on` = status bar showing permissions mode

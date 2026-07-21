@@ -6,11 +6,9 @@ author: Hermes Agent + Teknium
 tags: [polymarket, prediction-markets, market-data, trading]
 platforms: [linux, macos, windows]
 ---
-
 # Polymarket — Prediction Market Data
 
 Query prediction market data from Polymarket using their public REST APIs.
-All endpoints are read-only and require zero authentication.
 
 See `references/api-endpoints.md` for the full endpoint reference with curl examples.
 
@@ -40,8 +38,6 @@ See `references/api-endpoints.md` for the full endpoint reference with curl exam
 
 ## Typical Workflow
 
-When a user asks about prediction market odds:
-
 1. **Search** using the Gamma API public-search endpoint with their query
 2. **Parse** the response — extract events and their nested markets
 3. **Present** market question, current prices as percentages, and volume
@@ -49,7 +45,6 @@ When a user asks about prediction market odds:
 
 ## Presenting Results
 
-Format prices as percentages for readability:
 - outcomePrices `["0.652", "0.348"]` becomes "Yes: 65.2%, No: 34.8%"
 - Always show the market question and probability
 - Include volume when available
@@ -64,7 +59,6 @@ inside JSON responses (double-encoded). When processing with Python, parse them 
 
 ## Rate Limits
 
-Generous — unlikely to hit for normal usage:
 - Gamma: 4,000 requests per 10 seconds (general)
 - CLOB: 9,000 requests per 10 seconds (general)
 - Data: 1,000 requests per 10 seconds (general)

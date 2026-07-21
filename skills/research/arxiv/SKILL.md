@@ -10,7 +10,6 @@ metadata:
     tags: [Research, Arxiv, Papers, Academic, Science, API]
     related_skills: [ocr-and-documents]
 ---
-
 # arXiv Research
 
 Search and retrieve academic papers from arXiv via their free REST API. No API key, no dependencies — just curl.
@@ -113,9 +112,6 @@ curl -s "https://export.arxiv.org/api/query?id_list=2402.03300,2401.12345,2403.0
 
 ## BibTeX Generation
 
-After fetching metadata for a paper, generate a BibTeX entry:
-
-{% raw %}
 ```bash
 curl -s "https://export.arxiv.org/api/query?id_list=1706.03762" | python3 -c "
 import sys, xml.etree.ElementTree as ET
@@ -141,11 +137,8 @@ print(f'  url       = {{https://arxiv.org/abs/{raw_id}}}')
 print('}')
 "
 ```
-{% endraw %}
 
 ## Reading Paper Content
-
-After finding a paper, read it:
 
 ```
 # Abstract page (fast, metadata + abstract)
@@ -184,8 +177,6 @@ python scripts/search_arxiv.py --category cs.AI --sort date
 python scripts/search_arxiv.py --id 2402.03300
 python scripts/search_arxiv.py --id 2402.03300,2401.12345
 ```
-
-No dependencies — uses only Python stdlib.
 
 ---
 

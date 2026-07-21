@@ -1435,7 +1435,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         logger.warning("Job '%s': %s", job["id"], msg)
         return msg
 
-    from tools.send_message_tool import _send_to_platform
+    from tools.send_message_tool import _send_to_platform, _send_via_adapter
     from gateway.config import load_gateway_config, Platform
 
     # Optionally wrap the content with a header/footer so the user knows this
@@ -1625,89 +1625,26 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 opened_thread_id = new_thread_id
 
         if runtime_adapter is not None and loop is not None and getattr(loop, "is_running", lambda: False)():
-            # Telegram topic routing (#22773, regression fixed #52060): a
-            # ``telegram:<positive_chat_id>:<numeric_thread_id>`` cron target is
-            # ambiguous — a forum-style topic in a private chat and a genuine
-            # Bot API channel Direct-Messages topic share the same shape and
-            # need OPPOSITE routing. Disambiguate at delivery time via
-            # ``_is_channel_dm_topic`` (see its docstring for the full
-            # rationale); ``thread_id`` goes in ``route_metadata`` so the
-            # anchorless cron send bypasses the DeliveryRouter's private-chat
-            # reply-anchor requirement. Compute the routed metadata ONCE so both
-            # the text send (via DeliveryRouter) and the media send agree.
-            from gateway.delivery import (
-                DeliveryRouter,
-                DeliveryTarget,
-                _looks_like_int,
-                looks_like_telegram_private_chat_id,
-            )
-
-            is_ambiguous_telegram_topic = (
-                platform == Platform.TELEGRAM
-                and thread_id is not None
-                and looks_like_telegram_private_chat_id(str(chat_id))
-                and _looks_like_int(str(thread_id))
-            )
-            route_via_dm_topic = is_ambiguous_telegram_topic and _is_channel_dm_topic(
-                runtime_adapter, chat_id, loop, job["id"],
-            )
-            if route_via_dm_topic:
-                # Genuine Bot API channel Direct-Messages topic (#22773 mode 2):
-                # routed via direct_messages_topic_id, no bare thread_id.
-                route_thread_id = None
-                route_metadata = {
-                    "direct_messages_topic_id": str(thread_id),
-                    "job_id": job["id"],
-                }
-                # Media metadata mirrors the text routing so attachments land in
-                # the same DM topic instead of the General lane (#22773).
-                media_metadata = {"direct_messages_topic_id": str(thread_id)}
-            else:
-                # Forum-style topic (private chat / supergroup) or non-topic
-                # target: route via message_thread_id (#52060).  Put thread_id in
-                # *route_metadata* (not just the DeliveryTarget) deliberately —
-                # the DeliveryRouter's private-chat topic detection
-                # (gateway/delivery.py) demands a reply anchor when thread_id is
-                # absent from metadata; cron deliveries have no inbound reply
-                # anchor, so the metadata key bypasses that check and lets the
-                # adapter route via a plain message_thread_id.
-                route_thread_id = str(thread_id) if thread_id is not None else None
-                route_metadata = {"job_id": job["id"]}
-                if route_thread_id:
-                    route_metadata["thread_id"] = route_thread_id
-                media_metadata = {"thread_id": thread_id} if thread_id else None
-
+            # Agent wake delivery — route cron output through the adapter's
+            # handle_message(internal=True) so it arrives in the agent's session
+            # as an internal wake event, rather than direct Bot API delivery.
+            # The agent can then triage — alert human if urgent, file, take action,
+            # or summarize. Raw dump to a sleeping human is noise.
             try:
-                # Send cleaned text (MEDIA tags stripped) — not the raw content.
-                # Route through the gateway's DeliveryRouter so the live send
-                # gets the same platform-specific routing as live messages —
-                # in particular Telegram's three-mode topic routing.  The
-                # standalone cron path lacked this, so DM-topic cron deliveries
-                # landed in the General topic or were rejected by Bot API 10.0
-                # (#22773).
                 text_to_send = cleaned_delivery_content.strip()
                 adapter_ok = True
                 timed_out = False
                 if text_to_send:
                     from agent.async_utils import safe_schedule_threadsafe
 
-                    router = DeliveryRouter(config, adapters)
-                    route_target = DeliveryTarget(
-                        platform=platform,
-                        chat_id=str(chat_id),
-                        thread_id=route_thread_id,
-                        is_explicit=True,
-                    )
-                    # Pass thread routing via the target (not a bare metadata
-                    # "thread_id"): the router only applies its Telegram DM-topic
-                    # detection when "thread_id"/"message_thread_id" are absent
-                    # from metadata, deriving the routing from target.thread_id
-                    # or the explicit direct_messages_topic_id above.
                     future = safe_schedule_threadsafe(
-                        router._deliver_to_platform(
-                            route_target,
+                        _send_via_adapter(
+                            platform,
+                            pconfig,
+                            str(chat_id),
                             text_to_send,
-                            route_metadata,
+                            thread_id=str(thread_id) if thread_id is not None else None,
+                            try_adapter_only=False,
                         ),
                         loop,
                     )
@@ -1720,23 +1657,6 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         try:
                             send_result = future.result(timeout=60)
                         except TimeoutError:
-                            # #38922: a slow confirmation does NOT necessarily
-                            # mean the send failed — but we must distinguish two
-                            # cases via future.cancel()'s return value:
-                            #
-                            #   cancel() == False -> the coroutine was already
-                            #     running on the gateway loop when the timeout
-                            #     fired; the request is in flight on the wire and
-                            #     cannot be un-sent.  Re-sending via standalone
-                            #     would be a guaranteed DUPLICATE, so treat it as
-                            #     delivered (assume-delivered).
-                            #
-                            #   cancel() == True -> the scheduled callback never
-                            #     started executing (loop wedged/backlogged for
-                            #     the full 60s), so nothing was sent.  We MUST
-                            #     fall through to the standalone path or the
-                            #     message is silently dropped (worse than a
-                            #     duplicate).
                             cancelled = future.cancel()
                             if cancelled:
                                 msg = (
@@ -1748,7 +1668,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                     job["id"], msg,
                                 )
                                 target_errors.append(msg)
-                                adapter_ok = False  # fall through to standalone path
+                                adapter_ok = False
                                 timeout_handled = True
                             else:
                                 timed_out = True
@@ -1761,93 +1681,40 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                     job["id"], platform_name, chat_id,
                                 )
                         except Exception as ex:
-                            # A real send error (not a slow confirmation) — fall
-                            # through to the standalone path so the message is
-                            # still delivered.
                             target_errors.append(f"live adapter send failed: {ex}")
                             raise
 
                         if timeout_handled:
-                            # The timeout branch above already decided the
-                            # outcome (assume-delivered if in flight, or
-                            # adapter_ok=False to fall through if never
-                            # dispatched).  send_result is None, so skip the
-                            # confirmation/thread-fallback inspection below.
                             pass
                         else:
-                            # _deliver_to_platform returns either a SendResult
-                            # (.success attr) or, when the silence-narration
-                            # filter drops the message, a plain dict
-                            # {"success": True, "delivered": False, ...}.
-                            # Normalize both shapes so a getattr default doesn't
-                            # misread a dict, and so a None / success-less object
-                            # is NOT counted as delivered (#47056).
+                            # _send_via_adapter returns {"success": True, "queued": True} on success
                             if isinstance(send_result, dict):
                                 send_success = bool(send_result.get("success", False))
-                                send_raw_response = send_result.get("raw_response")
                             else:
-                                send_success = _confirm_adapter_delivery(send_result)
-                                send_raw_response = getattr(send_result, "raw_response", None)
+                                send_success = False
 
                             if not send_success:
                                 if isinstance(send_result, dict):
                                     err = send_result.get("error", "unknown")
-                                    shape = "dict"
                                 elif send_result is not None:
-                                    err = getattr(send_result, "error", None)
-                                    shape = type(send_result).__name__
+                                    err = getattr(send_result, "error", str(send_result))
                                 else:
                                     err = "no response from adapter"
-                                    shape = "None"
                                 msg = (
                                     f"live adapter send to {platform_name}:{chat_id} "
-                                    f"returned unconfirmed result ({shape}, error={err})"
+                                    f"failed: {err}"
                                 )
                                 logger.warning(
                                     "Job '%s': %s, falling back to standalone",
                                     job["id"], msg,
                                 )
                                 target_errors.append(msg)
-                                adapter_ok = False  # fall through to standalone path
-                            elif (
-                                send_raw_response
-                                and thread_id
-                                and send_raw_response.get("thread_fallback")
-                            ):
-                                requested_thread_id = send_raw_response.get("requested_thread_id") or thread_id
-                                msg = (
-                                    f"configured thread_id {requested_thread_id} for "
-                                    f"{platform_name}:{chat_id} was not found; delivered without thread_id"
-                                )
-                                logger.warning("Job '%s': %s", job["id"], msg)
-                                delivery_errors.append(msg)
+                                adapter_ok = False
 
-                # Send extracted media files as native attachments via the live
-                # adapter, using the same DM-topic-aware routing as the text send
-                # (#22773 — media previously used a bare thread_id and landed in
-                # the General lane for private DM topics).  Skip on an in-flight
-                # confirmation timeout: the gateway loop is contended, so each
-                # media send would also block its 30s budget, and the text
-                # payload is already assumed delivered (#38922).  Record the
-                # skipped attachments so the drop is visible rather than silently
-                # lost.
-                if adapter_ok and not timed_out and media_files:
-                    _send_media_via_adapter(
-                        runtime_adapter,
-                        chat_id,
-                        media_files,
-                        media_metadata,
-                        loop,
-                        job,
-                        platform=platform,
-                    )
-                elif timed_out and media_files:
-                    msg = (
-                        f"{len(media_files)} media attachment(s) not delivered to "
-                        f"{platform_name}:{chat_id} (live adapter confirmation timed out)"
-                    )
-                    logger.warning("Job '%s': %s", job["id"], msg)
-                    delivery_errors.append(msg)
+                # Media attachments are skipped for agent wake delivery — the agent
+                # receives the full text and can access any referenced files via
+                # filesystem. Direct platform media delivery is noise when the
+                # human is asleep.
 
                 if adapter_ok:
                     logger.info("Job '%s': delivered to %s:%s via live adapter", job["id"], platform_name, chat_id)
@@ -1900,7 +1767,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 delivery_errors.extend(target_errors)
                 continue
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
-            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
+            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files, agent_wake=True)
             try:
                 result = asyncio.run(coro)
             except RuntimeError as run_err:
@@ -1929,7 +1796,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 try:
                     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                     try:
-                        future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
+                        future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files, agent_wake=True))
                         result = future.result(timeout=30)
                     finally:
                         pool.shutdown(wait=False)

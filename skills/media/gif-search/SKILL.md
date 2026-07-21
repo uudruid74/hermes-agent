@@ -12,7 +12,6 @@ metadata:
   hermes:
     tags: [GIF, Media, Search, Tenor, API]
 ---
-
 # GIF Search (Tenor API)
 
 Search and download GIFs directly via the Tenor API using curl. No extra tools needed.

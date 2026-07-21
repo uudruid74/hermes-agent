@@ -3,19 +3,15 @@ name: youtube-content
 description: "YouTube transcripts to summaries, threads, blogs."
 platforms: [linux, macos, windows]
 ---
-
 # YouTube Content Tool
 
 ## When to use
 
 Use when the user shares a YouTube URL or video link, asks to summarize a video, requests a transcript, or wants to extract and reformat content from any YouTube video. Transforms transcripts into structured content (chapters, summaries, threads, blog posts).
 
-Extract transcripts from YouTube videos and convert them into useful formats.
-
 ## Setup
 
 Use `uv` so the dependency is installed into the same Hermes-managed environment
-that runs the helper script:
 
 ```bash
 uv pip install youtube-transcript-api
@@ -40,8 +36,6 @@ uv run python3 SKILL_DIR/scripts/fetch_transcript.py "URL" --language tr,en
 ```
 
 ## Output Formats
-
-After fetching the transcript, format it based on what the user asks for:
 
 - **Chapters**: Group by topic shifts, output timestamped chapter list
 - **Summary**: Concise 5-10 sentence overview of the entire video

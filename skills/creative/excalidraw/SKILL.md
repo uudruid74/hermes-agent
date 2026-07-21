@@ -12,7 +12,6 @@ metadata:
     related_skills: []
 
 ---
-
 # Excalidraw Diagram Skill
 
 Create diagrams by writing standard Excalidraw element JSON and saving as `.excalidraw` files. These files can be drag-and-dropped onto [excalidraw.com](https://excalidraw.com) for viewing and editing. No accounts, no API keys, no rendering libraries -- just JSON.
@@ -75,24 +74,19 @@ Canvas background is white.
 
 ### Element Types
 
-**Rectangle**:
 ```json
 { "type": "rectangle", "id": "r1", "x": 100, "y": 100, "width": 200, "height": 100 }
 ```
 - `roundness: { "type": 3 }` for rounded corners
 - `backgroundColor: "#a5d8ff"`, `fillStyle: "solid"` for filled
 
-**Ellipse**:
 ```json
 { "type": "ellipse", "id": "e1", "x": 100, "y": 100, "width": 150, "height": 150 }
 ```
 
-**Diamond**:
 ```json
 { "type": "diamond", "id": "d1", "x": 100, "y": 100, "width": 150, "height": 150 }
 ```
-
-**Labeled shape (container binding)** -- create a text element bound to the shape:
 
 > **WARNING:** Do NOT use `"label": { "text": "..." }` on shapes. This is NOT a valid
 > Excalidraw property and will be silently ignored, producing blank shapes. You MUST
@@ -114,7 +108,6 @@ The shape needs `boundElements` listing the text, and the text needs `containerI
 - `originalText` should match `text`
 - Always include `fontFamily: 1` (Virgil/hand-drawn font)
 
-**Labeled arrow** -- same container binding approach:
 ```json
 { "type": "arrow", "id": "a1", "x": 300, "y": 150, "width": 200, "height": 0,
   "points": [[0,0],[200,0]], "endArrowhead": "arrow",
@@ -125,7 +118,6 @@ The shape needs `boundElements` listing the text, and the text needs `containerI
   "containerId": "a1", "originalText": "connects", "autoResize": true }
 ```
 
-**Standalone text** (titles and annotations only -- no container):
 ```json
 { "type": "text", "id": "t1", "x": 150, "y": 138, "text": "Hello", "fontSize": 20,
   "fontFamily": 1, "strokeColor": "#1e1e1e", "originalText": "Hello", "autoResize": true }
@@ -133,7 +125,6 @@ The shape needs `boundElements` listing the text, and the text needs `containerI
 - `x` is the LEFT edge. To center at position `cx`: `x = cx - (text.length * fontSize * 0.5) / 2`
 - Do NOT rely on `textAlign` or `width` for positioning
 
-**Arrow**:
 ```json
 { "type": "arrow", "id": "a1", "x": 300, "y": 150, "width": 200, "height": 0,
   "points": [[0,0],[200,0]], "endArrowhead": "arrow" }
@@ -164,13 +155,11 @@ The shape needs `boundElements` listing the text, and the text needs `containerI
 
 ### Sizing Guidelines
 
-**Font sizes:**
 - Minimum `fontSize`: **16** for body text, labels, descriptions
 - Minimum `fontSize`: **20** for titles and headings
 - Minimum `fontSize`: **14** for secondary annotations only (sparingly)
 - NEVER use `fontSize` below 14
 
-**Element sizes:**
 - Minimum shape size: 120x60 for labeled rectangles/ellipses
 - Leave 20-30px gaps between elements minimum
 - Prefer fewer, larger elements over many tiny ones
@@ -195,5 +184,3 @@ See `references/colors.md` for full color tables. Quick reference:
 - Do NOT use emoji in text -- they don't render in Excalidraw's font
 - For dark mode diagrams, see `references/dark-mode.md`
 - For larger examples, see `references/examples.md`
-
-

@@ -8,7 +8,6 @@ metadata:
     tags: [qa, testing, browser, web, dogfood]
     related_skills: []
 ---
-
 # Dogfood: Systematic Web Application QA Testing
 
 ## Overview
@@ -22,14 +21,11 @@ This skill guides you through systematic exploratory QA testing of web applicati
 
 ## Inputs
 
-The user provides:
 1. **Target URL** — the entry point for testing
 2. **Scope** — what areas/features to focus on (or "full site" for comprehensive testing)
 3. **Output directory** (optional) — where to save screenshots and the report (default: `./dogfood-output`)
 
 ## Workflow
-
-Follow this 5-phase systematic workflow:
 
 ### Phase 1: Plan
 
@@ -49,8 +45,6 @@ Follow this 5-phase systematic workflow:
 
 ### Phase 2: Explore
 
-For each page or feature in your plan:
-
 1. **Navigate** to the page:
    ```
    browser_navigate(url="https://example.com/page")
@@ -58,18 +52,15 @@ For each page or feature in your plan:
 
 2. **Take a snapshot** to understand the DOM structure:
    ```
-   browser_snapshot()
    ```
 
 3. **Check the console** for JavaScript errors:
    ```
-   browser_console(clear=true)
    ```
    Do this after every navigation and after every significant interaction. Silent JS errors are high-value findings.
 
 4. **Take an annotated screenshot** to visually assess the page and identify interactive elements:
    ```
-   browser_vision(question="Describe the page layout, identify any visual issues, broken elements, or accessibility concerns", annotate=true)
    ```
    The `annotate=true` flag overlays numbered `[N]` labels on interactive elements. Each `[N]` maps to ref `@eN` for subsequent browser commands.
 
@@ -88,11 +79,8 @@ For each page or feature in your plan:
 
 ### Phase 3: Collect Evidence
 
-For every issue found:
-
 1. **Take a screenshot** showing the issue:
    ```
-   browser_vision(question="Capture and describe the issue visible on this page", annotate=false)
    ```
    Save the `screenshot_path` from the response — you will reference it in the report.
 

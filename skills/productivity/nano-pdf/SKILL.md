@@ -10,7 +10,6 @@ metadata:
     tags: [PDF, Documents, Editing, NLP, Productivity]
     homepage: https://pypi.org/project/nano-pdf/
 ---
-
 # nano-pdf
 
 Edit PDFs using natural-language instructions. Point it at a page and describe what to change.

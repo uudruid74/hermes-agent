@@ -4,20 +4,11 @@ description: "Manim CE animations: 3Blue1Brown math/algo videos."
 version: 1.0.0
 platforms: [linux, macos, windows]
 ---
-
 # Manim Video Production Pipeline
 
 ## When to use
 
-Use when users request: animated explanations, math animations, concept visualizations, algorithm walkthroughs, technical explainers, 3Blue1Brown style videos, or any programmatic animation with geometric/mathematical content. Creates 3Blue1Brown-style explainer videos, algorithm visualizations, equation derivations, architecture diagrams, and data stories using Manim Community Edition.
-
 ## Creative Standard
-
-This is educational cinema. Every frame teaches. Every animation reveals structure.
-
-**Before writing a single line of code**, articulate the narrative arc. What misconception does this correct? What is the "aha moment"? What visual story takes the viewer from confusion to understanding? The user's prompt is a starting point — interpret it with pedagogical ambition.
-
-**Geometry before algebra.** Show the shape first, the equation second. Visual memory encodes faster than symbolic memory. When the viewer sees the geometric pattern before the formula, the equation feels earned.
 
 **First-render excellence is non-negotiable.** The output must be visually clear and aesthetically cohesive without revision rounds. If something looks cluttered, poorly timed, or like "AI-generated slides," it is wrong.
 
@@ -162,7 +153,6 @@ class Scene1_Introduction(Scene):
         self.play(FadeOut(title), run_time=0.5)
 ```
 
-Key patterns:
 - **Subtitles** on every animation: `self.add_subcaption("text", duration=N)` or `subcaption="text"` on `self.play()`
 - **Shared color constants** at file top for cross-scene consistency
 - **`self.camera.background_color`** set in every scene
@@ -255,7 +245,6 @@ If the user asks for creative, experimental, or unconventional explanatory appro
 - **Assumption Reversal** — when the user wants to challenge how something is typically taught
 
 ### SCAMPER Transformation
-Take a standard mathematical/technical visualization and transform it:
 - **Substitute**: replace the standard visual metaphor (number line → winding path, matrix → city grid)
 - **Combine**: merge two explanation approaches (algebraic + geometric simultaneously)
 - **Reverse**: derive backward — start from the result and deconstruct to axioms

@@ -15,7 +15,6 @@ metadata:
       - /docs/user-guide/messaging/teams-meetings
       - /docs/guides/operate-teams-meeting-pipeline
 ---
-
 # Teams Meeting Pipeline
 
 Use this skill whenever the user asks about Microsoft Teams meeting summaries, transcripts, recordings, action items, Graph subscriptions, or any operational question about the Teams meeting pipeline. Works in any language — the triggers below are examples, not an exhaustive list.
@@ -24,7 +23,6 @@ Everything operator-facing is a `hermes teams-pipeline` subcommand run via the t
 
 ## When to use this skill
 
-The user is asking to:
 - summarize a Teams meeting / extract action items / pull meeting notes
 - check pipeline status, inspect a stored meeting job, or see recent meetings
 - replay / re-run a stored job that failed or needs a fresh summary
@@ -33,7 +31,6 @@ The user is asking to:
 - manage Graph webhook subscriptions (create, renew, delete, inspect)
 - set up automated subscription renewal (see pitfall below)
 
-Multilingual trigger examples (not exhaustive):
 - English: "summarize the Teams meeting", "pipeline status", "replay job X"
 - Turkish: "Teams meeting özetle", "action item çıkar", "toplantı notu", "pipeline durumu", "replay job"
 
@@ -109,7 +106,6 @@ When the user reports "the pipeline worked yesterday but nothing is arriving tod
 
 ## Related docs
 
-Point the user to these when they need more depth than this skill covers:
 - Azure app registration walkthrough: `/docs/guides/microsoft-graph-app-registration`
 - Full pipeline setup: `/docs/user-guide/messaging/teams-meetings`
 - Operator runbook (renewal automation, troubleshooting, go-live checklist): `/docs/guides/operate-teams-meeting-pipeline`

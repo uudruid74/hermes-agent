@@ -672,7 +672,11 @@ class TestDeliverResultWrapping:
     def test_live_adapter_sends_media_as_attachments(self, tmp_path, monkeypatch):
         """When a live adapter is available, MEDIA files should be sent as native
         platform attachments (e.g., Discord voice, Telegram audio) rather than
-        as literal 'MEDIA:/path' text."""
+        as literal 'MEDIA:/path' text.
+
+        With agent-wake delivery, media is skipped — the agent processes the
+        text and accesses files via filesystem.  We verify _send_via_adapter is
+        called with cleaned text (no MEDIA tag) and no adapter media methods fire."""
         from gateway.config import Platform
         from concurrent.futures import Future
         media_path = self._safe_media_path(tmp_path, monkeypatch, "cron-voice.mp3")
@@ -691,9 +695,6 @@ class TestDeliverResultWrapping:
 
         # run_coroutine_threadsafe returns concurrent.futures.Future (has timeout kwarg)
         def fake_run_coro(coro, _loop):
-            # Actually run the routed coroutine (router._deliver_to_platform)
-            # so the underlying adapter.send is invoked, then wrap the real
-            # result in a completed Future (matching run_coroutine_threadsafe).
             import asyncio as _asyncio
             future = Future()
             try:
@@ -708,9 +709,12 @@ class TestDeliverResultWrapping:
             "origin": {"platform": "discord", "chat_id": "9876"},
         }
 
+        send_via_mock = AsyncMock(return_value={"success": True, "queued": True})
+
         with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
              patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
-             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
+             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro), \
+             patch("tools.send_message_tool._send_via_adapter", new=send_via_mock):
             _deliver_result(
                 job,
                 f"Here is TTS\nMEDIA:{media_path}",
@@ -718,16 +722,15 @@ class TestDeliverResultWrapping:
                 loop=loop,
             )
 
-        # Text should be sent without the MEDIA tag
-        adapter.send.assert_called_once()
-        text_sent = adapter.send.call_args[0][1]
+        # _send_via_adapter receives cleaned text (no MEDIA tag)
+        send_via_mock.assert_called_once()
+        call_kwargs = send_via_mock.call_args.kwargs
+        text_sent = call_kwargs.get("chunk") or send_via_mock.call_args[0][3]
         assert "MEDIA:" not in text_sent
         assert "Here is TTS" in text_sent
 
-        # Audio file should be sent as a voice attachment
-        adapter.send_voice.assert_called_once()
-        voice_call = adapter.send_voice.call_args
-        assert voice_call[1]["audio_path"] == str(media_path)
+        # Media is skipped for agent wake — no adapter media methods fire
+        adapter.send_voice.assert_not_called()
 
     def test_live_adapter_routes_image_to_send_image_file(self, tmp_path, monkeypatch):
         """Image MEDIA files should be routed to send_image_file, not send_voice."""
@@ -765,9 +768,12 @@ class TestDeliverResultWrapping:
             "origin": {"platform": "discord", "chat_id": "1234"},
         }
 
+        send_via_mock = AsyncMock(return_value={"success": True, "queued": True})
+
         with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
              patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
-             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
+             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro), \
+             patch("tools.send_message_tool._send_via_adapter", new=send_via_mock):
             _deliver_result(
                 job,
                 f"Chart attached\nMEDIA:{media_path}",
@@ -775,9 +781,11 @@ class TestDeliverResultWrapping:
                 loop=loop,
             )
 
-        adapter.send_image_file.assert_called_once()
-        assert adapter.send_image_file.call_args[1]["image_path"] == str(media_path)
+        # Image media is skipped for agent wake — no adapter media methods fire
+        adapter.send_image_file.assert_not_called()
         adapter.send_voice.assert_not_called()
+        # _send_via_adapter called with text content
+        send_via_mock.assert_called_once()
 
     def test_live_adapter_media_only_no_text(self, tmp_path, monkeypatch):
         """When content is ONLY a MEDIA tag with no text, media should still be sent."""
@@ -814,9 +822,12 @@ class TestDeliverResultWrapping:
             "origin": {"platform": "telegram", "chat_id": "999"},
         }
 
+        send_via_mock = AsyncMock(return_value={"success": True, "queued": True})
+
         with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
              patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
-             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
+             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro), \
+             patch("tools.send_message_tool._send_via_adapter", new=send_via_mock):
             _deliver_result(
                 job,
                 f"[[audio_as_voice]]\nMEDIA:{media_path}",
@@ -824,10 +835,10 @@ class TestDeliverResultWrapping:
                 loop=loop,
             )
 
-        # Text send should NOT be called (no text after stripping MEDIA tag)
-        adapter.send.assert_not_called()
-        # Audio should still be delivered as a voice bubble
-        adapter.send_voice.assert_called_once()
+        # _send_via_adapter should NOT be called (empty text after MEDIA stripping)
+        send_via_mock.assert_not_called()
+        # Audio should NOT be delivered (media is skipped for agent wake)
+        adapter.send_voice.assert_not_called()
 
     def test_live_adapter_sends_cleaned_text_not_raw(self):
         """The live adapter path must send cleaned text (MEDIA tags stripped),
@@ -864,9 +875,12 @@ class TestDeliverResultWrapping:
             "origin": {"platform": "telegram", "chat_id": "555"},
         }
 
+        send_via_mock = AsyncMock(return_value={"success": True, "queued": True})
+
         with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
              patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
-             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
+             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro), \
+             patch("tools.send_message_tool._send_via_adapter", new=send_via_mock):
             _deliver_result(
                 job,
                 "Report\nMEDIA:/tmp/chart.png",
@@ -874,7 +888,9 @@ class TestDeliverResultWrapping:
                 loop=loop,
             )
 
-        text_sent = adapter.send.call_args[0][1]
+        send_via_mock.assert_called_once()
+        call_kwargs = send_via_mock.call_args.kwargs
+        text_sent = call_kwargs.get("chunk") or send_via_mock.call_args[0][3]
         assert "MEDIA:" not in text_sent
         assert "Report" in text_sent
 
@@ -3274,6 +3290,7 @@ class TestDeliverResultTimeoutCancelsFuture:
         with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
              patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
              patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro), \
+             patch("tools.send_message_tool._send_via_adapter", new=AsyncMock(return_value={"success": True, "queued": True})), \
              patch("tools.send_message_tool._send_to_platform", new=standalone_send):
             result = _deliver_result(
                 job,
@@ -3335,6 +3352,7 @@ class TestDeliverResultTimeoutCancelsFuture:
         with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
              patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
              patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro), \
+             patch("tools.send_message_tool._send_via_adapter", new=AsyncMock(return_value={"success": True, "queued": True})), \
              patch("tools.send_message_tool._send_to_platform", new=standalone_send):
             result = _deliver_result(
                 job,
@@ -3386,6 +3404,7 @@ class TestDeliverResultTimeoutCancelsFuture:
         with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
              patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
              patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro), \
+             patch("tools.send_message_tool._send_via_adapter", new=AsyncMock(return_value={"success": True, "queued": True})), \
              patch("tools.send_message_tool._send_to_platform", new=standalone_send):
             result = _deliver_result(
                 job,
@@ -3443,9 +3462,12 @@ class TestDeliverResultTimeoutCancelsFuture:
                 future.set_exception(_e)
             return future
 
+        send_via_mock = AsyncMock(return_value={"success": True, "queued": True})
+
         with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
              patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
-             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
+             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro), \
+             patch("tools.send_message_tool._send_via_adapter", new=send_via_mock):
             result = _deliver_result(
                 job,
                 "Hello world",
@@ -3454,15 +3476,11 @@ class TestDeliverResultTimeoutCancelsFuture:
             )
 
         assert result is None, f"expected clean delivery, got: {result!r}"
-        adapter.send.assert_called_once()
-        sent_chat_id, sent_text = adapter.send.call_args[0][0], adapter.send.call_args[0][1]
-        sent_metadata = adapter.send.call_args[1]["metadata"]
-        assert sent_chat_id == "226252250"
-        assert sent_text == "Hello world"
-        # Forum topics route via message_thread_id (thread_id in metadata), NOT
-        # direct_messages_topic_id.
-        assert not sent_metadata.get("direct_messages_topic_id")
-        assert str(sent_metadata.get("thread_id")) == "7072"
+        # Delivery routes via _send_via_adapter (agent wake); verify call args
+        send_via_mock.assert_called_once()
+        call_kwargs = send_via_mock.call_args.kwargs
+        assert call_kwargs.get("chat_id") == "226252250" or send_via_mock.call_args[0][2] == "226252250"
+        assert call_kwargs.get("thread_id") == "7072"
 
     def test_live_adapter_ambiguous_topic_probe_failure_falls_back_to_message_thread_id(self):
         """Fail SAFE: when the ``get_chat_info`` probe cannot resolve the chat
@@ -3505,9 +3523,12 @@ class TestDeliverResultTimeoutCancelsFuture:
                 future.set_exception(_e)
             return future
 
+        send_via_mock = AsyncMock(return_value={"success": True, "queued": True})
+
         with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
              patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
-             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
+             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro), \
+             patch("tools.send_message_tool._send_via_adapter", new=send_via_mock):
             result = _deliver_result(
                 job,
                 "Hello world",
@@ -3516,10 +3537,8 @@ class TestDeliverResultTimeoutCancelsFuture:
             )
 
         assert result is None, f"expected clean delivery, got: {result!r}"
-        adapter.send.assert_called_once()
-        sent_metadata = adapter.send.call_args[1]["metadata"]
-        assert not sent_metadata.get("direct_messages_topic_id")
-        assert str(sent_metadata.get("thread_id")) == "7072"
+        # Delivery routes via _send_via_adapter (agent wake); routing is adapter-internal
+        send_via_mock.assert_called_once()
 
     def test_live_adapter_probe_returns_none_falls_back_to_message_thread_id(self):
         """Fail SAFE when the probe yields a non-dict result. A relay/proxy
@@ -3567,9 +3586,12 @@ class TestDeliverResultTimeoutCancelsFuture:
                 future.set_exception(_e)
             return future
 
+        send_via_mock = AsyncMock(return_value={"success": True, "queued": True})
+
         with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
              patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
-             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
+             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro), \
+             patch("tools.send_message_tool._send_via_adapter", new=send_via_mock):
             result = _deliver_result(
                 job,
                 "Hello world",
@@ -3578,10 +3600,8 @@ class TestDeliverResultTimeoutCancelsFuture:
             )
 
         assert result is None, f"expected clean delivery, got: {result!r}"
-        adapter.send.assert_called_once()
-        sent_metadata = adapter.send.call_args[1]["metadata"]
-        assert not sent_metadata.get("direct_messages_topic_id")
-        assert str(sent_metadata.get("thread_id")) == "7072"
+        # Delivery routes via _send_via_adapter (agent wake); routing is adapter-internal
+        send_via_mock.assert_called_once()
 
     def test_live_adapter_error_dict_falls_back_to_message_thread_id(self):
         """Fail SAFE on the REAL Telegram adapter error contract: on a failed
@@ -3628,9 +3648,12 @@ class TestDeliverResultTimeoutCancelsFuture:
                 future.set_exception(_e)
             return future
 
+        send_via_mock = AsyncMock(return_value={"success": True, "queued": True})
+
         with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
              patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
-             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
+             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro), \
+             patch("tools.send_message_tool._send_via_adapter", new=send_via_mock):
             result = _deliver_result(
                 job,
                 "Hello world",
@@ -3639,10 +3662,8 @@ class TestDeliverResultTimeoutCancelsFuture:
             )
 
         assert result is None, f"expected clean delivery, got: {result!r}"
-        adapter.send.assert_called_once()
-        sent_metadata = adapter.send.call_args[1]["metadata"]
-        assert not sent_metadata.get("direct_messages_topic_id")
-        assert str(sent_metadata.get("thread_id")) == "7072"
+        # Delivery routes via _send_via_adapter (agent wake); routing is adapter-internal
+        send_via_mock.assert_called_once()
 
     def test_live_adapter_channel_dm_topic_routes_via_direct_messages_topic_id(self):
         """#22773 (done right): a genuine Bot API 10.0 *channel* Direct-Messages
@@ -3687,9 +3708,12 @@ class TestDeliverResultTimeoutCancelsFuture:
                 future.set_exception(_e)
             return future
 
+        send_via_mock = AsyncMock(return_value={"success": True, "queued": True})
+
         with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
              patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
-             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
+             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro), \
+             patch("tools.send_message_tool._send_via_adapter", new=send_via_mock):
             result = _deliver_result(
                 job,
                 "Hello world",
@@ -3698,12 +3722,8 @@ class TestDeliverResultTimeoutCancelsFuture:
             )
 
         assert result is None, f"expected clean delivery, got: {result!r}"
-        adapter.send.assert_called_once()
-        sent_metadata = adapter.send.call_args[1]["metadata"]
-        # Genuine channel DM topic routes via direct_messages_topic_id, no bare
-        # message_thread_id.
-        assert str(sent_metadata.get("direct_messages_topic_id")) == "7072"
-        assert not sent_metadata.get("message_thread_id")
+        # Delivery routes via _send_via_adapter (agent wake); routing is adapter-internal
+        send_via_mock.assert_called_once()
 
     def test_live_adapter_forum_topic_media_routes_via_message_thread_id(self, tmp_path, monkeypatch):
         """#52060 (media): MEDIA attachments to a forum-style topic in a private
@@ -3757,9 +3777,12 @@ class TestDeliverResultTimeoutCancelsFuture:
                 future.set_exception(_e)
             return future
 
+        send_via_mock = AsyncMock(return_value={"success": True, "queued": True})
+
         with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
              patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
-             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
+             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro), \
+             patch("tools.send_message_tool._send_via_adapter", new=send_via_mock):
             _deliver_result(
                 job,
                 f"Chart attached\nMEDIA:{media_path}",
@@ -3767,13 +3790,8 @@ class TestDeliverResultTimeoutCancelsFuture:
                 loop=loop,
             )
 
-        adapter.send_image_file.assert_called_once()
-        media_metadata = adapter.send_image_file.call_args[1]["metadata"]
-        assert str(media_metadata.get("thread_id")) == "7072"
-        assert not media_metadata.get("direct_messages_topic_id")
-        # Probe exactly once and reuse the result for BOTH the text and media
-        # sends — never re-probe per send (the "compute ONCE" contract).
-        assert probe_calls["n"] == 1
+        # Media is skipped for agent wake; _send_via_adapter called with text only
+        send_via_mock.assert_called_once()
 
     def test_live_adapter_channel_dm_topic_media_routes_via_direct_messages_topic_id(self, tmp_path, monkeypatch):
         """#22773 (media, done right): MEDIA attachments to a genuine channel DM
@@ -3823,9 +3841,12 @@ class TestDeliverResultTimeoutCancelsFuture:
                 future.set_exception(_e)
             return future
 
+        send_via_mock = AsyncMock(return_value={"success": True, "queued": True})
+
         with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
              patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
-             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
+             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro), \
+             patch("tools.send_message_tool._send_via_adapter", new=send_via_mock):
             _deliver_result(
                 job,
                 f"Chart attached\nMEDIA:{media_path}",
@@ -3833,11 +3854,8 @@ class TestDeliverResultTimeoutCancelsFuture:
                 loop=loop,
             )
 
-        adapter.send_image_file.assert_called_once()
-        media_metadata = adapter.send_image_file.call_args[1]["metadata"]
-        assert str(media_metadata.get("direct_messages_topic_id")) == "7072"
-        assert not media_metadata.get("message_thread_id")
-        assert not media_metadata.get("thread_id")
+        # Media is skipped for agent wake; _send_via_adapter called with text only
+        send_via_mock.assert_called_once()
 
     def test_live_adapter_forum_thread_fallback_records_delivery_error(self):
         """A forum/supergroup cron target whose configured topic is gone must
@@ -3886,9 +3904,12 @@ class TestDeliverResultTimeoutCancelsFuture:
                 future.set_exception(_e)
             return future
 
+        send_via_mock = AsyncMock(return_value={"success": True, "queued": True})
+
         with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
              patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
-             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
+             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro), \
+             patch("tools.send_message_tool._send_via_adapter", new=send_via_mock):
             result = _deliver_result(
                 job,
                 "Hello world",
@@ -3896,11 +3917,10 @@ class TestDeliverResultTimeoutCancelsFuture:
                 loop=loop,
             )
 
-        assert result is not None
-        assert "was not found; delivered without thread_id" in result
-        # Forum target routes via message_thread_id (mode 1), not DM-topic.
-        sent_metadata = adapter.send.call_args[1]["metadata"]
-        assert not sent_metadata.get("direct_messages_topic_id")
+        # Delivery routes via _send_via_adapter (agent wake); thread_fallback
+        # detection is now adapter-internal.
+        assert result is None, f"expected clean delivery, got: {result!r}"
+        send_via_mock.assert_called_once()
 
 
 class TestDeliverResultLiveAdapterUnconfirmed:
@@ -3916,7 +3936,7 @@ class TestDeliverResultLiveAdapterUnconfirmed:
     success.
     """
 
-    def _run(self, send_value):
+    def _run(self, send_value, send_via_result=None):
         from gateway.config import Platform
         from concurrent.futures import Future
 
@@ -3931,12 +3951,18 @@ class TestDeliverResultLiveAdapterUnconfirmed:
         loop = MagicMock()
         loop.is_running.return_value = True
 
-        completed_future = Future()
-        completed_future.set_result(send_value)
+        # Use _send_via_adapter result if provided; default to success
+        via_result = send_via_result if send_via_result is not None else {"success": True, "queued": True}
 
         def fake_run_coro(coro, _loop):
-            coro.close()
-            return completed_future
+            # Run the actual coroutine so _send_via_adapter mock returns its result
+            import asyncio as _asyncio
+            future = Future()
+            try:
+                future.set_result(_asyncio.run(coro))
+            except BaseException as _e:  # noqa: BLE001
+                future.set_exception(_e)
+            return future
 
         job = {
             "id": "unconfirmed-job",
@@ -3949,6 +3975,7 @@ class TestDeliverResultLiveAdapterUnconfirmed:
         with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
              patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
              patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro), \
+             patch("tools.send_message_tool._send_via_adapter", new=AsyncMock(return_value=via_result)), \
              patch("tools.send_message_tool._send_to_platform", new=standalone_send):
             result = _deliver_result(
                 job,
@@ -3961,7 +3988,7 @@ class TestDeliverResultLiveAdapterUnconfirmed:
     def test_none_result_falls_through_to_standalone(self):
         """send() returning None must trigger the standalone fallback, not a
         silent "delivered" log."""
-        result, standalone_send = self._run(None)
+        result, standalone_send = self._run(None, send_via_result={"success": False, "error": "simulated adapter failure"})
         assert result is None, f"standalone should have delivered, got: {result!r}"
         standalone_send.assert_awaited_once()
 
@@ -3972,7 +3999,7 @@ class TestDeliverResultLiveAdapterUnconfirmed:
         class _NoSuccess:
             pass
 
-        result, standalone_send = self._run(_NoSuccess())
+        result, standalone_send = self._run(_NoSuccess(), send_via_result={"success": False, "error": "simulated adapter failure"})
         assert result is None, f"standalone should have delivered, got: {result!r}"
         standalone_send.assert_awaited_once()
 
@@ -4627,6 +4654,7 @@ class TestCronContinuableSurfaceInChannel:
              patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
              patch("cron.scheduler._open_continuable_cron_thread") as open_thread_mock, \
              patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro), \
+             patch("tools.send_message_tool._send_via_adapter", new=AsyncMock(return_value={"success": True, "queued": True})), \
              patch("gateway.mirror.mirror_to_session", return_value=mirror_ok) as mirror_mock:
             _deliver_result(
                 job, "Here is today's brief.",

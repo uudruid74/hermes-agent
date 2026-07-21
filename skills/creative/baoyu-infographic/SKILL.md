@@ -10,12 +10,9 @@ metadata:
     tags: [infographic, visual-summary, creative, image-generation]
     homepage: https://github.com/JimLiu/baoyu-skills#baoyu-infographic
 ---
-
 # Infographic Generator
 
 Adapted from [baoyu-infographic](https://github.com/JimLiu/baoyu-skills) for Hermes Agent's tool ecosystem.
-
-Two dimensions: **layout** (information structure) × **style** (visual aesthetics). Freely combine any layout with any style.
 
 ## When to Use
 
@@ -112,10 +109,6 @@ Default: `bento-grid` + `craft-handmade`
 
 ## Keyword Shortcuts
 
-When user input contains these keywords, **auto-select** the associated layout and offer associated styles as top recommendations in Step 3. Skip content-based layout inference for matched keywords.
-
-If a shortcut has **Prompt Notes**, append them to the generated prompt (Step 5) as additional style instructions.
-
 | User Keyword | Layout | Recommended Styles | Default Aspect | Prompt Notes |
 |--------------|--------|--------------------|----------------|--------------|
 | 高密度信息大图 / high-density-info | `dense-modules` | `morandi-journal`, `pop-laboratory`, `retro-pop-grid` | portrait | — |
@@ -158,7 +151,6 @@ See `references/analysis-framework.md` for detailed format.
 
 ### Step 2: Generate Structured Content → `structured-content.md`
 
-Transform content into infographic structure:
 1. Title and learning objectives
 2. Sections with: key concept, content (verbatim), visual element, text labels
 3. Data points (all statistics/quotes copied exactly)
@@ -182,8 +174,6 @@ See `references/structured-content-template.md` for detailed format.
 
 Use the `clarify` tool to confirm options with the user. Since `clarify` handles one question at a time, ask the most important question first:
 
-**Q1 — Combination**: Present 3+ layout×style combos with rationale. Ask user to pick one.
-
 **Q2 — Aspect**: Ask for aspect ratio preference (landscape/portrait/square or custom W:H).
 
 **Q3 — Language** (only if source ≠ user language): Ask which language the text content should use.
@@ -194,7 +184,6 @@ Use the `clarify` tool to confirm options with the user. Since `clarify` handles
 
 **Load references**: Read the selected layout from `references/layouts/<layout>.md` and style from `references/styles/<style>.md`.
 
-Combine:
 1. Layout definition from `references/layouts/<layout>.md`
 2. Style definition from `references/styles/<style>.md`
 3. Base template from `references/base-prompt.md`

@@ -12,7 +12,6 @@ metadata:
 prerequisites:
   commands: [pygount]
 ---
-
 # Codebase Inspection with pygount
 
 Analyze repositories for lines of code, language breakdown, file counts, and code-vs-comment ratios using `pygount`.
@@ -45,8 +44,6 @@ pygount --format=summary \
 **IMPORTANT:** Always use `--folders-to-skip` to exclude dependency/build directories, otherwise pygount will crawl them and take a very long time or hang.
 
 ## 2. Common Folder Exclusions
-
-Adjust based on the project type:
 
 ```bash
 # Python projects
@@ -94,14 +91,12 @@ pygount --format=summary . 2>/dev/null
 
 ## 6. Interpreting Results
 
-The summary table columns:
 - **Language** — detected programming language
 - **Files** — number of files of that language
 - **Code** — lines of actual code (executable/declarative)
 - **Comment** — lines that are comments or documentation
 - **%** — percentage of total
 
-Special pseudo-languages:
 - `__empty__` — empty files
 - `__binary__` — binary files (images, compiled, etc.)
 - `__generated__` — auto-generated files (detected heuristically)

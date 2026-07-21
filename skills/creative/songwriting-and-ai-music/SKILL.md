@@ -12,17 +12,13 @@ triggers:
   - adapting a song
   - AI music generation
 ---
-
 # Songwriting & AI Music Generation
 
 Everything here is a GUIDELINE, not a rule. Art breaks rules on purpose.
-Use what serves the song. Ignore what doesn't.
 
 ---
 
 ## 1. Song Structure (Pick One or Invent Your Own)
-
-Common skeletons — mix, modify, or throw out as needed:
 
 ```
 ABABCB  Verse/Chorus/Verse/Chorus/Bridge/Chorus    (most pop/rock)
@@ -39,9 +35,6 @@ The six building blocks:
 - Bridge     — a detour, a shift in perspective or key
 - Outro      — the farewell, can echo or subvert the rest
 
-You don't need all of these. Some great songs are just one section
-that evolves. Structure serves the emotion, not the other way around.
-
 ---
 
 ## 2. Rhyme, Meter, and Sound
@@ -57,8 +50,6 @@ Mix them. All perfect rhymes can sound like a nursery rhyme.
 All slant rhymes can sound lazy. The blend is where it lives.
 
 INTERNAL RHYME: Rhyming within a line, not just at the ends.
-  "We pruned the lies from bleeding trees / Distilled the storm
-   from entropy" — "lies/flies," "trees/entropy" create internal echoes.
 
 METER: The rhythm of stressed vs unstressed syllables.
 - Matching syllable counts between parallel lines helps singability
@@ -70,11 +61,7 @@ METER: The rhythm of stressed vs unstressed syllables.
 
 ## 3. Emotional Arc and Dynamics
 
-Think of a song as a journey, not a flat road.
-
 ENERGY MAPPING (rough idea, not prescription):
-  Intro: 2-3  |  Verse: 5-6  |  Pre-Chorus: 7
-  Chorus: 8-9  |  Bridge: varies  |  Final Chorus: 9-10
 
 The most powerful dynamic trick: CONTRAST.
 - Whisper before a scream hits harder than just screaming
@@ -83,7 +70,6 @@ The most powerful dynamic trick: CONTRAST.
 - Silence is an instrument
 
 "Whisper to roar to whisper" — start intimate, build to full power,
-strip back to vulnerability. Works for ballads, epics, anthems.
 
 ---
 
@@ -102,9 +88,7 @@ THE HOOK:
 
 PROSODY — lyrics and music supporting each other:
 - Stable feelings (resolution, peace) pair with settled melodies,
-  perfect rhymes, resolved chords
 - Unstable feelings (longing, doubt) pair with wandering melodies,
-  near-rhymes, unresolved chords
 - Verse melody typically sits lower, chorus goes higher
 - But flip this if it serves the song
 
@@ -117,8 +101,6 @@ AVOID (unless you're doing it on purpose):
 ---
 
 ## 5. Parody and Adaptation
-
-When rewriting an existing song with new lyrics:
 
 THE SKELETON: Map the original's structure first.
 - Count syllables per line
@@ -133,19 +115,15 @@ FITTING NEW WORDS:
   (if original holds "LOOOVE" with an "oo" vowel, "FOOOD" fits
    better than "LIFE")
 - Monosyllabic swaps in key spots keep rhythm intact
-  (Crime -> Code, Snake -> Noose)
 - Sing your new words over the original — if you stumble, revise
 
 CONCEPT:
 - Pick a concept strong enough to sustain the whole song
 - Start from the title/hook and build outward
 - Generate lots of raw material (puns, phrases, images) FIRST,
-  then fit the best ones into the structure
 - If you need a specific line somewhere, reverse-engineer the
-  rhyme scheme backward to set it up
 
 KEEP SOME ORIGINALS: Leaving a few original lines or structures
-intact adds recognizability and lets the audience feel the connection.
 
 ---
 
@@ -154,7 +132,6 @@ intact adds recognizability and lets the audience feel the connection.
 ### Style/Genre Description Field
 
 FORMULA (adapt as needed):
-  Genre + Mood + Era + Instruments + Vocal Style + Production + Dynamics
 
 ```
 BAD:  "sad rock song"
@@ -175,54 +152,36 @@ DESCRIBE THE JOURNEY, not just the genre:
 TIPS:
 - V4.5+ supports up to 1,000 chars in Style field — use them
 - NO artist names or trademarks. Describe the sound instead.
-  "1960s Cold War spy thriller brass" not "James Bond style"
-  "90s grunge" not "Nirvana-style"
 - Specify BPM and key when you have a preference
 - Use Exclude Styles field for what you DON'T want
 - Unexpected genre combos can be gold: "bossa nova trap",
-  "Appalachian gothic", "chiptune jazz"
 - Build a vocal PERSONA, not just a gender:
-  "A weathered torch singer with a smoky alto, slight rasp,
    who starts vulnerable and builds to devastating power"
 
 ### Metatags (place in [brackets] inside lyrics field)
 
 STRUCTURE:
-  [Intro] [Verse] [Verse 1] [Pre-Chorus] [Chorus]
-  [Post-Chorus] [Hook] [Bridge] [Interlude]
-  [Instrumental] [Instrumental Break] [Guitar Solo]
   [Breakdown] [Build-up] [Outro] [Silence] [End]
 
 VOCAL PERFORMANCE:
-  [Whispered] [Spoken Word] [Belted] [Falsetto] [Powerful]
-  [Soulful] [Raspy] [Breathy] [Smooth] [Gritty]
-  [Staccato] [Legato] [Vibrato] [Melismatic]
-  [Harmonies] [Choir] [Harmonized Chorus]
 
 DYNAMICS:
   [High Energy] [Low Energy] [Building Energy] [Explosive]
   [Emotional Climax] [Gradual swell] [Orchestral swell]
-  [Quiet arrangement] [Falling tension] [Slow Down]
 
 GENDER:
-  [Female Vocals] [Male Vocals]
 
 ATMOSPHERE:
-  [Melancholic] [Euphoric] [Nostalgic] [Aggressive]
-  [Dreamy] [Intimate] [Dark Atmosphere]
 
 SFX:
-  [Vinyl Crackle] [Rain] [Applause] [Static] [Thunder]
 
 Put tags in BOTH style field AND lyrics for reinforcement.
 Keep to 5-8 tags per section max — too many confuses the AI.
-Don't contradict yourself ([Calm] + [Aggressive] in same section).
 
 ### Custom Mode
 - Always use Custom Mode for serious work (separate Style + Lyrics)
 - Lyrics field limit: ~3,000 chars (~40-60 lines)
 - Always add structural tags — without them Suno defaults to
-  flat verse/chorus/verse with no emotional arc
 
 ---
 
@@ -271,17 +230,10 @@ Style can drift in extensions — restate genre/mood when extending.
 ## 9. Lessons Learned
 
 - Describing the dynamic ARC in the style field matters way more
-  than just listing genres. "Whisper to roar to whisper" gives
-  Suno a performance map.
 - Keeping some original lines intact in a parody adds recognizability
   and emotional weight — the audience feels the ghost of the original.
 - The bridge slot in a song is where you can transform imagery.
-  Swap the original's specific references for your theme's metaphors
   while keeping the emotional function (reflection, shift, revelation).
 - Monosyllabic word swaps in hooks/tags are the cleanest way to
-  maintain rhythm while changing meaning.
 - A strong vocal persona description in the style field makes a
-  bigger difference than any single metatag.
 - Don't be precious about rules. If a line breaks meter but hits
-  harder, keep it. The feeling is what matters. Craft serves art,
-  not the other way around.

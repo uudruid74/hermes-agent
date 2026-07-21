@@ -12,7 +12,6 @@ metadata:
     requires_toolsets: [terminal]
     supersedes: [find-nearby]
 ---
-
 # Maps Skill
 
 Location intelligence using free, open data sources. 8 commands, 44 POI
@@ -62,8 +61,6 @@ Returns: lat, lon, display name, type, bounding box, importance score.
 python3 $MAPS reverse 48.8584 2.2945
 ```
 
-Returns: full address breakdown (street, city, state, country, postcode).
-
 ### nearby — Find places by category
 
 ```bash
@@ -79,13 +76,7 @@ python3 $MAPS nearby --near "90210" --category pharmacy
 python3 $MAPS nearby --near "downtown austin" --category restaurant --category bar --limit 10
 ```
 
-46 categories: restaurant, cafe, bar, hospital, pharmacy, hotel, guest_house,
-camp_site, supermarket, atm, gas_station, parking, museum, park, school,
 university, bank, police, fire_station, library, airport, train_station,
-bus_stop, church, mosque, synagogue, dentist, doctor, cinema, theatre, gym,
-swimming_pool, post_office, convenience_store, bakery, bookshop, laundry,
-car_wash, car_rental, bicycle_rental, taxi, veterinary, zoo, playground,
-stadium, nightclub.
 
 Each result includes: `name`, `address`, `lat`/`lon`, `distance_m`,
 `maps_url` (clickable Google Maps link), `directions_url` (Google Maps
@@ -101,7 +92,6 @@ python3 $MAPS distance "Big Ben" --to "Tower Bridge" --mode walking
 ```
 
 Modes: driving (default), walking, cycling. Returns road distance, duration,
-and straight-line distance for comparison.
 
 ### directions — Turn-by-turn navigation
 
@@ -109,9 +99,6 @@ and straight-line distance for comparison.
 python3 $MAPS directions "Eiffel Tower" --to "Louvre Museum" --mode walking
 python3 $MAPS directions "JFK Airport" --to "Times Square" --mode driving
 ```
-
-Returns numbered steps with instruction, distance, duration, road name, and
-maneuver type (turn, depart, arrive, etc.).
 
 ### timezone — Timezone for coordinates
 
@@ -129,7 +116,6 @@ python3 $MAPS area "Manhattan, New York"
 python3 $MAPS area "London"
 ```
 
-Returns bounding box coordinates, width/height in km, and approximate area.
 Useful as input for the bbox command.
 
 ### bbox — Search within a bounding box
@@ -139,7 +125,6 @@ python3 $MAPS bbox 40.75 -74.00 40.77 -73.98 restaurant --limit 20
 ```
 
 Finds POIs within a geographic rectangle. Use `area` first to get the
-bounding box coordinates for a named place.
 
 ## Working With Telegram Location Pins
 
@@ -151,26 +136,20 @@ When a user sends a location pin, the message contains `latitude:` and
 python3 $MAPS nearby 36.17 -115.14 cafe --radius 1500
 ```
 
-Present results as a numbered list with names, distances, and the
 `maps_url` field so the user gets a tap-to-open link in chat. For "open
 now?" questions, check the `hours` field; if missing or unclear, verify
 with `web_search` since OSM hours are community-maintained and not always
-current.
 
 ## Workflow Examples
 
-**"Find Italian restaurants near the Colosseum":**
 1. `nearby --near "Colosseum Rome" --category restaurant --radius 500`
    — one command, auto-geocoded
 
-**"What's near this location pin they sent?":**
 1. Extract lat/lon from the Telegram message
 2. `nearby LAT LON cafe --radius 1500`
 
-**"How do I walk from hotel to conference center?":**
 1. `directions "Hotel Name" --to "Conference Center" --mode walking`
 
-**"What restaurants are in downtown Seattle?":**
 1. `area "Downtown Seattle"` → get bounding box
 2. `bbox S W N E restaurant --limit 30`
 
@@ -184,10 +163,6 @@ current.
 - `distance` and `directions` use `--to` flag for the destination (not positional)
 - If a zip code alone gives ambiguous results globally, include country/state
 
-## Verification
-
-```bash
-python3 ~/.hermes/skills/maps/scripts/maps_client.py search "Statue of Liberty"
 # Should return lat ~40.689, lon ~-74.044
 
 python3 ~/.hermes/skills/maps/scripts/maps_client.py nearby --near "Times Square" --category restaurant --limit 3

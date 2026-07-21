@@ -3050,6 +3050,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # hermes_state.get_last_init_error() for slash-command error strings.
             logger.warning("SQLite session store not available: %s", e)
 
+
+
         # Opportunistic state.db maintenance: prune ended sessions older
         # than sessions.retention_days + optional VACUUM. Tracks last-run
         # in state_meta so it only actually executes once per
@@ -3111,6 +3113,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
+        # MCP bridge server for inter-process socket management.
+        self._mcp_bridge_server = None
 
         # scale-to-zero (Phase 0, F13): gateway-scoped "last inbound seen" clock.
         # There is no such clock today (only a per-agent _last_activity_ts), so the
@@ -3122,7 +3126,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Set after a wake (re-arm cooldown, 0.F) so we don't immediately re-go
         # dormant before the drained backlog has a chance to update the clock.
         self._scale_to_zero_cooldown_until: float = 0.0
-
 
     def _wire_teams_pipeline_runtime(self) -> None:
         """Bind the Teams meeting pipeline runtime to Graph webhook ingress.
@@ -7260,6 +7263,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         if connected_count > 0:
             logger.info("Gateway running with %s platform(s)", connected_count)
+
+        # Start the MCP bridge server so MCP subprocesses (gimp_mcp_server.py)
+        # can call adapter.watch() / write_watched() / unwatch() via the
+        # well-known Unix socket at /tmp/hermes/mcp_bridge.sock.
+        try:
+            from gateway.mcp_bridge import start_bridge_server
+            self._mcp_bridge_server = await start_bridge_server(self)
+        except Exception as e:
+            logger.warning("MCP bridge server failed to start: %s", e)
+            self._mcp_bridge_server = None
         
         # Build initial channel directory for send_message name resolution
         try:
@@ -7401,6 +7414,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # is ignored via its instantiation epoch; only a current-epoch marker
         # engages drain on the first tick.
         asyncio.create_task(self._drain_control_watcher())
+
+        # Start background agent-command watcher — polls the spool directory
+        # for messages from hermes send -t agent, webhook servers, and cron
+        # scripts.  Delivered through handle_command() not the platform-adapter
+        # message pipeline (no adapter.handle_message(), no adapter.send()).
+        asyncio.create_task(self._agent_command_watcher())
 
         logger.info("Press Ctrl+C to stop")
         
@@ -7634,6 +7653,99 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not getattr(result, "success", True):
             err = getattr(result, "error", "send returned success=False")
             raise RuntimeError(f"adapter.send failed: {err}")
+
+    async def _agent_command_watcher(self, interval: float = 0.5) -> None:
+        """Background task that polls the spool directory for agent-directed
+        commands from ``hermes send -t agent`` and similar out-of-process
+        callers (webhook servers, cron scripts).
+
+        Each file is a JSON payload with a ``text`` field.  Messages are
+        delivered via ``handle_command()`` — NOT through the platform-adapter
+        message pipeline — so they wake the agent without pretending to come
+        from a specific platform user.
+        """
+        import glob
+        from hermes_cli.config import get_hermes_home
+        home = get_hermes_home()
+        spool_dir = home / "agent_spool"
+        spool_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(
+            "Agent command watcher: polling %s every %.1fs",
+            spool_dir, interval,
+        )
+        while self._running:
+            try:
+                files = sorted(glob.glob(str(spool_dir / "*.json")))
+                if files:
+                    for fpath in files:
+                        try:
+                            with open(fpath, "r") as fh:
+                                payload = json.load(fh)
+                            text = (payload.get("text") or "").strip()
+                            if text:
+                                logger.info(
+                                    "Agent command watcher: delivering %d chars via handle_command()",
+                                    len(text),
+                                )
+                                await self.handle_command(text)
+                        except json.JSONDecodeError:
+                            logger.warning(
+                                "Agent command watcher: corrupt spool file %s — deleting",
+                                fpath,
+                            )
+                        except Exception:
+                            logger.warning(
+                                "Agent command watcher: error processing %s",
+                                fpath, exc_info=True,
+                            )
+                        finally:
+                            try:
+                                os.unlink(fpath)
+                            except OSError:
+                                pass
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug(
+                    "Agent command watcher tick error",
+                    exc_info=True,
+                )
+            await asyncio.sleep(interval)
+
+    async def handle_command(self, text: str) -> None:
+        """Deliver an agent-directed command as a synthetic internal message.
+
+        Unlike ``adapter.handle_message()`` which routes through the full
+        platform-adapter message pipeline (debounce, auth checks, text merge),
+        this method injects text directly as an ``internal=True``
+        ``MessageEvent`` — the agent sees it as a wake event without any
+        platform context.
+
+        Unlike ``adapter.send()`` which delivers OUT to an external platform
+        (Telegram, Discord, …), this delivers IN to the agent itself.
+        """
+        from gateway.platforms.base import MessageEvent
+        from gateway.session import SessionSource
+        from gateway.config import Platform
+
+        # Use a generic "local" source so the session key is deterministic.
+        source = SessionSource(
+            platform=Platform.LOCAL,
+            chat_id="agent",
+            chat_type="internal",
+            user_id="system",
+            user_name="Agent Command",
+        )
+        event = MessageEvent(
+            text=text,
+            source=source,
+            internal=True,
+        )
+        logger.info(
+            "handle_command: dispatching %d chars to agent",
+            len(text),
+        )
+        await self._handle_message(event)
 
     async def _session_expiry_watcher(self, interval: int = 300):
         """Background task that finalizes expired sessions.

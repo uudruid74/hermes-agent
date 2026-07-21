@@ -12,7 +12,6 @@ metadata:
 prerequisites:
   commands: [memo]
 ---
-
 # Apple Notes
 
 Use `memo` to manage Apple Notes directly from the terminal. Notes sync across all Apple devices via iCloud.

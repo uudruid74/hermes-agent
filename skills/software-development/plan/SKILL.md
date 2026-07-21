@@ -8,16 +8,11 @@ platforms: [linux, macos, windows]
 metadata:
   hermes:
     tags: [planning, plan-mode, implementation, workflow, design, documentation]
-    related_skills: [subagent-driven-development, test-driven-development, requesting-code-review]
+    related_skills: [plan-driven-subagent-execution, test-driven-development, requesting-code-review]
 ---
-
 # Plan Mode
 
-Use this skill when the user wants a plan instead of execution.
-
 ## Core behavior
-
-For this turn, you are planning only.
 
 - Do not implement code.
 - Do not edit project files except the plan markdown file.
@@ -27,9 +22,6 @@ For this turn, you are planning only.
 
 ## Output requirements
 
-Write a markdown plan that is concrete and actionable.
-
-Include, when relevant:
 - Goal
 - Current context / assumptions
 - Proposed approach
@@ -67,40 +59,30 @@ The rest of this skill is the craft of authoring a *good* implementation plan �
 
 Write comprehensive implementation plans assuming the implementer has zero context for the codebase and questionable taste. Document everything they need: which files to touch, complete code, testing commands, docs to check, how to verify. Give them bite-sized tasks. DRY. YAGNI. TDD. Frequent commits.
 
-Assume the implementer is a skilled developer but knows almost nothing about the toolset or problem domain. Assume they don't know good test design very well.
-
-**Core principle:** A good plan makes implementation obvious. If someone has to guess, the plan is incomplete.
-
 ## When a Full Implementation Plan Helps
 
 **Always use before:**
 - Implementing multi-step features
 - Breaking down complex requirements
-- Delegating to subagents via subagent-driven-development
+- Delegating to subagents via plan-driven-subagent-execution
 
-**Don't skip when:**
 - Feature seems simple (assumptions cause bugs)
 - You plan to implement it yourself (future you needs guidance)
 - Working alone (documentation matters)
 
 ## Bite-Sized Task Granularity
 
-**Each task = 2-5 minutes of focused work.**
-
-Every step is one action:
 - "Write the failing test" — step
 - "Run it to make sure it fails" — step
 - "Implement the minimal code to make the test pass" — step
 - "Run the tests and make sure they pass" — step
 - "Commit" — step
 
-**Too big:**
 ```markdown
 ### Task 1: Build authentication system
 [50 lines of code across 5 files]
 ```
 
-**Right size:**
 ```markdown
 ### Task 1: Create User model with email field
 [10 lines, 1 file]
@@ -121,7 +103,7 @@ Every plan MUST start with:
 ```markdown
 # [Feature Name] Implementation Plan
 
-> **For Hermes:** Use subagent-driven-development skill to implement this plan task-by-task.
+> **For Hermes:** Use plan-driven-subagent-execution skill to implement this plan task-by-task.
 
 **Goal:** [One sentence describing what this builds]
 
@@ -133,8 +115,6 @@ Every plan MUST start with:
 ```
 
 ### Task Structure
-
-Each task follows this format:
 
 ````markdown
 ### Task N: [Descriptive Name]
@@ -149,9 +129,7 @@ Each task follows this format:
 **Step 1: Write failing test**
 
 ```python
-def test_specific_behavior():
     result = function(input)
-    assert result == expected
 ```
 
 **Step 2: Run test to verify failure**
@@ -163,7 +141,6 @@ Expected: FAIL — "function not defined"
 
 ```python
 def function(input):
-    return expected
 ```
 
 **Step 4: Run test to verify pass**
@@ -175,7 +152,6 @@ Expected: PASS
 
 ```bash
 git add tests/path/test.py src/path/file.py
-git commit -m "feat: add specific feature"
 ```
 ````
 
@@ -183,15 +159,12 @@ git commit -m "feat: add specific feature"
 
 ### Step 1: Understand Requirements
 
-Read and understand:
 - Feature requirements
 - Design documents or user description
 - Acceptance criteria
 - Constraints
 
 ### Step 2: Explore the Codebase
-
-Use Hermes tools to understand the project:
 
 ```python
 # Understand project structure
@@ -209,7 +182,6 @@ read_file("src/app.py")
 
 ### Step 3: Design Approach
 
-Decide:
 - Architecture pattern
 - File organization
 - Dependencies needed
@@ -217,7 +189,6 @@ Decide:
 
 ### Step 4: Write Tasks
 
-Create tasks in order:
 1. Setup/infrastructure
 2. Core functionality (TDD for each)
 3. Edge cases
@@ -226,7 +197,6 @@ Create tasks in order:
 
 ### Step 5: Add Complete Details
 
-For each task, include:
 - **Exact file paths** (not "the config file" but `src/config/settings.py`)
 - **Complete code examples** (not "add validation" but the actual code)
 - **Exact commands** with expected output
@@ -234,7 +204,6 @@ For each task, include:
 
 ### Step 6: Review the Plan
 
-Check:
 - [ ] Tasks are sequential and logical
 - [ ] Each task is bite-sized (2-5 min)
 - [ ] File paths are exact
@@ -247,13 +216,9 @@ Check:
 
 ### DRY (Don't Repeat Yourself)
 
-**Bad:** Copy-paste validation in 3 places
 **Good:** Extract validation function, use everywhere
 
 ### YAGNI (You Aren't Gonna Need It)
-
-**Bad:** Add "flexibility" for future requirements
-**Good:** Implement only what's needed now
 
 ```python
 # Bad — YAGNI violation
@@ -283,7 +248,6 @@ See `test-driven-development` skill for details.
 
 ### Frequent Commits
 
-Commit after every task:
 ```bash
 git add [files]
 git commit -m "type: description"
@@ -294,7 +258,6 @@ git commit -m "type: description"
 ### Vague Tasks
 
 **Bad:** "Add authentication"
-**Good:** "Create User model with email and password_hash fields"
 
 ### Incomplete Code
 
@@ -303,7 +266,6 @@ git commit -m "type: description"
 
 ### Missing Verification
 
-**Bad:** "Step 3: Test it works"
 **Good:** "Step 3: Run `pytest tests/test_auth.py -v`, expected: 3 passed"
 
 ### Missing File Paths
@@ -313,11 +275,7 @@ git commit -m "type: description"
 
 ## Execution Handoff
 
-After saving the plan, offer the execution approach:
-
-**"Plan complete and saved. Ready to execute using subagent-driven-development — I'll dispatch a fresh subagent per task with two-stage review (spec compliance then code quality). Shall I proceed?"**
-
-When executing, use the `subagent-driven-development` skill:
+When executing, use the `plan-driven-subagent-execution` skill:
 - Fresh `delegate_task` per task with full context
 - Spec compliance review after each task
 - Code quality review after spec passes
@@ -334,5 +292,3 @@ Verification steps
 DRY, YAGNI, TDD
 Frequent commits
 ```
-
-**A good plan makes implementation obvious.**

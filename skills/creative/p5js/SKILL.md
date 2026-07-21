@@ -8,7 +8,6 @@ metadata:
     tags: [creative-coding, generative-art, p5js, canvas, interactive, visualization, webgl, shaders, animation]
     related_skills: [ascii-video, manim-video, excalidraw]
 ---
-
 # p5.js Production Pipeline
 
 ## When to use
@@ -22,8 +21,6 @@ Production pipeline for interactive and generative visual art using p5.js. Creat
 ## Creative Standard
 
 This is visual art rendered in the browser. The canvas is the medium; the algorithm is the brush.
-
-**Before writing a single line of code**, articulate the creative concept. What does this piece communicate? What makes the viewer stop scrolling? What separates this from a code tutorial example? The user's prompt is a starting point — interpret it with creative ambition.
 
 **First-render excellence is non-negotiable.** The output must be visually striking on first load. If it looks like a p5.js tutorial exercise, a default configuration, or "AI-generated creative coding," it is wrong. Rethink before shipping.
 
@@ -115,7 +112,6 @@ Never use default configurations. For every project:
 
 ### Project-Specific Invention
 
-For every project, invent at least one of:
 - A custom color palette matching the mood (not a preset)
 - A novel noise field combination (e.g., curl noise + domain warp + feedback)
 - A unique particle behavior (custom forces, custom trails, custom spawning)
@@ -144,16 +140,12 @@ Every parameter should change how the algorithm *thinks*, not just how it *looks
 
 ### Step 1: Creative Vision
 
-Before any code, articulate:
-
 - **Mood / atmosphere**: What should the viewer feel? Contemplative? Energized? Unsettled? Playful?
 - **Visual story**: What happens over time (or on interaction)? Build? Decay? Transform? Oscillate?
 - **Color world**: Warm/cool? Monochrome? Complementary? What's the dominant hue? The accent?
 - **Shape language**: Organic curves? Sharp geometry? Dots? Lines? Mixed?
 - **Motion vocabulary**: Slow drift? Explosive burst? Breathing pulse? Mechanical precision?
 - **What makes THIS different**: What is the one thing that makes this sketch unique?
-
-Map the user's prompt to aesthetic choices. "Relaxing generative background" demands different everything from "glitch data visualization."
 
 ### Step 2: Technical Design
 
@@ -244,7 +236,6 @@ function windowResized() { resizeCanvas(windowWidth, windowHeight); }
 </html>
 ```
 
-Key implementation patterns:
 - **Seeded randomness**: Always `randomSeed()` + `noiseSeed()` for reproducibility
 - **Color mode**: Use `colorMode(HSB, 360, 100, 100, 100)` for intuitive color control
 - **State separation**: CONFIG for parameters, PALETTE for colors, globals for mutable state
@@ -373,8 +364,6 @@ function fbm(x, y, octaves = 4) {
 For flowing organic forms, use **domain warping**: feed noise output back as noise input coordinates. See `references/visual-effects.md`.
 
 ### createGraphics() for Layers — Not Optional
-
-Flat single-pass rendering looks flat. Use offscreen buffers for composition:
 
 ```javascript
 let bgLayer, fgLayer, trailLayer;
@@ -538,7 +527,6 @@ If the user asks for creative, experimental, surprising, or unconventional outpu
 4. Code the blend as a unified system, not two systems side-by-side
 
 ### SCAMPER Transformation
-Take a known generative pattern (flow field, particle system, L-system, cellular automata) and systematically transform it:
 - **Substitute**: replace circles with text characters, lines with gradients
 - **Combine**: merge two patterns (flow field + voronoi)
 - **Adapt**: apply a 2D pattern to a 3D projection

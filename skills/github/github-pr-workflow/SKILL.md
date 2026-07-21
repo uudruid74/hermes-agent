@@ -10,8 +10,29 @@ metadata:
     tags: [GitHub, Pull-Requests, CI/CD, Git, Automation, Merge]
     related_skills: [github-auth, github-code-review]
 ---
-
 # GitHub Pull Request Workflow
+
+## 🚨 MANDATORY GUARDRAIL — Read Before Any Git Operation
+
+**Never execute destructive git operations without explicit user authorization.**
+
+- `git checkout` (switching branches — can discard uncommitted changes)
+- `git merge` (rewrites branch history or pointers)
+- `git reset` (moves branch pointers — can orphan commits)
+- `git branch -D` / `git push --delete` (removes branches)
+- `git rebase` (rewrites commit history)
+- `git clean -fd` (deletes untracked files)
+- `git push --force` / `git push --force-with-lease` (overwrites remote history)
+
+**You must:**
+1. Check the working tree is clean first (`git status`)
+2. Tell the user exactly what operation you're about to run and why
+3. Wait for explicit approval — "ok", "do it", "go ahead", or their equivalent
+4. Only then execute
+
+This rule exists because the user's uncommitted changes, local commits, or working tree state may contain work you cannot see in the conversation history. A clean `git status` in your terminal session does not guarantee no work was done outside it.
+
+**Exceptions:** `git add`, `git commit`, `git push` (regular push, not force-push) are safe and do not need approval unless the user has explicitly said otherwise.
 
 Complete guide for managing the PR lifecycle. Each section shows the `gh` way first, then the `git` + `curl` fallback for machines without `gh`.
 
@@ -68,7 +89,6 @@ git checkout main && git pull origin main
 git checkout -b feat/add-user-authentication
 ```
 
-Branch naming conventions:
 - `feat/description` — new features
 - `fix/description` — bug fixes
 - `refactor/description` — code restructuring
@@ -92,7 +112,6 @@ git commit -m "feat: add JWT-based user authentication
 - Add unit tests for auth flow"
 ```
 
-Commit message format (Conventional Commits):
 ```
 type(scope): short description
 
@@ -110,8 +129,6 @@ git push -u origin HEAD
 ```
 
 ### Create the PR
-
-**With gh:**
 
 ```bash
 gh pr create \
@@ -152,8 +169,6 @@ To create as a draft, add `"draft": true` to the JSON body.
 ## 4. Monitoring CI Status
 
 ### Check CI Status
-
-**With gh:**
 
 ```bash
 # One-shot check
@@ -215,8 +230,6 @@ When CI fails, diagnose and fix. This loop works with either auth method.
 
 ### Step 1: Get Failure Details
 
-**With gh:**
-
 ```bash
 # List recent workflow runs on this branch
 gh run list --branch $(git branch --show-current) --limit 5
@@ -275,8 +288,6 @@ When asked to auto-fix CI, follow this loop:
 6. Repeat if still failing (up to 3 attempts, then ask the user)
 
 ## 6. Merging
-
-**With gh:**
 
 ```bash
 # Squash merge + delete branch (cleanest for feature branches)

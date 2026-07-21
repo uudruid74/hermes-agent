@@ -10,7 +10,6 @@ metadata:
     tags: [Coding-Agent, Codex, OpenAI, Code-Review, Refactoring]
     related_skills: [claude-code, hermes-agent]
 ---
-
 # Codex CLI
 
 Delegate coding tasks to [Codex](https://github.com/openai/codex) via the Hermes terminal. Codex is OpenAI's autonomous coding agent CLI.
@@ -44,7 +43,6 @@ that Codex auth is missing.
 terminal(command="codex exec 'Add dark mode toggle to settings'", workdir="~/project", pty=true)
 ```
 
-For scratch work (Codex needs a git repo):
 ```
 terminal(command="cd $(mktemp -d) && git init && codex exec 'Build a snake game in Python'", pty=true)
 ```
@@ -84,15 +82,12 @@ when the same command works in the user's interactive shell. A typical symptom i
 bubblewrap/user-namespace errors such as `setting up uid map: Permission denied`
 or `loopback: Failed RTM_NEWADDR: Operation not permitted`.
 
-In that context, prefer:
-
 ```
 codex exec --sandbox danger-full-access "<task>"
 ```
 
 Use process boundaries as the safety layer instead: explicit `workdir`, clean git
 status before launch, narrow task prompts, `git diff` review, targeted tests, and
-human/agent confirmation before committing broad changes.
 
 ## PR Reviews
 

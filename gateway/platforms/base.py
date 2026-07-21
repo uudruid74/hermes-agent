@@ -2366,10 +2366,14 @@ class BasePlatformAdapter(ABC):
         # Gateway shutdown cancels these so an old gateway instance doesn't keep
         # working on a task after --replace or manual restarts.
         self._background_tasks: set[asyncio.Task] = set()
-        # Active fd watchers registered via watch_fd(). Maps opaque handle →
-        # (fd, callback, on_close, owned).  owned=True means the fd was
-        # created by watch_unix_socket() and should be os.close()d on unwatch.
-        self._watched_fds: dict[str, tuple[int, Callable, Callable | None, bool]] = {}
+        # Active socket watchers registered via watch(). Maps opaque handle →
+        # {\"loop\", \"listen_sock\", \"conn\", \"sock_path\", \"callback\", \"on_close\"}.
+        # Gateway OWNS the socket — binds, listens, unlinks on unwatch.
+        # After first accept, the reader moves from listen_sock.fileno()
+        # to conn.fileno() so the persistent connection is watched for
+        # incoming data. The conn is stored for bidirectional writes via
+        # write_watched().
+        self._watched: dict[str, dict] = {}
         # One-shot callbacks to fire after the main response is delivered.
         # Keyed by session_key. Values are either a bare callback (legacy) or
         # a ``(generation, callback)`` tuple so GatewayRunner can make deferred
@@ -2403,101 +2407,250 @@ class BasePlatformAdapter(ABC):
         # _keep_typing skips send_typing when the chat_id is in this set.
         self._typing_paused: set = set()
 
-    # ── fd watcher API ──────────────────────────────────────────────
-    # Plugin push-channel: plugins register a file descriptor (Unix
-    # socket, FIFO, pipe) and a callback. The gateway watches it via
-    # loop.add_reader(). On data the callback fires — plugins can then
-    # construct MessageEvent(internal=True) and call handle_message()
-    # to inject data into the agent mid-run.
+    # ── Socket watcher API ───────────────────────────────────────────
+    # watch() / write_watched() / unwatch(): gateway-owned Unix socket
+    # lifecycle with persistent bidirectional connections.
+    #
+    # The gateway OPENS, BINDS, and LISTENS on a Unix socket.  The
+    # first client to connect (e.g. the Prometheus GIMP plugin) becomes
+    # the persistent peer.  Incoming data fires the callback (handoff
+    # push).  Outbound data is written via write_watched() (drawing
+    # commands).  One socket per session, bidirectional.
+    #
+    # See /tmp/live-agents.md Part 2 for the architecture spec.
 
-    def watch_fd(
-        self, fd: int, callback: Callable[[bytes], None]
-    ) -> str:
-        """Register a watched file descriptor.
-
-        Returns an opaque handle for later ``unwatch_fd()``.
-        *callback* receives raw bytes read from the fd.
-        """
-        import uuid
-        handle = uuid.uuid4().hex[:12]
-        loop = asyncio.get_running_loop()
-        loop.add_reader(fd, self._make_fd_reader(handle, fd, callback))
-        self._watched_fds[handle] = (fd, callback, None, False)
-        return handle
-
-    def unwatch_fd(self, handle: str) -> None:
-        """Remove a watched file descriptor.
-
-        Closes the fd if it was created by watch_unix_socket() (owned=True).
-        """
-        entry = self._watched_fds.pop(handle, None)
-        if entry is None:
-            return
-        fd, _callback, _on_close, owned = entry
-        try:
-            loop = asyncio.get_running_loop()
-            loop.remove_reader(fd)
-        except Exception:
-            pass
-        if owned:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-
-    def watch_unix_socket(
-        self,
-        path: str,
-        callback: Callable[[bytes], None],
+    def watch(
+        self, url: str, callback: Callable[[bytes], None],
         on_close: Callable[[], None] | None = None,
     ) -> str:
-        """Connect to a Unix domain socket and watch it for data.
+        """Watch a Unix socket for incoming data from a persistent peer.
 
-        The gateway opens the connection, sets it non-blocking, and
-        registers it with the event loop.  *callback* fires on data.
-        *on_close* fires when the peer disconnects or an error occurs.
-        Returns an opaque handle for ``unwatch_fd()``, which will also
-        close the socket fd.
+        url: ``"unix:///tmp/cave-painter/<session_id>.sock"``
+        Returns an opaque handle for later ``write_watched()`` and
+        ``unwatch()``.
 
-        Only ``unix://`` URLs are supported.  Pass the path directly
-        (e.g. ``/tmp/prometheus/sess.sock``).
+        The GATEWAY opens the socket and manages its lifecycle.
+        The first client to connect becomes the persistent peer.
         """
-        import socket as _socket
-        sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
-        sock.setblocking(False)
-        try:
-            sock.connect(path)
-        except BlockingIOError:
-            pass  # non-blocking connect — expected
-        fd = sock.fileno()
+        if not url.startswith("unix://"):
+            raise ValueError(f"Only unix:// URLs supported, got {url}")
+        sock_path = url[7:]  # strip "unix://"
         import uuid as _uuid
         handle = _uuid.uuid4().hex[:12]
         loop = asyncio.get_running_loop()
-        loop.add_reader(fd, self._make_fd_reader(handle, fd, callback, on_close))
-        self._watched_fds[handle] = (fd, callback, on_close, True)
+
+        # Gateway opens (creates and binds) the socket so it owns the
+        # lifecycle.  SOCK_STREAM — single persistent peer.
+        listen_sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        listen_sock.setblocking(False)
+        try:
+            os.unlink(sock_path)  # clean up stale socket
+        except FileNotFoundError:
+            pass
+        os.makedirs(os.path.dirname(sock_path), exist_ok=True)
+        listen_sock.bind(sock_path)
+        listen_sock.listen(1)
+
+        info = {
+            "loop": loop,
+            "listen_sock": listen_sock,
+            "conn": None,          # persistent plugin peer
+            "mcp_conn": None,      # transient MCP relay peer
+            "sock_path": sock_path,
+            "callback": callback,
+            "on_close": on_close,
+            "handle": handle,
+        }
+        self._watched[handle] = info
+
+        # Register reader on the listening socket.  On first accept the
+        # plugin peer is stored; subsequent accepts become MCP relay peers.
+        # The listen socket reader stays active for the socket lifetime.
+        loop.add_reader(
+            listen_sock.fileno(),
+            self._make_watch_reader(info),
+        )
         return handle
 
-    def _make_fd_reader(
-        self, handle: str, fd: int, callback: Callable[[bytes], None],
-        on_close: Callable[[], None] | None = None,
-    ):
-        def _reader() -> None:
+    def write_watched(self, handle: str, data: bytes) -> bool:
+        """Write data to a watched socket's persistent peer.
+
+        Returns True if the write succeeded, False otherwise.
+        """
+        info = self._watched.get(handle)
+        if info is None:
+            return False
+        conn = info.get("conn")
+        if conn is None:
+            return False
+        try:
+            conn.sendall(data)
+            return True
+        except OSError:
+            return False
+
+    def unwatch(self, handle: str) -> None:
+        """Remove a watched socket. Closes peer conn and listen fd,
+        unlinks socket file."""
+        info = self._watched.pop(handle, None)
+        if info is None:
+            return
+        loop = info["loop"]
+        conn = info.get("conn")
+        mcp_conn = info.get("mcp_conn")
+
+        # Remove readers and close connections
+        if conn is not None:
             try:
-                data = os.read(fd, 65536)
+                loop.remove_reader(conn.fileno())
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except OSError:
+                pass
+        if mcp_conn is not None:
+            try:
+                loop.remove_reader(mcp_conn.fileno())
+            except Exception:
+                pass
+            try:
+                mcp_conn.close()
+            except OSError:
+                pass
+        if conn is None and mcp_conn is None:
+            listen_sock = info["listen_sock"]
+            try:
+                loop.remove_reader(listen_sock.fileno())
+            except Exception:
+                pass
+
+        try:
+            info["listen_sock"].close()
+        except OSError:
+            pass
+        try:
+            os.unlink(info["sock_path"])
+        except FileNotFoundError:
+            pass
+
+        on_close = info.get("on_close")
+        if on_close:
+            try:
+                on_close()
+            except Exception:
+                pass
+
+    def _make_watch_reader(self, info: dict):
+        """Build a reader callback for the listening socket.
+
+        First accept → persistent plugin peer (``info["conn"]``).
+        Subsequent accepts → transient MCP relay peer (``info["mcp_conn"]``).
+
+        Plugin data is delivered to the callback AND forwarded to
+        the MCP peer when connected.  MCP data is forwarded directly
+        to the plugin peer.  The listen socket stays alive so its
+        file acts as a liveness marker.
+        """
+        def _on_accept() -> None:
+            listen_sock = info["listen_sock"]
+            try:
+                conn, _addr = listen_sock.accept()
             except (BlockingIOError, InterruptedError):
                 return
             except OSError:
-                self.unwatch_fd(handle)
-                if on_close:
-                    on_close()
+                self.unwatch(info["handle"])
                 return
-            if not data:  # EOF — peer closed
-                self.unwatch_fd(handle)
-                if on_close:
-                    on_close()
+
+            conn.setblocking(False)
+            loop = info["loop"]
+
+            if info["conn"] is None:
+                # First connection — persistent plugin peer.
+                info["conn"] = conn
+                loop.add_reader(conn.fileno(), _on_conn_data)
+                # Listen socket stays alive — keep its reader so
+                # subsequent MCP connections are accepted.
+            elif info["mcp_conn"] is None:
+                # MCP relay connection — accept, set up reader,
+                # forward data bidirectionally.
+                info["mcp_conn"] = conn
+                loop.add_reader(conn.fileno(), _on_mcp_data)
+            else:
+                # MCP slot already occupied — reject this one.
+                # The current MCP will disconnect after its
+                # request completes.
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+
+        def _on_conn_data() -> None:
+            conn = info["conn"]
+            if conn is None:
                 return
-            callback(data)
-        return _reader
+            try:
+                data = conn.recv(65536)
+            except (BlockingIOError, InterruptedError):
+                return
+            except OSError:
+                self.unwatch(info["handle"])
+                return
+            if data:
+                # Fire the watch callback (handoff / command-response routing)
+                try:
+                    info["callback"](data)
+                except Exception:
+                    pass
+                # Also forward to MCP peer if connected (relay path)
+                mcp = info.get("mcp_conn")
+                if mcp is not None:
+                    try:
+                        mcp.sendall(data)
+                    except OSError:
+                        _close_mcp(info)
+            else:
+                # EOF — plugin peer disconnected
+                self.unwatch(info["handle"])
+
+        def _on_mcp_data() -> None:
+            conn = info.get("mcp_conn")
+            plugin = info.get("conn")
+            if conn is None or plugin is None:
+                return
+            try:
+                data = conn.recv(65536)
+            except (BlockingIOError, InterruptedError):
+                return
+            except OSError:
+                _close_mcp(info)
+                return
+            if data:
+                # Forward MCP command to plugin peer
+                try:
+                    plugin.sendall(data)
+                except OSError:
+                    self.unwatch(info["handle"])
+            else:
+                # EOF — MCP peer disconnected
+                _close_mcp(info)
+
+        def _close_mcp(info: dict) -> None:
+            """Close the MCP relay peer, remove its reader."""
+            mcp = info.pop("mcp_conn", None)
+            if mcp is None:
+                return
+            try:
+                info["loop"].remove_reader(mcp.fileno())
+            except Exception:
+                pass
+            try:
+                mcp.close()
+            except OSError:
+                pass
+
+        return _on_accept
+
 
     @property
     def message_len_fn(self) -> Callable[[str], int]:

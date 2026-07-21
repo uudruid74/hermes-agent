@@ -12,7 +12,6 @@ metadata:
 prerequisites:
   commands: [blogwatcher-cli]
 ---
-
 # Blogwatcher
 
 Track blog and RSS/Atom feed updates with the `blogwatcher-cli` tool. Supports automatic feed discovery, HTML scraping fallback, OPML import, and read/unread article management.

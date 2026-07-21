@@ -10,7 +10,6 @@ metadata:
     tags: [GitHub, Issues, Project-Management, Bug-Tracking, Triage]
     related_skills: [github-auth, github-pr-workflow]
 ---
-
 # GitHub Issues Management
 
 Create, search, triage, and manage GitHub issues. Each section shows `gh` first, then the `curl` fallback.
@@ -45,8 +44,6 @@ REPO=$(echo "$OWNER_REPO" | cut -d/ -f2)
 ---
 
 ## 1. Viewing Issues
-
-**With gh:**
 
 ```bash
 gh issue list
@@ -105,8 +102,6 @@ for i in json.load(sys.stdin)['items']:
 ```
 
 ## 2. Creating Issues
-
-**With gh:**
 
 ```bash
 gh issue create \
@@ -181,8 +176,6 @@ curl -s -X POST \
 
 ### Add/Remove Labels
 
-**With gh:**
-
 ```bash
 gh issue edit 42 --add-label "priority:high,bug"
 gh issue edit 42 --remove-label "needs-triage"
@@ -214,8 +207,6 @@ for l in json.load(sys.stdin):
 
 ### Assignment
 
-**With gh:**
-
 ```bash
 gh issue edit 42 --add-assignee username
 gh issue edit 42 --add-assignee @me
@@ -232,8 +223,6 @@ curl -s -X POST \
 
 ### Commenting
 
-**With gh:**
-
 ```bash
 gh issue comment 42 --body "Investigated — root cause is in auth middleware. Working on a fix."
 ```
@@ -248,8 +237,6 @@ curl -s -X POST \
 ```
 
 ### Closing and Reopening
-
-**With gh:**
 
 ```bash
 gh issue close 42
@@ -275,23 +262,15 @@ curl -s -X PATCH \
 
 ### Linking Issues to PRs
 
-Issues are automatically closed when a PR merges with the right keywords in the body:
-
 ```
 Closes #42
 Fixes #42
 Resolves #42
 ```
 
-To create a branch from an issue:
-
-**With gh:**
-
 ```bash
 gh issue develop 42 --checkout
 ```
-
-**With git (manual equivalent):**
 
 ```bash
 git checkout main && git pull origin main
@@ -299,8 +278,6 @@ git checkout -b fix/issue-42-login-redirect
 ```
 
 ## 4. Issue Triage Workflow
-
-When asked to triage issues:
 
 1. **List untriaged issues:**
 
@@ -330,8 +307,6 @@ for i in json.load(sys.stdin):
 ## 5. Bulk Operations
 
 For batch operations, combine API calls with shell scripting:
-
-**With gh:**
 
 ```bash
 # Close all issues with a specific label

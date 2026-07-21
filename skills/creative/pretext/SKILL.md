@@ -10,7 +10,6 @@ metadata:
     tags: [creative-coding, typography, pretext, ascii-art, canvas, generative, text-layout, kinetic-typography]
     related_skills: [p5js, claude-design, excalidraw, architecture-diagram]
 ---
-
 # Pretext Creative Demos
 
 ## Overview
@@ -23,7 +22,6 @@ This skill exists so Hermes can make **cool demos** with it — the kind people 
 
 ## When to Use
 
-Use when the user asks for:
 - A "pretext demo" / "cool pretext thing" / "text-as-X"
 - Text flowing around a moving shape (hero sections, editorial layouts, animated long-form pages)
 - ASCII-art effects using **real words or prose**, not monospace rasters
@@ -33,15 +31,12 @@ Use when the user asks for:
 - Multiline "shrink-wrap" UI (smallest container width that still fits the text)
 - Anything that would require knowing line breaks *before* rendering
 
-Don't use for:
 - Static SVG/HTML pages where CSS already solves layout — just use CSS
 - Rich text editors, general inline formatting engines (pretext is intentionally narrow)
 - Image → text (use `ascii-art` / `ascii-video` skills)
 - Pure canvas generative art with no text role — use `p5js`
 
 ## Creative Standard
-
-This is visual art rendered in a browser. Pretext returns numbers; **you** draw the thing.
 
 - **Don't ship a "hello world" demo.** The `hello-orb-flow.html` template is the *starting* point. Every delivered demo must add intentional color, motion, composition, and one visual detail the user didn't ask for but will appreciate.
 - **Dark backgrounds, warm cores, considered palette.** Classic amber-on-black (CRT / terminal) works, but so do cold-white-on-charcoal (editorial) and desaturated pastels (risograph). Pick one and commit.
@@ -75,8 +70,6 @@ Pin the version. `@0.0.6` at time of writing — check [npm](https://www.npmjs.c
 
 ## The Two Use Cases
 
-Almost everything reduces to one of these two shapes. Learn both.
-
 ### Use-case 1 — measure, then render with CSS/DOM
 
 ```js
@@ -107,8 +100,6 @@ This is where the creative work lives. You own the drawing, so you can:
 - Substitute per-glyph transforms (rotation, jitter, scale, opacity)
 - Use line metadata (width, grapheme positions) as geometry
 
-For **variable-width-per-line** flow (text around a shape, text in a donut band, text in a non-rectangular column):
-
 ```js
 let cursor = { segmentIndex: 0, graphemeIndex: 0 };
 let y = 0;
@@ -122,8 +113,6 @@ while (true) {
   y += lineHeight;
 }
 ```
-
-This is the most important pattern in the whole library. It's what unlocks "text flowing around a dragged sprite" — the demo that went viral on X.
 
 ### Helpers worth knowing
 
@@ -173,37 +162,6 @@ See `templates/donut-orbit.html` and `templates/hello-orb-flow.html` for working
 - Keep visual animation and layout animation coupled. If a sphere morphs into a cube, tween both the rendered cell buffer and the obstacle spans with the same value; otherwise the demo looks painted-on instead of physically reflowed.
 - For fades, prefer layer opacity over changing glyph intensity or obstacle scale. Put transient ASCII sprites on their own canvas and fade the canvas with CSS/GSAP opacity so geometry does not appear to shrink.
 - Canvas `ctx.font` setting is surprisingly slow; set it **once** per frame if font doesn't vary, not per `fillText` call.
-
-## Common Pitfalls
-
-1. **Drifting CSS/canvas font strings.** `ctx.font = "16px Inter"` measured, but CSS says `font-family: Inter, sans-serif; font-size: 16px`. Fine *if* Inter loads. If Inter 404s, CSS falls back to sans-serif and measurements drift by 5-20%. Always `preload` the font or use a web-safe family.
-
-2. **Re-preparing inside the animation loop.** Only `layout*` is cheap. Re-calling `prepare` every frame will tank perf. Keep the prepared handle in module scope.
-
-3. **Forgetting `Intl.Segmenter` for grapheme splits.** Emoji, combining marks, CJK — `"é".split("")` gives you two chars. Use `new Intl.Segmenter(undefined, { granularity: "grapheme" })` when sampling individual visible glyphs.
-
-4. **`break: 'never'` chips without `extraWidth`.** In `rich-inline`, if you use `break: 'never'` for an atomic chip/mention, you must also supply `extraWidth` for the pill padding — otherwise chip chrome overflows the container.
-
-5. **Using `@chenglou/pretext` from `unpkg` with TypeScript-only entry.** Use `esm.sh` — it compiles the TS exports to browser-ready ESM automatically. `unpkg` will 404 or serve raw TS.
-
-6. **Monospace fallbacks silently erasing the whole point.** Users seeing monospace-looking output often have a CSS `font-family` that fell through to `monospace`. Verify the actual rendered font via DevTools.
-
-7. **Skipping rows vs adjusting width** when flowing around a shape. If the corridor on this row is too narrow to fit a line, *skip the row* (`y += lineHeight; continue;`) rather than passing a tiny maxWidth to `layoutNextLineRange` — pretext will return one-grapheme lines that look broken.
-
-8. **Shipping a cold demo.** The default first-paint looks tutorial-grade. Add: vignette, subtle scanline, idle auto-motion, one carefully chosen interactive response (drag, hover, scroll, click). Without these, "cool pretext demo" lands as "intern repro of the README."
-
-## Verification Checklist
-
-- [ ] Demo is a single self-contained `.html` file — opens by double-click or `python3 -m http.server`
-- [ ] `@chenglou/pretext` imported via `esm.sh` with pinned version
-- [ ] Corpus is real prose, not lorem ipsum, and matches the demo's concept
-- [ ] Font string passed to `prepare` matches the CSS font exactly
-- [ ] `prepare()` / `prepareWithSegments()` called once, not per frame
-- [ ] Dark background + considered palette — not the default white canvas
-- [ ] At least one interactive response (drag / hover / scroll / click) or idle auto-motion
-- [ ] Tested locally with `python3 -m http.server` and confirmed no console errors
-- [ ] 60fps on a mid-tier laptop (or graceful degradation documented)
-- [ ] One "extra mile" detail the user didn't ask for
 
 ## Reference: Community Demos
 

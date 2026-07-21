@@ -7,7 +7,7 @@ adapter.unwatch() on the gateway's event loop so socket lifecycle stays
 owned by the gateway process.
 
 Protocol (newline-delimited JSON):
-  -> {"action": "watch",   "url": "unix:///tmp/prometheus/sess.sock", "session_id": "..."}
+  -> {"action": "watch",   "url": "unix:///tmp/cave-painter/sess.sock", "session_id": "..."}
   <- {"ok": true, "handle": "abc123"}
   -> {"action": "write",  "handle": "abc123", "data": "<json line>", "msg_id": "..."}
   <- {"ok": true, "response": {"msg_id": "...", ...}}   (after plugin responds)
@@ -129,8 +129,11 @@ def _handle_watch(runner, cmd: dict, writer: asyncio.StreamWriter) -> None:
                 return
             # If no waiting future, fall through to handoff path
 
-        # Handoff data -> agent wake event
-        if payload.get("type") == "handoff" or not msg_id:
+        # Handoff data -> agent wake event.
+        # Only inject handoff-typed payloads.  Command responses
+        # (with or without msg_id) are routed above or silently
+        # dropped — the relay path forwards them to MCP directly.
+        if payload.get("type") == "handoff":
             try:
                 from gateway.config import load_gateway_config
                 cfg = load_gateway_config()

@@ -8,9 +8,8 @@ platforms: [linux, macos, windows]
 metadata:
   hermes:
     tags: [code-review, security, verification, quality, pre-commit, auto-fix]
-    related_skills: [subagent-driven-development, plan, test-driven-development, github-code-review]
+    related_skills: [plan-driven-subagent-execution, plan, test-driven-development, github-code-review]
 ---
-
 # Pre-Commit Code Verification
 
 Automated verification pipeline before code lands. Static scans, baseline-aware
@@ -23,7 +22,7 @@ quality gates, an independent reviewer subagent, and an auto-fix loop.
 - After implementing a feature or bug fix, before `git commit` or `git push`
 - When user says "commit", "push", "ship", "done", "verify", or "review before merge"
 - After completing a task with 2+ file edits in a git repo
-- After each task in subagent-driven-development (the two-stage review)
+- After each task in plan-driven-subagent-execution (the two-stage review)
 
 **Skip for:** documentation-only changes, pure config tweaks, or when user says "skip verification".
 
@@ -175,10 +174,6 @@ Return ONLY this JSON:
 
 ## Step 6 — Evaluate results
 
-Combine results from Steps 2, 3, and 5.
-
-**All passed:** Proceed to Step 8 (commit).
-
 **Any failures:** Report what failed, then proceed to Step 7 (auto-fix).
 
 ```
@@ -227,8 +222,6 @@ After the fix agent completes, re-run Steps 1-6 (full verification cycle).
 
 ## Step 8 — Commit
 
-If verification passed:
-
 ```bash
 git add -A && git commit -m "[verified] <description>"
 ```
@@ -260,13 +253,9 @@ element.textContent = userInput;
 
 ## Integration with Other Skills
 
-**subagent-driven-development:** Run this after EACH task as the quality gate.
-The two-stage review (spec compliance + code quality) uses this pipeline.
+**plan-driven-subagent-execution:** Run this after EACH task as the quality gate.
 
 **test-driven-development:** This pipeline verifies TDD discipline was followed —
-tests exist, tests pass, no regressions.
-
-**plan:** Validates implementation matches the plan requirements.
 
 ## Pitfalls
 

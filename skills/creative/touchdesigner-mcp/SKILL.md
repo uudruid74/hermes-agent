@@ -11,7 +11,6 @@ metadata:
     related_skills: [native-mcp, ascii-video, manim-video, hermes-video]
 
 ---
-
 # TouchDesigner Integration (twozero MCP)
 
 ## CRITICAL RULES
@@ -28,7 +27,6 @@ metadata:
 Hermes Agent -> MCP (Streamable HTTP) -> twozero.tox (port 40404) -> TD Python
 ```
 
-36 native tools. Free plugin (no payment/license — confirmed April 2026).
 Context-aware (knows selected OP, current network).
 Hub health check: `GET http://localhost:40404/mcp` returns JSON with instance PID, project name, TD version.
 
@@ -40,7 +38,6 @@ Run the setup script to handle everything:
 bash "${HERMES_HOME:-$HOME/.hermes}/skills/creative/touchdesigner-mcp/scripts/setup.sh"
 ```
 
-The script will:
 1. Check if TD is running
 2. Download twozero.tox if not already cached
 3. Add `twozero_td` MCP server to Hermes config (if missing)
@@ -74,8 +71,6 @@ Call td_get_hints with the topic you're building (e.g. "glsl", "audio reactive",
 Call td_get_focus to see where the user is and what's selected.
 Call td_get_network to see what already exists.
 ```
-
-No temp nodes, no cleanup. This replaces the old discovery dance entirely.
 
 ### Step 1: Clean + Build
 
@@ -140,8 +135,6 @@ td_get_operator_info(path="/project1/out", detail="full")
 td_get_screenshot(path="/project1/out")
 ```
 
-Or open a window via script:
-
 ```python
 win = op('/project1').create(windowCOMP, 'display')
 win.par.winop = op('/project1/out').path
@@ -151,7 +144,6 @@ win.par.winopen.pulse()
 
 ## MCP Tool Quick Reference
 
-**Core (use these most):**
 | Tool | What |
 |------|------|
 | `td_execute_python` | Run arbitrary Python in TD. Full API access. |
@@ -165,7 +157,6 @@ win.par.winopen.pulse()
 | `td_get_hints` | Get patterns/tips before building |
 | `td_get_focus` | What network is open, what's selected |
 
-**Read/Write:**
 | Tool | What |
 |------|------|
 | `td_read_dat` | Read DAT text content |
@@ -173,7 +164,6 @@ win.par.winopen.pulse()
 | `td_read_chop` | Read CHOP channel values |
 | `td_read_textport` | Read TD console output |
 
-**Visual:**
 | Tool | What |
 |------|------|
 | `td_get_screenshot` | Capture one OP viewer to file |
@@ -181,13 +171,11 @@ win.par.winopen.pulse()
 | `td_get_screen_screenshot` | Capture actual screen via TD |
 | `td_navigate_to` | Jump network editor to an OP |
 
-**Search:**
 | Tool | What |
 |------|------|
 | `td_find_op` | Find ops by name/type across project |
 | `td_search` | Search code, expressions, string params |
 
-**System:**
 | Tool | What |
 |------|------|
 | `td_get_perf` | Performance profiling (FPS, slow ops) |
@@ -197,7 +185,6 @@ win.par.winopen.pulse()
 | `td_reinit_extension` | Reload extension after code edit |
 | `td_clear_textport` | Clear console before debug session |
 
-**Input Automation:**
 | Tool | What |
 |------|------|
 | `td_input_execute` | Send mouse/keyboard to TD |

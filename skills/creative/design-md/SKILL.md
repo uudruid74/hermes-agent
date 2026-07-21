@@ -10,7 +10,6 @@ metadata:
     tags: [design, design-system, tokens, ui, accessibility, wcag, tailwind, dtcg, google]
     related_skills: [popular-web-designs, claude-design, excalidraw, architecture-diagram]
 ---
-
 # DESIGN.md Skill
 
 DESIGN.md is Google's open spec (Apache-2.0, `google-labs-code/design.md`) for
@@ -33,7 +32,6 @@ diffs versions for regressions, and exports to Tailwind or W3C DTCG JSON.
 
 For purely visual inspiration or layout examples, use `popular-web-designs`
 instead. For *process and taste* when designing a one-off HTML artifact
-from scratch (prototype, deck, landing page, component lab), use
 `claude-design`. This skill is for the *formal spec file* itself.
 
 ## File anatomy
@@ -105,12 +103,10 @@ Public Sans for everything except small all-caps labels...
 
 Component property whitelist: `backgroundColor`, `textColor`, `typography`,
 `rounded`, `padding`, `size`, `height`, `width`. Variants (hover, active,
-pressed) are **separate component entries** with related key names
 (`button-primary-hover`), not nested.
 
 ## Canonical section order
 
-Sections are optional, but present ones MUST appear in this order. Duplicate
 headings reject the file.
 
 1. Overview (alias: Brand & Style)
@@ -122,7 +118,6 @@ headings reject the file.
 7. Components
 8. Do's and Don'ts
 
-Unknown sections are preserved, not errored. Unknown token names are accepted
 if the value type is valid. Unknown component properties produce a warning.
 
 ## Workflow: authoring a new DESIGN.md
@@ -133,9 +128,7 @@ if the value type is valid. Unknown component properties produce a warning.
 2. **Write `DESIGN.md`** in their project root using `write_file`. Always
    include `name:` and `colors:`; other sections optional but encouraged.
 3. **Use token references** (`{colors.primary}`) in the `components:` section
-   instead of re-typing hex values. Keeps the palette single-source.
 4. **Lint it** (see below). Fix any broken references or WCAG failures
-   before returning.
 5. **If the user has an existing project**, also write Tailwind or DTCG
    exports next to the file (`tailwind.theme.json`, `tokens.json`).
 
@@ -162,7 +155,6 @@ npx -y @google/design.md spec --rules-only --format json
 
 All commands accept `-` for stdin. `lint` returns exit 1 on errors. Use the
 `--format json` flag and parse the output if you need to report findings
-structurally.
 
 ### Lint rule reference (what the 7 rules catch)
 
@@ -173,7 +165,6 @@ structurally.
   ratio against WCAG AA (4.5:1) and AAA (7:1)
 - `unknown-component-property` (warning) — outside the whitelist above
 
-When the user cares about accessibility, call this out explicitly in your
 summary — WCAG findings are the most load-bearing reason to use the CLI.
 
 ## Pitfalls
@@ -187,7 +178,6 @@ summary — WCAG findings are the most load-bearing reason to use the CLI.
 - **Section order is enforced.** If the user gives you prose in a random order,
   reorder it to match the canonical list before saving.
 - **`version: alpha` is the current spec version** (as of Apr 2026). The spec
-  is marked alpha — watch for breaking changes.
 - **Token references resolve by dotted path.** `{colors.primary}` works;
   `{primary}` does not.
 

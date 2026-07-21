@@ -11,21 +11,18 @@ metadata:
     tags: [architecture, diagrams, SVG, HTML, visualization, infrastructure, cloud]
     related_skills: [concept-diagrams, excalidraw]
 ---
-
 # Architecture Diagram Skill
 
 Generate professional, dark-themed technical architecture diagrams as standalone HTML files with inline SVG graphics. No external tools, no API keys, no rendering libraries — just write the HTML file and open it in a browser.
 
 ## Scope
 
-**Best suited for:**
 - Software system architecture (frontend / backend / database layers)
 - Cloud infrastructure (VPC, regions, subnets, managed services)
 - Microservice / service-mesh topology
 - Database + API map, deployment diagrams
 - Anything with a tech-infra subject that fits a dark, grid-backed aesthetic
 
-**Look elsewhere first for:**
 - Physics, chemistry, math, biology, or other scientific subjects
 - Physical objects (vehicles, hardware, anatomy, cross-sections)
 - Floor plans, narrative journeys, educational / textbook-style visuals
@@ -52,7 +49,6 @@ Save diagrams to a user-specified path, or default to the current working direct
 
 ### Preview
 
-After saving, suggest the user open it:
 ```bash
 # macOS
 open ./my-architecture.html

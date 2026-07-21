@@ -4,7 +4,6 @@ description: "Create, read, edit .pptx decks, slides, notes, templates."
 license: Proprietary. LICENSE.txt has complete terms
 platforms: [linux, macos, windows]
 ---
-
 # Powerpoint Skill
 
 ## When to use
@@ -49,13 +48,9 @@ python scripts/office/unpack.py presentation.pptx unpacked/
 
 **Read [pptxgenjs.md](pptxgenjs.md) for full details.**
 
-Use when no template or reference presentation is available.
-
 ---
 
 ## Design Ideas
-
-**Don't create boring slides.** Plain bullets on a white background won't impress anyone. Consider ideas from this list for each slide.
 
 ### Before Starting
 
@@ -83,20 +78,16 @@ Choose colors that match your topic — don't default to generic blue. Use these
 
 ### For Each Slide
 
-**Every slide needs a visual element** — image, chart, icon, or shape. Text-only slides are forgettable.
-
 **Layout options:**
 - Two-column (text left, illustration on right)
 - Icon + text rows (icon in colored circle, bold header, description below)
 - 2x2 or 2x3 grid (image on one side, grid of content blocks on other)
 - Half-bleed image (full left or right side) with content overlay
 
-**Data display:**
 - Large stat callouts (big numbers 60-72pt with small labels below)
 - Comparison columns (before/after, pros/cons, side-by-side options)
 - Timeline or process flow (numbered steps, arrows)
 
-**Visual polish:**
 - Icons in small colored circles next to section headers
 - Italic accent text for key stats or taglines
 
@@ -145,8 +136,6 @@ Choose colors that match your topic — don't default to generic blue. Use these
 
 ## QA (Required)
 
-**Assume there are problems. Your job is to find them.**
-
 Your first render is almost never correct. Approach QA as a bug hunt, not a confirmation step. If you found zero issues on first inspection, you weren't looking hard enough.
 
 ### Content QA
@@ -154,10 +143,6 @@ Your first render is almost never correct. Approach QA as a bug hunt, not a conf
 ```bash
 python -m markitdown output.pptx
 ```
-
-Check for missing content, typos, wrong order.
-
-**When using templates, check for leftover placeholder text:**
 
 ```bash
 python -m markitdown output.pptx | grep -iE "xxxx|lorem|ipsum|this.*(page|slide).*layout"
@@ -168,8 +153,6 @@ If grep returns results, fix them before declaring success.
 ### Visual QA
 
 **⚠️ USE SUBAGENTS** — even for 2-3 slides. You've been staring at the code and will see what you expect, not what's there. Subagents have fresh eyes.
-
-Convert slides to images (see [Converting to Images](#converting-to-images)), then use this prompt:
 
 ```
 Visually inspect these slides. Assume there are issues — find them.
@@ -197,21 +180,7 @@ Read and analyze these images:
 Report ALL issues found, including minor ones.
 ```
 
-### Verification Loop
-
-1. Generate slides → Convert to images → Inspect
-2. **List issues found** (if none found, look again more critically)
-3. Fix issues
-4. **Re-verify affected slides** — one fix often creates another problem
-5. Repeat until a full pass reveals no new issues
-
-**Do not declare success until you've completed at least one fix-and-verify cycle.**
-
----
-
 ## Converting to Images
-
-Convert presentations to individual slide images for visual inspection:
 
 ```bash
 python scripts/office/soffice.py --headless --convert-to pdf output.pptx

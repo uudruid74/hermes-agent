@@ -10,7 +10,6 @@ metadata:
     tags: [Coding-Agent, OpenCode, Autonomous, Refactoring, Code-Review]
     related_skills: [claude-code, codex, hermes-agent]
 ---
-
 # OpenCode CLI
 
 Use [OpenCode](https://opencode.ai) as an autonomous coding worker orchestrated by Hermes terminal/process tools. OpenCode is a provider-agnostic, open-source AI coding agent with a TUI and CLI.
@@ -31,8 +30,6 @@ Use [OpenCode](https://opencode.ai) as an autonomous coding worker orchestrated 
 - `pty=true` for interactive TUI sessions
 
 ## Binary Resolution (Important)
-
-Shell environments may resolve different OpenCode binaries. If behavior differs between your terminal and Hermes, check:
 
 ```
 terminal(command="which -a opencode")
@@ -64,8 +61,6 @@ Show model thinking with `--thinking`:
 ```
 terminal(command="opencode run 'Debug why tests fail in CI' --thinking", workdir="~/project")
 ```
-
-Force a specific model:
 
 ```
 terminal(command="opencode run 'Refactor auth module' --model openrouter/anthropic/claude-sonnet-4", workdir="~/project")
@@ -155,8 +150,6 @@ OpenCode has a built-in PR command:
 terminal(command="opencode pr 42", workdir="~/project", pty=true)
 ```
 
-Or review in a temporary clone for isolation:
-
 ```
 terminal(command="REVIEW=$(mktemp -d) && git clone https://github.com/user/repo.git $REVIEW && cd $REVIEW && opencode run 'Review this PR vs main. Report bugs, security risks, test gaps, and style issues.' -f $(git diff origin/main --name-only | head -20 | tr '\n' ' ')", pty=true)
 ```
@@ -179,8 +172,6 @@ List past sessions:
 terminal(command="opencode session list")
 ```
 
-Check token usage and costs:
-
 ```
 terminal(command="opencode stats")
 terminal(command="opencode stats --days 7 --models anthropic/claude-sonnet-4")
@@ -195,19 +186,6 @@ terminal(command="opencode stats --days 7 --models anthropic/claude-sonnet-4")
   - `process(action="log", session_id="<id>")`
 - Avoid sharing one working directory across parallel OpenCode sessions.
 - Enter may need to be pressed twice to submit in the TUI (once to finalize text, once to send).
-
-## Verification
-
-Smoke test:
-
-```
-terminal(command="opencode run 'Respond with exactly: OPENCODE_SMOKE_OK'")
-```
-
-Success criteria:
-- Output includes `OPENCODE_SMOKE_OK`
-- Command exits without provider/model errors
-- For code tasks: expected files changed and tests pass
 
 ## Rules
 

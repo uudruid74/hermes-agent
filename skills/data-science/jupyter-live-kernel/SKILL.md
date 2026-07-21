@@ -10,7 +10,6 @@ metadata:
     tags: [jupyter, notebook, repl, data-science, exploration, iterative]
     category: data-science
 ---
-
 # Jupyter Live Kernel (hamelnb)
 
 Gives you a **stateful Python REPL** via a live Jupyter kernel. Variables persist
@@ -25,8 +24,6 @@ state incrementally, explore APIs, inspect DataFrames, or iterate on complex cod
 | `execute_code` | One-shot scripts needing hermes tool access (web_search, file ops). Stateless. |
 | `terminal` | Shell commands, builds, installs, git, process management |
 
-**Rule of thumb:** If you'd want a Jupyter notebook for the task, use this skill.
-
 ## Prerequisites
 
 1. **uv** must be installed (check: `which uv`)
@@ -35,24 +32,20 @@ state incrementally, explore APIs, inspect DataFrames, or iterate on complex cod
 
 ## Setup
 
-The hamelnb script location:
 ```
 SCRIPT="$HOME/.agent-skills/hamelnb/skills/jupyter-live-kernel/scripts/jupyter_live_kernel.py"
 ```
 
-If not cloned yet:
 ```
 git clone https://github.com/hamelsmu/hamelnb.git ~/.agent-skills/hamelnb
 ```
 
 ### Starting JupyterLab
 
-Check if a server is already running:
 ```
 uv run "$SCRIPT" servers
 ```
 
-If no servers found, start one:
 ```
 jupyter-lab --no-browser --port=8888 --notebook-dir=$HOME/notebooks \
   --IdentityProvider.token='' --ServerApp.password='' > /tmp/jupyter.log 2>&1 &
@@ -63,7 +56,6 @@ Note: Token/password disabled for local agent access. The server runs headless.
 
 ### Creating a Notebook for REPL Use
 
-If you just need a REPL (no existing notebook), create a minimal notebook file:
 ```
 mkdir -p ~/notebooks
 ```
@@ -94,7 +86,6 @@ uv run "$SCRIPT" execute --path <notebook.ipynb> --code '<python code>' --compac
 
 State persists across execute calls. Variables, imports, objects all survive.
 
-Multi-line code works with $'...' quoting:
 ```
 uv run "$SCRIPT" execute --path scratch.ipynb --code $'import os\nfiles = os.listdir(".")\nprint(f"Found {len(files)} files")' --compact
 ```
@@ -126,9 +117,6 @@ uv run "$SCRIPT" edit --path <notebook.ipynb> delete --cell-id <id> --compact
 
 ### 5. Verification (restart + run all)
 
-Only use when the user asks for a clean verification or you need to confirm
-the notebook runs top-to-bottom:
-
 ```
 uv run "$SCRIPT" restart-run-all --path <notebook.ipynb> --save-outputs --compact
 ```
@@ -136,14 +124,11 @@ uv run "$SCRIPT" restart-run-all --path <notebook.ipynb> --save-outputs --compac
 ## Practical Tips from Experience
 
 1. **First execution after server start may timeout** — the kernel needs a moment
-   to initialize. If you get a timeout, just retry.
 
 2. **The kernel Python is JupyterLab's Python** — packages must be installed in
    that environment. If you need additional packages, install them into the
-   JupyterLab tool environment first.
 
 3. **--compact flag saves significant tokens** — always use it. JSON output can
-   be very verbose without it.
 
 4. **For pure REPL use**, create a scratch.ipynb and don't bother with cell editing.
    Just use `execute` repeatedly.
@@ -155,10 +140,8 @@ uv run "$SCRIPT" restart-run-all --path <notebook.ipynb> --save-outputs --compac
    (see Setup section). The tool can't execute without a live kernel session.
 
 7. **Errors are returned as JSON** with traceback — read the `ename` and `evalue`
-   fields to understand what went wrong.
 
 8. **Occasional websocket timeouts** — some operations may timeout on first try,
-   especially after a kernel restart. Retry once before escalating.
 
 ## Timeout Defaults
 

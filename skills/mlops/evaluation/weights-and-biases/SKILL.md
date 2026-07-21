@@ -11,12 +11,10 @@ metadata:
     tags: [MLOps, Weights And Biases, WandB, Experiment Tracking, Hyperparameter Tuning, Model Registry, Collaboration, Real-Time Visualization, PyTorch, TensorFlow, HuggingFace]
 
 ---
-
 # Weights & Biases: ML Experiment Tracking & MLOps
 
 ## When to Use This Skill
 
-Use Weights & Biases (W&B) when you need to:
 - **Track ML experiments** with automatic metric logging
 - **Visualize training** in real-time dashboards
 - **Compare runs** across hyperparameters and configurations
@@ -122,9 +120,6 @@ wandb.finish()
 ## Core Concepts
 
 ### 1. Projects and Runs
-
-**Project**: Collection of related experiments
-**Run**: Single execution of your training script
 
 ```python
 # Create/use project
@@ -590,5 +585,3 @@ print(f"Share this URL: {run.url}")
 - `references/sweeps.md` - Comprehensive hyperparameter optimization guide
 - `references/artifacts.md` - Data and model versioning patterns
 - `references/integrations.md` - Framework-specific examples
-
-

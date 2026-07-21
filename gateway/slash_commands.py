@@ -3211,7 +3211,7 @@ class GatewaySlashCommandsMixin:
                 skip_memory=True,
                 enabled_toolsets=["memory"],
                 session_id=session_entry.session_id,
-                session_db=getattr(self._session_db, "_db", self._session_db),
+                session_db=self._resolve_session_db(),
             )
             try:
                 tmp_agent._print_fn = lambda *a, **kw: None
@@ -3739,7 +3739,7 @@ class GatewaySlashCommandsMixin:
         current_entry = await self.async_session_store.get_or_create_session(source)
         rows = await asyncio.to_thread(
             query_session_listing,
-            getattr(self._session_db, "_db", self._session_db),
+            self._resolve_session_db(),
             source=source.platform.value if source.platform else None,
             current_session_id=current_entry.session_id,
             include_all_sources=cross_origin,

@@ -26,12 +26,10 @@ metadata:
     related_skills: [stable-diffusion-image-generation, image_gen]
     category: creative
 ---
-
 # ComfyUI
 
 Generate images, video, audio, and 3D content through ComfyUI using the
 official `comfy-cli` for setup/lifecycle and direct REST/WebSocket API
-for workflow execution.
 
 ## What's in this skill
 
@@ -45,7 +43,6 @@ for workflow execution.
   (`values.a`, `resize_type.width`), Cloud quirks (302 redirect, 1 concurrent
   free-tier job, 1080p VRAM ceiling), Discord-compatible ffmpeg stitch.
   Authored by [@purzbeats](https://github.com/purzbeats). Load this whenever
-  you're starting from an official template.
 
 **Scripts (`scripts/`):**
 
@@ -112,7 +109,6 @@ python3 scripts/hardware_check.py
 ```
 
 If nothing is installed, see **Setup & Onboarding** below — but always run the
-hardware check first.
 
 ### One-line health check
 
@@ -184,7 +180,6 @@ python3 scripts/run_batch.py \
 ```
 
 `-1` for `seed` (or omitting it with `--randomize-seed`) generates a fresh
-random seed per run.
 
 ### Step 4: Present results
 
@@ -233,7 +228,6 @@ The scripts emit JSON to stdout describing every output file:
 When a user asks to set up ComfyUI, **the FIRST thing to do is ask whether
 they want Comfy Cloud (hosted, zero install, API key) or Local (install
 ComfyUI on their machine)**. Don't start running install commands or hardware
-checks until they've answered.
 
 **Official docs:** https://docs.comfy.org/installation
 **CLI docs:** https://docs.comfy.org/comfy-cli/getting-started
@@ -242,10 +236,7 @@ checks until they've answered.
 
 ### Step 0: Ask Local vs Cloud (ALWAYS FIRST)
 
-Suggested script:
-
 > "Do you want to run ComfyUI locally on your machine, or use Comfy Cloud?
->
 > - **Comfy Cloud** — hosted on RTX 6000 Pro GPUs, all common models pre-installed,
 >   zero setup. Requires an API key (paid subscription required to actually run
 >   workflows; free tier is read-only). Best if you don't have a capable GPU.
@@ -254,10 +245,7 @@ Suggested script:
 >   - AMD GPU with ROCm support (Linux), OR
 >   - Apple Silicon Mac (M1+) with **≥16 GB unified memory** (≥32 GB recommended).
 >   - Intel Macs and machines with no GPU will NOT work — use Cloud instead.
->
 > Which would you like?"
-
-Routing:
 
 - **Cloud** → skip to **Path A**.
 - **Local** → run hardware check first, then pick a path from Paths B–E based on the verdict.
@@ -287,7 +275,6 @@ Cloud or (b) force a local install (will OOM or be unusably slow on modern model
 ### Choosing an Installation Path
 
 Use the hardware check first. The table below is the fallback for when the
-user has already told you their hardware:
 
 | Situation | Recommended Path |
 |-----------|------------------|
@@ -310,7 +297,6 @@ bash scripts/comfyui_setup.sh --m-series --port=8190 --workspace=/data/comfy
 It runs `hardware_check.py` internally, refuses to install locally when the
 verdict is `cloud` (unless `--force-cloud-override`), picks the right
 `comfy-cli` flag, and prefers `pipx`/`uvx` over global `pip` to avoid polluting
-system Python.
 
 ---
 
@@ -330,13 +316,11 @@ For users without a capable GPU or who want zero setup. Hosted on RTX 6000 Pro.
    ```bash
    python3 scripts/run_workflow.py \
      --workflow workflows/flux_dev_txt2img.json \
-     --args '{"prompt": "..."}' \
      --host https://cloud.comfy.org \
      --output-dir ./outputs
    ```
 
 **Pricing:** https://www.comfy.org/cloud/pricing
-**Concurrent jobs:** Free/Standard 1, Creator 3, Pro 5. Free tier
 **cannot run workflows via API** — only browse models. Paid subscription
 required for `/api/prompt`, `/api/upload/*`, `/api/view`, etc.
 
@@ -380,7 +364,6 @@ uvx --from comfy-cli comfy --help
 pip install --user comfy-cli
 ```
 
-Disable analytics non-interactively:
 ```bash
 comfy --skip-prompt tracking disable
 ```
@@ -521,11 +504,8 @@ curl -X POST "https://cloud.comfy.org/api/upload/image" \
   (don't leak the API key to S3/CloudFront).
 - **Endpoint differences from local ComfyUI:**
   - `/api/object_info`, `/api/queue`, `/api/userdata` — **403 on free tier**;
-    paid only.
   - `/history` is renamed to `/history_v2` on cloud (the scripts route
-    automatically).
   - `/models/<folder>` is renamed to `/experiment/models/<folder>` on cloud
-    (the scripts route automatically).
   - `clientId` in WebSocket is currently ignored — all connections for a
     user receive the same broadcast. Filter by `prompt_id` client-side.
   - `subfolder` is accepted on uploads but ignored — cloud has a flat namespace.
@@ -587,26 +567,10 @@ python3 scripts/fetch_logs.py --tail-queue --host https://cloud.comfy.org
 
 9. **Workflow JSON is arbitrary code** — custom nodes run Python, so
    submitting an unknown workflow has the same trust profile as `eval`.
-   Inspect workflows from untrusted sources before running.
 
 10. **Auto-randomized seed** — pass `seed: -1` in `--args` (or use
     `--randomize-seed` and omit the seed) to get a fresh seed per run.
-    The actual seed is logged to stderr.
 
 11. **`tracking` prompt** — first run of `comfy` may prompt for analytics.
     Use `comfy --skip-prompt tracking disable` to skip non-interactively.
     `comfyui_setup.sh` does this for you.
-
-## Verification Checklist
-
-Use `python3 scripts/health_check.py` to run the whole list at once. Manual:
-
-- [ ] `hardware_check.py` verdict is `ok` OR the user explicitly chose Comfy Cloud
-- [ ] `comfy --version` works (or `uvx --from comfy-cli comfy --help`)
-- [ ] `curl http://HOST:PORT/system_stats` returns JSON
-- [ ] `comfy model list` shows at least one checkpoint (local) OR
-      `/api/experiment/models/checkpoints` returns models (cloud)
-- [ ] Workflow JSON is in API format
-- [ ] `check_deps.py` reports `is_ready: true` (or only `node_check_skipped`
-      on cloud free tier)
-- [ ] Test run with a small workflow completes; outputs land in `--output-dir`

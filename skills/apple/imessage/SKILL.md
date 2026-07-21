@@ -11,7 +11,6 @@ metadata:
 prerequisites:
   commands: [imsg]
 ---
-
 # iMessage
 
 Use `imsg` to read and send iMessage/SMS via macOS Messages.app.
@@ -88,8 +87,6 @@ imsg watch --chat-id 1 --attachments
 4. **Don't spam** — rate-limit yourself
 
 ## Example Workflow
-
-User: "Text mom that I'll be late"
 
 ```bash
 # 1. Find mom's chat

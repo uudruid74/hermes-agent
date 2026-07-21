@@ -11,7 +11,6 @@ metadata:
     category: productivity
     homepage: https://petdex.dev
 ---
-
 # Petdex Skill
 
 Browse, install, and select animated "pet" mascots from the public
@@ -58,7 +57,6 @@ Use the `terminal` tool to run `hermes pets <subcommand>`.
 2. Install + activate: `hermes pets install <slug> --select`.
 3. Preview it: `hermes pets show` (Ctrl+C to stop).
 4. Confirm setup: `hermes pets doctor` — shows the resolved pet, configured
-   render mode, detected terminal graphics protocol, and effective mode.
 
 Pets install into `<HERMES_HOME>/pets/<slug>/` (profile-aware). Selecting a pet
 writes `display.pet.slug` + `display.pet.enabled` to `config.yaml`.
@@ -73,7 +71,6 @@ Under `display.pet` in `config.yaml`:
 - `scale` (float) — on-screen size of the native 192×208 frames (default 0.33,
   clamped 0.1–3.0). One knob resizes every surface; set it with
   `hermes pets scale <factor>`, the `/pet scale` slash command, or the desktop
-  Appearance slider.
 - `unicode_cols` (int) — width in columns for the Unicode fallback.
 
 ## Pitfalls
@@ -82,8 +79,3 @@ Under `display.pet` in `config.yaml`:
 - Inside a pipe/redirect (no TTY) terminal rendering is disabled by design.
 - The petdex npm CLI installs to `~/.codex/pets`; Hermes uses its own
   profile-scoped `<HERMES_HOME>/pets/` instead — install through `hermes pets`.
-
-## Verification
-
-- `hermes pets doctor` reports `✓ ready` when a pet is installed, selected,
-  enabled, and Pillow is importable.

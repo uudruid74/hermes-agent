@@ -12,7 +12,6 @@ metadata:
     tags: [Notion, Productivity, Notes, Database, API, CLI, Workers]
     homepage: https://developers.notion.com
 ---
-
 # Notion
 
 Talk to Notion two ways. Same integration token works for both — pick by what's available.
@@ -78,7 +77,6 @@ ntn api v1/pages parent[page_id]=abc123 \         # POST with inline body
 ntn api v1/pages/abc123 -X PATCH archived:=true   # PATCH; := is non-string (bool/num/null)
 ```
 
-Syntax notes:
 - `key=value` — string fields
 - `key[nested]=value` — nested object fields
 - `key:=value` — typed assignment (booleans, numbers, null, arrays)
@@ -151,8 +149,6 @@ Compare to the 3-step HTTP flow (create upload → PUT bytes → reference).
 | `NOTION_WORKSPACE_ID` | Skip the workspace picker prompt |
 
 ## Path B — HTTP + curl (cross-platform, default on Windows)
-
-All requests share this pattern:
 
 ```bash
 curl -s -X GET "https://api.notion.com/v1/..." \
@@ -304,8 +300,6 @@ curl -s -X PUT "{upload_url}" --data-binary @photo.png
 
 ## Property Types
 
-Common property formats for database items:
-
 - **Title:** `{"title": [{"text": {"content": "..."}}]}`
 - **Rich text:** `{"rich_text": [{"text": {"content": "..."}}]}`
 - **Select:** `{"select": {"name": "Option"}}`
@@ -327,12 +321,10 @@ Common property formats for database items:
 
 ## Notion Workers (advanced, requires `ntn`)
 
-Workers are TypeScript programs Notion hosts for you. One worker can expose any combination of:
 - **Syncs** — pull data from external APIs into a Notion database on a schedule (default 30 min).
 - **Tools** — appear as callable tools inside Notion's Custom Agents.
 - **Webhooks** — receive HTTP events from external services (GitHub, Stripe, etc.) and act in Notion.
 
-**Plan / platform gating:**
 - CLI works on all plans. **Deploying Workers requires Business or Enterprise.**
 - `ntn` is macOS/Linux only as of May 2026. Windows users need WSL2 or to wait for native support.
 - Free through August 11, 2026; metered on Notion credits after.
@@ -397,7 +389,6 @@ When asked to build a Worker, scaffold with `ntn workers new`, write the code in
 
 Standard CommonMark plus XML-like tags for Notion-specific blocks. Use **tabs** for indentation.
 
-**Blocks beyond CommonMark:**
 ```
 <callout icon="🎯" color="blue_bg">
 	Ship the MVP by **Friday**.
@@ -416,7 +407,6 @@ Standard CommonMark plus XML-like tags for Notion-specific blocks. Use **tabs** 
 <table_of_contents color="gray"/>
 ```
 
-**Inline:**
 - Mentions: `<mention-user url="..."/>`, `<mention-page url="...">Title</mention-page>`, `<mention-date start="2026-05-15"/>`
 - Underline: `<span underline="true">text</span>`
 - Color: `<span color="blue">text</span>` or block-level `{color="blue"}` on the first line

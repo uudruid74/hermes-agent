@@ -13,7 +13,6 @@ metadata:
     tags: [Airtable, Productivity, Database, API]
     homepage: https://airtable.com/developers/web/api/introduction
 ---
-
 # Airtable — Bases, Tables & Records
 
 Work with Airtable's REST API directly via `curl` using the `terminal` tool. No MCP server, no OAuth flow, no Python SDK — just `curl` and a personal access token.
@@ -104,7 +103,6 @@ curl -s "https://api.airtable.com/v0/$BASE_ID/$TABLE?filterByFormula=$ENC&maxRec
   -H "Authorization: Bearer $AIRTABLE_API_KEY" | python3 -m json.tool
 ```
 
-Useful formula patterns:
 - Exact match: `{Email}='user@example.com'`
 - Contains: `FIND('bug', LOWER({Title}))`
 - Multiple conditions: `AND({Status}='Todo', {Priority}='High')`
@@ -124,7 +122,6 @@ Square brackets in query params MUST be URL-encoded (`%5B` / `%5D`).
 curl -s "https://api.airtable.com/v0/$BASE_ID/$TABLE?view=Grid%20view&maxRecords=50" \
   -H "Authorization: Bearer $AIRTABLE_API_KEY" | python3 -m json.tool
 ```
-Views apply their saved filter + sort server-side.
 
 ## Common Mutations
 
@@ -149,7 +146,6 @@ curl -s -X POST "https://api.airtable.com/v0/$BASE_ID/$TABLE" \
     ]
   }' | python3 -m json.tool
 ```
-Batch endpoints are capped at **10 records per request**. For larger inserts, loop in batches of 10 with a short sleep to respect 5 req/sec/base.
 
 ### Update a record (PATCH — merges, preserves unchanged fields)
 ```bash

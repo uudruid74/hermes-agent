@@ -733,6 +733,23 @@ def cronjob(
                             success=False,
                         )
 
+            # Auto-pin the current provider when the caller didn't pin one.
+            # _resolve_model_override (above) already resolves the nested
+            # ``model`` object param; this fallback catches the case where
+            # neither the model object nor the top-level provider string was
+            # supplied — the most common LLM call shape. Without this, the
+            # job is unpinned and the drift guard blocks it on the next global
+            # provider change (#44585).
+            if not provider:
+                try:
+                    from hermes_cli.config import load_config
+                    cfg = load_config()
+                    model_cfg = cfg.get("model", {})
+                    if isinstance(model_cfg, dict):
+                        provider = model_cfg.get("provider") or None
+                except Exception:
+                    pass  # Best-effort; provider stays None
+
             job = create_job(
                 prompt=prompt or "",
                 schedule=schedule,

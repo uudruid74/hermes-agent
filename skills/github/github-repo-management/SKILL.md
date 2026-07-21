@@ -10,7 +10,6 @@ metadata:
     tags: [GitHub, Repositories, Git, Releases, Secrets, Configuration]
     related_skills: [github-auth, github-pr-workflow, github-issues]
 ---
-
 # GitHub Repository Management
 
 Create, clone, fork, configure, and manage GitHub repositories. Each section shows `gh` first, then the `git` + `curl` fallback.
@@ -43,8 +42,6 @@ else
 fi
 ```
 
-If you're inside a repo already:
-
 ```bash
 REMOTE_URL=$(git remote get-url origin)
 OWNER_REPO=$(echo "$REMOTE_URL" | sed -E 's|.*github\.com[:/]||; s|\.git$||')
@@ -75,16 +72,12 @@ git clone --branch develop https://github.com/owner/repo-name.git
 git clone git@github.com:owner/repo-name.git
 ```
 
-**With gh (shorthand):**
-
 ```bash
 gh repo clone owner/repo-name
 gh repo clone owner/repo-name -- --depth 1
 ```
 
 ## 2. Creating Repositories
-
-**With gh:**
 
 ```bash
 # Create a public repo and clone it
@@ -129,8 +122,6 @@ git remote add origin https://github.com/$GH_USER/my-new-project.git
 git push -u origin main
 ```
 
-To create under an organization:
-
 ```bash
 curl -s -X POST \
   -H "Authorization: token $GITHUB_TOKEN" \
@@ -139,8 +130,6 @@ curl -s -X POST \
 ```
 
 ### From a Template
-
-**With gh:**
 
 ```bash
 gh repo create my-new-app --template owner/template-repo --public --clone
@@ -156,8 +145,6 @@ curl -s -X POST \
 ```
 
 ## 3. Forking Repositories
-
-**With gh:**
 
 ```bash
 gh repo fork owner/repo-name --clone
@@ -190,15 +177,11 @@ git merge upstream/main
 git push origin main
 ```
 
-**With gh (shortcut):**
-
 ```bash
 gh repo sync $GH_USER/repo-name
 ```
 
 ## 4. Repository Information
-
-**With gh:**
 
 ```bash
 gh repo view owner/repo-name
@@ -242,8 +225,6 @@ for r in json.load(sys.stdin)['items']:
 ```
 
 ## 5. Repository Settings
-
-**With gh:**
 
 ```bash
 gh repo edit --description "Updated description" --visibility public
@@ -301,8 +282,6 @@ curl -s -X PUT \
 
 ## 7. Secrets Management (GitHub Actions)
 
-**With gh:**
-
 ```bash
 gh secret set API_KEY --body "your-secret-value"
 gh secret set SSH_KEY < ~/.ssh/id_rsa
@@ -359,8 +338,6 @@ Note: For secrets, `gh secret set` is dramatically simpler. If setting secrets i
 
 ## 8. Releases
 
-**With gh:**
-
 ```bash
 gh release create v1.0.0 --title "v1.0.0" --generate-notes
 gh release create v2.0.0-rc1 --draft --prerelease --generate-notes
@@ -405,8 +382,6 @@ curl -s -X POST \
 ```
 
 ## 9. GitHub Actions Workflows
-
-**With gh:**
 
 ```bash
 gh workflow list
@@ -467,8 +442,6 @@ curl -s -X POST \
 ```
 
 ## 10. Gists
-
-**With gh:**
 
 ```bash
 gh gist create script.py --public --desc "Useful script"

@@ -10,7 +10,6 @@ metadata:
     tags: [sketch, mockup, design, ui, prototype, html, variants, exploration, wireframe, comparison]
     related_skills: [spike, claude-design, popular-web-designs, excalidraw]
 ---
-
 # Sketch
 
 Use this skill when the user wants to **see a design direction before committing** to one — exploring a UI/UX idea as disposable HTML mockups. The point is to generate 2-3 interactive variants so the user can compare visual directions side-by-side, not to produce shippable code.
@@ -36,13 +35,9 @@ intake  →  variants  →  head-to-head  →  pick winner (or iterate)
 
 ### 1. Intake (skip if the user already gave you enough)
 
-Before generating variants, get three things — one question at a time, not all at once:
-
 1. **Feel.** "What should this feel like? Adjectives, emotions, a vibe." — *"calm, editorial, like Linear"* tells you more than *"minimal"*.
 2. **References.** "What apps, sites, or products capture the feel you're imagining?" — actual references beat abstract descriptions.
 3. **Core action.** "What's the single most important thing a user does on this screen?" — the variants should all serve this well; if they don't, they're just decoration.
-
-Reflect each answer briefly before the next question. If the user already gave you all three upfront, skip straight to variants.
 
 ### 2. Variants (2-3, never 1, rarely 4+)
 
@@ -57,8 +52,6 @@ Each variant should take a **different design stance**, not different pixel valu
 - **Grounding:** card-based / bare-content / document-style
 
 Pick one axis and pull apart from it. Two variants that differ only in accent color are wasted effort — the user can't distinguish them.
-
-**Variant naming:** describe the stance, not the number.
 
 ```
 sketches/
@@ -136,8 +129,6 @@ One sentence on the principle driving this variant.
 
 ### 5. Head-to-head
 
-After all variants are built, present them as a comparison. Don't just list — **opinionate**:
-
 ```markdown
 ## Three takes on the home screen
 
@@ -150,8 +141,6 @@ After all variants are built, present them as a comparison. Don't just list — 
 
 **My take:** Utilitarian dense for power users, calm editorial for content-forward audiences. Playful split is weakest — tries to do both and commits to neither.
 ```
-
-Let the user pick a winner, or combine two into a hybrid, or ask for another round.
 
 ## Theming (when the project has a visual identity)
 
@@ -180,8 +169,6 @@ A sketch is interactive enough when the user can:
 2. **See one meaningful state transition** (filter a list, toggle a mode, open/close a panel)
 3. **Hover recognizable affordances** (buttons, rows, tabs)
 
-More than that is over-engineering a throwaway. Less than that is a screenshot.
-
 ## Frontier mode (picking what to sketch next)
 
 If sketches already exist and the user says "what should I sketch next?":
@@ -201,8 +188,6 @@ Propose 2-4 named candidates. Let the user pick.
 - Tell the user how to open them: `open sketches/001-calm-editorial/index.html` on macOS, `xdg-open` on Linux, `start` on Windows
 - Keep variants disposable — a sketch that you felt the need to preserve should be promoted into real project code, not curated as an asset
 
-**Typical tool sequence for one variant:**
-
 ```
 terminal("mkdir -p sketches/001-calm-editorial")
 write_file("sketches/001-calm-editorial/index.html", "<!doctype html>...")
@@ -210,8 +195,6 @@ write_file("sketches/001-calm-editorial/README.md", "## Variant: Calm editorial\
 browser_navigate(url="file://$(pwd)/sketches/001-calm-editorial/index.html")
 browser_vision(question="How does this look? Any obvious layout issues?")
 ```
-
-Repeat for each variant, then present the comparison table.
 
 ## Attribution
 

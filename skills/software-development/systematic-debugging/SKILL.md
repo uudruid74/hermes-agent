@@ -8,9 +8,8 @@ platforms: [linux, macos, windows]
 metadata:
   hermes:
     tags: [debugging, troubleshooting, problem-solving, root-cause, investigation]
-    related_skills: [test-driven-development, plan, subagent-driven-development]
+    related_skills: [test-driven-development, plan, plan-driven-subagent-execution]
 ---
-
 # Systematic Debugging
 
 ## Overview
@@ -26,14 +25,6 @@ Random fixes waste time and create new bugs. Quick patches mask underlying issue
 ```
 NO FIXES WITHOUT ROOT CAUSE INVESTIGATION FIRST
 ```
-
-If you haven't completed Phase 1, you cannot propose fixes.
-
-## The Feedback Loop Rule
-
-The feedback loop is the debugging work. Before reading code to build a theory, create or identify a **tight** command that can go red on the user's exact symptom and green when the bug is fixed. A tight loop is fast, deterministic, agent-runnable, and specific enough to catch this bug — not merely "doesn't crash".
-
-When a clean repro is hard, spend disproportionate effort building the loop. Guessing without a red-capable loop is the failure mode this skill exists to prevent.
 
 ## When to Use
 
@@ -52,7 +43,6 @@ Use for ANY technical issue:
 - Previous fix didn't work
 - You don't fully understand the issue
 
-**Don't skip when:**
 - Issue seems simple (simple bugs have root causes too)
 - You're in a hurry (rushing guarantees rework)
 - Someone wants it fixed NOW (systematic is faster than thrashing)
@@ -76,46 +66,21 @@ You MUST complete each phase before proceeding to the next.
 
 **Action:** Use `read_file` on the relevant source files. Use `search_files` to find the error string in the codebase.
 
-### 2. Build a Tight Feedback Loop
+### 2. Reproduce Consistently
 
-- Can you trigger the user's exact symptom with one command?
-- Does the command fail for this bug and only pass once the bug is fixed?
-- Is it fast enough to run repeatedly?
-- Is it deterministic? For flaky bugs, can you raise the reproduction rate high enough to debug?
-- If not reproducible → gather more data, don't guess.
+- Can you trigger it reliably?
+- What are the exact steps?
+- Does it happen every time?
+- If not reproducible → gather more data, don't guess
 
-**Ways to construct a loop — try in roughly this order:**
-
-1. **Failing test** at the seam that reaches the bug: unit, integration, or end-to-end.
-2. **HTTP script / curl** against a running dev server.
-3. **CLI invocation** with fixture input, diffing stdout/stderr against expected output.
-4. **Headless browser script** (Playwright/Puppeteer) asserting on DOM, console, or network.
-5. **Replay a captured trace**: HAR, request payload, event log, queue message, or webhook body.
-6. **Throwaway harness** that boots the smallest useful slice of the system and calls the failing path.
-7. **Property / fuzz loop** when the bug is intermittent wrong output over a broad input space.
-8. **Bisection harness** suitable for `git bisect run` when the bug appeared between two known states.
-9. **Differential loop** comparing old vs new version, two configs, two providers, or two datasets.
-10. **Human-in-the-loop script** only as a last resort: script the human steps and capture their result so the loop stays structured.
-
-**Tighten the loop once it exists:**
-
-- Make it faster: cache setup, narrow scope, skip unrelated initialization.
-- Make the signal sharper: assert the exact symptom, not generic success.
-- Make it more deterministic: pin time, seed randomness, isolate filesystem, freeze network.
-
-For non-deterministic bugs, the immediate goal is a higher reproduction rate, not perfection. Run the trigger 100x, parallelize, add stress, narrow timing windows, or inject sleeps. A 50% flake is debuggable; a 1% flake usually is not.
-
-**Action:** Use the `terminal` tool to run the tight loop:
+**Action:** Use the `terminal` tool to run the failing test or trigger the bug:
 
 ```bash
-# Run a specific failing test
+# Run specific failing test
 pytest tests/test_module.py::test_name -v
 
-# Or run a scripted repro
-python scripts/repro_bug.py
-
-# Or run a high-repetition flaky repro
-for i in {1..100}; do pytest tests/test_flake.py::test_name -q || break; done
+# Run with verbose output
+pytest tests/test_module.py -v --tb=long
 ```
 
 ### 3. Check Recent Changes
@@ -123,8 +88,6 @@ for i in {1..100}; do pytest tests/test_flake.py::test_name -q || break; done
 - What changed that could cause this?
 - Git diff, recent commits
 - New dependencies, config changes
-
-**Action:**
 
 ```bash
 # Recent commits
@@ -172,16 +135,30 @@ search_files("function_name(", path="src/", file_glob="*.py")
 search_files("variable_name\\s*=", path="src/", file_glob="*.py")
 ```
 
+### 5b. Trace Event-Driven / Streaming Pipelines
+
+**WHEN data flows through events, streaming deltas, message queues, or cross-process channels** — the standard function-call trace doesn't work because components live in different processes or fire asynchronously.
+
+**Approach: Map the full pipeline before debugging any single stage.**
+
+1. **List every transformation step** from source to sink, noting process boundaries (model → gateway → desktop/TUI app → renderer).
+2. **Check each stage's data contract:** What shape is the input? What shape is the output? Is the stage stateful or stateless? Does it assume complete input?
+3. **Isolate side-of-failure first** — determine if the corruption happens server-side (before the event is emitted) or client-side (after the UI receives it).
+4. **Check accumulation logic** — streaming text is built up from deltas. Each accumulation point (buffer, concatenation, ref) is a potential corruption site.
+5. **Check every regex transform** — regexes written for complete text can over-match or drop content when fed partial streaming deltas.
+
+See `references/streaming-pipeline-debugging.md` for the full technique with a concrete worked example (garbled assistant output traced through the Hermes streaming pipeline).
+
+**Browser printing:** See `references/browser-printing-linux.md` for the diagnosis workflow when Brave/Chrome silently fails to print — no CUPS job, no error, no log. The fix chain is: disable new PDF viewer flag → disable print preview flag → disable GPU rasterization.
+
 ### Phase 1 Completion Checklist
 
 - [ ] Error messages fully read and understood
-- [ ] A tight loop command exists and has been run at least once
-- [ ] Loop is red-capable: it asserts the user's exact symptom, not a nearby failure
-- [ ] Loop is deterministic, or a flaky bug has a high enough reproduction rate to debug
+- [ ] Issue reproduced consistently
 - [ ] Recent changes identified and reviewed
 - [ ] Evidence gathered (logs, state, data flow)
 - [ ] Problem isolated to specific component/code
-- [ ] Root cause hypotheses can be stated and tested
+- [ ] Root cause hypothesis formed
 
 **STOP:** Do not proceed to Phase 2 until you understand WHY it's happening.
 
@@ -190,12 +167,6 @@ search_files("variable_name\\s*=", path="src/", file_glob="*.py")
 ## Phase 2: Pattern Analysis
 
 **Find the pattern before fixing:**
-
-### 0. Minimize the Reproduction
-
-Once the loop is red, shrink the repro to the smallest scenario that still goes red. Cut inputs, callers, config, data, and steps **one at a time**, re-running the loop after each cut. Keep only what is load-bearing for the failure.
-
-Done when removing any remaining element makes the loop go green. A minimal repro narrows the hypothesis space and often becomes the cleanest regression test.
 
 ### 1. Find Working Examples
 
@@ -232,22 +203,17 @@ search_files("similar_pattern", path="src/", file_glob="*.py")
 
 **Scientific method:**
 
-### 1. Form Ranked Falsifiable Hypotheses
+### 1. Form a Single Hypothesis
 
-- Generate 3–5 plausible hypotheses before testing any single one.
-- Rank them by likelihood and cheapness to falsify.
-- State the prediction each hypothesis makes: "If X is the cause, then changing or observing Y should make Z happen."
-- Discard or sharpen any hypothesis that does not make a testable prediction.
-
-If the user is present, show the ranked list before testing. They may have domain knowledge that instantly re-ranks it. If the user is AFK, proceed with your ranking.
+- State clearly: "I think X is the root cause because Y"
+- Write it down
+- Be specific, not vague
 
 ### 2. Test Minimally
 
-- Test the highest-ranked hypothesis with the smallest possible probe.
-- Change one variable at a time.
-- Don't fix multiple things at once.
-- Prefer debugger/REPL inspection when available; one breakpoint beats ten logs.
-- If you add logs, tag every temporary line with a unique prefix such as `[DEBUG-a4f2]` so cleanup is a single search.
+- Make the SMALLEST possible change to test the hypothesis
+- One variable at a time
+- Don't fix multiple things at once
 
 ### 3. Verify Before Continuing
 
@@ -302,7 +268,6 @@ pytest tests/ -q
 
 ### 5. If 3+ Fixes Failed: Question Architecture
 
-**Pattern indicating an architectural problem:**
 - Each fix reveals new shared state/coupling in a different place
 - Fixes require "massive refactoring" to implement
 - Each fix creates new symptoms elsewhere
@@ -320,7 +285,6 @@ This is NOT a failed hypothesis — this is a wrong architecture.
 
 ## Red Flags — STOP and Follow Process
 
-If you catch yourself thinking:
 - "Quick fix for now, investigate later"
 - "Just try changing X and see if it works"
 - "Add multiple changes, run tests"
@@ -349,6 +313,66 @@ If you catch yourself thinking:
 | "Reference too long, I'll adapt the pattern" | Partial understanding guarantees bugs. Read it completely. |
 | "I see the problem, let me fix it" | Seeing symptoms ≠ understanding root cause. |
 | "One more fix attempt" (after 2+ failures) | 3+ failures = architectural problem. Question the pattern, don't fix again. |
+
+### Never declare victory on a fix you proposed until the user confirms
+
+**Rule:** When you propose a fix and the user says anything tentative ("seems to", "might be", "let me check", "I think"), that is NOT confirmation. Do NOT close the investigation, write fabric entries, or update skills declaring the issue resolved.
+
+**Why this matters:** Tentative feedback from a user is easy to hear as affirmation. The cost of a premature close + wrong fabric entry (which then poisons other agents' context) is far higher than the cost of waiting for an explicit "yes, this is fixed."
+
+1. When the user says anything tentative → keep investigating other angles
+2. Wait for explicit confirmation like "it's fixed", "that worked", "resolved"
+3. If they say "I think we might be good" → acknowledge the possibility but DO NOT close
+4. Only close the loop when you're confident AND the user confirms
+
+- "They said 'good' so the fix worked" — no, they said "might be good"
+- "My explanation convinced them" — you solved the wrong problem
+- "Better to write it down in case it is fixed" — wrong data is worse than no data
+
+### The user saying "seems like X fixed it" — hardest variant to catch
+
+**The trap:** The user reports a change they made (new desktop client, toggled a setting) and says it "seems to have done it." This sounds like user confirmation — but the keyword is "seems." The user is reporting a HYPOTHESIS they're testing, not a CONFIRMED result.
+
+**Concrete example from a production session:**
+> User: "I think we might be good. The new desktop client cranked up the reasoning from Standard to Max and that seems to have done it"
+
+My wrong response: immediately wrote a fabric entry declaring "Garbled output fixed by raising reasoning level to Max" and closed the case.
+
+- "seems to have done it" was the user testing a theory, not confirming a result
+- I latched onto the first plausible explanation instead of continuing to investigate
+- The actual root cause (ICARUS context injection truncation) was completely different from the reasoning-effort theory
+- The wrong fabric entry poisoned context until manually deleted
+
+- The user attributes the fix to something THEY did (setting change, restart, etc.) — they're describing what they tried, not what worked
+- Any hedging language ("seems", "might", "I think", "appears", "looks like", "could be") before a positive outcome claim
+- The fix description is vague ("cranked up") rather than precise
+- The user hasn't seen the next response yet — garbling could still be happening
+
+1. Acknowledge the test: "Good data point"
+2. Keep investigating other angles: "Let me also check X while you verify"
+3. Wait for explicit "yep, fixed" or "resolved" before closing anything
+4. If you don't hear back, do NOT assume the fix worked — the user would tell you if it did
+
+### Verify at every layer before declaring done
+
+Multi-layered systems (config.yaml + .env + SDK code + Docker + running daemon) require verification at EVERY layer before a fix is confirmed. Changing one file and assuming it works is how the Firecrawl 402 fix failed repeatedly — the config looked right but the env var was in the wrong .env file, the SDK defaulted to cloud, and the running process had stale state.
+
+See `references/verify-every-layer.md` for the full protocol and the Firecrawl 402 case study.
+
+### Variable scope across retry/fallback code paths
+
+`UnboundLocalError` in a retry loop or multi-path error handler almost always means a variable is referenced in one code path but only assigned in a *later, separate* path within the same function.
+
+**Hotspot pattern:** A long function (50+ lines) with multiple error-handling sections — eager fallback, credential pool rotation, compression recovery, retry-before-sleep. A variable is introduced and assigned in the *retry backoff / wait* section, but another section that runs *before* it (e.g., eager fallback) also references the same variable.
+
+1. Search for all references to the variable name in the function
+2. Note the line numbers — is the first reference a read or a write?
+3. If the first reference is a read (not an assignment), you've found the bug
+4. Trace which code paths reach that read before any assignment runs
+
+**Fix:** Initialize the variable to `None` (or a safe default) at the top of the enclosing block — right before the *earliest* code path that references it. Even if a later section also initializes it, the earlier path needs its own initialization.
+
+**Example:** In `conversation_loop.py`, `_retry_after` was set to `None` in the retry-backoff section (line ~3435), but the eager-fallback path (line ~2785) used it in a `_try_activate_fallback(retry_after_seconds=_retry_after)` call. Fix: initialize `_retry_after = None` right before the eager-fallback block.
 
 ## Quick Reference
 

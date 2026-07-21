@@ -10,7 +10,6 @@ metadata:
     tags: [GitHub, Authentication, Git, gh-cli, SSH, Setup]
     related_skills: [github-pr-workflow, github-code-review, github-issues, github-repo-management]
 ---
-
 # GitHub Authentication Setup
 
 This skill sets up authentication so the agent can work with GitHub repositories, PRs, issues, and CI. It covers two paths:
@@ -19,8 +18,6 @@ This skill sets up authentication so the agent can work with GitHub repositories
 - **`gh` CLI (if installed)** — richer GitHub API access with a simpler auth flow
 
 ## Detection Flow
-
-When a user asks you to work with GitHub, run this check first:
 
 ```bash
 # Check what's available
@@ -32,7 +29,6 @@ gh auth status 2>/dev/null || echo "gh not authenticated"
 git config --global credential.helper 2>/dev/null || echo "no git credential helper"
 ```
 
-**Decision tree:**
 1. If `gh auth status` shows authenticated → you're good, use `gh` for everything
 2. If `gh` is installed but not authenticated → use "gh auth" method below
 3. If `gh` is not installed → use "git-only" method below (no sudo needed)
@@ -44,8 +40,6 @@ git config --global credential.helper 2>/dev/null || echo "no git credential hel
 This works on any machine with `git` installed. No root access needed.
 
 ### Option A: HTTPS with Personal Access Token (Recommended)
-
-This is the most portable method — works everywhere, no SSH config needed.
 
 **Step 1: Create a personal access token**
 
@@ -73,10 +67,6 @@ git config --global credential.helper store
 git ls-remote https://github.com/<their-username>/<any-repo>.git
 ```
 
-After entering credentials once, they're saved and reused for all future operations.
-
-**Alternative: cache helper (credentials expire from memory)**
-
 ```bash
 # Cache in memory for 8 hours (28800 seconds) instead of saving to disk
 git config --global credential.helper 'cache --timeout=28800'
@@ -97,8 +87,6 @@ git config --global user.name "Their Name"
 git config --global user.email "their-email@example.com"
 ```
 
-**Step 4: Verify**
-
 ```bash
 # Test push access (this should work without any prompts now)
 git ls-remote https://github.com/<their-username>/<any-repo>.git
@@ -118,8 +106,6 @@ Good for users who prefer SSH or already have keys set up.
 ls -la ~/.ssh/id_*.pub 2>/dev/null || echo "No SSH keys found"
 ```
 
-**Step 2: Generate a key if needed**
-
 ```bash
 # Generate an ed25519 key (modern, secure, fast)
 ssh-keygen -t ed25519 -C "their-email@example.com" -f ~/.ssh/id_ed25519 -N ""
@@ -132,8 +118,6 @@ Tell the user to add the public key at: **https://github.com/settings/keys**
 - Click "New SSH key"
 - Paste the public key content
 - Give it a title like "hermes-agent-<machine-name>"
-
-**Step 3: Test the connection**
 
 ```bash
 ssh -T git@github.com
@@ -203,16 +187,12 @@ curl -s -H "Authorization: token $GITHUB_TOKEN" \
 
 ### Extracting the Token from Git Credentials
 
-If git credentials are already configured (via credential.helper store), the token can be extracted:
-
 ```bash
 # Read from git credential store
 grep "github.com" ~/.git-credentials 2>/dev/null | head -1 | sed 's|https://[^:]*:\([^@]*\)@.*|\1|'
 ```
 
 ### Helper: Detect Auth Method
-
-Use this pattern at the start of any GitHub workflow:
 
 ```bash
 # Try gh first, fall back to git + curl
@@ -245,3 +225,4 @@ fi
 | Credentials not persisting | Check `git config --global credential.helper` — must be `store` or `cache` |
 | Multiple GitHub accounts | Use SSH with different keys per host alias in `~/.ssh/config`, or per-repo credential URLs |
 | `gh: command not found` + no sudo | Use git-only Method 1 above — no installation needed |
+| `~/.git-credentials` not found | If `$HOME` resolves to a profile directory (e.g. `~/.hermes/profiles/<profile>/home`) instead of the real user home, `~/.git-credentials` resolves to the wrong path. Fix: `git config --local credential.helper 'store --file /home/<user>/.git-credentials'` or use an absolute path to the credential file. |

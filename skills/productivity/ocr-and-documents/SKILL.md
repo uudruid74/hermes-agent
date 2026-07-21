@@ -10,12 +10,10 @@ metadata:
     tags: [PDF, Documents, Research, Arxiv, Text-Extraction, OCR]
     related_skills: [powerpoint]
 ---
-
 # PDF & Document Extraction
 
 For DOCX: use `python-docx` (parses actual document structure, far better than OCR).
 For PPTX: see the `powerpoint` skill (uses `python-pptx` with full slide/notes support).
-This skill covers **PDFs and scanned documents**.
 
 ## Step 1: Remote URL Available?
 
@@ -62,7 +60,6 @@ If the user needs marker capabilities but the system lacks ~5GB free disk:
 pip install pymupdf pymupdf4llm
 ```
 
-**Via helper script**:
 ```bash
 python scripts/extract_pymupdf.py document.pdf              # Plain text
 python scripts/extract_pymupdf.py document.pdf --markdown    # Markdown
@@ -72,7 +69,6 @@ python scripts/extract_pymupdf.py document.pdf --metadata    # Title, author, pa
 python scripts/extract_pymupdf.py document.pdf --pages 0-4   # Specific pages
 ```
 
-**Inline**:
 ```bash
 python3 -c "
 import pymupdf
@@ -93,7 +89,6 @@ python scripts/extract_marker.py --check
 pip install marker-pdf
 ```
 
-**Via helper script**:
 ```bash
 python scripts/extract_marker.py document.pdf                # Markdown
 python scripts/extract_marker.py document.pdf --json         # JSON with metadata
@@ -156,8 +151,6 @@ for i, page in enumerate(doc):
         print(f"Page {i+1}: {len(results)} match(es)")
         print(page.get_text("text"))
 ```
-
-No extra dependencies needed — pymupdf covers split, merge, search, and text extraction in one package.
 
 ---
 

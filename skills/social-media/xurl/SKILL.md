@@ -13,12 +13,10 @@ metadata:
     homepage: https://github.com/xdevplatform/xurl
     upstream_skill: https://github.com/openclaw/openclaw/blob/main/skills/xurl/SKILL.md
 ---
-
 # xurl — X (Twitter) API via the Official CLI
 
 `xurl` is the X developer platform's official CLI for the X API. It supports shortcut commands for common actions AND raw curl-style access to any v2 endpoint. All commands return JSON to stdout.
 
-Use this skill for:
 - posting, replying, quoting, deleting posts
 - searching posts and reading timelines/mentions
 - liking, reposting, bookmarking
@@ -67,8 +65,6 @@ npm install -g @xdevplatform/xurl
 # Go
 go install github.com/xdevplatform/xurl@latest
 ```
-
-Verify:
 
 ```bash
 xurl --help
@@ -158,7 +154,6 @@ After this, the agent can use any command below without further setup. OAuth 2.0
 | Per-request app | `xurl --app NAME /2/users/me` |
 | Auth status | `xurl auth status` |
 
-Notes:
 - `POST_ID` accepts full URLs too (e.g. `https://x.com/user/status/1234567890`) — xurl extracts the ID.
 - Usernames work with or without a leading `@`.
 
@@ -315,8 +310,6 @@ xurl https://api.x.com/2/users/me
 
 ## Streaming
 
-Streaming endpoints are auto-detected. Known ones include:
-
 - `/2/tweets/search/stream`
 - `/2/tweets/sample/stream`
 - `/2/tweets/sample10/stream`
@@ -332,8 +325,6 @@ All commands return JSON to stdout. Structure mirrors X API v2:
 ```json
 { "data": { "id": "1234567890", "text": "Hello world!" } }
 ```
-
-Errors are also JSON:
 
 ```json
 { "errors": [ { "message": "Not authorized", "code": 403 } ] }

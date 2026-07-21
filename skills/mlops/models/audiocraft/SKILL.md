@@ -11,14 +11,10 @@ metadata:
     tags: [Multimodal, Audio Generation, Text-to-Music, Text-to-Audio, MusicGen]
 
 ---
-
 # AudioCraft: Audio Generation
-
-Comprehensive guide to using Meta's AudioCraft for text-to-music and text-to-audio generation with MusicGen, AudioGen, and EnCodec.
 
 ## When to use AudioCraft
 
-**Use AudioCraft when:**
 - Need to generate music from text descriptions
 - Creating sound effects and environmental audio
 - Building music generation applications
@@ -26,7 +22,6 @@ Comprehensive guide to using Meta's AudioCraft for text-to-music and text-to-aud
 - Want stereo audio output
 - Require controllable music generation with style transfer
 
-**Key features:**
 - **MusicGen**: Text-to-music generation with melody conditioning
 - **AudioGen**: Text-to-sound effects generation
 - **EnCodec**: High-fidelity neural audio codec
@@ -34,7 +29,6 @@ Comprehensive guide to using Meta's AudioCraft for text-to-music and text-to-aud
 - **Stereo support**: Full stereo audio generation
 - **Style conditioning**: MusicGen-Style for reference-based generation
 
-**Use alternatives instead:**
 - **Stable Audio**: For longer commercial music generation
 - **Bark**: For text-to-speech with music/sound effects
 - **Riffusion**: For spectogram-based music generation

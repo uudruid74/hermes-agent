@@ -11,7 +11,6 @@ metadata:
 prerequisites:
   commands: [remindctl]
 ---
-
 # Apple Reminders
 
 Use `remindctl` to manage Apple Reminders directly from the terminal. Tasks sync across all Apple devices via iCloud.
@@ -81,8 +80,6 @@ For a reminder due at 2:00 PM with a notification 30 minutes earlier:
 remindctl add --title "Hairdresser" --due "2026-05-15 14:00" --alarm "2026-05-15 13:30"
 ```
 
-To edit an existing reminder:
-
 ```bash
 remindctl edit 87354 --due "2026-05-15 14:00" --alarm "2026-05-15 13:30"
 ```
@@ -92,8 +89,6 @@ The Reminders UI may show or group the item by the alarm time because that is wh
 ```bash
 remindctl today --json
 ```
-
-Expected shape:
 
 - `dueDate`: actual due time
 - `alarmDate`: notification / early nudge time

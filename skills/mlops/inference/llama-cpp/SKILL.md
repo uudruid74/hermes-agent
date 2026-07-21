@@ -10,7 +10,6 @@ metadata:
   hermes:
     tags: [llama.cpp, GGUF, Quantization, Hugging Face Hub, CPU Inference, Apple Silicon, Edge Deployment, AMD GPUs, Intel GPUs, NVIDIA, URL-first]
 ---
-
 # llama.cpp + GGUF
 
 Use this skill for local GGUF inference, quant selection, or Hugging Face repo discovery for llama.cpp.
@@ -187,8 +186,6 @@ When the user asks what GGUFs exist, return:
 - quant label
 - whether it is a main model or an auxiliary projector
 
-Ignore unless requested:
-
 - README
 - BF16 shard files
 - imatrix blobs or calibration artifacts
@@ -213,8 +210,6 @@ https://huggingface.co/<repo>/tree/main
 ```
 
 ## Output format
-
-When answering discovery requests, prefer a compact structured result like:
 
 ```text
 Repo: <repo>

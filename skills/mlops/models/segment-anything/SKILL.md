@@ -11,7 +11,6 @@ metadata:
     tags: [Multimodal, Image Segmentation, Computer Vision, SAM, Zero-Shot]
 
 ---
-
 # Segment Anything Model (SAM)
 
 Comprehensive guide to using Meta AI's Segment Anything Model for zero-shot image segmentation.
@@ -26,7 +25,6 @@ Comprehensive guide to using Meta AI's Segment Anything Model for zero-shot imag
 - Building object detection/segmentation pipelines
 - Processing medical, satellite, or domain-specific images
 
-**Key features:**
 - **Zero-shot segmentation**: Works on any image domain without fine-tuning
 - **Flexible prompts**: Points, bounding boxes, or previous masks
 - **Automatic segmentation**: Generate all object masks automatically
@@ -34,7 +32,6 @@ Comprehensive guide to using Meta AI's Segment Anything Model for zero-shot imag
 - **Multiple model sizes**: ViT-B (fastest), ViT-L, ViT-H (most accurate)
 - **ONNX export**: Deploy in browsers and edge devices
 
-**Use alternatives instead:**
 - **YOLO/Detectron2**: For real-time object detection with classes
 - **Mask2Former**: For semantic/panoptic segmentation with categories
 - **GroundingDINO + SAM**: For text-prompted segmentation
@@ -135,7 +132,6 @@ masks = processor.image_processor.post_process_masks(
 
 ### Model architecture
 
-<!-- ascii-guard-ignore -->
 ```
 SAM Architecture:
 ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
@@ -146,7 +142,6 @@ SAM Architecture:
    Image Embeddings      Prompt Embeddings         Masks + IoU
    (computed once)       (per prompt)             predictions
 ```
-<!-- ascii-guard-ignore-end -->
 
 ### Model variants
 
