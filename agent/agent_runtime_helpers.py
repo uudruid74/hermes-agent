@@ -26,10 +26,11 @@ import copy
 import json
 import logging
 import re
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from hermes_cli.timeouts import get_provider_request_timeout
 from agent.prompt_builder import format_steer_marker
@@ -3299,3 +3300,88 @@ __all__ = [
     "_iter_pool_sockets",
     "force_close_tcp_sockets",
 ]
+
+# ── In-flight turn tripwire (upstream concurrent-turn detection) ─────────
+_INFLIGHT_TURNS_BY_SESSION: Dict[str, Tuple[str, float]] = {}
+_INFLIGHT_TURNS_LOCK = threading.Lock()
+
+
+def note_turn_start(agent, turn_id: str):
+    """Tripwire: detect a turn starting while a previous turn of the same
+    agent — or of the same underlying *session* on a different agent object —
+    has not completed its turn-end persist.
+
+    Two turns interleaving on one session corrupt the durable transcript:
+    their flushes race (user rows can persist out of arrival order), a row
+    can be swallowed by the identity-marker dedup over shared history dicts,
+    and the second turn runs on a history base that never saw the first
+    turn's exchange. This helper does NOT prevent any of that — it names the
+    occurrence, with both turn ids, so the dispatch route that let the
+    second turn through the busy guard can be identified from logs.
+
+    Returns the previous in-flight turn_id when an overlap is detected,
+    else None. Takes ownership of the in-flight slot either way, so a turn
+    that crashed before its persist produces at most one warning."""
+    prev = getattr(agent, "_inflight_turn_id", None)
+    prev_started = getattr(agent, "_inflight_turn_started", 0.0)
+    agent._inflight_turn_id = turn_id
+    agent._inflight_turn_started = time.time()
+    overlap = None
+    if prev and prev != turn_id:
+        logger.warning(
+            "turn %s starting while turn %s (started %.0fs ago) has not "
+            "completed its turn-end persist (session=%s) — concurrent turns "
+            "on one session; transcript writes may interleave",
+            turn_id,
+            prev,
+            time.time() - prev_started if prev_started else -1.0,
+            getattr(agent, "session_id", None) or "-",
+        )
+        overlap = prev
+
+    # Cross-agent leg: same session_id in flight under a different agent
+    # object means two routing keys resolve to one durable session — the
+    # busy guard (keyed by routing key) cannot see this overlap at all.
+    # Persist-disabled agents (background-review forks) deliberately share
+    # the live parent's session_id for prompt-cache warmth but can never
+    # write to the transcript — they must not register here (would warn a
+    # false overlap against the parent's real turn) nor pop the parent's
+    # slot at their persist (note_turn_persisted skips them symmetrically).
+    session_id = getattr(agent, "session_id", None)
+    if session_id and not getattr(agent, "_persist_disabled", False):
+        now = time.time()
+        with _INFLIGHT_TURNS_LOCK:
+            entry = _INFLIGHT_TURNS_BY_SESSION.get(session_id)
+            _INFLIGHT_TURNS_BY_SESSION[session_id] = (turn_id, now)
+        # Stamp the session id this turn registered under: compression can
+        # rotate agent.session_id mid-turn, and the persist-time clear must
+        # pop the slot the turn actually holds, not the rotated id.
+        agent._inflight_turn_session_id = session_id
+        if entry and entry[0] not in (turn_id, prev):
+            logger.warning(
+                "turn %s starting while turn %s (started %.0fs ago) is still "
+                "in flight on session %s under a different agent object — "
+                "two routing keys are mapped to one session_id; concurrent "
+                "turns on one session; transcript writes may interleave",
+                turn_id,
+                entry[0],
+                now - entry[1] if entry[1] else -1.0,
+                session_id,
+            )
+            overlap = overlap or entry[0]
+    return overlap
+
+
+def note_turn_persisted(agent):
+    """Clear the in-flight marker at turn-end persist (see note_turn_start).
+
+    Called from the single persist funnel; unconditional by design — when two
+    turns genuinely overlap, the first persist clears the second turn's slot
+    and the tripwire under-reports instead of double-reporting. A diagnostic
+    must never be noisier than the defect it hunts."""
+    agent._inflight_turn_id = None
+    session_id = getattr(agent, "_inflight_turn_session_id", None)
+    if session_id and not getattr(agent, "_persist_disabled", False):
+        with _INFLIGHT_TURNS_LOCK:
+            _INFLIGHT_TURNS_BY_SESSION.pop(session_id, None)
+    agent._inflight_turn_session_id = None
