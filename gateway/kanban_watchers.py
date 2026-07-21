@@ -155,7 +155,11 @@ class GatewayKanbanWatchersMixin:
                 "kanban notifier: disabled via config kanban.dispatch_in_gateway=false"
             )
             return
+        _wake_home_session = bool(kanban_cfg.get("wake_home_session", False))
         from gateway.config import Platform as _Platform
+        from gateway.session import SessionSource
+        from gateway.platforms.base import MessageEvent, MessageType
+        from datetime import datetime
         try:
             from hermes_cli import kanban_db as _kb
         except Exception:
@@ -413,9 +417,49 @@ class GatewayKanbanWatchersMixin:
                             sub["chat_id"], sub.get("thread_id") or "",
                         )
                         try:
-                            await adapter.send(
-                                sub["chat_id"], msg, metadata=metadata,
+                            # Resolve the real chat_type from the home
+                            # channel config so the session key matches
+                            # the user's actual session.  Previously
+                            # hardcoded "group", which could resolve to
+                            # a different session key and cause the agent
+                            # to lose conversation context (turn 1 in an
+                            # empty session).  Falls back to "group" when
+                            # the home channel isn't configured (legacy
+                            # deployments without /sethome chat_type).
+                            _home_ch = self.config.get_home_channel(plat) if hasattr(self, "config") and self.config else None
+                            _sub_chat_type = (_home_ch.chat_type) if _home_ch and getattr(_home_ch, "chat_type", None) else "group"
+                            session_source = SessionSource(
+                                platform=_Platform(sub["platform"]),
+                                chat_id=sub["chat_id"],
+                                thread_id=sub.get("thread_id"),
+                                chat_type=_sub_chat_type,
+                                user_id=sub.get("user_id"),
+                                profile=sub.get("notifier_profile"),
                             )
+                            notify_event = MessageEvent(
+                                text=msg,
+                                source=session_source,
+                                message_type=MessageType.TEXT,
+                                internal=True,
+                                timestamp=datetime.now(),
+                            )
+                            try:
+                                await adapter.handle_message(notify_event)
+                                logger.info(
+                                    "kanban notifier: pushed %s event for %s to agent via handle_message "
+                                    "(%s/%s) on board %s",
+                                    kind, sub["task_id"], platform_str,
+                                    sub["chat_id"], board_slug,
+                                )
+                            except Exception as _exc:
+                                logger.warning(
+                                    "kanban notifier: handle_message failed for %s (%s); "
+                                    "falling back to adapter.send",
+                                    sub["task_id"], _exc,
+                                )
+                                await adapter.send(
+                                    sub["chat_id"], msg, metadata=metadata,
+                                )
                             logger.debug(
                                 "kanban notifier: delivered %s event for %s to %s/%s on board %s",
                                 kind, sub["task_id"], platform_str, sub["chat_id"], board_slug,
@@ -512,29 +556,15 @@ class GatewayKanbanWatchersMixin:
                                         assignee=_assignee,
                                         board=board_slug,
                                     )
-                                    from gateway.session import SessionSource
-                                    from gateway.platforms.base import MessageEvent, MessageType
-                                    # KNOWN LIMITATION (tracked follow-up): the
-                                    # subscription row does not persist the
-                                    # creator's chat_type, and it is not carried
-                                    # on the session-context bridge, so we cannot
-                                    # faithfully reconstruct the creator's real
-                                    # session key here. build_session_key() keys
-                                    # DMs (":dm:<chat_id>") on a wholly different
-                                    # shape from group/thread, so any hardcoded
-                                    # value mis-routes some creators. "group" is
-                                    # the least-surprising default for the
-                                    # dashboard/group flows this wake primarily
-                                    # serves; DM-originated creators are handled
-                                    # by the follow-up that stamps + persists
-                                    # chat_type end-to-end. handle_message()
-                                    # get_or_create_session's the target, so a
-                                    # mismatch degrades to "wake lands in a fresh
-                                    # group session" — never an exception.
+                                    # Resolve chat_type from the home channel config
+                                    # so the session key matches the user's actual
+                                    # session.  Falls back to "group" when the home
+                                    # channel isn't configured.
+                                    _wake_chat_type = _sub_chat_type  # reuse resolution from primary notification
                                     _source = SessionSource(
                                         platform=plat,
                                         chat_id=sub["chat_id"],
-                                        chat_type="group",
+                                        chat_type=_wake_chat_type,
                                         thread_id=sub.get("thread_id") or None,
                                         user_id=sub.get("user_id"),
                                         profile=sub_profile or None,
@@ -546,6 +576,46 @@ class GatewayKanbanWatchersMixin:
                                         internal=True,
                                     )
                                     await adapter.handle_message(_synth_event)
+                                    # HOME session wake: when
+                                    # kanban.wake_home_session is true, also
+                                    # inject a wake event into the creator's
+                                    # HOME session so they are woken in their
+                                    # primary conversation channel. Best-effort
+                                    # — a missing or unreachable HOME channel
+                                    # is logged at debug and skipped; the
+                                    # subscription channel wake above is
+                                    # unaffected.
+                                    if _wake_home_session:
+                                        try:
+                                            _home_ch = self.config.get_home_channel(plat)
+                                        except Exception:
+                                            _home_ch = None
+                                        if _home_ch and _home_ch.chat_id:
+                                            try:
+                                                _home_source = SessionSource(
+                                                    platform=plat,
+                                                    chat_id=_home_ch.chat_id,
+                                                    chat_type=getattr(_home_ch, "chat_type", None) or "group",
+                                                    thread_id=_home_ch.thread_id,
+                                                    user_id=sub.get("user_id"),
+                                                    profile=sub_profile or None,
+                                                )
+                                                _home_event = MessageEvent(
+                                                    text=_synth,
+                                                    message_type=MessageType.TEXT,
+                                                    source=_home_source,
+                                                    internal=True,
+                                                )
+                                                await adapter.handle_message(_home_event)
+                                                logger.info(
+                                                    "kanban notifier: woke HOME session for %s on %s/%s profile=%s events=%s",
+                                                    sub["task_id"], platform_str, _home_ch.chat_id, sub_profile or "default", _wake_kinds,
+                                                )
+                                            except Exception as _home_err:
+                                                logger.debug(
+                                                    "kanban notifier: HOME session wake skipped for %s: %s",
+                                                    sub["task_id"], _home_err,
+                                                )
                                     logger.info(
                                         "kanban notifier: woke agent for %s on %s/%s profile=%s events=%s",
                                         sub["task_id"], platform_str, sub["chat_id"], sub_profile or "default", _wake_kinds,
