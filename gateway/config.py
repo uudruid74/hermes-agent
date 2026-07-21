@@ -327,7 +327,8 @@ class HomeChannel:
     chat_id: str
     name: str  # Human-readable name for display
     thread_id: Optional[str] = None
-    
+    chat_type: str = "group"  # "dm", "group", "channel" — for session-key matching
+
     def to_dict(self) -> Dict[str, Any]:
         result = {
             "platform": self.platform.value,
@@ -336,6 +337,8 @@ class HomeChannel:
         }
         if self.thread_id:
             result["thread_id"] = self.thread_id
+        if self.chat_type:
+            result["chat_type"] = self.chat_type
         return result
     
     @classmethod
@@ -345,6 +348,7 @@ class HomeChannel:
             chat_id=str(data["chat_id"]),
             name=data.get("name", "Home"),
             thread_id=str(data["thread_id"]) if data.get("thread_id") else None,
+            chat_type=str(data.get("chat_type", "group") or "group"),
         )
 
 

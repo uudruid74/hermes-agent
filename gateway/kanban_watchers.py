@@ -516,14 +516,17 @@ class GatewayKanbanWatchersMixin:
                             # reactions. Falls back to adapter.send() on
                             # failure as a safety net.
                             try:
-                                # Heuristic chat_type: the subscription row doesn't persist
-                                # the creator's chat_type (KNOWN LIMITATION, see
-                                # the wake path below). A thread_id strongly
-                                # implies a group/forum subscription; DMs don't
-                                # have thread_id. Fall back to "group" as the
-                                # least-surprising default for dashboard/group
-                                # flows — the wake path uses the same default.
-                                _sub_chat_type = "group"
+                                # Resolve the real chat_type from the home
+                                # channel config so the session key matches
+                                # the user's actual session.  Previously
+                                # hardcoded "group", which could resolve to
+                                # a different session key and cause the agent
+                                # to lose conversation context (turn 1 in an
+                                # empty session).  Falls back to "group" when
+                                # the home channel isn't configured (legacy
+                                # deployments without /sethome chat_type).
+                                _home_ch = self.config.get_home_channel(plat) if hasattr(self, "config") and self.config else None
+                                _sub_chat_type = (_home_ch.chat_type) if _home_ch and getattr(_home_ch, "chat_type", None) else "group"
                                 session_source = SessionSource(
                                     platform=Platform(sub["platform"]),
                                     chat_id=sub["chat_id"],
@@ -674,27 +677,15 @@ class GatewayKanbanWatchersMixin:
                                         assignee=_assignee,
                                         board=board_slug,
                                     )
-                                    # KNOWN LIMITATION (tracked follow-up): the
-                                    # subscription row does not persist the
-                                    # creator's chat_type, and it is not carried
-                                    # on the session-context bridge, so we cannot
-                                    # faithfully reconstruct the creator's real
-                                    # session key here. build_session_key() keys
-                                    # DMs (":dm:<chat_id>") on a wholly different
-                                    # shape from group/thread, so any hardcoded
-                                    # value mis-routes some creators. "group" is
-                                    # the least-surprising default for the
-                                    # dashboard/group flows this wake primarily
-                                    # serves; DM-originated creators are handled
-                                    # by the follow-up that stamps + persists
-                                    # chat_type end-to-end. handle_message()
-                                    # get_or_create_session's the target, so a
-                                    # mismatch degrades to "wake lands in a fresh
-                                    # group session" — never an exception.
+                                    # Resolve chat_type from the home channel config
+                                    # so the session key matches the user's actual
+                                    # session.  Falls back to "group" when the home
+                                    # channel isn't configured.
+                                    _wake_chat_type = _sub_chat_type  # reuse resolution from primary notification
                                     _source = SessionSource(
                                         platform=plat,
                                         chat_id=sub["chat_id"],
-                                        chat_type="group",
+                                        chat_type=_wake_chat_type,
                                         thread_id=sub.get("thread_id") or None,
                                         user_id=sub.get("user_id"),
                                         profile=sub_profile or None,
@@ -725,7 +716,7 @@ class GatewayKanbanWatchersMixin:
                                                 _home_source = SessionSource(
                                                     platform=plat,
                                                     chat_id=_home_ch.chat_id,
-                                                    chat_type="group",
+                                                    chat_type=getattr(_home_ch, "chat_type", None) or "group",
                                                     thread_id=_home_ch.thread_id,
                                                     user_id=sub.get("user_id"),
                                                     profile=sub_profile or None,
