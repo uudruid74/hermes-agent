@@ -22984,6 +22984,15 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     if callable(start_watchdog):
         start_watchdog()
 
+    # Start the MCP bridge server (Unix socket) so external processes
+    # like ``hermes send -t agent`` can inject wake events via the
+    # gateway's adapter pipeline.
+    try:
+        from gateway.mcp_bridge import start_bridge_server
+        asyncio.ensure_future(start_bridge_server(runner))
+    except Exception:
+        logger.debug("MCP bridge server could not start", exc_info=True)
+
     # Wait for shutdown
     await runner.wait_for_shutdown()
 
