@@ -1135,6 +1135,44 @@ def run_conversation(
                         # so user sees the rate-limit message that led here.
                         agent._flush_status_buffer()
                         agent._persist_session(messages, conversation_history)
+                        # ── Kanban worker: record rate-limited failure ──
+                        # Same reasoning as the max_retries_exhausted path
+                        # below — signal the dispatcher before exiting so the
+                        # clean exit isn't misclassified as a protocol violation.
+                        _kanban_task_nous = os.environ.get("HERMES_KANBAN_TASK")
+                        if _kanban_task_nous:
+                            try:
+                                from hermes_cli import kanban_db as _kb2
+                                _conn2 = _kb2.connect()
+                                try:
+                                    _kb2._record_task_failure(
+                                        _conn2,
+                                        _kanban_task_nous,
+                                        error=f"Nous rate limit — {_nous_msg}",
+                                        outcome="rate_limited",
+                                        release_claim=True,
+                                        end_run=True,
+                                        event_payload_extra={
+                                            "reason": "nous_rate_limit",
+                                        },
+                                    )
+                                    logger.info(
+                                        "recorded nous rate-limited failure "
+                                        "for kanban task %s",
+                                        _kanban_task_nous,
+                                    )
+                                finally:
+                                    try:
+                                        _conn2.close()
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                logger.warning(
+                                    "Failed to record nous rate-limited "
+                                    "failure for kanban task %s",
+                                    _kanban_task_nous,
+                                    exc_info=True,
+                                )
                         return {
                             "final_response": (
                                 f"⏳ {_nous_msg}\n\n"
@@ -4131,6 +4169,62 @@ def run_conversation(
                             "execute_code with Python's open() for large "
                             "files, or to write in smaller sections."
                         )
+                    # ── Kanban worker: signal rate-limit / billing failure ──
+                    # When the worker is a kanban task and ALL API providers are
+                    # exhausted (rate-limit wall, billing exhausted, connection
+                    # refused), record the failure NOW so the dispatcher sees a
+                    # terminal run outcome before the process exits with rc=0.
+                    # Without this, the dispatcher misclassifies the clean exit
+                    # as a protocol violation (worker finished without calling
+                    # kanban_complete) and auto-blocks the task instead of
+                    # retrying later.  rate_limit / billing failures are
+                    # transient quota walls, not task errors — the dispatcher's
+                    # respawn guard defers re-dispatch until the window clears
+                    # and does NOT count a failure toward the circuit breaker.
+                    # See KANBAN_RATE_LIMIT_EXIT_CODE in hermes_cli/kanban_db.py
+                    # and the detect_crashed_workers rate_limited path.
+                    _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
+                    if _kanban_task and classified.reason in (
+                        FailoverReason.rate_limit,
+                        FailoverReason.billing,
+                    ):
+                        try:
+                            from hermes_cli import kanban_db as _kb
+                            _conn = _kb.connect()
+                            try:
+                                _kb._record_task_failure(
+                                    _conn,
+                                    _kanban_task,
+                                    error=(
+                                        f"API providers exhausted: "
+                                        f"{_final_summary}"
+                                    ),
+                                    outcome="rate_limited",
+                                    release_claim=True,
+                                    end_run=True,
+                                    event_payload_extra={
+                                        "provider": str(_provider),
+                                        "model": str(_model),
+                                        "reason": classified.reason.value,
+                                    },
+                                )
+                                logger.info(
+                                    "recorded rate-limited failure for "
+                                    "kanban task %s (%s/%s)",
+                                    _kanban_task, _provider, _model,
+                                )
+                            finally:
+                                try:
+                                    _conn.close()
+                                except Exception:
+                                    pass
+                        except Exception:
+                            logger.warning(
+                                "Failed to record rate-limited failure "
+                                "for kanban task %s",
+                                _kanban_task,
+                                exc_info=True,
+                            )
                     return {
                         "final_response": _final_response,
                         "messages": messages,
