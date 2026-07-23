@@ -695,7 +695,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._telegram_typing_cooldown_until: Dict[str, float] = {}
         self._telegram_typing_cooldown_seconds: float = self._coerce_float_extra(
             "typing_cooldown_seconds",
-            30.0,
+            5.0,
             min_value=1.0,
             max_value=300.0,
         )
@@ -7022,6 +7022,8 @@ class TelegramAdapter(BasePlatformAdapter):
 
     def _record_typing_cooldown(self, chat_id: str, exc: Exception) -> None:
         """Suppress Telegram typing refreshes for this chat after transient failures."""
+        import random
+
         if not hasattr(self, "_telegram_typing_cooldown_until"):
             self._telegram_typing_cooldown_until = {}
         loop = asyncio.get_running_loop()
@@ -7030,13 +7032,18 @@ class TelegramAdapter(BasePlatformAdapter):
             delay = float(retry_after) if retry_after is not None else self._telegram_typing_cooldown_seconds
         except (TypeError, ValueError):
             delay = self._telegram_typing_cooldown_seconds
+        if retry_after is None:
+            # Add ±40 % jitter so cooldowns don't all expire simultaneously
+            # after a shared network blip.  Base 5 s → 3–7 s range.
+            jitter = 1.0 + random.uniform(-0.4, 0.4)
+            delay = delay * jitter
         delay = max(1.0, min(delay, 300.0))
         self._telegram_typing_cooldown_until[str(chat_id)] = loop.time() + delay
 
     def _typing_in_cooldown(self, chat_id: str) -> bool:
         if not hasattr(self, "_telegram_typing_cooldown_until"):
             self._telegram_typing_cooldown_until = {}
-            self._telegram_typing_cooldown_seconds = 30.0
+            self._telegram_typing_cooldown_seconds = 5.0
         until = self._telegram_typing_cooldown_until.get(str(chat_id))
         if until is None:
             return False

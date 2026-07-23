@@ -4994,6 +4994,21 @@ class BasePlatformAdapter(ABC):
         self._active_sessions[session_key] = command_guard
         thread_meta = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
 
+        # Start typing indicator while the command handler runs.
+        # Without this, /stop processing can feel unresponsive — the user
+        # sees no typing while cancel_session_processing drains the agent.
+        command_typing_task: Optional[asyncio.Task] = None
+        command_typing_stop: Optional[asyncio.Event] = None
+        if getattr(self.config, "typing_indicator", True):
+            command_typing_stop = asyncio.Event()
+            command_typing_task = asyncio.create_task(
+                self._keep_typing(
+                    event.source.chat_id,
+                    metadata=thread_meta,
+                    stop_event=command_typing_stop,
+                )
+            )
+
         try:
             response = await self._message_handler(event)
             _text, _eph_ttl = self._unwrap_ephemeral(response)
@@ -5038,6 +5053,15 @@ class BasePlatformAdapter(ABC):
                 else:
                     self._release_session_guard(session_key, guard=command_guard)
             raise
+        finally:
+            # Always stop the command typing indicator.
+            if command_typing_task is not None and command_typing_stop is not None:
+                command_typing_stop.set()
+                await self._stop_typing_refresh(
+                    event.source.chat_id,
+                    command_typing_task,
+                    metadata=thread_meta,
+                )
 
         await self._drain_pending_after_session_command(session_key, command_guard)
 
