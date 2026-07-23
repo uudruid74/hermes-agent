@@ -492,6 +492,14 @@ class GatewaySlashCommandsMixin:
                                     user_id=user_id,
                                     notifier_profile=getattr(self, "_kanban_notifier_profile", None) or self._active_profile_name(),
                                 )
+                                # Store origin routing as a system comment so
+                                # the watcher can always find the right channel,
+                                # even if the subscription race is lost.
+                                _kb.store_origin_routing(
+                                    conn, task_id,
+                                    platform=platform_str, chat_id=chat_id,
+                                    thread_id=thread_id or "",
+                                )
                             finally:
                                 conn.close()
                         await asyncio.to_thread(_sub)
@@ -3479,7 +3487,7 @@ class GatewaySlashCommandsMixin:
                 skip_memory=True,
                 enabled_toolsets=["memory"],
                 session_id=session_entry.session_id,
-                session_db=self._resolve_session_db(),
+                session_db=getattr(self._session_db, "_db", self._session_db),
             )
             try:
                 tmp_agent._print_fn = lambda *a, **kw: None
@@ -3998,7 +4006,7 @@ class GatewaySlashCommandsMixin:
         current_entry = await self.async_session_store.get_or_create_session(source)
         rows = await asyncio.to_thread(
             query_session_listing,
-            self._resolve_session_db(),
+            getattr(self._session_db, "_db", self._session_db),
             source=source.platform.value if source.platform else None,
             current_session_id=current_entry.session_id,
             include_all_sources=cross_origin,

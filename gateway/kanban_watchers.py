@@ -387,21 +387,28 @@ class GatewayKanbanWatchersMixin:
                                 for _plat, _pcfg in _gw_cfg.platforms.items():
                                     if not _pcfg or not _pcfg.enabled:
                                         continue
-                                    # Check board→topic mapping first
-                                    # (kanban.board_topics in config.yaml).
-                                    # This maps board slugs to platform-
-                                    # specific (chat_id, thread_id) pairs,
-                                    # enabling CLI-created tasks to route
-                                    # notifications to a specific topic
-                                    # instead of the generic home channel.
-                                    _bt = _board_topics.get(slug, {}).get(_plat.value) if _board_topics else None
-                                    if isinstance(_bt, dict) and _bt.get("chat_id"):
+                                    # 1. Check origin routing comment first —
+                                    #    stored by slash_commands.py on create.
+                                    #    This is the ground truth for where the
+                                    #    task was created from.
+                                    _origin = _kb.get_origin_routing(conn, _tid)
+                                    if _origin and _origin.get("platform") == _plat.value:
+                                        _chat_id = _origin["chat_id"]
+                                        _thread_id = str(_origin.get("thread_id") or "")
+                                        logger.info(
+                                            "kanban notifier: origin routing for %s → %s/%s/%s",
+                                            _tid, _plat.value, _chat_id, _thread_id,
+                                        )
+                                    # 2. Check board→topic mapping
+                                    #    (kanban.board_topics in config.yaml).
+                                    elif (_bt := (_board_topics.get(slug, {}).get(_plat.value) if _board_topics else None)) and isinstance(_bt, dict) and _bt.get("chat_id"):
                                         _chat_id = _bt["chat_id"]
                                         _thread_id = str(_bt.get("thread_id") or "")
                                         logger.info(
                                             "kanban notifier: board_topic mapping %s/%s → %s/%s",
                                             slug, _plat.value, _chat_id, _thread_id,
                                         )
+                                    # 3. Fall back to home channel.
                                     else:
                                         _home = _gw_cfg.get_home_channel(_plat)
                                         if not _home or not _home.chat_id:
@@ -557,22 +564,48 @@ class GatewayKanbanWatchersMixin:
                             # reactions. Falls back to adapter.send() on
                             # failure as a safety net.
                             try:
-                                # Infer chat_type: subscriptions with a thread_id
-                                # originate from group/forum topics → chat_type
-                                # is "group". Subscriptions without a thread_id
+                                # Resolve delivery coordinates. Origin routing
+                                # (stored as a system comment by
+                                # slash_commands.py on create) is the ground
+                                # truth -- it overrides whatever the
+                                # subscription says so that tasks created
+                                # from a topic always route back to that
+                                # topic, regardless of subscription state.
+                                _delivery_chat_id = sub["chat_id"]
+                                _delivery_thread_id = sub.get("thread_id") or ""
+                                try:
+                                    from hermes_cli import kanban_db as _kb2
+                                    _origin_conn = _kb2.connect(board=board_slug)
+                                    try:
+                                        _origin = _kb2.get_origin_routing(_origin_conn, sub["task_id"])
+                                        if _origin and _origin.get("platform") == platform_str:
+                                            _delivery_chat_id = _origin["chat_id"] or _delivery_chat_id
+                                            _delivery_thread_id = _origin.get("thread_id") or _delivery_thread_id
+                                            logger.debug(
+                                                "kanban notifier: using origin routing for %s -> %s/%s/%s",
+                                                sub["task_id"], platform_str,
+                                                _delivery_chat_id, _delivery_thread_id,
+                                            )
+                                    finally:
+                                        _origin_conn.close()
+                                except Exception:
+                                    pass  # origin routing is best-effort
+                                # Infer chat_type: deliveries with a thread_id
+                                # originate from group/forum topics -> chat_type
+                                # is "group". Deliveries without a thread_id
                                 # could be DMs or groups; resolve from home
                                 # channel config when available, falling back
                                 # to "group" for legacy deployments without
                                 # /sethome.
-                                if (sub.get("thread_id") or "").strip():
+                                if _delivery_thread_id.strip():
                                     _sub_chat_type = "group"
                                 else:
                                     _home_ch = self.config.get_home_channel(plat) if hasattr(self, "config") and self.config else None
                                     _sub_chat_type = (_home_ch.chat_type) if _home_ch and getattr(_home_ch, "chat_type", None) else "group"
                                 session_source = SessionSource(
                                     platform=Platform(sub["platform"]),
-                                    chat_id=sub["chat_id"],
-                                    thread_id=sub.get("thread_id"),
+                                    chat_id=_delivery_chat_id,
+                                    thread_id=_delivery_thread_id or None,
                                     chat_type=_sub_chat_type,
                                     user_id=sub.get("user_id"),
                                     profile=sub.get("notifier_profile"),
