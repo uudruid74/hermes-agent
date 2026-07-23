@@ -176,12 +176,13 @@ class TestCurrentBoard:
         assert not kb.board_exists("ghost")
         assert [b["slug"] for b in kb.list_boards()] == ["default"]
 
-    def test_env_beats_file(self, fresh_home, monkeypatch):
+    def test_file_beats_env(self, fresh_home, monkeypatch):
+        """``boards switch`` (current file) takes priority over HERMES_KANBAN_BOARD."""
         kb.create_board("a")
         kb.create_board("b")
         kb.set_current_board("a")
         monkeypatch.setenv("HERMES_KANBAN_BOARD", "b")
-        assert kb.get_current_board() == "b"
+        assert kb.get_current_board() == "a"
 
     def test_stale_env_falls_through_to_file_pointer(self, fresh_home, monkeypatch):
         kb.create_board("persisted")
@@ -346,16 +347,17 @@ class TestConnectionIsolation:
             tasks = kb.list_tasks(conn)
         assert [t.title for t in tasks] == ["implicit"]
 
-    def test_connect_env_var_overrides_current(self, fresh_home, monkeypatch):
+    def test_connect_file_beats_env(self, fresh_home, monkeypatch):
+        """``kb.connect()`` respects the current file over HERMES_KANBAN_BOARD."""
         kb.create_board("persist")
         kb.create_board("envwin")
         kb.set_current_board("persist")
         monkeypatch.setenv("HERMES_KANBAN_BOARD", "envwin")
         with kb.connect() as conn:
-            kb.create_task(conn, title="via-env", assignee="x")
-        with kb.connect(board="envwin") as conn:
-            assert [t.title for t in kb.list_tasks(conn)] == ["via-env"]
+            kb.create_task(conn, title="via-file", assignee="x")
         with kb.connect(board="persist") as conn:
+            assert [t.title for t in kb.list_tasks(conn)] == ["via-file"]
+        with kb.connect(board="envwin") as conn:
             assert kb.list_tasks(conn) == []
 
     def test_connect_stale_env_uses_fallback_board_without_recreating_it(

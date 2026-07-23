@@ -417,11 +417,17 @@ def get_current_board() -> str:
 
     Order (highest precedence first):
 
-    1. ``HERMES_KANBAN_BOARD`` env var (set by the dispatcher on worker
-       spawn, or manually for ad-hoc overrides).
+    1. In-process scoped override (``--board`` flag via
+       :func:`scoped_current_board`).
     2. ``<root>/kanban/current`` on disk (set by ``hermes kanban boards
-       switch``), but only when that board still exists.
-    3. ``DEFAULT_BOARD`` (``"default"``).
+       switch``), but only when that board still exists. The file takes
+       priority over the env var because a user running ``boards switch``
+       writes the file and expects it to persist — the env var is an
+       implementation detail for dispatcher isolation and chat-session
+       pinning, not a user-facing override.
+    3. ``HERMES_KANBAN_BOARD`` env var (set by the dispatcher on worker
+       spawn, or for ad-hoc overrides).
+    4. ``DEFAULT_BOARD`` (``"default"``).
 
     A malformed or stale slug at any step falls through to the next layer
     with a best-effort warning — the dispatcher must never crash because a
@@ -436,14 +442,13 @@ def get_current_board() -> str:
         except ValueError:
             pass
 
-    env = os.environ.get("HERMES_KANBAN_BOARD", "").strip()
-    if env:
-        try:
-            normed = _normalize_board_slug(env)
-            if normed and board_exists(normed):
-                return normed
-        except ValueError:
-            pass
+    # The ``current`` file takes priority over the env var (step 2 vs 3).
+    # ``hermes kanban boards switch`` writes this file; a user who runs
+    # ``boards switch`` expects subsequent CLI commands to respect it.
+    # The env var is infrastructure (dispatcher, gateway) that should not
+    # shadow the user's explicit switch. Workers are protected by
+    # ``HERMES_KANBAN_DB`` (exact file path, highest priority in
+    # ``kanban_db_path``), not by this env var.
     try:
         f = current_board_path()
         if f.exists():
@@ -457,6 +462,15 @@ def get_current_board() -> str:
                     pass
     except OSError:
         pass
+
+    env = os.environ.get("HERMES_KANBAN_BOARD", "").strip()
+    if env:
+        try:
+            normed = _normalize_board_slug(env)
+            if normed and board_exists(normed):
+                return normed
+        except ValueError:
+            pass
     return DEFAULT_BOARD
 
 
@@ -474,20 +488,24 @@ def set_current_board(slug: str) -> Path:
     path = current_board_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(normed + "\n", encoding="utf-8")
-    # Update the process env var so that get_current_board() resolves
-    # to the new board immediately — otherwise a previously-pinned
-    # HERMES_KANBAN_BOARD (set at chat bootstrap) would shadow the
-    # fresh current file and the switch would appear to have no effect.
+    # Belt-and-suspenders: update the process env var as well so that any
+    # code checking ``HERMES_KANBAN_BOARD`` directly (not through
+    # ``get_current_board()``) also sees the switch immediately.
     os.environ["HERMES_KANBAN_BOARD"] = normed
     return path
 
 
 def clear_current_board() -> None:
-    """Remove ``<root>/kanban/current`` so the active board reverts to ``default``."""
+    """Remove ``<root>/kanban/current`` so the active board reverts to ``default``.
+
+    Also clears the ``HERMES_KANBAN_BOARD`` env var — otherwise a stale
+    value could shadow the fallback to ``default``.
+    """
     try:
         current_board_path().unlink()
     except FileNotFoundError:
         pass
+    os.environ.pop("HERMES_KANBAN_BOARD", None)
 
 
 def board_dir(board: Optional[str] = None) -> Path:
@@ -523,15 +541,32 @@ def kanban_db_path(board: Optional[str] = None) -> Path:
 
     Resolution (highest precedence first):
 
-    1. ``HERMES_KANBAN_DB`` env var — pins the path directly. Honoured for
+    1. In-process scoped override (``--board`` flag, ContextVar) — when set,
+       this overtakes even ``HERMES_KANBAN_DB`` so that explicit
+       ``--board`` routing always wins, even in dispatcher-injected
+       environments.
+    2. ``HERMES_KANBAN_DB`` env var — pins the path directly. Honoured for
        back-compat and for the dispatcher→worker handoff (defense in
        depth: dispatcher injects this into worker env so workers are
-       immune to any path-resolution disagreement).
-    2. When ``board`` arg is None, the active board from
+       immune to any path-resolution disagreement). Bypassed when a
+       scoped override (1) or explicit ``board`` arg is present.
+    3. When ``board`` arg is None, the active board from
        :func:`get_current_board` is used.
-    3. Board ``default`` → ``<root>/kanban.db`` (back-compat path).
+    4. Board ``default`` → ``<root>/kanban.db`` (back-compat path).
        Other boards → ``<root>/kanban/boards/<slug>/kanban.db``.
     """
+    # 1. In-process scoped override: the ``--board`` flag sets a ContextVar
+    #    via ``scoped_current_board()``. When present, use the scoped slug
+    #    as if ``board=`` had been passed explicitly — this makes
+    #    ``--board`` work even when ``HERMES_KANBAN_DB`` is in the env.
+    if board is None:
+        scoped = (_CURRENT_BOARD_OVERRIDE.get() or "").strip()
+        if scoped:
+            try:
+                board = _normalize_board_slug(scoped)
+            except ValueError:
+                pass
+
     override = os.environ.get("HERMES_KANBAN_DB", "").strip()
     if override and board is None:
         return Path(override).expanduser()
@@ -8740,6 +8775,25 @@ def _default_spawn(
     # what the tool reads — set it explicitly here so comments are
     # attributed correctly regardless of how the child loads config.
     env["HERMES_PROFILE"] = profile_arg
+
+    # Inject worker_temperature from the profile's kanban config so the
+    # worker's init_agent can set agent.worker_temperature for
+    # resolve_temperature() to pick up. Falls back gracefully when the
+    # config key is absent or unreadable.
+    try:
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        from hermes_cli.config import load_config
+
+        token = set_hermes_home_override(env["HERMES_HOME"])
+        try:
+            cfg = load_config()
+            worker_temp = (cfg.get("kanban") or {}).get("worker_temperature")
+            if worker_temp is not None:
+                env["HERMES_WORKER_TEMPERATURE"] = str(worker_temp)
+        finally:
+            reset_hermes_home_override(token)
+    except Exception:
+        pass
 
     # A worker must NEVER boot the interactive TUI: an inherited HERMES_TUI=1
     # or a `display.interface: tui` in the profile's config would send the

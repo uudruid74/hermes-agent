@@ -1048,13 +1048,13 @@ def kanban_command(args: argparse.Namespace) -> int:
     if action == "boards":
         return _dispatch_boards(args)
 
-    # `--board <slug>` applies to every subcommand below by way of an
-    # env-var pin for the duration of this call. Using HERMES_KANBAN_BOARD
-    # (rather than threading `board=` through 50+ kb.connect() sites)
-    # keeps the patch small and inherits the exact same resolution the
-    # dispatcher uses for workers — consistency is a feature here.
+    # Always resolve the active board via get_current_board(), then pin it
+    # via a scoped override so that kanban_db_path respects it even when
+    # HERMES_KANBAN_DB is in the environment.  When --board is passed it
+    # takes priority; otherwise the persisted current file / env var chain
+    # is used.  Workers (kanban agent tools) bypass this path entirely —
+    # they call kb.connect() directly and HERMES_KANBAN_DB protects them.
     board_override = getattr(args, "board", None)
-    board_scope = contextlib.nullcontext()
     if board_override:
         try:
             normed = kb._normalize_board_slug(board_override)
@@ -1064,8 +1064,6 @@ def kanban_command(args: argparse.Namespace) -> int:
         if not normed:
             print("kanban: --board requires a slug", file=sys.stderr)
             return 2
-        # Boards other than 'default' must already exist — typoed slugs
-        # would otherwise silently create an empty board.
         if normed != kb.DEFAULT_BOARD and not kb.board_exists(normed):
             print(
                 f"kanban: board {normed!r} does not exist. "
@@ -1073,7 +1071,9 @@ def kanban_command(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
-        board_scope = kb.scoped_current_board(normed)
+    else:
+        normed = kb.get_current_board()
+    board_scope = kb.scoped_current_board(normed)
 
     # Auto-initialize the DB before dispatching any subcommand. init_db
     # is idempotent, so running it every invocation is cheap (one
