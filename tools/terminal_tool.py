@@ -2751,7 +2751,23 @@ def terminal_tool(
                         wait_time = 2 ** retry_count
                         logger.warning("Execution error, retrying in %ds (attempt %d/%d) - Command: %s - Error: %s: %s - Task: %s, Backend: %s",
                                        wait_time, retry_count, max_retries, _safe_command_preview(command), type(e).__name__, e, effective_task_id, env_type)
-                        time.sleep(wait_time)
+                        # Poll is_interrupted() during the backoff sleep so a
+                        # /stop issued while we're waiting between retries is
+                        # not ignored for 2-8s.  Check every 250ms.
+                        _sleep_deadline = time.monotonic() + wait_time
+                        _interrupted = False
+                        while time.monotonic() < _sleep_deadline:
+                            from tools.interrupt import is_interrupted
+                            if is_interrupted():
+                                _interrupted = True
+                                break
+                            time.sleep(min(0.25, _sleep_deadline - time.monotonic()))
+                        if _interrupted:
+                            return json.dumps({
+                                "output": "",
+                                "exit_code": 130,
+                                "error": "Command interrupted during retry backoff",
+                            }, ensure_ascii=False)
                         continue
                     
                     logger.error("Execution failed after %d retries - Command: %s - Error: %s: %s - Task: %s, Backend: %s",

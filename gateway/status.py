@@ -2106,3 +2106,70 @@ def is_gateway_running(
 ) -> bool:
     """Check if the gateway daemon is currently running."""
     return get_running_pid(pid_path, cleanup_stale=cleanup_stale) is not None
+
+
+# ------------------------------------------------------------------
+# Stale profile state file cleanup
+# ------------------------------------------------------------------
+
+def cleanup_stale_profile_state_files(hermes_base: Optional[Path] = None) -> int:
+    """Remove *other* profiles' ``gateway_state.json`` files whose PID is dead.
+
+    Called once at gateway startup so ``hermes gateway status`` and the
+    dashboard do not report split-brain states from profiles whose gateway
+    exited without cleaning up (e.g. OOM-killed, power-loss, or taskkill /F).
+    The *current* profile's own state file is never touched — it was just
+    written with ``gateway_state=\"starting\"`` and the live PID.
+
+    Returns the number of files cleaned up.
+    """
+    if hermes_base is None:
+        hermes_base = Path(os.environ.get("HERMES_HOME", _get_platform_default_hermes_home()))
+    profiles_dir = hermes_base / "profiles"
+    cleaned = 0
+
+    # 1.  Root-level state file (the default/\"parent\" profile).
+    _root_state = hermes_base / _RUNTIME_STATUS_FILE
+    cleaned += _remove_if_pid_dead(_root_state)
+
+    # 2.  Per-profile state files.
+    if profiles_dir.is_dir():
+        try:
+            for child in profiles_dir.iterdir():
+                if not child.is_dir():
+                    continue
+                state_file = child / _RUNTIME_STATUS_FILE
+                cleaned += _remove_if_pid_dead(state_file)
+        except OSError:
+            pass
+
+    if cleaned:
+        logger.info(
+            "gateway startup: cleaned %d stale gateway_state.json file(s) from "
+            "other profiles whose PIDs are no longer alive",
+            cleaned,
+        )
+    return cleaned
+
+
+def _remove_if_pid_dead(state_path: Path) -> int:
+    """Remove *state_path* if it exists and its recorded PID is dead.  Returns 1 on removal, 0 otherwise."""
+    if not state_path.is_file():
+        return 0
+    record = _read_json_file(state_path)
+    if not isinstance(record, dict):
+        return 0
+    pid = _pid_from_record(record)
+    if pid is None:
+        return 0
+    if _pid_exists(pid):
+        return 0  # PID still running — keep the file
+    try:
+        state_path.unlink()
+        logger.info(
+            "gateway startup: removed stale state file %s (PID %d is dead)",
+            state_path, pid,
+        )
+        return 1
+    except OSError:
+        return 0

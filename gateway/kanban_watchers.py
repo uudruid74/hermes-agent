@@ -446,24 +446,11 @@ class GatewayKanbanWatchersMixin:
                     try:
                         plat = _Platform(platform_str)
                     except ValueError:
-                        # Unknown platform string; skip and advance cursor so
-                        # we don't replay forever.
                         await asyncio.to_thread(
                             self._kanban_advance, sub, d["cursor"], board_slug,
                         )
                         continue
                     sub_profile = sub.get("notifier_profile") or ""
-                    # Route via the SAME chokepoint the authorization path uses
-                    # (gateway/authz_mixin.py::_authorization_adapter): a stamped
-                    # profile with its own adapter-registry entry must be served
-                    # by THAT profile's same-platform adapter and must NOT silently
-                    # fall back to the default profile's adapter — otherwise a
-                    # secondary profile's task notification is delivered by the
-                    # wrong bot (the cross-profile mis-delivery this whole change
-                    # exists to fix). The helper returns None only when the profile
-                    # (or default) genuinely has no adapter for the platform.
-                    # When sub_profile matches the active profile, pass None to
-                    # use self.adapters directly (avoids _profile_adapters lookup).
                     _adapter_profile = sub_profile or None
                     if _adapter_profile and _adapter_profile == notifier_profile:
                         _adapter_profile = None
@@ -481,6 +468,22 @@ class GatewayKanbanWatchersMixin:
                             board_slug,
                         )
                         continue
+                    # Pulse typing indicator on claimed/ready so the user sees
+                    # "thinking" while the kanban worker starts up, even though
+                    # no direct-message processing is in flight.
+                    _kanban_event_kinds = [e.kind for e in d.get("events", [])]
+                    if any(k in ("claimed", "ready") for k in _kanban_event_kinds):
+                        try:
+                            await adapter.send_typing(
+                                sub["chat_id"],
+                                metadata=(
+                                    {"thread_id": sub["thread_id"]}
+                                    if sub.get("thread_id")
+                                    else None
+                                ),
+                            )
+                        except Exception:
+                            pass  # typing is best-effort; never block delivery
                     title = (task.title if task else sub["task_id"])[:120]
                     board_tag = f"[{board_slug}] " if board_slug else ""
                     for ev in d["events"]:

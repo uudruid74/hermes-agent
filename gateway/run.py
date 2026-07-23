@@ -7416,6 +7416,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             pass
 
+        # Clean up stale gateway_state.json files left behind by other
+        # profiles whose gateway exited without running its shutdown handler
+        # (e.g. OOM-killed, power-loss).  Prevents the "split-brain" state
+        # where ``hermes gateway status`` reports a dead PID's connection
+        # errors as current.
+        try:
+            from gateway.status import cleanup_stale_profile_state_files
+            cleanup_stale_profile_state_files()
+        except Exception:
+            pass
+
         # Log any active supply-chain security advisories. Operators see this
         # in gateway.log and `hermes status` surfaces it; we do NOT block
         # startup or surface it inline to user messages, since the gateway
