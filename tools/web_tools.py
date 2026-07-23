@@ -41,6 +41,7 @@ import logging
 import os
 import re
 import asyncio
+import base64
 from typing import List, Dict, Any, Optional, TYPE_CHECKING
 import httpx  # noqa: F401 — kept at module top so tests can patch tools.web_tools.httpx
 # After the web-provider plugin migration (PR #25182), the Firecrawl SDK
@@ -456,11 +457,36 @@ def convert_base64_images_to_links(text: str) -> str:
     inspectable placeholder. Real (http/https) markdown image links are left
     untouched so the agent can ``web_extract`` / ``vision_analyze`` them.
 
+    Exception: Ragamuffin debug reports embed screenshots intentionally
+    (marked with ``# 🔍 Ragamuffin Agentic Scrape Debug Report``). Those
+    are preserved so the user can see the page state at failure.
+
     Transformations:
       ``![alt](data:image/png;base64,AAAA...)``  -> ``[IMAGE: alt](base64 image omitted)``
       ``(data:image/png;base64,AAAA...)``        -> ``[IMAGE]``
       bare ``data:image/...;base64,AAAA...``     -> ``[IMAGE]``
     """
+    # Ragamuffin debug reports: extract the screenshot, save it locally,
+    # and emit a MEDIA: tag so the gateway delivers it as a native
+    # platform attachment (Telegram sendPhoto, etc.) instead of an
+    # inline data URI that platforms silently drop.
+    if "Ragamuffin Agentic Scrape Debug Report" in text:
+        _rag_md_b64 = re.compile(
+            r"!\[(?P<alt>[^\]]*)\]\(\s*data:image/[^;]+;base64,(?P<data>[A-Za-z0-9+/=\s]+)\)"
+        )
+        def _rag_save(m: "re.Match[str]") -> str:
+            alt = (m.group("alt") or "Screenshot at abort").strip()
+            try:
+                png_bytes = base64.b64decode(m.group("data"))
+                _path = "/tmp/ragamuffin_debug_screenshot.png"
+                with open(_path, "wb") as f:
+                    f.write(png_bytes)
+                return f"![{alt}](MEDIA:{_path})"
+            except Exception:
+                return f"[IMAGE: {alt}]"
+        text = _rag_md_b64.sub(_rag_save, text)
+        # Also clean up any bare base64 URIs that snuck through
+        return text
     # 1. Markdown image with base64 source -> keep alt text, drop the blob.
     def _md_repl(m: "re.Match[str]") -> str:
         alt = (m.group("alt") or "").strip()
@@ -989,8 +1015,13 @@ async def web_extract_tool(
             raw_content = result.get("raw_content", "") or result.get("content", "")
             if not raw_content:
                 continue
+            # Ragamuffin debug reports have embedded screenshots that need
+            # extra headroom — auto-boost char_limit so the full base64 passes.
+            this_limit = effective_char_limit
+            if "Ragamuffin Agentic Scrape Debug Report" in raw_content:
+                this_limit = max(this_limit, 50000)
             clean = convert_base64_images_to_links(raw_content)
-            model_text, truncated = _truncate_with_footer(clean, url, effective_char_limit)
+            model_text, truncated = _truncate_with_footer(clean, url, this_limit)
             result["content"] = model_text
             if truncated:
                 debug_call_data["pages_truncated"] += 1

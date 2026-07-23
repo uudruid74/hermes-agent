@@ -21,7 +21,7 @@ firecrawl implementation that previously lived in tools/web_tools.py:
 Async note: the underlying SDK is sync. ``extract()`` is declared
 ``async def`` because it performs per-URL I/O that benefits from
 running in an executor; the implementation wraps each scrape in
-:func:`asyncio.to_thread` with :func:`asyncio.wait_for(timeout=60)` to
+:func:`asyncio.to_thread` with :func:`asyncio.wait_for(timeout=90)` to
 guard against hung fetches.
 
 Config keys this provider responds to::
@@ -492,7 +492,7 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
                             url=url,
                             formats=formats,
                         ),
-                        timeout=60,
+                        timeout=90,
                     )
                 except asyncio.TimeoutError:
                     logger.warning("Firecrawl scrape timed out for %s", url)
@@ -502,8 +502,7 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
                             "title": "",
                             "content": "",
                             "error": (
-                                "Scrape timed out after 60s — page may be too large "
-                                "or unresponsive. Try browser_navigate instead."
+                                "Scrape timed out after 90s — try browser_navigate instead."
                             ),
                         }
                     )
