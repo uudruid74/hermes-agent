@@ -360,6 +360,13 @@ class ChatCompletionsTransport(ProviderTransport):
             "messages": sanitized,
         }
 
+        # Temperature — resolved from agent (session > worker > profile > None).
+        # Fixed-temp / omit-temp overrides are applied upstream in
+        # chat_completion_helpers.build_api_kwargs() before reaching here.
+        temp = params.get("temperature")
+        if temp is not None:
+            api_kwargs["temperature"] = temp
+
         timeout = params.get("timeout")
         if timeout is not None:
             api_kwargs["timeout"] = timeout

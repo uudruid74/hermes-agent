@@ -61,6 +61,8 @@ _HERMES_CORE_TOOLS = [
     "session_search",
     # Clarifying questions
     "clarify",
+    # Temperature control
+    "adjust_temperature",
     # Code execution + delegation
     "execute_code", "delegate_task",
     # Cronjob management
@@ -234,6 +236,12 @@ TOOLSETS = {
     "clarify": {
         "description": "Ask the user clarifying questions (multiple-choice or open-ended)",
         "tools": ["clarify"],
+        "includes": []
+    },
+    
+    "temperature": {
+        "description": "Adjust the agent's sampling temperature mid-session via adjust_temperature",
+        "tools": ["adjust_temperature"],
         "includes": []
     },
     

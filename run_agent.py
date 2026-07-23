@@ -493,8 +493,16 @@ class AIAgent:
         checkpoint_max_total_size_mb: int = 500,
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
+        temperature: float | None = None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
+        # Extract temperature from config if caller did not supply one.
+        if temperature is None:
+            try:
+                from hermes_cli.config import load_config as _load_cfg, cfg_get as _cfg_get
+                temperature = _cfg_get(_load_cfg(), "agent", "worker_temperature", default=None)
+            except Exception:
+                pass
         from agent.agent_init import init_agent
         init_agent(
             self,
@@ -569,6 +577,7 @@ class AIAgent:
             checkpoint_max_total_size_mb=checkpoint_max_total_size_mb,
             checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
             pass_session_id=pass_session_id,
+            temperature=temperature,
         )
 
     def _get_session_db_for_recall(self):

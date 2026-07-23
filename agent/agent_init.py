@@ -356,6 +356,7 @@ def init_agent(
     checkpoint_max_total_size_mb: int = 500,
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
+    temperature: float | None = None,
 ):
     """
     Initialize the AI Agent.
@@ -640,6 +641,24 @@ def init_agent(
     agent.reasoning_config = reasoning_config  # None = use default (medium for OpenRouter)
     agent.service_tier = service_tier
     agent.request_overrides = dict(request_overrides or {})
+
+    # Kanban worker temperature — propagated by the dispatcher's
+    # _default_spawn from the profile's kanban.worker_temperature config,
+    # or explicitly passed by the caller (e.g. subagent inheritance).
+    # resolve_temperature() picks up agent.worker_temperature when
+    # HERMES_KANBAN_TASK is set, so kanban workers get their own
+    # temperature independent of interactive sessions.
+    if temperature is not None:
+        agent.worker_temperature = float(temperature)
+    else:
+        _worker_temp_env = os.environ.get("HERMES_WORKER_TEMPERATURE", "").strip()
+        if _worker_temp_env:
+            try:
+                agent.worker_temperature = float(_worker_temp_env)
+            except (ValueError, TypeError):
+                agent.worker_temperature = None
+        else:
+            agent.worker_temperature = None
     agent.prefill_messages = prefill_messages or []  # Prefilled conversation turns
     agent._force_ascii_payload = False
     
@@ -1377,12 +1396,29 @@ def init_agent(
     from tools.todo_tool import TodoStore
     agent._todo_store = TodoStore()
     
+    # Store session temperature from caller.
+    agent._temperature = temperature
+    # Session override — set by the adjust_temperature tool, read by
+    # resolve_temperature() as priority 1 over profile/worker temperature.
+    agent._session_temperature = None
+
     # Load config once for memory, skills, and compression sections
     try:
         from hermes_cli.config import load_config as _load_agent_config
         _agent_cfg = _load_agent_config()
     except Exception:
         _agent_cfg = {}
+
+    # Temperature fallback from config if caller did not provide one.
+    if agent._temperature is None:
+        try:
+            agent._temperature = cfg_get(_agent_cfg, "agent", "worker_temperature", default=None)
+        except Exception:
+            pass
+    if agent._temperature is None:
+        # Last resort: model.temperature from config, default 0.7
+        model_cfg = _agent_cfg.get("model", {}) if isinstance(_agent_cfg, dict) else {}
+        agent._temperature = model_cfg.get("temperature", 0.7)
 
     # Codex commentary visibility (display.show_commentary, default true).
     # When true, completed Codex phase=commentary messages are delivered as

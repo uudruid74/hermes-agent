@@ -981,6 +981,31 @@ def interruptible_api_call(agent, api_kwargs: dict):
 
 
 
+def resolve_temperature(agent) -> Optional[float]:
+    """Resolve temperature with priority: session > task-type > profile > None.
+
+    Returns:
+        float if resolved, None to omit (let provider decide).
+    """
+    # 1. Session override (from adjust_temperature tool)
+    if getattr(agent, '_session_temperature', None) is not None:
+        return agent._session_temperature
+
+    # 2. Task-type: kanban/delegated → worker_temperature
+    is_kanban = os.environ.get("HERMES_KANBAN_TASK") is not None
+    is_delegated = getattr(agent, '_subagent_id', None) is not None
+
+    if (is_kanban or is_delegated) and getattr(agent, 'worker_temperature', None) is not None:
+        return agent.worker_temperature
+
+    # 3. Profile default (interactive temperature)
+    if getattr(agent, '_temperature', None) is not None:
+        return agent._temperature
+
+    # 4. None = omit (provider default)
+    return None
+
+
 def build_api_kwargs(agent, api_messages: list) -> dict:
     """Build the keyword arguments dict for the active API mode."""
     tools_for_api = agent.tools
@@ -1119,6 +1144,14 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
         _omit_temp = False
         _fixed_temp = None
 
+    # Resolved temperature: session > worker > profile > None.
+    # Fixed-temperature models override; omit-temperature models suppress.
+    _resolved_temp = resolve_temperature(agent)
+    if _omit_temp:
+        _resolved_temp = None
+    elif _fixed_temp is not None:
+        _resolved_temp = _fixed_temp
+
     # Provider preferences (aggregator profile decides whether to emit them).
     _prefs = _provider_preferences_for_agent(agent)
 
@@ -1190,6 +1223,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
             anthropic_max_output=_ant_max,
             supports_reasoning=agent._supports_reasoning_extra_body(),
             qwen_session_metadata=_qwen_meta,
+            temperature=_resolved_temp,
         )
 
     # ── Legacy flag path ────────────────────────────────────────────
@@ -1237,6 +1271,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
         lmstudio_reasoning_options=agent._lmstudio_reasoning_options_cached() if _is_lmstudio else None,
         anthropic_max_output=_ant_max,
         provider_name=agent.provider,
+        temperature=_resolved_temp,
     )
 
 
@@ -3836,6 +3871,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 __all__ = [
     "interruptible_api_call",
     "build_api_kwargs",
+    "resolve_temperature",
     "build_assistant_message",
     "try_activate_fallback",
     "handle_max_iterations",

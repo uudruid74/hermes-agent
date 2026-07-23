@@ -2912,6 +2912,12 @@ DEFAULT_CONFIG = {
         # worker process (if still running host-locally) is terminated
         # before the reclaim.  0 disables stale detection entirely.
         "dispatch_stale_timeout_seconds": 14400,
+        # Temperature used for kanban workers and delegated subagents.
+        # Lower than interactive sessions (0.1 vs typical 0.3-0.7) so
+        # workers stay deterministic and focused on their assigned task.
+        # Set to None (or omit) to let workers inherit the profile's
+        # default temperature.
+        "worker_temperature": 0.1,
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.

@@ -5955,6 +5955,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key,
             )
             effective_mode = "queue"
+        # #84712 — Interrupt recursion depth cap.  Each interrupt increments
+        # _interrupt_depth; at MAX-1 the NEXT interrupt would hit the cap and
+        # silently queue the message, producing a zero-api-call turn that can
+        # stall for 130-210s with no response for the user.  Demote early so
+        # the current turn finishes naturally and the follow-up becomes a
+        # normal queued-next-turn instead.
+        demoted_for_interrupt_depth = False
+        _depth = 0
+        if effective_mode == "interrupt" and running_agent is not None and running_agent is not _AGENT_PENDING_SENTINEL:
+            try:
+                _depth = int(getattr(running_agent, "_gateway_interrupt_depth", 0))
+            except (TypeError, ValueError):
+                _depth = 0
+            demoted_for_interrupt_depth = _depth >= self._MAX_INTERRUPT_DEPTH - 1
+        if demoted_for_interrupt_depth:
+            logger.info(
+                "Demoting busy_input_mode 'interrupt' to 'queue' for session %s "
+                "because interrupt recursion depth %d would hit the cap of %d (#84712)",
+                session_key,
+                _depth,
+                self._MAX_INTERRUPT_DEPTH,
+            )
+            effective_mode = "queue"
         steered = False
         if effective_mode == "steer":
             steer_text = (event.text or "").strip()
@@ -18232,6 +18255,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if hasattr(agent, "_last_flushed_db_idx"):
                 agent._last_flushed_db_idx = 0
         agent._api_call_count = 0
+        # Track recursion depth on the agent so _handle_active_session_busy_message
+        # can demote interrupt→queue before the depth cap is reached (#84712).
+        agent._gateway_interrupt_depth = interrupt_depth
 
     def _commit_memory_before_soft_evict(self, agent: Any, key: str) -> None:
         """Fire on_session_end extraction before soft-evicting a live agent.
@@ -21882,8 +21908,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _interrupt_depth >= self._MAX_INTERRUPT_DEPTH:
                     logger.warning(
                         "Interrupt recursion depth %d reached for session %s — "
-                        "queueing message instead of recursing.",
+                        "queueing message '%s...' instead of recursing. "
+                        "The queued message will be processed as a new turn after the current chain unwinds (#84712).",
                         _interrupt_depth, session_key,
+                        (pending[:60] if pending else (getattr(pending_event, 'text', '') or '')[:60]),
                     )
                     adapter = self._adapter_for_source(source)
                     if adapter and pending_event:
@@ -22661,6 +22689,79 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                 f"   Or use 'hermes gateway run --replace' to auto-replace.\n"
             )
             return False
+
+    # ── Restart-flood throttle ───────────────────────────────────────
+    # When the gateway exits non-zero within seconds of starting, systemd's
+    # Restart=on-failure revives it immediately — producing a tight 6-second
+    # restart loop (gateway.start → exit_nonzero → restart → ...).  This
+    # exhausts StartLimitBurst in ~30s then systemd gives up entirely.
+    # Read the exit-diag log and, if the last N starts were rapid failures,
+    # sleep for a backoff window so systemd can rest (#84712).
+    try:
+        import json as _json
+        _diag_path = _hermes_home / "logs" / "gateway-exit-diag.log"
+        if _diag_path.exists():
+            _lines = []
+            with open(_diag_path, "r") as _f:
+                for _line in _f:
+                    _lines.append(_line.rstrip("\n"))
+                    if len(_lines) > 40:
+                        _lines.pop(0)
+            _starts = []  # list of (ts, pid)
+            _fails = set()  # pids that failed
+            for _line in _lines:
+                try:
+                    _rec = _json.loads(_line)
+                except Exception:
+                    continue
+                _tag = _rec.get("tag", "")
+                _pid = _rec.get("pid")
+                _ts = _rec.get("ts", "")
+                if _tag == "gateway.start" and _pid:
+                    _starts.append((_ts, _pid))
+                elif _tag == "gateway.exit_nonzero" and _pid:
+                    _fails.add(_pid)
+            # Find rapid failures: start→exit within 10s, counting from most recent
+            _rapid_fails = 0
+            _now = time.time()
+            for _ts_str, _pid in reversed(_starts[-6:]):
+                if _pid not in _fails:
+                    continue
+                try:
+                    _start_ts = datetime.fromisoformat(_ts_str).timestamp()
+                except Exception:
+                    continue
+                if _now - _start_ts > 120.0:
+                    # Only count failures in the last 2 minutes
+                    continue
+                # Look for the corresponding exit in the same lines
+                _started = False
+                _exit_ts = None
+                for _line in _lines:
+                    try:
+                        _rec = _json.loads(_line)
+                    except Exception:
+                        continue
+                    if _rec.get("tag") == "gateway.start" and _rec.get("pid") == _pid:
+                        _started = True
+                    elif _started and _rec.get("tag") in ("gateway.exit_nonzero", "asyncio.run.returned") and _rec.get("pid") == _pid:
+                        try:
+                            _exit_ts = datetime.fromisoformat(_rec["ts"]).timestamp()
+                        except Exception:
+                            pass
+                        break
+                if _exit_ts is not None and _exit_ts - _start_ts < 10.0:
+                    _rapid_fails += 1
+            if _rapid_fails >= 3:
+                _backoff = min(_rapid_fails * 5, 60)  # 15s → 60s max
+                logger.warning(
+                    "Restart-flood detected: %d rapid failure(s) in the last 2 minutes. "
+                    "Sleeping %ds before starting to break the restart loop (#84712).",
+                    _rapid_fails, _backoff,
+                )
+                time.sleep(_backoff)
+    except Exception as _e:
+        logger.debug("Restart-flood throttle check failed (non-fatal): %s", _e)
 
     # Sync bundled skills on gateway start (fast -- skips unchanged)
     try:
