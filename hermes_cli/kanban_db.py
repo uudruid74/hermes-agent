@@ -6473,6 +6473,11 @@ DEFAULT_FAILURE_LIMIT = 2
 # Legacy alias — callers / tests still reference the old name.
 DEFAULT_SPAWN_FAILURE_LIMIT = DEFAULT_FAILURE_LIMIT
 
+# Safety cap: when max_spawn is not configured, limit concurrent spawns to
+# prevent a gateway restart from flooding all ready tasks at once. Operators
+# can raise this via kanban.max_spawn in config.yaml or --max on the CLI.
+DEFAULT_MAX_SPAWN = 5
+
 # Max bytes to keep in a single worker log file. The dispatcher truncates
 # and rotates on spawn if the file is larger than this at spawn time.
 DEFAULT_LOG_ROTATE_BYTES = 2 * 1024 * 1024   # 2 MiB

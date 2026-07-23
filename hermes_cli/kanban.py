@@ -2466,6 +2466,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         max_spawn = cli_max if cli_max is not None else _coerce_positive_int(
             _kanban_cfg.get("max_spawn")
         )
+        # Apply DEFAULT_MAX_SPAWN when neither CLI nor config provides a cap.
+        if max_spawn is None:
+            max_spawn = kb.DEFAULT_MAX_SPAWN
     except Exception:
         default_assignee = None
         max_in_progress_per_profile = None

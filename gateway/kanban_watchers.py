@@ -1155,9 +1155,18 @@ class GatewayKanbanWatchersMixin:
             interval = 60.0
         interval = max(interval, 1.0)  # sanity floor — tighter than this is a footgun
 
-        # Read max_spawn config to limit concurrent kanban tasks
+        # Read max_spawn config to limit concurrent kanban tasks.
+        # When not configured, apply DEFAULT_MAX_SPAWN so a gateway
+        # restart doesn't flood-spawn every ready task at once.
         max_spawn = kanban_cfg.get("max_spawn", None)
-        if max_spawn is not None:
+        if max_spawn is None:
+            from hermes_cli.kanban_db import DEFAULT_MAX_SPAWN
+            max_spawn = DEFAULT_MAX_SPAWN
+            logger.info(
+                "kanban dispatcher: max_spawn not configured, "
+                "using default=%d", max_spawn,
+            )
+        else:
             logger.info(f"kanban dispatcher: max_spawn={max_spawn}")
 
         # Cap the number of simultaneously running tasks so slow workers
