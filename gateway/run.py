@@ -5764,6 +5764,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._enqueue_fifo(session_key, event, adapter)
 
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
+        # --- Internal synthetic events bypass authorization ---
+        # Kanban notifications, delegate_task completions, and background-
+        # process completions are system-generated (not user-initiated).
+        # They must never be dropped by the user-authorization gate because
+        # they carry no user_id (the internal source is the gateway itself).
+        if getattr(event, "internal", False):
+            return False
+
         # --- Authorization gate (#17775) ---
         # The cold path (_handle_message) checks _is_user_authorized before
         # creating a session.  The busy path must enforce the same check;
