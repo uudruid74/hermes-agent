@@ -161,6 +161,7 @@ class GatewayKanbanWatchersMixin:
             )
             return
         _wake_home_session = bool(kanban_cfg.get("wake_home_session", False))
+        _board_topics = kanban_cfg.get("board_topics") or {}
         from gateway.config import Platform as _Platform
         try:
             from hermes_cli import kanban_db as _kb
@@ -357,6 +358,25 @@ class GatewayKanbanWatchersMixin:
                                     slug, len(_active_rows), len(subs),
                                 )
                             for _tid in _unsubbed:
+                                # Age gate: skip tasks created less than 15
+                                # seconds ago to avoid racing with
+                                # slash_commands.py's add_notify_sub, which
+                                # captures the origin chat_id/thread_id.
+                                # Without this gate, the auto-subscriber may
+                                # insert a home-channel subscription before
+                                # the slash command handler does, resulting
+                                # in dual delivery (home + origin topic).
+                                _created_row = conn.execute(
+                                    "SELECT created_at FROM tasks WHERE id = ?", (_tid,)
+                                ).fetchone()
+                                if _created_row and _created_row[0]:
+                                    _age = int(time.time()) - _created_row[0]
+                                    if _age < 15:
+                                        logger.debug(
+                                            "kanban notifier: skipping auto-sub for %s — "
+                                            "created %ds ago (age gate)", _tid, _age,
+                                        )
+                                        continue
                                 _gw_cfg = _load_gw_cfg() if _load_gw_cfg else None
                                 if _gw_cfg is None:
                                     logger.warning(
@@ -367,28 +387,46 @@ class GatewayKanbanWatchersMixin:
                                 for _plat, _pcfg in _gw_cfg.platforms.items():
                                     if not _pcfg or not _pcfg.enabled:
                                         continue
-                                    _home = _gw_cfg.get_home_channel(_plat)
-                                    if not _home or not _home.chat_id:
-                                        logger.debug(
-                                            "kanban notifier: no home channel for %s on platform %s, skipping auto-sub",
-                                            _tid, _plat.value,
+                                    # Check board→topic mapping first
+                                    # (kanban.board_topics in config.yaml).
+                                    # This maps board slugs to platform-
+                                    # specific (chat_id, thread_id) pairs,
+                                    # enabling CLI-created tasks to route
+                                    # notifications to a specific topic
+                                    # instead of the generic home channel.
+                                    _bt = _board_topics.get(slug, {}).get(_plat.value) if _board_topics else None
+                                    if isinstance(_bt, dict) and _bt.get("chat_id"):
+                                        _chat_id = _bt["chat_id"]
+                                        _thread_id = str(_bt.get("thread_id") or "")
+                                        logger.info(
+                                            "kanban notifier: board_topic mapping %s/%s → %s/%s",
+                                            slug, _plat.value, _chat_id, _thread_id,
                                         )
-                                        continue
+                                    else:
+                                        _home = _gw_cfg.get_home_channel(_plat)
+                                        if not _home or not _home.chat_id:
+                                            logger.debug(
+                                                "kanban notifier: no home channel for %s on platform %s, skipping auto-sub",
+                                                _tid, _plat.value,
+                                            )
+                                            continue
+                                        _chat_id = _home.chat_id
+                                        _thread_id = _home.thread_id or ""
                                     try:
                                         conn.execute(
                                             "INSERT INTO kanban_notify_subs"
                                             " (task_id, platform, chat_id, thread_id, user_id, notifier_profile, created_at)"
                                             " VALUES (?,?,?,?,?,NULL,?)",
-                                            (_tid, _plat.value, _home.chat_id,
-                                             _home.thread_id or "", "", int(time.time())),
+                                            (_tid, _plat.value, _chat_id,
+                                             _thread_id, "", int(time.time())),
                                         )
                                         conn.commit()
                                         logger.info("kanban notifier: auto-subscribed %s → %s/%s",
-                                                    _tid, _plat.value, _home.chat_id)
+                                                    _tid, _plat.value, _chat_id)
                                     except Exception as _sub_exc:
                                         logger.warning(
                                             "kanban notifier: auto-subscribe FAILED for %s on %s/%s: %s",
-                                            _tid, _plat.value, _home.chat_id, _sub_exc,
+                                            _tid, _plat.value, _chat_id, _sub_exc,
                                         )
                         finally:
                             conn.close()
@@ -516,17 +554,18 @@ class GatewayKanbanWatchersMixin:
                             # reactions. Falls back to adapter.send() on
                             # failure as a safety net.
                             try:
-                                # Resolve the real chat_type from the home
-                                # channel config so the session key matches
-                                # the user's actual session.  Previously
-                                # hardcoded "group", which could resolve to
-                                # a different session key and cause the agent
-                                # to lose conversation context (turn 1 in an
-                                # empty session).  Falls back to "group" when
-                                # the home channel isn't configured (legacy
-                                # deployments without /sethome chat_type).
-                                _home_ch = self.config.get_home_channel(plat) if hasattr(self, "config") and self.config else None
-                                _sub_chat_type = (_home_ch.chat_type) if _home_ch and getattr(_home_ch, "chat_type", None) else "group"
+                                # Infer chat_type: subscriptions with a thread_id
+                                # originate from group/forum topics → chat_type
+                                # is "group". Subscriptions without a thread_id
+                                # could be DMs or groups; resolve from home
+                                # channel config when available, falling back
+                                # to "group" for legacy deployments without
+                                # /sethome.
+                                if (sub.get("thread_id") or "").strip():
+                                    _sub_chat_type = "group"
+                                else:
+                                    _home_ch = self.config.get_home_channel(plat) if hasattr(self, "config") and self.config else None
+                                    _sub_chat_type = (_home_ch.chat_type) if _home_ch and getattr(_home_ch, "chat_type", None) else "group"
                                 session_source = SessionSource(
                                     platform=Platform(sub["platform"]),
                                     chat_id=sub["chat_id"],
