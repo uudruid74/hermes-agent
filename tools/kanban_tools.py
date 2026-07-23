@@ -1271,6 +1271,16 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
             thread_id=thread_id, user_id=user_id,
             notifier_profile=notifier_profile,
         )
+        # Store origin routing as a system comment so the watcher can
+        # always find the right channel — even if the subscription is
+        # later lost/overwritten, the origin comment survives as the
+        # source of truth.  Mirrors what slash_commands.py does for
+        # /kanban create in gateway sessions.
+        _kb.store_origin_routing(
+            conn, task_id=task_id,
+            platform=platform, chat_id=chat_id,
+            thread_id=thread_id or "",
+        )
         return True
     except Exception as _exc:
         logger.warning(
