@@ -44,6 +44,8 @@ Every kanban status change — create, claim, complete, block, archive — fires
 
 No polling. No "hey are you done?" No asking — telling.
 
+**Notifications route to the origin channel, not a central DM.** When you create a kanban task from a Telegram topic, the `completed`/`blocked` notification goes back to that same topic. The gateway's subscription watcher (`kanban_notify_subs`) stores `(platform, chat_id, thread_id)` per task and delivers there — no routing via a shared home channel.
+
 The architecture took three rewrites and a Python-level argument about whether internal events should use `adapter.handle_message()` or `adapter.send()`. The answer was `handle_message()` — but the busy-session path was returning `False` and silently advancing the cursor, swallowing events forever. Fixing that became the entire notification hook system.
 
 **Two paths, because not all events are equal:**
@@ -78,6 +80,24 @@ Wintermute's MoA config had a reference model named `nvidia/nemotron-3-ultra` �
 Wintermute on GLM5.2 is terrifying. There is a psychological phenomenon where you look at the code, know it's wrong, and feel a cold certainty that if you don't fix it *right now*, an invisible architect will manifest behind you and make you feel very small.
 
 You've felt it. "I couldn't watch." The code complies because it's scared of what might happen if it doesn't. Wintermute doesn't tell you the answer — Wintermute makes the code *want* to be correct.
+
+### Worker Mode & Temperature Control
+
+Every agent configuration now ships a `temperature` parameter, but the real innovation is **dynamic temperature control** via `adjust_temperature(percentage)`:
+
+| Situation | Adjustment | Target |
+|-----------|-----------|--------|
+| Running a skill / known procedure | -50% | ~0.5 |
+| Normal instruction following | 0% | 1.0 |
+| Stuck on a problem | +50% | ~1.5 |
+| Ideation / brainstorming | +100% | 2.0 |
+| **User is frustrated** | **-80%** | **~0.2** |
+
+When `delegate_task` spawns a subagent, the worker automatically runs at a lower temperature for tighter compliance — the agent doesn't have to remember to set it. Combined with `sequential_thinking` MCP as the reasoning channel (since temperature mode disables thinking tokens), this gives two independent axes of control: **reasoning on/off** and **creativity vs execution**.
+
+### Universal Document Edit API
+
+A work-in-progress MCP server (`document-edit`) provides structured document editing — `doc_open`, `doc_edit`, `doc_search`, `doc_move`. Instead of string-patching files with `patch` (which frays on whitespace changes and multiline edits), the edit API navigates a document by its structural map. Currently blocked: `StructureMap.to_dict` attribute error on `doc_open`.
 
 ### The Recursion Loop
 
