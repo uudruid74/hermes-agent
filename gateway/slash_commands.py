@@ -456,6 +456,15 @@ class GatewaySlashCommandsMixin:
             action = tok
             break
 
+        # Resolve the board the same way the CLI does so the subscription
+        # and origin routing always land on the correct board.
+        if not requested_board:
+            try:
+                from hermes_cli.kanban_db import get_current_board
+                requested_board = get_current_board()
+            except Exception:
+                requested_board = None
+
         is_create = action == "create"
 
         try:
@@ -495,11 +504,17 @@ class GatewaySlashCommandsMixin:
                                 # Store origin routing as a system comment so
                                 # the watcher can always find the right channel,
                                 # even if the subscription race is lost.
-                                _kb.store_origin_routing(
-                                    conn, task_id,
-                                    platform=platform_str, chat_id=chat_id,
-                                    thread_id=thread_id or "",
-                                )
+                                try:
+                                    _kb.store_origin_routing(
+                                        conn, task_id,
+                                        platform=platform_str, chat_id=chat_id,
+                                        thread_id=thread_id or "",
+                                    )
+                                except Exception as _orig_exc:
+                                    logger.warning(
+                                        "kanban create origin-routing store failed for %s: %s",
+                                        task_id, _orig_exc,
+                                    )
                             finally:
                                 conn.close()
                         await asyncio.to_thread(_sub)

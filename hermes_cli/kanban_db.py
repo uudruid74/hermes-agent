@@ -3362,11 +3362,13 @@ def store_origin_routing(
     """
     import json
 
+    # Escape _ for SQLite LIKE: _ is a single-char wildcard.
+    _escaped_marker = _ORIGIN_MARKER.replace("_", "\\_")
     existing = conn.execute(
         "SELECT 1 FROM task_comments"
-        " WHERE task_id = ? AND author = 'system' AND body LIKE ?"
+        " WHERE task_id = ? AND author = 'system' AND body LIKE ? ESCAPE '\\'"
         " LIMIT 1",
-        (task_id, f"{_ORIGIN_MARKER}%"),
+        (task_id, f"{_escaped_marker}%"),
     ).fetchone()
     if existing:
         return  # already stored; idempotent
@@ -3395,11 +3397,13 @@ def get_origin_routing(
     """
     import json
 
+    # Escape _ for SQLite LIKE: _ is a single-char wildcard.
+    _escaped_marker = _ORIGIN_MARKER.replace("_", "\\_")
     row = conn.execute(
         "SELECT body FROM task_comments"
-        " WHERE task_id = ? AND author = 'system' AND body LIKE ?"
+        " WHERE task_id = ? AND author = 'system' AND body LIKE ? ESCAPE '\\'"
         " ORDER BY created_at ASC LIMIT 1",
-        (task_id, f"{_ORIGIN_MARKER}%"),
+        (task_id, f"{_escaped_marker}%"),
     ).fetchone()
     if not row:
         return None
