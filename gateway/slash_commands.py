@@ -488,6 +488,7 @@ class GatewaySlashCommandsMixin:
                     ).lower()
                     chat_id = str(getattr(source, "chat_id", "") or "")
                     thread_id = str(getattr(source, "thread_id", "") or "")
+                    chat_type = str(getattr(source, "chat_type", "") or "")
                     user_id = str(getattr(source, "user_id", "") or "") or None
                     if platform_str and chat_id:
                         def _sub():
@@ -509,6 +510,7 @@ class GatewaySlashCommandsMixin:
                                         conn, task_id,
                                         platform=platform_str, chat_id=chat_id,
                                         thread_id=thread_id or "",
+                                        chat_type=chat_type or "",
                                     )
                                 except Exception as _orig_exc:
                                     logger.warning(

@@ -305,6 +305,50 @@ class GatewayKanbanWatchersMixin:
                             # tolerates that race, but we still skip the
                             # redundant call to avoid the wasted work.
                             subs = _kb.list_notify_subs(conn)
+                            # ── zombie cleanup ──────────────────────────
+                            # Remove subscriptions for done/archived tasks
+                            # that have no unseen events remaining.
+                            _zombie_ids = {
+                                _tid for (_tid,) in conn.execute(
+                                    "SELECT id FROM tasks WHERE status IN ('done','archived')"
+                                ).fetchall()
+                            }
+                            if _zombie_ids:
+                                # Get the max event id per zombie task so we
+                                # only drop subs whose cursor has caught up.
+                                _max_ev = dict(
+                                    conn.execute(
+                                        "SELECT task_id, MAX(id) FROM task_events"
+                                        " WHERE task_id IN ({}) GROUP BY task_id".format(
+                                            ",".join("?" * len(_zombie_ids))
+                                        ),
+                                        tuple(_zombie_ids),
+                                    ).fetchall()
+                                )
+                                _zombie_subs = [
+                                    s for s in subs
+                                    if s["task_id"] in _zombie_ids
+                                    and s.get("last_event_id", 0) >= _max_ev.get(s["task_id"], 0)
+                                ]
+                                if _zombie_subs:
+                                    with _kb.write_txn(conn):
+                                        for _zs in _zombie_subs:
+                                            conn.execute(
+                                                "DELETE FROM kanban_notify_subs"
+                                                " WHERE task_id = ? AND platform = ?"
+                                                " AND chat_id = ? AND thread_id = ?",
+                                                (_zs["task_id"], _zs["platform"],
+                                                 _zs["chat_id"], _zs.get("thread_id") or ""),
+                                            )
+                                    logger.info(
+                                        "kanban notifier: board %s — cleaned up %d zombie subscription(s) "
+                                        "for done/archived tasks: %s",
+                                        slug, len(_zombie_subs),
+                                        sorted({zs["task_id"] for zs in _zombie_subs}),
+                                    )
+                                    # Re-read subs after cleanup
+                                    subs = _kb.list_notify_subs(conn)
+                            # ─────────────────────────────────────────────
                             if subs:
                                 logger.info("kanban notifier: board %s has %d subscription(s)", slug, len(subs))
                             for sub in subs:
@@ -428,12 +472,19 @@ class GatewayKanbanWatchersMixin:
                                         _chat_id = _home.chat_id
                                         _thread_id = _home.thread_id or ""
                                     try:
+                                        # Start the cursor at the tip of history
+                                        # so we don't replay old events.
+                                        _latest_ev = conn.execute(
+                                            "SELECT MAX(id) FROM task_events WHERE task_id = ?",
+                                            (_tid,),
+                                        ).fetchone()
+                                        _start = int(_latest_ev[0]) if (_latest_ev and _latest_ev[0] is not None) else 0
                                         conn.execute(
                                             "INSERT INTO kanban_notify_subs"
-                                            " (task_id, platform, chat_id, thread_id, user_id, notifier_profile, created_at)"
-                                            " VALUES (?,?,?,?,?,NULL,?)",
+                                            " (task_id, platform, chat_id, thread_id, user_id, notifier_profile, created_at, last_event_id)"
+                                            " VALUES (?,?,?,?,?,NULL,?,?)",
                                             (_tid, _plat.value, _chat_id,
-                                             _thread_id, "", int(time.time())),
+                                             _thread_id, "", int(time.time()), _start),
                                         )
                                         conn.commit()
                                         logger.info("kanban notifier: auto-subscribed %s → %s/%s",
@@ -620,6 +671,7 @@ class GatewayKanbanWatchersMixin:
                                 # topic, regardless of subscription state.
                                 _delivery_chat_id = sub["chat_id"]
                                 _delivery_thread_id = sub.get("thread_id") or ""
+                                _origin = None  # pre-bind for type checker; set inside try
                                 try:
                                     from hermes_cli import kanban_db as _kb2
                                     _origin_conn = _kb2.connect(board=board_slug)
@@ -637,18 +689,87 @@ class GatewayKanbanWatchersMixin:
                                         _origin_conn.close()
                                 except Exception:
                                     pass  # origin routing is best-effort
-                                # Infer chat_type: deliveries with a thread_id
-                                # originate from group/forum topics -> chat_type
-                                # is "group". Deliveries without a thread_id
-                                # could be DMs or groups; resolve from home
-                                # channel config when available, falling back
-                                # to "group" for legacy deployments without
-                                # /sethome.
-                                if _delivery_thread_id.strip():
+                                # Infer chat_type. The origin routing comment
+                                # (stored by slash_commands.py on /kanban
+                                # create) carries the true chat_type from the
+                                # message source and is the ground truth.
+                                #
+                                # Without origin routing, we must infer:
+                                # - Telegram DM topics: chat_type="dm" with
+                                #   thread_id set (NOT "group"). A "group"
+                                #   inference here breaks DM-topic session
+                                #   keys and routes notifications to the
+                                #   wrong session.
+                                # - Forum/supergroup topics: chat_type="group"
+                                #   or "forum" with thread_id.
+                                # - Non-threaded deliveries: resolve from
+                                #   home channel config, fall back "group".
+                                _origin_chat_type = (_origin.get("chat_type") or "").strip() if _origin else ""
+                                if _origin_chat_type:
+                                    _sub_chat_type = _origin_chat_type
+                                    logger.info(
+                                        "kanban notifier: chat_type from origin routing for %s: %s",
+                                        sub["task_id"], _sub_chat_type,
+                                    )
+                                elif _delivery_thread_id.strip():
+                                    # Threaded delivery, unknown chat_type.
+                                    # For Telegram, check whether this is a
+                                    # DM topic (chat_type="dm") rather than
+                                    # a forum/supergroup topic.
                                     _sub_chat_type = "group"
+                                    if platform_str == "telegram":
+                                        try:
+                                            # Check adapter for DM topic info
+                                            _tg_adapter = getattr(self, "_authorization_adapter", None)
+                                            if _tg_adapter is not None:
+                                                _tg_adapter = _tg_adapter(plat)
+                                            if _tg_adapter and hasattr(type(_tg_adapter), "_get_dm_topic_info"):
+                                                _topic_info = _tg_adapter._get_dm_topic_info(
+                                                    _delivery_chat_id, _delivery_thread_id
+                                                )
+                                                if isinstance(_topic_info, dict):
+                                                    _sub_chat_type = "dm"
+                                                    logger.info(
+                                                        "kanban notifier: DM topic detected via adapter for %s: %s/%s",
+                                                        sub["task_id"], _delivery_chat_id, _delivery_thread_id,
+                                                    )
+                                        except Exception as _dm_exc:
+                                            logger.debug(
+                                                "kanban notifier: DM topic check failed for %s: %s",
+                                                sub["task_id"], _dm_exc,
+                                            )
+                                        # Also check via is_telegram_dm_topic_target (handles
+                                        # operator-declared topics that are not in the
+                                        # adapter cache yet)
+                                        if _sub_chat_type != "dm":
+                                            try:
+                                                _check = getattr(self, "_is_telegram_dm_topic_target", None)
+                                                if _check and _check(
+                                                    plat, _delivery_chat_id, _delivery_thread_id,
+                                                    chat_type="dm",
+                                                ):
+                                                    _sub_chat_type = "dm"
+                                                    logger.info(
+                                                        "kanban notifier: DM topic via _is_telegram_dm_topic_target for %s",
+                                                        sub["task_id"],
+                                                    )
+                                            except Exception:
+                                                pass
+                                    logger.info(
+                                        "kanban notifier: inferred chat_type for threaded %s: %s "
+                                        "(platform=%s thread=%s)",
+                                        sub["task_id"], _sub_chat_type, platform_str,
+                                        _delivery_thread_id,
+                                    )
                                 else:
                                     _home_ch = self.config.get_home_channel(plat) if hasattr(self, "config") and self.config else None
                                     _sub_chat_type = (_home_ch.chat_type) if _home_ch and getattr(_home_ch, "chat_type", None) else "group"
+                                    logger.info(
+                                        "kanban notifier: chat_type from home channel for %s: %s "
+                                        "(home=%s)",
+                                        sub["task_id"], _sub_chat_type,
+                                        _home_ch.chat_type if _home_ch else "none",
+                                    )
                                 session_source = SessionSource(
                                     platform=Platform(sub["platform"]),
                                     chat_id=_delivery_chat_id,
@@ -776,7 +897,7 @@ class GatewayKanbanWatchersMixin:
                         # above for the failure mode this prevents.
                         task_terminal = task and task.status in {"done", "archived"}
                         _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked",
-                                      "commented", "protocol_violation")
+                                      "commented", "protocol_violation", "claimed")
                         _wake_kinds = {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
                         if _wake_kinds:
                             try:
@@ -790,6 +911,7 @@ class GatewayKanbanWatchersMixin:
                                     if "crashed" in _wake_kinds: _parts.append(t("gateway.kanban.wake.crashed"))
                                     if "timed_out" in _wake_kinds: _parts.append(t("gateway.kanban.wake.timed_out"))
                                     if "blocked" in _wake_kinds: _parts.append(t("gateway.kanban.wake.blocked"))
+                                    if "claimed" in _wake_kinds: _parts.append(t("gateway.kanban.wake.claimed"))
                                     _status = t("gateway.kanban.wake.status_joiner").join(_parts) or t("gateway.kanban.wake.status_default")
                                     _synth = t(
                                         "gateway.kanban.wake.message",
