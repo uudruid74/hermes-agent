@@ -2,13 +2,15 @@
 """
 Temperature Tool Module — Session-scoped temperature adjustment.
 
-Lets the agent adjust its own sampling temperature mid-session via
-``adjust_temperature(percentage)``. The value is stored on the agent
-as ``_session_temperature`` and takes priority in ``resolve_temperature()``
-over profile defaults and worker temperature.
+Lets the agent set its own sampling temperature mid-session via
+``adjust_temperature(temperature)`` (absolute value). The value is stored
+on the agent as ``_session_temperature`` and takes priority in
+``resolve_temperature()`` over profile defaults and worker temperature.
 
 Kimi / Moonshot providers do not support temperature — the tool returns
 ``null`` (no-op) for those providers.
+
+Values outside [0.0, 2.0] are rejected (no change, current value returned).
 """
 
 import json
@@ -21,12 +23,15 @@ def _is_kimi_provider(agent) -> bool:
     return provider in {"kimi-coding", "kimi-coding-cn"}
 
 
-def adjust_temperature_tool(percentage: float, agent) -> str:
-    """Adjust session temperature by a percentage offset.
+def adjust_temperature_tool(temperature: float, agent) -> str:
+    """Set session temperature to an absolute value.
 
     Args:
-        percentage: Signed percentage change (e.g. +20 = 20% hotter,
-                    -10 = 10% colder).
+        temperature: Absolute temperature value.  Must be in [0.0, 2.0];
+                     values outside this range are rejected (no change).
+                     0.0 = deterministic (coding/math),
+                     1.0 = balanced (data analysis),
+                     2.0 = creative (conversation/translation).
         agent: The AIAgent instance (injected at call site).
 
     Returns:
@@ -41,19 +46,20 @@ def adjust_temperature_tool(percentage: float, agent) -> str:
         return json.dumps({"error": "adjust_temperature requires agent dispatch; registry fallback failed"})
 
     previous = getattr(agent, "_session_temperature", None)
-    # Use the profile temperature as baseline if no session override exists
-    baseline = previous if previous is not None else (getattr(agent, "_temperature", None) or 0.7)
 
-    # Calculate new temperature: baseline * (1 + percentage/100), clamped [0.0, 2.0]
-    new_temp = baseline * (1.0 + percentage / 100.0)
-    new_temp = max(0.0, min(2.0, new_temp))
-
-    agent._session_temperature = new_temp
-    changed = previous is None or abs(new_temp - previous) > 0.001
+    # Value in [0.0, 2.0] → set it. Outside → no change, return current.
+    if 0.0 <= temperature <= 2.0:
+        agent._session_temperature = temperature
+        changed = previous is None or abs(temperature - previous) > 0.001
+        return json.dumps({
+            "temperature": temperature,
+            "changed": changed,
+            "previous": previous,
+        })
 
     return json.dumps({
-        "temperature": new_temp,
-        "changed": changed,
+        "temperature": previous,
+        "changed": False,
         "previous": previous,
     })
 
@@ -63,24 +69,28 @@ def adjust_temperature_tool(percentage: float, agent) -> str:
 ADJUST_TEMPERATURE_SCHEMA = {
     "name": "adjust_temperature",
     "description": (
-        "Adjust the agent's sampling temperature for the remainder of the session. "
-        "Positive percentage = more creative; negative = more deterministic. "
-        "Temperature is clamped to [0.0, 2.0] and applies multiplicatively "
-        "to the current value. Kimi/Moonshot providers return null (unsupported)."
+        "Set the agent's sampling temperature to an absolute value for "
+        "the remainder of the session. Values outside [0.0, 2.0] are "
+        "rejected (no change). "
+        "0.0 = deterministic (coding/math), 1.0 = balanced (data analysis), "
+        "2.0 = creative (conversation/translation). "
+        "Kimi/Moonshot providers return null (unsupported)."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "percentage": {
+            "temperature": {
                 "type": "number",
+                "minimum": 0.0,
+                "maximum": 2.0,
                 "description": (
-                    "Signed percentage change. +20 makes temperature 20% higher "
-                    "(more creative). -20 makes it 20% lower (more deterministic). "
-                    "e.g. current=0.7, +20 → 0.84; current=0.7, -50 → 0.35"
+                    "Absolute temperature value. 0.0 = deterministic (coding/math), "
+                    "1.0 = balanced (data analysis), 2.0 = creative conversation/translation. "
+                    "values outside this range are rejected (no change)."
                 ),
             },
         },
-        "required": ["percentage"],
+        "required": ["temperature"],
     },
 }
 
@@ -94,7 +104,7 @@ registry.register(
     toolset="temperature",
     schema=ADJUST_TEMPERATURE_SCHEMA,
     handler=lambda args, **kw: adjust_temperature_tool(
-        percentage=args.get("percentage", 0.0),
+        temperature=args.get("temperature", 0.7),
         agent=kw.get("agent", None),  # injected at agent-level dispatch; None = registry fallback
     ),
     emoji="🌡️",
