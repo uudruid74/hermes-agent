@@ -415,10 +415,67 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
             response = client.search(query=query, limit=limit)
             web_results = _extract_web_search_results(response)
             logger.info("Firecrawl: found %d search results", len(web_results))
-            return {"success": True, "data": {"web": web_results}}
         except Exception as exc:  # noqa: BLE001
             logger.warning("Firecrawl search error: %s", exc)
             return {"success": False, "error": f"Firecrawl search failed: {exc}"}
+
+        # Ragamuffin fallback: the Firecrawl v2 SDK expects
+        # ``{"data": {"web": [...], "news": [...], "images": [...]}}``
+        # but Ragamuffin (and other Firecrawl-compatible servers) may
+        # return a flat ``{"data": [{...}]}`` array.  The SDK's
+        # ``SearchData`` model drops this on the floor (web=None).
+        # When results are empty, fall back to a raw HTTP call so we
+        # can extract the flat array ourselves.
+        if not web_results:
+            web_results = self._try_raw_search(query, limit, client)
+
+        return {"success": True, "data": {"web": web_results}}
+
+    @staticmethod
+    def _try_raw_search(query: str, limit: int, client: Any) -> List[Dict[str, Any]]:
+        """Fallback: raw HTTP search for Ragamuffin-style flat-array responses.
+
+        When the Firecrawl SDK's ``SearchData`` model cannot find results
+        (``web=None``), make a direct POST to ``/v2/search`` and extract
+        results from the ``data`` key when it is a flat list rather than
+        the expected ``{"web": [...]}`` dict.
+
+        Returns an empty list on any failure — the caller already has
+        the SDK result as the primary path; this is a best-effort
+        compat shim.
+        """
+        try:
+            import requests as _requests
+        except ImportError:
+            return []
+        try:
+            api_url = (getattr(client, "api_url", None) or "").rstrip("/")
+            api_key = getattr(client, "api_key", None) or ""
+            if not api_url:
+                return []
+            headers = {"Content-Type": "application/json"}
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
+            resp = _requests.post(
+                f"{api_url}/v2/search",
+                json={"query": query, "limit": limit},
+                headers=headers,
+                timeout=30,
+            )
+            if resp.status_code != 200:
+                return []
+            payload = resp.json()
+            data = payload.get("data")
+            if isinstance(data, list):
+                normalized = _normalize_result_list(data)
+                logger.info(
+                    "Firecrawl raw fallback: found %d results in flat array",
+                    len(normalized),
+                )
+                return normalized
+        except Exception:  # noqa: BLE001 — best-effort compat
+            pass
+        return []
 
     async def extract(self, urls: List[str], **kwargs: Any) -> List[Dict[str, Any]]:
         """Extract content from one or more URLs via Firecrawl.
