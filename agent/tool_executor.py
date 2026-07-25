@@ -1395,7 +1395,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             def _execute(next_args: dict) -> Any:
                 from tools.temperature_tool import adjust_temperature_tool as _adj_temp
                 return _adj_temp(
-                    percentage=next_args.get("percentage", 0.0),
+                    temperature=next_args.get("temperature", 0.7),
                     agent=agent,
                 )
             function_result, function_args = _run_agent_tool_execution_middleware(

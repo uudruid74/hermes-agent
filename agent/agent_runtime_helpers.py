@@ -2360,7 +2360,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             from tools.temperature_tool import adjust_temperature_tool as _adj_temp
             return _finish_agent_tool(
                 _adj_temp(
-                    percentage=next_args.get("percentage", 0.0),
+                    temperature=next_args.get("temperature", 0.7),
                     agent=agent,
                 ),
                 next_args,
