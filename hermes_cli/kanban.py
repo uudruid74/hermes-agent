@@ -320,102 +320,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
             "or docs/hermes-kanban-v1-spec.pdf for the full design."
         ),
     )
-    # --- global --board flag ---
-    # Applies to every subcommand below. When set, scopes all reads and
-    # writes to that board's DB. When omitted, resolves via the
-    # HERMES_KANBAN_BOARD env var, then the persisted current-board
-    # file, then "default". See kanban_db.get_current_board().
-    kanban_parser.add_argument(
-        "--board",
-        default=None,
-        metavar="<slug>",
-        help=(
-            "Board slug to operate on. Defaults to the current board "
-            "(set via `hermes kanban boards switch <slug>` or the "
-            "HERMES_KANBAN_BOARD env var). Use `hermes kanban boards list` "
-            "to see all boards."
-        ),
-    )
     sub = kanban_parser.add_subparsers(dest="kanban_action")
 
     # --- init ---
     sub.add_parser("init", help="Create kanban.db if missing (idempotent)")
-
-    # --- boards (new in v2: multi-project support) ---
-    p_boards = sub.add_parser(
-        "boards",
-        help="Manage kanban boards (one board per project / workstream)",
-        description=(
-            "Boards let you separate unrelated streams of work "
-            "(projects, repos, domains) into isolated queues. Each "
-            "board has its own DB, workspaces directory, and dispatcher "
-            "loop — tasks on one board cannot collide with tasks on "
-            "another. The first board is 'default' and always exists."
-        ),
-    )
-    boards_sub = p_boards.add_subparsers(dest="boards_action")
-
-    b_list = boards_sub.add_parser(
-        "list", aliases=["ls"],
-        help="List all boards with task counts",
-    )
-    b_list.add_argument("--json", action="store_true")
-    b_list.add_argument("--all", action="store_true",
-                        help="Include archived boards too")
-
-    b_create = boards_sub.add_parser(
-        "create", aliases=["new"],
-        help="Create a new board",
-    )
-    b_create.add_argument("slug",
-                          help="Board slug (kebab-case, e.g. atm10-server)")
-    b_create.add_argument("--name", default=None,
-                          help="Human-readable display name (defaults to Title Case of slug)")
-    b_create.add_argument("--description", default=None,
-                          help="Optional description")
-    b_create.add_argument("--icon", default=None,
-                          help="Optional emoji or single-character icon for the dashboard")
-    b_create.add_argument("--color", default=None,
-                          help="Optional hex color (e.g. '#8b5cf6') for the dashboard")
-    b_create.add_argument("--switch", action="store_true",
-                          help="Switch to the new board after creating it")
-    b_create.add_argument("--default-workdir", default=None,
-                          help="Default workspace path for tasks created on this board")
-
-    b_rm = boards_sub.add_parser(
-        "rm", aliases=["remove", "delete"],
-        help="Archive (default) or delete a board",
-    )
-    b_rm.add_argument("slug")
-    b_rm.add_argument("--delete", action="store_true",
-                      help="Hard-delete the board directory instead of archiving it. "
-                           "Default is to move it to boards/_archived/ so it's recoverable.")
-
-    b_switch = boards_sub.add_parser(
-        "switch", aliases=["use"],
-        help="Set the active board for subsequent CLI calls",
-    )
-    b_switch.add_argument("slug")
-
-    boards_sub.add_parser(
-        "show", aliases=["current"],
-        help="Print the currently-active board slug",
-    )
-
-    b_rename = boards_sub.add_parser(
-        "rename",
-        help="Change a board's human-readable display name (slug is immutable)",
-    )
-    b_rename.add_argument("slug")
-    b_rename.add_argument("name", help="New display name")
-
-    b_set_wd = boards_sub.add_parser(
-        "set-default-workdir",
-        help="Set the default workspace path for tasks on a board",
-    )
-    b_set_wd.add_argument("slug")
-    b_set_wd.add_argument("path", nargs="?", default=None,
-                          help="Absolute path to use as default workdir. Omit to clear.")
 
     # --- create ---
     p_create = sub.add_parser("create", help="Create a new task")
@@ -481,6 +389,20 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "that require immediate human ops (R3 gate) "
                                "to skip the brief running-to-blocked transition.")
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
+
+    p_create.add_argument(
+        "-c",
+        "--channel",
+        metavar="CHANNEL",
+        default=None,
+        help=(
+            "Origin routing for CLI-created tasks (needed when there is no "
+            "gateway event.source). Format: 'platform:chat_id[:thread_id]'. "
+            "Stored as a system comment so kanban notifications route to the "
+            "right channel. Examples: "
+            "telegram:-1001234567890:17585, discord:#ops."
+        ),
+    )
 
     # --- swarm ---
     p_swarm = sub.add_parser(
@@ -1040,41 +962,6 @@ def kanban_command(args: argparse.Namespace) -> int:
             )
         return 0
 
-    # Board-management commands operate on board metadata and the persisted
-    # current-board pointer itself. They must ignore the shared `--board`
-    # task-routing override; otherwise `/kanban --board beta boards show`
-    # reports beta as the current board even when the on-disk pointer is
-    # alpha.
-    if action == "boards":
-        return _dispatch_boards(args)
-
-    # Always resolve the active board via get_current_board(), then pin it
-    # via a scoped override so that kanban_db_path respects it even when
-    # HERMES_KANBAN_DB is in the environment.  When --board is passed it
-    # takes priority; otherwise the persisted current file / env var chain
-    # is used.  Workers (kanban agent tools) bypass this path entirely —
-    # they call kb.connect() directly and HERMES_KANBAN_DB protects them.
-    board_override = getattr(args, "board", None)
-    if board_override:
-        try:
-            normed = kb._normalize_board_slug(board_override)
-        except ValueError as exc:
-            print(f"kanban: {exc}", file=sys.stderr)
-            return 2
-        if not normed:
-            print("kanban: --board requires a slug", file=sys.stderr)
-            return 2
-        if normed != kb.DEFAULT_BOARD and not kb.board_exists(normed):
-            print(
-                f"kanban: board {normed!r} does not exist. "
-                f"Create it with `hermes kanban boards create {normed}`.",
-                file=sys.stderr,
-            )
-            return 1
-    else:
-        normed = kb.get_current_board()
-    board_scope = kb.scoped_current_board(normed)
-
     # Auto-initialize the DB before dispatching any subcommand. init_db
     # is idempotent, so running it every invocation is cheap (one
     # SELECT against sqlite_master when tables already exist) and
@@ -1082,71 +969,66 @@ def kanban_command(args: argparse.Namespace) -> int:
     # HERMES_HOME. Previously only `init` and `daemon` triggered
     # schema creation; `create` / `list` / every other command would
     # error out on a fresh install.
-    with board_scope:
-        # `repair` must dispatch BEFORE the auto-init below: on a corrupt DB
-        # init_db() itself raises KanbanDbCorruptError, which would turn
-        # every `hermes kanban repair` into "could not initialize database"
-        # without ever reaching the repair path.
-        if action == "repair":
-            return _cmd_repair(args)
-        try:
-            kb.init_db()
-        except Exception as exc:
-            print(f"kanban: could not initialize database: {exc}", file=sys.stderr)
-            return 1
+    if action == "repair":
+        return _cmd_repair(args)
+    try:
+        kb.init_db()
+    except Exception as exc:
+        print(f"kanban: could not initialize database: {exc}", file=sys.stderr)
+        return 1
 
-        handlers = {
-            "init":     _cmd_init,
-            "create":   _cmd_create,
-            "swarm":    _cmd_swarm,
-            "list":     _cmd_list,
-            "ls":       _cmd_list,
-            "show":     _cmd_show,
-            "assign":   _cmd_assign,
-            "reclaim":  _cmd_reclaim,
-            "reassign": _cmd_reassign,
-            "diagnostics": _cmd_diagnostics,
-            "diag":     _cmd_diagnostics,
-            "link":     _cmd_link,
-            "unlink":   _cmd_unlink,
-            "claim":    _cmd_claim,
-            "comment":  _cmd_comment,
-            "attach":   _cmd_attach,
-            "attachments": _cmd_attachments,
-            "attach-rm": _cmd_attach_rm,
-            "complete": _cmd_complete,
-            "edit":     _cmd_edit,
-            "block":    _cmd_block,
-            "schedule": _cmd_schedule,
-            "unblock":  _cmd_unblock,
-            "promote":  _cmd_promote,
-            "archive":  _cmd_archive,
-            "tail":     _cmd_tail,
-            "dispatch": _cmd_dispatch,
-            "daemon":   _cmd_daemon,
-            "watch":    _cmd_watch,
-            "stats":    _cmd_stats,
-            "log":      _cmd_log,
-            "runs":     _cmd_runs,
-            "heartbeat": _cmd_heartbeat,
-            "assignees": _cmd_assignees,
-            "notify-subscribe":   _cmd_notify_subscribe,
-            "notify-list":        _cmd_notify_list,
-            "notify-unsubscribe": _cmd_notify_unsubscribe,
-            "context":  _cmd_context,
-            "specify":  _cmd_specify,
-            "decompose":  _cmd_decompose,
-            "gc":       _cmd_gc,
-        }
-        handler = handlers.get(action)
-        if not handler:
-            print(f"kanban: unknown action {action!r}", file=sys.stderr)
-            return 2
-        try:
-            return int(handler(args) or 0)
-        except (ValueError, RuntimeError) as exc:
-            print(f"kanban: {exc}", file=sys.stderr)
-            return 1
+    handlers = {
+        "init":     _cmd_init,
+        "create":   _cmd_create,
+        "swarm":    _cmd_swarm,
+        "list":     _cmd_list,
+        "ls":       _cmd_list,
+        "show":     _cmd_show,
+        "assign":   _cmd_assign,
+        "reclaim":  _cmd_reclaim,
+        "reassign": _cmd_reassign,
+        "diagnostics": _cmd_diagnostics,
+        "diag":     _cmd_diagnostics,
+        "link":     _cmd_link,
+        "unlink":   _cmd_unlink,
+        "claim":    _cmd_claim,
+        "comment":  _cmd_comment,
+        "attach":   _cmd_attach,
+        "attachments": _cmd_attachments,
+        "attach-rm": _cmd_attach_rm,
+        "complete": _cmd_complete,
+        "edit":     _cmd_edit,
+        "block":    _cmd_block,
+        "schedule": _cmd_schedule,
+        "unblock":  _cmd_unblock,
+        "promote":  _cmd_promote,
+        "archive":  _cmd_archive,
+        "tail":     _cmd_tail,
+        "dispatch": _cmd_dispatch,
+        "daemon":   _cmd_daemon,
+        "watch":    _cmd_watch,
+        "stats":    _cmd_stats,
+        "log":      _cmd_log,
+        "runs":     _cmd_runs,
+        "heartbeat": _cmd_heartbeat,
+        "assignees": _cmd_assignees,
+        "notify-subscribe":   _cmd_notify_subscribe,
+        "notify-list":        _cmd_notify_list,
+        "notify-unsubscribe": _cmd_notify_unsubscribe,
+        "context":  _cmd_context,
+        "specify":  _cmd_specify,
+        "decompose":  _cmd_decompose,
+        "gc":       _cmd_gc,
+    }
+    handler = handlers.get(action)
+    if not handler:
+        print(f"kanban: unknown action {action!r}", file=sys.stderr)
+        return 2
+    try:
+        return int(handler(args) or 0)
+    except (ValueError, RuntimeError) as exc:
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 1
 
 
 # ---------------------------------------------------------------------------
@@ -1167,210 +1049,8 @@ def _profile_author() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Boards management (hermes kanban boards …)
-# ---------------------------------------------------------------------------
-
-def _dispatch_boards(args: argparse.Namespace) -> int:
-    """Handle ``hermes kanban boards <action>``.
-
-    Boards management is deliberately separate from the task-level
-    commands: it operates on the filesystem (board directories,
-    ``current`` pointer, ``board.json``), not on the per-board SQLite
-    DB, so a fresh HERMES_HOME that has never called ``kanban init``
-    can still run ``boards create`` / ``boards list``.
-    """
-    sub = getattr(args, "boards_action", None) or "list"
-    if sub in {"list", "ls"}:
-        return _cmd_boards_list(args)
-    if sub in {"create", "new"}:
-        return _cmd_boards_create(args)
-    if sub in {"rm", "remove", "delete"}:
-        return _cmd_boards_rm(args)
-    if sub in {"switch", "use"}:
-        return _cmd_boards_switch(args)
-    if sub in {"show", "current"}:
-        return _cmd_boards_show(args)
-    if sub == "rename":
-        return _cmd_boards_rename(args)
-    if sub == "set-default-workdir":
-        return _cmd_boards_set_default_workdir(args)
-    print(f"kanban boards: unknown action {sub!r}", file=sys.stderr)
-    return 2
-
-
-def _board_task_counts(slug: str) -> dict[str, int]:
-    """Return ``{status: count}`` for a board. Safe to call on an empty DB."""
-    try:
-        path = kb.kanban_db_path(board=slug)
-        if not path.exists():
-            return {}
-        with kb.connect_closing(board=slug) as conn:
-            rows = conn.execute(
-                "SELECT status, COUNT(*) AS n FROM tasks GROUP BY status"
-            ).fetchall()
-        return {r["status"]: int(r["n"]) for r in rows}
-    except Exception:
-        return {}
-
-
-def _cmd_boards_list(args: argparse.Namespace) -> int:
-    include_archived = bool(getattr(args, "all", False))
-    boards = kb.list_boards(include_archived=include_archived)
-    # Enrich each entry with task counts + whether it's the current board.
-    current = kb.get_current_board()
-    for b in boards:
-        b["is_current"] = (b["slug"] == current)
-        b["counts"] = _board_task_counts(b["slug"])
-        b["total"] = sum(b["counts"].values())
-    if getattr(args, "json", False):
-        print(json.dumps(boards, indent=2, ensure_ascii=False))
-        return 0
-    # Human table: marker (•) for current, slug, display name, counts.
-    if not boards:
-        print("(no boards — create one with `hermes kanban boards create <slug>`)")
-        return 0
-    print(f"{'':2s}  {'SLUG':24s}  {'NAME':28s}  COUNTS")
-    for b in boards:
-        marker = "●" if b["is_current"] else " "
-        counts = b["counts"] or {}
-        counts_str = (
-            ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
-            or "(empty)"
-        )
-        name = b.get("name") or ""
-        if b.get("archived"):
-            name += " [archived]"
-        print(f"{marker:2s}  {b['slug']:24s}  {name:28s}  {counts_str}")
-    print()
-    print(f"Current board: {current}")
-    if len(boards) > 1:
-        print("Switch boards with `hermes kanban boards switch <slug>`.")
-    return 0
-
-
-def _cmd_boards_create(args: argparse.Namespace) -> int:
-    try:
-        normed = kb._normalize_board_slug(args.slug)
-    except ValueError as exc:
-        print(f"kanban boards create: {exc}", file=sys.stderr)
-        return 2
-    if not normed:
-        print("kanban boards create: slug is required", file=sys.stderr)
-        return 2
-    already = kb.board_exists(normed) and normed != kb.DEFAULT_BOARD
-    meta = kb.create_board(
-        normed,
-        name=args.name,
-        description=args.description,
-        icon=args.icon,
-        color=args.color,
-        default_workdir=args.default_workdir,
-    )
-    verb = "already exists" if already else "created"
-    print(f"Board {meta['slug']!r} {verb}.")
-    print(f"  Display name: {meta.get('name', '')}")
-    print(f"  DB path:      {meta['db_path']}")
-    if getattr(args, "switch", False):
-        kb.set_current_board(meta["slug"])
-        print(f"  Switched to {meta['slug']!r}.")
-    else:
-        print(f"  Use `hermes kanban boards switch {meta['slug']}` to make it current.")
-    return 0
-
-
-def _cmd_boards_rm(args: argparse.Namespace) -> int:
-    # When the user runs `hermes kanban boards delete <slug>` (alias), the
-    # boards_action is 'delete' but args.delete is never set to True because
-    # the --delete flag belongs to the 'rm' subparser only.  Detect the alias
-    # and treat it identically to `boards rm --delete` (fixes #23139).
-    force_delete = getattr(args, "delete", False) or getattr(args, "boards_action", "") == "delete"
-    try:
-        res = kb.remove_board(args.slug, archive=not force_delete)
-    except ValueError as exc:
-        print(f"kanban boards rm: {exc}", file=sys.stderr)
-        return 1
-    if res["action"] == "archived":
-        print(f"Board {res['slug']!r} archived → {res['new_path']}")
-        print("Recover by moving the directory back to "
-              "<root>/kanban/boards/<slug>/.")
-    else:
-        print(f"Board {res['slug']!r} deleted.")
-    return 0
-
-
-def _cmd_boards_switch(args: argparse.Namespace) -> int:
-    try:
-        normed = kb._normalize_board_slug(args.slug)
-    except ValueError as exc:
-        print(f"kanban boards switch: {exc}", file=sys.stderr)
-        return 2
-    if not normed:
-        print("kanban boards switch: slug is required", file=sys.stderr)
-        return 2
-    if not kb.board_exists(normed):
-        print(
-            f"kanban boards switch: board {normed!r} does not exist. "
-            f"Create it with `hermes kanban boards create {normed}`.",
-            file=sys.stderr,
-        )
-        return 1
-    kb.set_current_board(normed)
-    print(f"Active board is now {normed!r}.")
-    return 0
-
-
-def _cmd_boards_show(args: argparse.Namespace) -> int:
-    current = kb.get_current_board()
-    meta = kb.read_board_metadata(current)
-    counts = _board_task_counts(current)
-    total = sum(counts.values())
-    print(f"Current board: {current}")
-    print(f"  Display name: {meta.get('name', '')}")
-    if meta.get("description"):
-        print(f"  Description:  {meta['description']}")
-    print(f"  DB path:      {meta['db_path']}")
-    print(f"  Tasks:        {total} total"
-          + (f" ({', '.join(f'{k}={v}' for k, v in sorted(counts.items()))})"
-             if counts else ""))
-    return 0
-
-
-def _cmd_boards_rename(args: argparse.Namespace) -> int:
-    try:
-        normed = kb._normalize_board_slug(args.slug)
-    except ValueError as exc:
-        print(f"kanban boards rename: {exc}", file=sys.stderr)
-        return 2
-    if not normed or not kb.board_exists(normed):
-        print(f"kanban boards rename: board {args.slug!r} does not exist",
-              file=sys.stderr)
-        return 1
-    meta = kb.write_board_metadata(normed, name=args.name)
-    print(f"Board {normed!r} renamed to {meta['name']!r}.")
-    return 0
-
-
-def _cmd_boards_set_default_workdir(args: argparse.Namespace) -> int:
-    try:
-        normed = kb._normalize_board_slug(args.slug)
-    except ValueError as exc:
-        print(f"kanban boards set-default-workdir: {exc}", file=sys.stderr)
-        return 2
-    if not normed or not kb.board_exists(normed):
-        print(f"kanban boards set-default-workdir: board {args.slug!r} does not exist",
-              file=sys.stderr)
-        return 1
-    meta = kb.write_board_metadata(normed, default_workdir=args.path)
-    new_val = meta.get("default_workdir")
-    if new_val:
-        print(f"Board {normed!r} default workdir set to {new_val!r}.")
-    else:
-        print(f"Board {normed!r} default workdir cleared.")
-    return 0
-
 
 # ---------------------------------------------------------------------------
-
 
 def _parse_duration(val) -> Optional[int]:
     """Parse ``30s`` / ``5m`` / ``2h`` / ``1d`` or a raw integer → seconds.
@@ -1465,6 +1145,50 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
     return 0
 
 
+def _store_cli_origin_routing(conn, task_id: str, channel_flag: str) -> None:
+    """Parse --channel flag and store origin routing via kanban_db.
+
+    Format: platform:chat_id[:thread_id]
+    """
+    parts = channel_flag.split(":", 1)
+    platform = parts[0].strip().lower()
+    chat_id = ""
+    thread_id = ""
+    if len(parts) > 1:
+        remaining = parts[1].strip()
+        # Try to extract thread_id from the remaining part.
+        # Platform-specific parsing: try numeric:thread format
+        colon_idx = remaining.rfind(":")
+        if colon_idx > 0:
+            maybe_chat = remaining[:colon_idx].strip()
+            maybe_thread = remaining[colon_idx + 1:].strip()
+            # Heuristic: if the last segment looks like a thread_id
+            # (numeric, starts with -, or contains topic), use it.
+            # Otherwise treat the whole thing as chat_id.
+            if maybe_thread and (maybe_thread.lstrip("-").isdigit() or maybe_thread.startswith("topic ")):
+                chat_id = maybe_chat
+                thread_id = maybe_thread
+            else:
+                chat_id = remaining
+        else:
+            chat_id = remaining
+    if not platform or not chat_id:
+        print(
+            f"kanban: --channel requires format 'platform:chat_id[:thread_id]'. "
+            f"Got: '{channel_flag}'",
+            file=sys.stderr,
+        )
+        return
+    try:
+        kb.store_origin_routing(
+            conn, task_id,
+            platform=platform, chat_id=chat_id,
+            thread_id=thread_id or "",
+        )
+    except Exception as exc:
+        print(f"kanban: failed to store origin routing: {exc}", file=sys.stderr)
+
+
 def _cmd_create(args: argparse.Namespace) -> int:
     try:
         ws_kind, ws_path = _parse_workspace_flag(args.workspace)
@@ -1512,6 +1236,10 @@ def _cmd_create(args: argparse.Namespace) -> int:
             initial_status=getattr(args, "initial_status", "running"),
         )
         task = kb.get_task(conn, task_id)
+        # Store origin routing for CLI-created tasks when --channel is set.
+        channel_flag = getattr(args, "channel", None)
+        if channel_flag:
+            _store_cli_origin_routing(conn, task_id, channel_flag)
     if getattr(args, "json", False):
         print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))
     else:
@@ -1570,7 +1298,7 @@ def _cmd_list(args: argparse.Namespace) -> int:
     assignee = args.assignee
     if args.mine and not assignee:
         assignee = _profile_author()
-    with kb.connect_closing(board=args.board) as conn:
+    with kb.connect_closing(board=None) as conn:
         # dependencies that may have cleared since the last dispatcher tick.
         kb.recompute_ready(conn)
         tasks = kb.list_tasks(
@@ -1589,19 +1317,6 @@ def _cmd_list(args: argparse.Namespace) -> int:
         return 0
     # Passive discoverability: when the user has multiple boards, surface
     # which one they're looking at in the list header. Single-board users
-    # never see this — the feature stays invisible until you opt in.
-    try:
-        all_boards = kb.list_boards(include_archived=False)
-    except Exception:
-        all_boards = []
-    if len(all_boards) > 1:
-        current = kb.get_current_board()
-        other_count = len(all_boards) - 1
-        print(
-            f"Board: {current} "
-            f"({other_count} other board{'s' if other_count != 1 else ''} — "
-            f"`hermes kanban boards list`)\n"
-        )
     if not tasks:
         print("(no matching tasks)")
         return 0
@@ -1618,7 +1333,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
-    with kb.connect_closing(board=args.board) as conn:
+    with kb.connect_closing(board=None) as conn:
         task = kb.get_task(conn, args.task_id)
         if not task:
             print(f"no such task: {args.task_id}", file=sys.stderr)

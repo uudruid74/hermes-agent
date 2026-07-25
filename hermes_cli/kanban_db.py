@@ -8,19 +8,10 @@ the cross-profile coordination primitive. A worker spawned with
 claimed the task. The same applies to ``<root>/kanban/workspaces/`` and
 ``<root>/kanban/logs/``.
 
-**Multiple boards (projects):** users can create additional boards to
-separate unrelated streams of work (e.g. one per project / repo / domain).
-Each board is a directory under ``<root>/kanban/boards/<slug>/`` with
-its own ``kanban.db``, ``workspaces/``, and ``logs/``. All boards share
-the profile's Hermes home but are otherwise isolated: a worker spawned
-for a task on board ``atm10-server`` sees only that board's tasks,
-cannot enumerate other boards, and its dispatcher ticks don't touch
-other boards' DBs.
-
-The first (and for single-project users, only) board is ``default``.
-For back-compat its on-disk DB is ``<root>/kanban.db`` (not
-``boards/default/kanban.db``), so installs that predate the boards
-feature keep working with zero migration. See :func:`kanban_db_path`.
+There is a single storage backend for all tasks. The ``board``
+parameter is accepted by many functions for backward compatibility
+with callers that still pass it, but is ignored — all tasks live
+in the flat ``kanban.db``.
 
 Board resolution order (highest precedence first, all optional):
 
@@ -392,12 +383,11 @@ def kanban_home() -> Path:
 
 
 def boards_root() -> Path:
-    """Return ``<root>/kanban/boards`` — the parent of non-default board dirs.
+    """Return ``<root>/kanban/boards`` — the legacy board metadata directory.
 
-    ``default`` is intentionally NOT under this directory — its DB lives at
-    ``<root>/kanban.db`` for back-compat with pre-boards installs. This
-    function returns the directory where *additional* named boards live,
-    used by :func:`list_boards` to enumerate them.
+    Kept for backward compatibility with code that references board
+    directories. In the unified single-DB model this path is not used
+    for data storage.
     """
     return kanban_home() / "kanban" / "boards"
 
@@ -509,29 +499,18 @@ def clear_current_board() -> None:
 
 
 def board_dir(board: Optional[str] = None) -> Path:
-    """Return the on-disk directory for ``board``.
+    """Return the on-disk directory for ``board`` (backward-compat stub).
 
-    ``default`` is ``<root>/kanban/boards/default/`` **for metadata only**
-    (board.json + workspaces/ + logs/). Its DB file stays at
-    ``<root>/kanban.db`` for back-compat — see :func:`kanban_db_path`.
-
-    All other boards live at ``<root>/kanban/boards/<slug>/`` with
-    everything inside that directory including the ``kanban.db``.
+    The ``board`` parameter is accepted for backward compatibility
+    but is ignored — all storage lives under the flat kanban paths.
     """
     slug = _normalize_board_slug(board) or DEFAULT_BOARD
     return boards_root() / slug
 
 
 def board_exists(board: Optional[str] = None) -> bool:
-    """Return True if the board has persisted metadata or a DB on disk.
-
-    ``default`` is considered to always exist — its DB is created
-    on first :func:`connect` and there's no way for it to be missing
-    in a configuration where the kanban feature is usable at all.
-    """
+    """Return True if the board has persisted metadata or a DB on disk."""
     slug = _normalize_board_slug(board) or DEFAULT_BOARD
-    if slug == DEFAULT_BOARD:
-        return True
     d = board_dir(slug)
     return (d / "board.json").exists() or (d / "kanban.db").exists()
 
@@ -573,8 +552,6 @@ def kanban_db_path(board: Optional[str] = None) -> Path:
     slug = _normalize_board_slug(board)
     if slug is None:
         slug = get_current_board()
-    if slug == DEFAULT_BOARD:
-        return kanban_home() / "kanban.db"
     return board_dir(slug) / "kanban.db"
 
 
@@ -585,9 +562,7 @@ def workspaces_root(board: Optional[str] = None) -> Path:
     ``HERMES_KANBAN_WORKSPACES_ROOT`` pins the path directly (highest
     precedence) — the dispatcher injects this into worker env.
 
-    ``default`` keeps the legacy path ``<root>/kanban/workspaces/`` so
-    that existing scratch workspaces from before the boards feature are
-    preserved. Other boards use ``<root>/kanban/boards/<slug>/workspaces/``.
+    All boards use ``<root>/kanban/boards/<slug>/workspaces/``.
     """
     override = os.environ.get("HERMES_KANBAN_WORKSPACES_ROOT", "").strip()
     if override:
@@ -595,8 +570,6 @@ def workspaces_root(board: Optional[str] = None) -> Path:
     slug = _normalize_board_slug(board)
     if slug is None:
         slug = get_current_board()
-    if slug == DEFAULT_BOARD:
-        return kanban_home() / "kanban" / "workspaces"
     return board_dir(slug) / "workspaces"
 
 
@@ -625,8 +598,6 @@ def attachments_root(board: Optional[str] = None) -> Path:
     slug = _normalize_board_slug(board)
     if slug is None:
         slug = get_current_board()
-    if slug == DEFAULT_BOARD:
-        return kanban_home() / "kanban" / "attachments"
     return board_dir(slug) / "attachments"
 
 
@@ -638,16 +609,13 @@ def task_attachments_dir(task_id: str, board: Optional[str] = None) -> Path:
 def worker_logs_dir(board: Optional[str] = None) -> Path:
     """Return the directory under which per-task worker logs are written.
 
-    ``default`` keeps the legacy path ``<root>/kanban/logs/``. Other
-    boards use ``<root>/kanban/boards/<slug>/logs/``. Logs follow the
+    All boards use ``<root>/kanban/boards/<slug>/logs/``. Logs follow the
     board — makes ``hermes kanban log`` unambiguous even when multiple
     boards have tasks with the same id.
     """
     slug = _normalize_board_slug(board)
     if slug is None:
         slug = get_current_board()
-    if slug == DEFAULT_BOARD:
-        return kanban_home() / "kanban" / "logs"
     return board_dir(slug) / "logs"
 
 
@@ -782,47 +750,12 @@ def create_board(
 
 
 def list_boards(*, include_archived: bool = True) -> list[dict]:
-    """Enumerate all boards that exist on disk.
+    """Always returns a single-element list: the default board metadata.
 
-    Always includes ``default`` (even when the ``boards/default/``
-    metadata dir doesn't exist, because its DB is at the legacy path).
-    Other boards are discovered by scanning ``boards/`` for subdirectories
-    that either contain a ``kanban.db`` or a ``board.json``.
-
-    Returns a list of metadata dicts, sorted with ``default`` first and
-    the rest alphabetically.
+    There is only one storage backend. Callers that iterate boards
+    will process the single (default) board and nothing else.
     """
-    entries: list[dict] = []
-    seen: set[str] = set()
-
-    # Default board is always first.
-    entries.append(read_board_metadata(DEFAULT_BOARD))
-    seen.add(DEFAULT_BOARD)
-
-    root = boards_root()
-    if root.is_dir():
-        for child in sorted(root.iterdir(), key=lambda p: p.name.lower()):
-            if not child.is_dir():
-                continue
-            slug = child.name
-            # Keep slug normalisation soft for discovery — but skip dirs
-            # that don't parse as valid slugs so we don't surface junk.
-            try:
-                normed = _normalize_board_slug(slug)
-            except ValueError:
-                continue
-            if not normed or normed in seen:
-                continue
-            has_db = (child / "kanban.db").exists()
-            has_meta = (child / "board.json").exists()
-            if not (has_db or has_meta):
-                continue
-            meta = read_board_metadata(normed)
-            if meta.get("archived") and not include_archived:
-                continue
-            entries.append(meta)
-            seen.add(normed)
-    return entries
+    return [read_board_metadata(DEFAULT_BOARD)]
 
 
 def remove_board(slug: str, *, archive: bool = True) -> dict:
