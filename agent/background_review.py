@@ -672,6 +672,17 @@ def _run_review_in_thread(
             # -> codex_responses downgrade is applied inside the resolver.
             _rt = _resolve_review_runtime(agent)
             _routed = bool(_rt.get("routed"))
+            # Resolve worker temperature for the review fork.
+            # The review is a background task — it should use the
+            # profile's worker_temperature, not the main session
+            # temperature.  Read from config so profiles can set a
+            # colder, more deterministic temp for background work.
+            _review_temp = None
+            try:
+                from hermes_cli.config import load_config as _br_cfg_load, cfg_get as _br_cfg_get
+                _review_temp = _br_cfg_get(_br_cfg_load(), "agent", "worker_temperature", default=None)
+            except Exception:
+                pass
             # skip_memory=True keeps the review fork from
             # touching external memory plugins (honcho, mem0,
             # supermemory, etc.).  Without it, the fork's
@@ -724,6 +735,7 @@ def _run_review_in_thread(
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                 skip_memory=True,
+                temperature=_review_temp,
                 **_fork_kwargs,
             )
             review_agent._memory_write_origin = "background_review"
