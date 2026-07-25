@@ -14,7 +14,7 @@ Values outside [0.0, 2.0] are rejected (no change, current value returned).
 """
 
 import json
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 
 def _is_kimi_provider(agent) -> bool:
@@ -57,11 +57,30 @@ def adjust_temperature_tool(temperature: float, agent) -> str:
             "previous": previous,
         })
 
+    # Out of range → no change. Get the actual running temperature.
+    current = _get_current_temperature(agent)
     return json.dumps({
-        "temperature": previous,
+        "temperature": current,
         "changed": False,
-        "previous": previous,
+        "previous": current,
     })
+
+
+def _get_current_temperature(agent) -> Optional[float]:
+    """Resolve the agent's actual current temperature."""
+    # Session override (set by this tool)
+    session = getattr(agent, "_session_temperature", None)
+    if session is not None:
+        return session
+    # Profile default
+    profile = getattr(agent, "_temperature", None)
+    if profile is not None:
+        return profile
+    # Worker temperature (kanban/delegated)
+    worker = getattr(agent, "worker_temperature", None)
+    if worker is not None:
+        return worker
+    return None
 
 
 # --- Schema ---
