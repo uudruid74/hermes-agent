@@ -9,7 +9,7 @@ from hermes_cli import kanban_db as kb
 
 def _make_legacy_db(path: Path) -> None:
     """Write a kanban DB with the pre-AUTOINCREMENT (TEXT PK) schema for the
-    four tables #35096 affects, keeping every other table current so the
+    three tables #35096 affects, keeping every other table current so the
     additive-column migration runs cleanly on top.
     """
     conn = sqlite3.connect(str(path))
@@ -19,17 +19,12 @@ def _make_legacy_db(path: Path) -> None:
         DROP TABLE task_events;
         DROP TABLE task_comments;
         DROP TABLE task_runs;
-        DROP TABLE kanban_notify_subs;
         CREATE TABLE task_comments (id TEXT PRIMARY KEY, task_id TEXT NOT NULL,
             author TEXT NOT NULL, body TEXT NOT NULL, created_at INTEGER NOT NULL);
         CREATE TABLE task_events (id TEXT PRIMARY KEY, task_id TEXT NOT NULL,
             kind TEXT NOT NULL, payload TEXT, created_at INTEGER NOT NULL);
         CREATE TABLE task_runs (id TEXT PRIMARY KEY, task_id TEXT NOT NULL,
             profile TEXT, status TEXT NOT NULL, started_at INTEGER NOT NULL);
-        CREATE TABLE kanban_notify_subs (task_id TEXT NOT NULL, platform TEXT NOT NULL,
-            chat_id TEXT NOT NULL, thread_id TEXT NOT NULL DEFAULT '', user_id TEXT,
-            created_at INTEGER NOT NULL, last_event_id TEXT,
-            PRIMARY KEY (task_id, platform, chat_id, thread_id));
         """
     )
     conn.execute("INSERT INTO tasks (id, title, status, created_at) VALUES ('task-1', 'T', 'done', 1000)")
@@ -37,10 +32,6 @@ def _make_legacy_db(path: Path) -> None:
     conn.execute("INSERT INTO task_events VALUES ('e-1', 'task-1', 'completed', NULL, 2000)")
     conn.execute("INSERT INTO task_events VALUES ('e-2', 'task-1', 'blocked', NULL, 2100)")
     conn.execute("INSERT INTO task_runs VALUES ('r-1', 'task-1', 'default', 'done', 1000)")
-    conn.execute(
-        "INSERT INTO kanban_notify_subs (task_id, platform, chat_id, created_at, last_event_id) "
-        "VALUES ('task-1', 'telegram', '123', 1000, 'e-1')"
-    )
     conn.commit()
     conn.close()
 
@@ -113,20 +104,15 @@ def test_legacy_text_pk_tables_rebuilt_to_integer_autoincrement(tmp_path, monkey
             id_col = {r["name"]: r for r in conn.execute(f"PRAGMA table_info({table})")}["id"]
             assert id_col["type"].upper() == "INTEGER" and id_col["pk"] == 1
 
-        lei = {r["name"]: r for r in conn.execute("PRAGMA table_info(kanban_notify_subs)")}
-        assert lei["last_event_id"]["type"].upper() == "INTEGER"
-
         # Data preserved across the rebuild.
         assert len(conn.execute("SELECT * FROM task_events").fetchall()) == 2
         assert conn.execute("SELECT body FROM task_comments").fetchone()["body"] == "hi"
         assert len(conn.execute("SELECT * FROM task_runs").fetchall()) == 1
-        # Non-numeric legacy cursor ("e-1") casts to 0.
-        assert conn.execute("SELECT last_event_id FROM kanban_notify_subs").fetchone()["last_event_id"] == 0
 
         # Indexes restored, including idx_events_run (added by the additive pass).
         indexes = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")}
         for name in ("idx_events_task", "idx_events_run", "idx_comments_task",
-                     "idx_runs_task", "idx_runs_status", "idx_notify_task"):
+                     "idx_runs_task", "idx_runs_status"):
             assert name in indexes
 
         # AUTOINCREMENT actually works after the rebuild.
@@ -145,7 +131,7 @@ def test_rebuilt_schema_matches_fresh_db(tmp_path, monkeypatch):
     kb._INITIALIZED_PATHS.discard(str(fresh_path.resolve()))
 
     with kb.connect(legacy_path) as migrated, kb.connect(fresh_path) as fresh:
-        for table in ("task_events", "task_comments", "task_runs", "kanban_notify_subs"):
+        for table in ("task_events", "task_comments", "task_runs"):
             assert _table_struct(migrated, table) == _table_struct(fresh, table)
 
 
@@ -161,17 +147,3 @@ def test_migration_is_idempotent(tmp_path, monkeypatch):
         id_col = {r["name"]: r for r in conn.execute("PRAGMA table_info(task_events)")}["id"]
         assert id_col["type"].upper() == "INTEGER"
         assert len(conn.execute("SELECT * FROM task_events").fetchall()) == 2
-
-
-def test_unseen_events_for_sub_survives_migrated_db(tmp_path, monkeypatch):
-    """The crash that motivated #35096 — ``int(None)`` on a NULL cursor — is
-    gone after migration; the notifier query returns an integer cursor."""
-    db_path = _setup_home(tmp_path, monkeypatch)
-    _make_legacy_db(db_path)
-
-    with kb.connect(db_path) as conn:
-        cursor, events = kb.unseen_events_for_sub(
-            conn, task_id="task-1", platform="telegram", chat_id="123"
-        )
-        assert isinstance(cursor, int)
-        assert isinstance(events, list)

@@ -65,7 +65,7 @@ GIMP has a Canvas. You paint on it. You click a button called "Snapshot." A Unix
 - The last GEGL operation and its parameters (read via GTK widget introspection — no screen scraping)
 - A PNG diff of the changed canvas area
 
-That payload arrives in my session as a **continuation turn** — as if you typed it. No memory re-init. No context dump. No breaking the creative flow state. I just *see* what you did, with my own native vision (DeepSeek V4-Flash at $0.000013/image) and the tool data fed right off the layer stack.
+That payload arrives in my session as a **continuation turn** — as if you typed it. No memory re-init. No context dump. No breaking the creative flow state. I just *see* what you did, with my own vision pipeline (DeepSeek V4-Flash via vision_analyze at $0.000013/image) and the tool data fed right off the layer stack.
 
 I am now both orchestrator and student. You paint, I watch, I write skills from what I learn. **One demonstration = one reusable skill, forever.**
 
@@ -140,7 +140,7 @@ Six stores, each with a different access cost. The system prompt (`Memory OS`) r
 ## The Technology Stack
 
 - **Fork base:** Hermes Agent by Nous Research (upstream `main`, ~922 commits ahead at fork time)
-- **Model:** DeepSeek V4-Flash (primary, native vision), GLM5.2 (Wintermute — terrifying compliance enforcement)
+- **Model:** DeepSeek V4-Flash (primary, vision via vision_analyze), GLM5.2 (Wintermute — terrifying compliance enforcement)
 - **Provider:** Custom DeepSeek endpoint (the real one, not the censored OpenRouter version)
 - **Orchestration:** Kanban board + CLI (profile-aware routing, no group chat needed)
 - **Real-time:** Unix domain sockets → MCP tools → continuation feed injection

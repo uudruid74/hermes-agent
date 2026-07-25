@@ -502,103 +502,60 @@ def board_dir(board: Optional[str] = None) -> Path:
     """Return the on-disk directory for ``board`` (backward-compat stub).
 
     The ``board`` parameter is accepted for backward compatibility
-    but is ignored — all storage lives under the flat kanban paths.
+    but is ignored — there is only one flat kanban database.
     """
-    slug = _normalize_board_slug(board) or DEFAULT_BOARD
-    return boards_root() / slug
+    return kanban_home() / "kanban" / "boards" / "default"
 
 
 def board_exists(board: Optional[str] = None) -> bool:
-    """Return True if the board has persisted metadata or a DB on disk."""
-    slug = _normalize_board_slug(board) or DEFAULT_BOARD
-    d = board_dir(slug)
-    return (d / "board.json").exists() or (d / "kanban.db").exists()
+    """Return True — backward-compat stub, all tasks live in flat DB."""
+    return True
 
 
 def kanban_db_path(board: Optional[str] = None) -> Path:
-    """Return the path to the ``kanban.db`` for ``board``.
+    """Return the path to the single flat ``kanban.db``.
 
-    Resolution (highest precedence first):
+    Always returns ``<root>/kanban.db``. The ``board`` parameter is
+    accepted for backward compatibility but is ignored — all tasks
+    live in one flat database.
 
-    1. In-process scoped override (``--board`` flag, ContextVar) — when set,
-       this overtakes even ``HERMES_KANBAN_DB`` so that explicit
-       ``--board`` routing always wins, even in dispatcher-injected
-       environments.
-    2. ``HERMES_KANBAN_DB`` env var — pins the path directly. Honoured for
-       back-compat and for the dispatcher→worker handoff (defense in
-       depth: dispatcher injects this into worker env so workers are
-       immune to any path-resolution disagreement). Bypassed when a
-       scoped override (1) or explicit ``board`` arg is present.
-    3. When ``board`` arg is None, the active board from
-       :func:`get_current_board` is used.
-    4. Board ``default`` → ``<root>/kanban.db`` (back-compat path).
-       Other boards → ``<root>/kanban/boards/<slug>/kanban.db``.
+    ``HERMES_KANBAN_DB`` env var, when set, pins the path directly
+    (used by the dispatcher for worker handoff).
     """
-    # 1. In-process scoped override: the ``--board`` flag sets a ContextVar
-    #    via ``scoped_current_board()``. When present, use the scoped slug
-    #    as if ``board=`` had been passed explicitly — this makes
-    #    ``--board`` work even when ``HERMES_KANBAN_DB`` is in the env.
-    if board is None:
-        scoped = (_CURRENT_BOARD_OVERRIDE.get() or "").strip()
-        if scoped:
-            try:
-                board = _normalize_board_slug(scoped)
-            except ValueError:
-                pass
-
     override = os.environ.get("HERMES_KANBAN_DB", "").strip()
-    if override and board is None:
+    if override:
         return Path(override).expanduser()
-    slug = _normalize_board_slug(board)
-    if slug is None:
-        slug = get_current_board()
-    return board_dir(slug) / "kanban.db"
+    return kanban_home() / "kanban.db"
 
 
 def workspaces_root(board: Optional[str] = None) -> Path:
-    """Return the directory under which ``scratch`` workspaces are created.
+    """Return the directory under which task workspaces are created.
 
-    Anchored per-board so workspaces don't leak between projects.
+    Always returns ``<root>/kanban/workspaces/``. The ``board`` parameter
+    is accepted for backward compatibility but is ignored.
+
     ``HERMES_KANBAN_WORKSPACES_ROOT`` pins the path directly (highest
     precedence) — the dispatcher injects this into worker env.
-
-    All boards use ``<root>/kanban/boards/<slug>/workspaces/``.
     """
     override = os.environ.get("HERMES_KANBAN_WORKSPACES_ROOT", "").strip()
     if override:
         return Path(override).expanduser()
-    slug = _normalize_board_slug(board)
-    if slug is None:
-        slug = get_current_board()
-    return board_dir(slug) / "workspaces"
+    return kanban_home() / "kanban" / "workspaces"
 
 
 def attachments_root(board: Optional[str] = None) -> Path:
     """Return the directory under which task file attachments are stored.
 
-    Mirrors :func:`worker_logs_dir` / :func:`workspaces_root`: anchored
-    per-board so attachments don't leak between projects. Each task gets
-    its own ``<root>/.../attachments/<task_id>/`` subdirectory.
+    Always returns ``<root>/kanban/attachments/``. The ``board`` parameter
+    is accepted for backward compatibility but is ignored.
 
     ``HERMES_KANBAN_ATTACHMENTS_ROOT`` pins the path directly (highest
     precedence) for tests and unusual deployments.
-
-    ``default`` uses ``<root>/kanban/attachments/``; other boards use
-    ``<root>/kanban/boards/<slug>/attachments/``.
-
-    Workers (which run with full file-tool access) read attached files
-    by the absolute path surfaced in :func:`build_worker_context`. On the
-    local terminal backend — the default for kanban — that path resolves
-    directly. Remote backends (Docker/Modal) need this directory mounted;
-    see the kanban docs.
     """
     override = os.environ.get("HERMES_KANBAN_ATTACHMENTS_ROOT", "").strip()
     if override:
         return Path(override).expanduser()
-    slug = _normalize_board_slug(board)
-    if slug is None:
-        slug = get_current_board()
-    return board_dir(slug) / "attachments"
+    return kanban_home() / "kanban" / "attachments"
 
 
 def task_attachments_dir(task_id: str, board: Optional[str] = None) -> Path:
@@ -609,14 +566,10 @@ def task_attachments_dir(task_id: str, board: Optional[str] = None) -> Path:
 def worker_logs_dir(board: Optional[str] = None) -> Path:
     """Return the directory under which per-task worker logs are written.
 
-    All boards use ``<root>/kanban/boards/<slug>/logs/``. Logs follow the
-    board — makes ``hermes kanban log`` unambiguous even when multiple
-    boards have tasks with the same id.
+    Always returns ``<root>/kanban/logs/``. The ``board`` parameter
+    is accepted for backward compatibility but is ignored.
     """
-    slug = _normalize_board_slug(board)
-    if slug is None:
-        slug = get_current_board()
-    return board_dir(slug) / "logs"
+    return kanban_home() / "kanban" / "logs"
 
 
 def board_metadata_path(board: Optional[str] = None) -> Path:
@@ -1220,24 +1173,6 @@ CREATE TABLE IF NOT EXISTS task_attachments (
     uploaded_by  TEXT,
     created_at   INTEGER NOT NULL
 );
-
--- Subscription from a gateway source (platform + chat + thread) to a
--- task. The gateway's kanban-notifier watcher tails task_events and
--- pushes ``completed`` / ``blocked`` / ``spawn_auto_blocked`` events to
--- the original requester so human-in-the-loop workflows close the loop.
-CREATE TABLE IF NOT EXISTS kanban_notify_subs (
-    task_id       TEXT NOT NULL,
-    platform      TEXT NOT NULL,
-    chat_id       TEXT NOT NULL,
-    thread_id     TEXT NOT NULL DEFAULT '',
-    user_id       TEXT,
-    notifier_profile TEXT,
-    created_at    INTEGER NOT NULL,
-    last_event_id INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (task_id, platform, chat_id, thread_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
 CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
@@ -1246,7 +1181,6 @@ CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, cre
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
-CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 """
 
 
@@ -2323,18 +2257,6 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         "ON task_events(run_id, id)"
     )
 
-    notify_table_exists = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='kanban_notify_subs'"
-    ).fetchone() is not None
-    if notify_table_exists:
-        notify_cols = {
-            row["name"] for row in conn.execute("PRAGMA table_info(kanban_notify_subs)")
-        }
-        if "notifier_profile" not in notify_cols:
-            _add_column_if_missing(
-                conn, "kanban_notify_subs", "notifier_profile", "notifier_profile TEXT"
-            )
-
     # One-shot backfill: any task that is 'running' before runs existed
     # had its claim_lock / claim_expires / worker_pid on the task row.
     # Synthesize a matching task_runs row so subsequent end-run / heartbeat
@@ -2408,8 +2330,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     _rebuild_drifted_tables(conn)
 
 
-# Legacy DBs defined these tables with a ``TEXT PRIMARY KEY`` id (or, for
-# ``kanban_notify_subs``, a nullable ``TEXT last_event_id``). The current
+# Legacy DBs defined these tables with a ``TEXT PRIMARY KEY`` id. The current
 # schema uses ``INTEGER PRIMARY KEY AUTOINCREMENT`` / ``INTEGER NOT NULL
 # DEFAULT 0``. ``CREATE TABLE IF NOT EXISTS`` skips existing tables
 # regardless of schema and ``_add_column_if_missing`` only adds columns, so
@@ -2453,15 +2374,6 @@ _REBUILD_SPECS = {
             "CREATE INDEX idx_runs_status ON task_runs(status)",
         ),
     ),
-    "kanban_notify_subs": (
-        "CREATE TABLE kanban_notify_subs ("
-        " task_id TEXT NOT NULL, platform TEXT NOT NULL, chat_id TEXT NOT NULL,"
-        " thread_id TEXT NOT NULL DEFAULT '', user_id TEXT,"
-        " notifier_profile TEXT, created_at INTEGER NOT NULL,"
-        " last_event_id INTEGER NOT NULL DEFAULT 0,"
-        " PRIMARY KEY (task_id, platform, chat_id, thread_id))",
-        ("CREATE INDEX idx_notify_task ON kanban_notify_subs(task_id)",),
-    ),
 }
 
 
@@ -2470,9 +2382,6 @@ def _table_has_drifted(conn: sqlite3.Connection, table: str) -> bool:
     info = conn.execute(f"PRAGMA table_info({table})").fetchall()
     if not info:
         return False  # table absent — nothing to rebuild
-    if table == "kanban_notify_subs":
-        lei = next((c for c in info if c["name"] == "last_event_id"), None)
-        return lei is not None and (lei["type"] or "").upper() != "INTEGER"
     # task_events / task_comments / task_runs: id must be INTEGER and a PK.
     id_col = next((c for c in info if c["name"] == "id"), None)
     if id_col is None:
@@ -2483,9 +2392,7 @@ def _table_has_drifted(conn: sqlite3.Connection, table: str) -> bool:
 def _rebuild_drifted_tables(conn: sqlite3.Connection) -> None:
     """Rebuild any kanban table whose column types drifted from SCHEMA_SQL.
 
-    Old boards crash the gateway notifier (``int(None)`` on a NULL id in
-    ``unseen_events_for_sub``) and never match the ``id > cursor`` filter, so
-    every kanban notification is silently lost (#35096). Each affected table is
+    Old boards may have drifted column types that silently lose data (#35096). Each affected table is
     rebuilt with the standard SQLite pattern — CREATE new → INSERT shared
     columns → DROP old → RENAME — recreating its indexes too (DROP TABLE takes
     them down). The legacy TEXT ids are dropped (they aren't valid integers);
@@ -2511,23 +2418,13 @@ def _rebuild_drifted_tables(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE {table} RENAME TO {table}_legacy")
             conn.execute(create_sql)
             new_cols = {c["name"] for c in conn.execute(f"PRAGMA table_info({table})")}
-            if table == "kanban_notify_subs":
-                # Cast the legacy TEXT cursor to INTEGER; NULL / non-numeric → 0.
-                shared = [c for c in old_cols if c in new_cols and c != "last_event_id"]
-                cols_csv = ", ".join(shared)
-                conn.execute(
-                    f"INSERT INTO {table} ({cols_csv}, last_event_id) "
-                    f"SELECT {cols_csv}, COALESCE(CAST(last_event_id AS INTEGER), 0) "
-                    f"FROM {table}_legacy"
-                )
-            else:
-                # Drop the legacy TEXT id; AUTOINCREMENT reassigns it.
-                shared = [c for c in old_cols if c in new_cols and c != "id"]
-                cols_csv = ", ".join(shared)
-                conn.execute(
-                    f"INSERT INTO {table} ({cols_csv}) "
-                    f"SELECT {cols_csv} FROM {table}_legacy"
-                )
+            # Drop the legacy TEXT id; AUTOINCREMENT reassigns it.
+            shared = [c for c in old_cols if c in new_cols and c != "id"]
+            cols_csv = ", ".join(shared)
+            conn.execute(
+                f"INSERT INTO {table} ({cols_csv}) "
+                f"SELECT {cols_csv} FROM {table}_legacy"
+            )
             conn.execute(f"DROP TABLE {table}_legacy")
             for index_sql in index_sqls:
                 conn.execute(index_sql)
@@ -6020,7 +5917,6 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         return cur.rowcount == 1
 
@@ -6043,7 +5939,6 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
     recompute_ready(conn)
     return True
 
@@ -9212,221 +9107,6 @@ def task_age(task: Task) -> dict:
         "started_age_seconds": age_since_started,
         "time_to_complete_seconds": time_to_complete,
     }
-
-
-# ---------------------------------------------------------------------------
-# Notification subscriptions (used by the gateway kanban-notifier)
-# ---------------------------------------------------------------------------
-
-def add_notify_sub(
-    conn: sqlite3.Connection,
-    *,
-    task_id: str,
-    platform: str,
-    chat_id: str,
-    thread_id: Optional[str] = None,
-    user_id: Optional[str] = None,
-    notifier_profile: Optional[str] = None,
-) -> None:
-    """Register a gateway source that wants terminal-state notifications
-    for ``task_id``. Idempotent on (task, platform, chat, thread)."""
-    now = int(time.time())
-    with write_txn(conn):
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO kanban_notify_subs
-                (task_id, platform, chat_id, thread_id, user_id, notifier_profile, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (task_id, platform, chat_id, thread_id or "", user_id, notifier_profile, now),
-        )
-        if notifier_profile:
-            # Self-heal legacy rows that predate notifier ownership by
-            # backfilling only when the existing value is unset.
-            conn.execute(
-                """
-                UPDATE kanban_notify_subs
-                   SET notifier_profile = ?
-                 WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
-                   AND (notifier_profile IS NULL OR notifier_profile = '')
-                """,
-                (notifier_profile, task_id, platform, chat_id, thread_id or ""),
-            )
-
-
-def list_notify_subs(
-    conn: sqlite3.Connection, task_id: Optional[str] = None,
-) -> list[dict]:
-    if task_id is not None:
-        rows = conn.execute(
-            "SELECT * FROM kanban_notify_subs WHERE task_id = ?", (task_id,),
-        ).fetchall()
-    else:
-        rows = conn.execute("SELECT * FROM kanban_notify_subs").fetchall()
-    return [dict(r) for r in rows]
-
-
-def remove_notify_sub(
-    conn: sqlite3.Connection,
-    *,
-    task_id: str,
-    platform: str,
-    chat_id: str,
-    thread_id: Optional[str] = None,
-) -> bool:
-    with write_txn(conn):
-        cur = conn.execute(
-            "DELETE FROM kanban_notify_subs WHERE task_id = ? "
-            "AND platform = ? AND chat_id = ? AND thread_id = ?",
-            (task_id, platform, chat_id, thread_id or ""),
-        )
-    return cur.rowcount > 0
-
-
-def unseen_events_for_sub(
-    conn: sqlite3.Connection,
-    *,
-    task_id: str,
-    platform: str,
-    chat_id: str,
-    thread_id: Optional[str] = None,
-    kinds: Optional[Iterable[str]] = None,
-) -> tuple[int, list[Event]]:
-    """Return ``(new_cursor, events)`` for a given subscription.
-
-    Only events with ``id > last_event_id`` are returned. The subscription's
-    cursor is NOT advanced here; call :func:`advance_notify_cursor` after
-    the gateway has successfully delivered the notifications.
-    """
-    row = conn.execute(
-        "SELECT last_event_id FROM kanban_notify_subs "
-        "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
-        (task_id, platform, chat_id, thread_id or ""),
-    ).fetchone()
-    if row is None:
-        return 0, []
-    cursor = int(row["last_event_id"])
-    kind_list = list(kinds) if kinds else None
-    q = (
-        "SELECT * FROM task_events WHERE task_id = ? AND id > ? "
-        + ("AND kind IN (" + ",".join("?" * len(kind_list)) + ") " if kind_list else "")
-        + "ORDER BY id ASC"
-    )
-    params: list[Any] = [task_id, cursor]
-    if kind_list:
-        params.extend(kind_list)
-    rows = conn.execute(q, params).fetchall()
-    out: list[Event] = []
-    max_id = cursor
-    for r in rows:
-        try:
-            payload = json.loads(r["payload"]) if r["payload"] else None
-        except Exception:
-            payload = None
-        out.append(Event(
-            id=r["id"], task_id=r["task_id"], kind=r["kind"],
-            payload=payload, created_at=r["created_at"],
-            run_id=(int(r["run_id"]) if "run_id" in r.keys() and r["run_id"] is not None else None),
-        ))
-        max_id = max(max_id, int(r["id"]))
-    return max_id, out
-
-
-def claim_unseen_events_for_sub(
-    conn: sqlite3.Connection,
-    *,
-    task_id: str,
-    platform: str,
-    chat_id: str,
-    thread_id: Optional[str] = None,
-    kinds: Optional[Iterable[str]] = None,
-) -> tuple[int, int, list[Event]]:
-    """Atomically claim unseen notification events for one subscription.
-
-    Returns ``(old_cursor, new_cursor, events)``. When events are returned,
-    ``kanban_notify_subs.last_event_id`` has already been advanced to
-    ``new_cursor`` inside a ``BEGIN IMMEDIATE`` transaction. That makes the
-    notifier's read/claim step single-owner across multiple gateway watcher
-    processes pointed at the same board DB: concurrent watchers serialize on
-    SQLite's writer lock, and only the first process sees and claims a given
-    event range.
-
-    Callers should send the claimed events, then either leave the cursor at
-    ``new_cursor`` on success or call :func:`rewind_notify_cursor` if delivery
-    failed before any terminal unsubscribe removed the row.
-    """
-    with write_txn(conn):
-        row = conn.execute(
-            "SELECT last_event_id FROM kanban_notify_subs "
-            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
-            (task_id, platform, chat_id, thread_id or ""),
-        ).fetchone()
-        if row is None:
-            return 0, 0, []
-        old_cursor = int(row["last_event_id"])
-        new_cursor, events = unseen_events_for_sub(
-            conn,
-            task_id=task_id,
-            platform=platform,
-            chat_id=chat_id,
-            thread_id=thread_id,
-            kinds=kinds,
-        )
-        if not events:
-            return old_cursor, old_cursor, []
-        conn.execute(
-            "UPDATE kanban_notify_subs SET last_event_id = ? "
-            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
-            "AND last_event_id = ?",
-            (int(new_cursor), task_id, platform, chat_id, thread_id or "", int(old_cursor)),
-        )
-        return old_cursor, new_cursor, events
-
-
-def advance_notify_cursor(
-    conn: sqlite3.Connection,
-    *,
-    task_id: str,
-    platform: str,
-    chat_id: str,
-    thread_id: Optional[str] = None,
-    new_cursor: int,
-) -> None:
-    with write_txn(conn):
-        conn.execute(
-            "UPDATE kanban_notify_subs SET last_event_id = ? "
-            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
-            (int(new_cursor), task_id, platform, chat_id, thread_id or ""),
-        )
-
-
-def rewind_notify_cursor(
-    conn: sqlite3.Connection,
-    *,
-    task_id: str,
-    platform: str,
-    chat_id: str,
-    thread_id: Optional[str] = None,
-    claimed_cursor: int,
-    old_cursor: int,
-) -> bool:
-    """Undo a notification claim when delivery fails.
-
-    The CAS guard only rewinds if no later notifier advanced the row after our
-    claim. This keeps retry behavior for transient send failures without
-    clobbering newer progress.
-    """
-    with write_txn(conn):
-        cur = conn.execute(
-            "UPDATE kanban_notify_subs SET last_event_id = ? "
-            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
-            "AND last_event_id = ?",
-            (
-                int(old_cursor), task_id, platform, chat_id, thread_id or "",
-                int(claimed_cursor),
-            ),
-        )
-    return cur.rowcount > 0
 
 
 # ---------------------------------------------------------------------------

@@ -515,121 +515,27 @@ def test_task_age_helper(kanban_home):
 # Notify subscriptions
 # ---------------------------------------------------------------------------
 
-def test_notify_sub_crud(kanban_home):
+def test_origin_routing_crud(kanban_home):
+    """Origin routing via system comments is idempotent and retrievable."""
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="x")
-        kb.add_notify_sub(
-            conn, task_id=tid, platform="telegram", chat_id="123", user_id="u1",
-            notifier_profile="default",
-        )
-        subs = kb.list_notify_subs(conn, tid)
-        assert len(subs) == 1
-        assert subs[0]["platform"] == "telegram"
-        assert subs[0]["notifier_profile"] == "default"
-        # Duplicate add is a no-op.
-        kb.add_notify_sub(
+        kb.store_origin_routing(
             conn, task_id=tid, platform="telegram", chat_id="123",
         )
-        assert len(kb.list_notify_subs(conn, tid)) == 1
-        # Distinct thread is a new row.
-        kb.add_notify_sub(
-            conn, task_id=tid, platform="telegram", chat_id="123",
-            thread_id="5",
-        )
-        assert len(kb.list_notify_subs(conn, tid)) == 2
-        # Remove one.
-        ok = kb.remove_notify_sub(
+        origin = kb.get_origin_routing(conn, tid)
+        assert origin is not None
+        assert origin["platform"] == "telegram"
+        assert origin["chat_id"] == "123"
+        # Second store is idempotent.
+        kb.store_origin_routing(
             conn, task_id=tid, platform="telegram", chat_id="123",
         )
-        assert ok is True
-        assert len(kb.list_notify_subs(conn, tid)) == 1
+        origin2 = kb.get_origin_routing(conn, tid)
+        assert origin2 is not None
+        assert origin2["platform"] == "telegram"
     finally:
         conn.close()
-
-
-def test_notify_cursor_advances(kanban_home):
-    conn = kb.connect()
-    try:
-        tid = kb.create_task(conn, title="x", assignee="w")
-        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="123")
-        # Initial: one "created" event but we only want terminal kinds.
-        cursor, events = kb.unseen_events_for_sub(
-            conn, task_id=tid, platform="telegram", chat_id="123",
-            kinds=["completed", "blocked"],
-        )
-        assert events == []
-        # Complete the task → new `completed` event.
-        kb.complete_task(conn, tid, result="ok")
-        cursor, events = kb.unseen_events_for_sub(
-            conn, task_id=tid, platform="telegram", chat_id="123",
-            kinds=["completed", "blocked"],
-        )
-        assert len(events) == 1
-        assert events[0].kind == "completed"
-        # Advance cursor — next call returns empty.
-        kb.advance_notify_cursor(
-            conn, task_id=tid, platform="telegram", chat_id="123",
-            new_cursor=cursor,
-        )
-        _, events2 = kb.unseen_events_for_sub(
-            conn, task_id=tid, platform="telegram", chat_id="123",
-            kinds=["completed", "blocked"],
-        )
-        assert events2 == []
-    finally:
-        conn.close()
-
-
-def test_notify_claim_is_single_owner_and_rewindable(kanban_home):
-    conn1 = kb.connect()
-    conn2 = kb.connect()
-    try:
-        tid = kb.create_task(conn1, title="x", assignee="w")
-        kb.add_notify_sub(conn1, task_id=tid, platform="telegram", chat_id="123")
-        kb.complete_task(conn1, tid, result="ok")
-
-        old_cursor, claimed_cursor, events = kb.claim_unseen_events_for_sub(
-            conn1,
-            task_id=tid,
-            platform="telegram",
-            chat_id="123",
-            kinds=["completed", "blocked"],
-        )
-        assert old_cursor == 0
-        assert claimed_cursor > old_cursor
-        assert [ev.kind for ev in events] == ["completed"]
-
-        # A concurrent notifier instance sees the advanced cursor and cannot
-        # claim/send the same event range.
-        _, _, duplicate_events = kb.claim_unseen_events_for_sub(
-            conn2,
-            task_id=tid,
-            platform="telegram",
-            chat_id="123",
-            kinds=["completed", "blocked"],
-        )
-        assert duplicate_events == []
-
-        assert kb.rewind_notify_cursor(
-            conn1,
-            task_id=tid,
-            platform="telegram",
-            chat_id="123",
-            claimed_cursor=claimed_cursor,
-            old_cursor=old_cursor,
-        ) is True
-        _, retried_events = kb.unseen_events_for_sub(
-            conn2,
-            task_id=tid,
-            platform="telegram",
-            chat_id="123",
-            kinds=["completed", "blocked"],
-        )
-        assert [ev.kind for ev in retried_events] == ["completed"]
-    finally:
-        conn1.close()
-        conn2.close()
 
 
 # ---------------------------------------------------------------------------
@@ -852,21 +758,6 @@ def test_cli_stats_json(kanban_home):
     assert "oldest_ready_age_seconds" in data
 
 
-def test_cli_notify_subscribe_and_list(kanban_home):
-    tid = run_slash("create 'x' --json")
-    tid = json.loads(tid)["id"]
-    out = run_slash(
-        f"notify-subscribe {tid} --platform telegram --chat-id 999",
-    )
-    assert "Subscribed" in out
-    lst = run_slash("notify-list --json")
-    subs = json.loads(lst)
-    assert any(s["task_id"] == tid and s["platform"] == "telegram" for s in subs)
-    rm = run_slash(
-        f"notify-unsubscribe {tid} --platform telegram --chat-id 999",
-    )
-    assert "Unsubscribed" in rm
-
 
 def test_cli_log_missing_task(kanban_home):
     # No such task → exit-style (no log for...) message on stderr, returned
@@ -925,7 +816,6 @@ def test_run_slash_every_verb_returns_sensible_output(kanban_home, tmp_path):
         f"archive {tid_a}",
         "dispatch --dry-run --json",
         "stats --json",
-        "notify-list",
         f"log {tid_a}",
         f"context {tid_b}",
         "gc",
@@ -2193,30 +2083,6 @@ def test_event_dataclass_carries_run_id(kanban_home):
         # 'claimed' and 'completed' must have run_id.
         assert kinds_with_run.get("claimed") == run_id
         assert kinds_with_run.get("completed") == run_id
-    finally:
-        conn.close()
-
-
-def test_unseen_events_for_sub_includes_run_id(kanban_home):
-    """Gateway notifier path must also surface run_id on events."""
-    conn = kb.connect()
-    try:
-        tid = kb.create_task(conn, title="notify test", assignee="worker")
-        kb.add_notify_sub(
-            conn, task_id=tid, platform="telegram",
-            chat_id="12345", thread_id="",
-        )
-        kb.claim_task(conn, tid)
-        run_id = kb.latest_run(conn, tid).id
-        kb.complete_task(conn, tid, summary="notify-ready")
-
-        cursor, events = kb.unseen_events_for_sub(
-            conn, task_id=tid, platform="telegram",
-            chat_id="12345", thread_id="",
-            kinds=("completed",),
-        )
-        assert len(events) == 1
-        assert events[0].run_id == run_id
     finally:
         conn.close()
 

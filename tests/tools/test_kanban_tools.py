@@ -2113,31 +2113,13 @@ def test_board_param_in_all_schemas():
 #   even when the session has a delivery channel.
 # ---------------------------------------------------------------------------
 
-def _list_subs_for_task(task_id):
+def _get_origin_for_task(task_id):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
-        return list(kb.list_notify_subs(conn, task_id))
+        return kb.get_origin_routing(conn, task_id)
     finally:
         conn.close()
-
-
-def _sub_index(subs):
-    """Normalise a list of notify-subs (dicts or objects) into dicts
-    keyed by platform+chat_id, so assertions work regardless of the
-    return shape."""
-    out = []
-    for s in subs:
-        if isinstance(s, dict):
-            out.append(s)
-        else:
-            out.append({
-                "platform": getattr(s, "platform", None),
-                "chat_id": getattr(s, "chat_id", None),
-                "thread_id": getattr(s, "thread_id", None),
-                "user_id": getattr(s, "user_id", None),
-            })
-    return out
 
 
 def test_create_subscribes_gateway_session(monkeypatch, worker_env):
@@ -2159,13 +2141,11 @@ def test_create_subscribes_gateway_session(monkeypatch, worker_env):
     new_tid = d["task_id"]
     assert d["subscribed"] is True, d
 
-    subs = _sub_index(_list_subs_for_task(new_tid))
-    assert len(subs) == 1
-    s = subs[0]
-    assert s["platform"] == "telegram"
-    assert s["chat_id"] == "chat-42"
-    assert s["thread_id"] == "thread-7"
-    assert s["user_id"] == "user-9"
+    origin = _get_origin_for_task(new_tid)
+    assert origin is not None
+    assert origin["platform"] == "telegram"
+    assert origin["chat_id"] == "chat-42"
+    assert origin["thread_id"] == "thread-7"
 
 
 def test_create_subscribes_tui_session_via_session_key(monkeypatch, worker_env):
@@ -2190,10 +2170,10 @@ def test_create_subscribes_tui_session_via_session_key(monkeypatch, worker_env):
     new_tid = d["task_id"]
     assert d["subscribed"] is True, d
 
-    subs = _sub_index(_list_subs_for_task(new_tid))
-    assert len(subs) == 1
-    assert subs[0]["platform"] == "tui"
-    assert subs[0]["chat_id"] == "tui-session-abc"
+    origin = _get_origin_for_task(new_tid)
+    assert origin is not None
+    assert origin["platform"] == "tui"
+    assert origin["chat_id"] == "tui-session-abc"
 
 
 def test_create_does_not_subscribe_in_cli_session(monkeypatch, worker_env):
@@ -2213,7 +2193,7 @@ def test_create_does_not_subscribe_in_cli_session(monkeypatch, worker_env):
     assert d["ok"] is True
     assert d["subscribed"] is False, d
 
-    assert _list_subs_for_task(d["task_id"]) == []
+    assert _get_origin_for_task(d["task_id"]) is None
 
 
 def test_create_respects_auto_subscribe_on_create_false(monkeypatch, worker_env, tmp_path):
@@ -2242,7 +2222,7 @@ def test_create_respects_auto_subscribe_on_create_false(monkeypatch, worker_env,
     assert d["ok"] is True
     assert d["subscribed"] is False, d
 
-    assert _list_subs_for_task(d["task_id"]) == []
+    assert _get_origin_for_task(d["task_id"]) is None
 
 
 def test_create_partial_session_context_no_subscribe(monkeypatch, worker_env):
@@ -2264,24 +2244,21 @@ def test_create_partial_session_context_no_subscribe(monkeypatch, worker_env):
     assert d["subscribed"] is False, d
 
 
-def test_maybe_auto_subscribe_swallows_add_notify_sub_failure(monkeypatch, worker_env):
-    """If add_notify_sub itself raises (e.g. DB locked, schema drift),
-    _maybe_auto_subscribe must NOT bubble that up and fail the parent
-    kanban_create. The function returns False and the parent create
-    still succeeds with subscribed=False."""
+def test_maybe_auto_subscribe_swallows_store_origin_routing_failure(monkeypatch, worker_env):
+    """If store_origin_routing itself raises, auto-subscribe survives."""
     from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
     monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-42")
 
-    from hermes_cli import kanban_db as kb
-
     def _boom(*a, **kw):
-        raise RuntimeError("simulated DB failure")
+        raise RuntimeError("simulated store_origin_routing failure")
 
-    monkeypatch.setattr(kb, "add_notify_sub", _boom)
+    monkeypatch.setattr(kb, "store_origin_routing", _boom)
 
     out = kt._handle_create({
-        "title": "auto-sub tolerates add_notify_sub failure",
+        "title": "auto-sub tolerates store_origin_routing failure",
         "assignee": "peer",
     })
     d = json.loads(out)

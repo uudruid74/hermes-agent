@@ -1507,12 +1507,6 @@ def test_delete_archived_task_removes_related_rows(kanban_home):
         kb.claim_task(conn, tid)
         kb.complete_task(conn, tid, result="done")
         assert kb.archive_task(conn, tid)
-        conn.execute(
-            "INSERT INTO kanban_notify_subs(task_id, platform, chat_id, thread_id, user_id, created_at, last_event_id) "
-            "VALUES (?, 'telegram', '123', '', 'u', 0, 0)",
-            (tid,),
-        )
-        conn.commit()
 
         assert kb.delete_archived_task(conn, tid) is True
         assert kb.get_task(conn, tid) is None
@@ -1520,7 +1514,6 @@ def test_delete_archived_task_removes_related_rows(kanban_home):
         assert conn.execute("SELECT COUNT(*) FROM task_comments WHERE task_id = ?", (tid,)).fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id = ?", (tid,)).fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM task_runs WHERE task_id = ?", (tid,)).fetchone()[0] == 0
-        assert conn.execute("SELECT COUNT(*) FROM kanban_notify_subs WHERE task_id = ?", (tid,)).fetchone()[0] == 0
 
 
 def test_delete_archived_task_rejects_non_archived_rows(kanban_home):

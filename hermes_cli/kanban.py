@@ -747,38 +747,6 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_stats.add_argument("--json", action="store_true")
 
-    # --- notify subscribe / list / remove ---
-    p_nsub = sub.add_parser(
-        "notify-subscribe",
-        help="Subscribe a gateway source to a task's terminal events "
-             "(used by /kanban subscribe in the gateway adapter)",
-    )
-    p_nsub.add_argument("task_id")
-    p_nsub.add_argument("--platform", required=True)
-    p_nsub.add_argument("--chat-id", required=True)
-    p_nsub.add_argument("--thread-id", default=None)
-    p_nsub.add_argument("--user-id", default=None)
-    p_nsub.add_argument(
-        "--notifier-profile", default=None,
-        help="Profile gateway that owns/delivers this subscription (default: active profile)",
-    )
-
-    p_nlist = sub.add_parser(
-        "notify-list",
-        help="List notification subscriptions (optionally for a single task)",
-    )
-    p_nlist.add_argument("task_id", nargs="?", default=None)
-    p_nlist.add_argument("--json", action="store_true")
-
-    p_nrm = sub.add_parser(
-        "notify-unsubscribe",
-        help="Remove a gateway subscription from a task",
-    )
-    p_nrm.add_argument("task_id")
-    p_nrm.add_argument("--platform", required=True)
-    p_nrm.add_argument("--chat-id", required=True)
-    p_nrm.add_argument("--thread-id", default=None)
-
     # --- log ---
     p_log = sub.add_parser(
         "log",
@@ -1012,9 +980,6 @@ def kanban_command(args: argparse.Namespace) -> int:
         "runs":     _cmd_runs,
         "heartbeat": _cmd_heartbeat,
         "assignees": _cmd_assignees,
-        "notify-subscribe":   _cmd_notify_subscribe,
-        "notify-list":        _cmd_notify_list,
-        "notify-unsubscribe": _cmd_notify_unsubscribe,
         "context":  _cmd_context,
         "specify":  _cmd_specify,
         "decompose":  _cmd_decompose,
@@ -2468,52 +2433,6 @@ def _cmd_stats(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
-    with kb.connect_closing() as conn:
-        if kb.get_task(conn, args.task_id) is None:
-            print(f"no such task: {args.task_id}", file=sys.stderr)
-            return 1
-        kb.add_notify_sub(
-            conn, task_id=args.task_id,
-            platform=args.platform, chat_id=args.chat_id,
-            thread_id=args.thread_id, user_id=args.user_id,
-            notifier_profile=args.notifier_profile or _profile_author(),
-        )
-    print(f"Subscribed {args.platform}:{args.chat_id}"
-          + (f":{args.thread_id}" if args.thread_id else "")
-          + f" to {args.task_id}")
-    return 0
-
-
-def _cmd_notify_list(args: argparse.Namespace) -> int:
-    with kb.connect_closing() as conn:
-        subs = kb.list_notify_subs(conn, args.task_id)
-    if getattr(args, "json", False):
-        print(json.dumps(subs, indent=2, ensure_ascii=False))
-        return 0
-    if not subs:
-        print("(no subscriptions)")
-        return 0
-    for s in subs:
-        thr = f":{s['thread_id']}" if s.get("thread_id") else ""
-        owner = f"  owner={s['notifier_profile']}" if s.get("notifier_profile") else ""
-        print(f"  {s['task_id']:10s}  {s['platform']}:{s['chat_id']}{thr}"
-              f"  (since event {s['last_event_id']}){owner}")
-    return 0
-
-
-def _cmd_notify_unsubscribe(args: argparse.Namespace) -> int:
-    with kb.connect_closing() as conn:
-        ok = kb.remove_notify_sub(
-            conn, task_id=args.task_id,
-            platform=args.platform, chat_id=args.chat_id,
-            thread_id=args.thread_id,
-        )
-    if not ok:
-        print("(no such subscription)", file=sys.stderr)
-        return 1
-    print(f"Unsubscribed from {args.task_id}")
-    return 0
 
 
 def _cmd_log(args: argparse.Namespace) -> int:

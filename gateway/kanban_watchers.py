@@ -11,6 +11,7 @@ behavior-neutral move that lifts ~1,000 LOC out of run.py.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import sqlite3
@@ -118,23 +119,16 @@ class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
 
     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
-        """Poll ``kanban_notify_subs`` and deliver terminal events to users.
+        """Poll active tasks with origin routing and deliver events.
 
-        For each subscription row, fetches ``task_events`` newer than the
-        stored cursor with kind in the terminal set (``completed``,
-        ``blocked``, ``gave_up``, ``crashed``, ``timed_out``). Sends one
-        message per new event to ``(platform, chat_id, thread_id)``,
-        then advances the cursor. When a task reaches a terminal state
-        (``completed`` / ``archived``), the subscription is removed.
+        For each active task with a ``__kanban_origin__`` system comment,
+        fetches ``task_events`` newer than the in-memory cursor and delivers
+        them to the origin channel. Cursors are tracked in memory; on gateway
+        restart, we start from the current max event id so nothing replays.
 
         Runs in the gateway event loop; all SQLite work is pushed to a
         thread via ``asyncio.to_thread`` so the loop never blocks on the
         WAL lock. Failures in one tick don't stop subsequent ticks.
-
-        **Multi-board:** iterates every board discovered on disk per
-        tick. Subscriptions live inside each board's own DB and cannot
-        cross boards, so delivery semantics are unchanged — this is
-        purely a fan-out of the single-DB poll.
         """
         # Gate: only the dispatch-owning gateway opens kanban DBs for notifier polling.
         # Non-dispatch gateways have no subscriptions to deliver — all kanban state lives
@@ -161,7 +155,6 @@ class GatewayKanbanWatchersMixin:
             )
             return
         _wake_home_session = bool(kanban_cfg.get("wake_home_session", False))
-        _board_topics = kanban_cfg.get("board_topics") or {}
         from gateway.config import Platform as _Platform
         try:
             from hermes_cli import kanban_db as _kb
@@ -169,43 +162,7 @@ class GatewayKanbanWatchersMixin:
             logger.warning("kanban notifier: kanban_db not importable; notifier disabled")
             return
 
-        # Load gateway config once per tick for auto-subscription.
-        try:
-            from gateway.config import load_gateway_config as _load_gw_cfg
-            logger.info("kanban notifier: gateway config loaded for auto-subscription")
-        except Exception as _gw_exc:
-            _load_gw_cfg = None
-            logger.warning(
-                "kanban notifier: gateway config UNAVAILABLE — auto-subscription disabled (%s)",
-                _gw_exc,
-            )
-
-        # Deliver ALL status transitions — including created, claimed,
-        # spawned — so the agent sees every state change. Every kind that
-        # the task_events table can produce is listed here so nothing is
-        # silently dropped by the kind filter in claim_unseen_events_for_sub.
-        ALL_KINDS = (
-            # Terminal / outcome
-            "completed", "gave_up", "crashed", "timed_out",
-            # Lifecycle transitions
-            "created", "claimed", "spawned", "status",
-            "archived", "unblocked", "blocked",
-            "reclaimed", "promoted", "promoted_manual",
-            "protocol_violation", "scheduled",
-            "dependency_wait", "block_loop_detected",
-            # Cross-agent communication
-            "commented",
-            # High-frequency / silent (claimed so cursor advances, but
-            # filtered out before delivery by the silent-kinds check below)
-            "heartbeat",
-            # Informational events — claimed but silent
-            "assigned", "specified", "linked", "unlinked",
-            "claim_rejected", "suspected_hallucinated_references",
-        )
-        # Kinds that are claimed (so the cursor advances past them) but
-        # produce no user-facing notification. Heartbeats are noise;
-        # archived/unblocked are internal transitions; the informational
-        # kinds (assigned, linked, etc.) don't need to wake the agent.
+        # Kinds that produce no user-facing notification.
         SILENT_KINDS = frozenset({
             "heartbeat", "archived", "unblocked",
             "assigned", "specified", "linked", "unlinked",
@@ -262,240 +219,94 @@ class GatewayKanbanWatchersMixin:
                         logger.debug("kanban notifier: no connected adapters; skipping tick")
                         return deliveries
 
-                    # Enumerate every board on disk, but poll each resolved DB
-                    # path once. Multiple slugs can point at the same DB when
-                    # HERMES_KANBAN_DB pins the board path; without this guard
-                    # one gateway could collect the same subscription/event
-                    # more than once before advancing the cursor.
+                    # Single flat kanban.db — open once per tick.
                     try:
-                        boards = _kb.list_boards(include_archived=False)
-                    except Exception:
-                        boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
-                    seen_db_paths: set[str] = set()
-                    for board_meta in boards:
-                        slug = board_meta.get("slug") or _kb.DEFAULT_BOARD
-                        db_path = board_meta.get("db_path")
-                        try:
-                            resolved_db_path = str(Path(db_path).expanduser().resolve()) if db_path else str(_kb.kanban_db_path(slug).resolve())
-                        except Exception:
-                            resolved_db_path = f"slug:{slug}"
-                        if resolved_db_path in seen_db_paths:
-                            logger.debug(
-                                "kanban notifier: skipping duplicate board slug %s for DB %s",
-                                slug, resolved_db_path,
-                            )
-                            continue
-                        seen_db_paths.add(resolved_db_path)
-                        try:
-                            conn = _kb.connect(board=slug)
-                        except Exception as exc:
-                            logger.debug("kanban notifier: cannot open board %s: %s", slug, exc)
-                            continue
-                        try:
-                            # `connect()` runs the schema + idempotent migration
-                            # on first open per process, so an explicit
-                            # `init_db()` here would be redundant. Worse:
-                            # `init_db()` deliberately busts the per-process
-                            # cache and re-runs the migration on a *second*
-                            # connection, which races the first and used to
-                            # log a benign but noisy `duplicate column name`
-                            # traceback (and intermittent "database is locked"
-                            # — issue #21378) on every gateway start against
-                            # a legacy DB. `_add_column_if_missing` now
-                            # tolerates that race, but we still skip the
-                            # redundant call to avoid the wasted work.
-                            subs = _kb.list_notify_subs(conn)
-                            # ── zombie cleanup ──────────────────────────
-                            # Remove subscriptions for done/archived tasks
-                            # that have no unseen events remaining.
-                            _zombie_ids = {
-                                _tid for (_tid,) in conn.execute(
-                                    "SELECT id FROM tasks WHERE status IN ('done','archived')"
-                                ).fetchall()
-                            }
-                            if _zombie_ids:
-                                # Get the max event id per zombie task so we
-                                # only drop subs whose cursor has caught up.
-                                _max_ev = dict(
-                                    conn.execute(
-                                        "SELECT task_id, MAX(id) FROM task_events"
-                                        " WHERE task_id IN ({}) GROUP BY task_id".format(
-                                            ",".join("?" * len(_zombie_ids))
-                                        ),
-                                        tuple(_zombie_ids),
-                                    ).fetchall()
-                                )
-                                _zombie_subs = [
-                                    s for s in subs
-                                    if s["task_id"] in _zombie_ids
-                                    and s.get("last_event_id", 0) >= _max_ev.get(s["task_id"], 0)
-                                ]
-                                if _zombie_subs:
-                                    with _kb.write_txn(conn):
-                                        for _zs in _zombie_subs:
-                                            conn.execute(
-                                                "DELETE FROM kanban_notify_subs"
-                                                " WHERE task_id = ? AND platform = ?"
-                                                " AND chat_id = ? AND thread_id = ?",
-                                                (_zs["task_id"], _zs["platform"],
-                                                 _zs["chat_id"], _zs.get("thread_id") or ""),
-                                            )
-                                    logger.info(
-                                        "kanban notifier: board %s — cleaned up %d zombie subscription(s) "
-                                        "for done/archived tasks: %s",
-                                        slug, len(_zombie_subs),
-                                        sorted({zs["task_id"] for zs in _zombie_subs}),
-                                    )
-                                    # Re-read subs after cleanup
-                                    subs = _kb.list_notify_subs(conn)
-                            # ─────────────────────────────────────────────
-                            if subs:
-                                logger.info("kanban notifier: board %s has %d subscription(s)", slug, len(subs))
-                            for sub in subs:
-                                owner_profile = sub.get("notifier_profile") or None
-                                if owner_profile and owner_profile != notifier_profile:
-                                    _owner_adapters = getattr(self, "_profile_adapters", {}).get(owner_profile)
-                                    if not _owner_adapters:
-                                        logger.debug(
-                                            "kanban notifier: subscription for %s owned by profile %s; current profile %s has no adapter for it, skipping",
-                                            sub.get("task_id"), owner_profile, notifier_profile,
-                                        )
-                                        continue
-                                platform = (sub.get("platform") or "").lower()
-                                if platform not in active_platforms:
-                                    logger.debug(
-                                        "kanban notifier: subscription for %s on %s skipped; adapter not connected",
-                                        sub.get("task_id"), platform or "<missing>",
-                                    )
+                        conn = _kb.connect()
+                    except Exception as exc:
+                        logger.debug("kanban notifier: cannot open kanban DB: %s", exc)
+                        return deliveries
+                    try:
+                        # In-memory per-task event cursor. Keys are task_id.
+                        # On gateway restart we start from the current max event
+                        # id so nothing gets replayed.
+                        _task_cursors: dict[str, int] = getattr(
+                            self, "_kanban_task_cursors", {}
+                        )
+                        self._kanban_task_cursors = _task_cursors
+
+                        # Find all active tasks that have origin routing comments.
+                        _active_rows = conn.execute(
+                            "SELECT id FROM tasks WHERE status NOT IN ('done','archived')"
+                        ).fetchall()
+                        for (_tid,) in _active_rows:
+                            _origin = _kb.get_origin_routing(conn, _tid)
+                            if not _origin:
+                                continue
+                            platform = (_origin.get("platform") or "").lower()
+                            if platform not in active_platforms:
+                                continue
+                            chat_id = _origin.get("chat_id") or ""
+                            thread_id = _origin.get("thread_id") or ""
+
+                            # Age gate: skip tasks created less than 15s ago
+                            # to avoid racing with slash_commands.py's
+                            # store_origin_routing.
+                            _created_row = conn.execute(
+                                "SELECT created_at FROM tasks WHERE id = ?", (_tid,)
+                            ).fetchone()
+                            if _created_row and _created_row[0]:
+                                _age = int(time.time()) - _created_row[0]
+                                if _age < 15:
                                     continue
-                                old_cursor, cursor, events = _kb.claim_unseen_events_for_sub(
-                                    conn,
-                                    task_id=sub["task_id"],
-                                    platform=sub["platform"],
-                                    chat_id=sub["chat_id"],
-                                    thread_id=sub.get("thread_id") or "",
-                                    kinds=ALL_KINDS,
-                                )
-                                if not events:
-                                    logger.info("kanban notifier: no unseen events for %s; cursor=%s", sub["task_id"], old_cursor)
-                                    continue
-                                task = _kb.get_task(conn, sub["task_id"])
-                                logger.debug(
-                                    "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
-                                    len(events), sub["task_id"], slug, old_cursor, cursor,
-                                )
-                                deliveries.append({
-                                    "sub": sub,
-                                    "old_cursor": old_cursor,
-                                    "cursor": cursor,
-                                    "events": events,
-                                    "task": task,
-                                    "board": slug,
-                                })
-                            # Auto-subscribe active tasks without a subscription
-                            # so ALL events flow through the gateway's handle_message().
-                            _subbed_ids = {s["task_id"] for s in subs}
-                            _active_rows = conn.execute(
-                                "SELECT id FROM tasks WHERE status NOT IN ('done','archived')"
+
+                            cursor = _task_cursors.get(_tid, 0)
+                            # Fetch events newer than cursor.
+                            rows = conn.execute(
+                                "SELECT * FROM task_events WHERE task_id = ? AND id > ?"
+                                " ORDER BY id ASC",
+                                (_tid, cursor),
                             ).fetchall()
-                            _unsubbed = [_tid for (_tid,) in _active_rows if _tid not in _subbed_ids]
-                            if _unsubbed:
-                                logger.info(
-                                    "kanban notifier: %d unsubscribed active task(s) on board %s: %s",
-                                    len(_unsubbed), slug, _unsubbed[:5],
-                                )
-                            else:
-                                logger.info(
-                                    "kanban notifier: board %s: %d active, %d subscribed, 0 unsubscribed",
-                                    slug, len(_active_rows), len(subs),
-                                )
-                            for _tid in _unsubbed:
-                                # Age gate: skip tasks created less than 15
-                                # seconds ago to avoid racing with
-                                # slash_commands.py's add_notify_sub, which
-                                # captures the origin chat_id/thread_id.
-                                # Without this gate, the auto-subscriber may
-                                # insert a home-channel subscription before
-                                # the slash command handler does, resulting
-                                # in dual delivery (home + origin topic).
-                                _created_row = conn.execute(
-                                    "SELECT created_at FROM tasks WHERE id = ?", (_tid,)
-                                ).fetchone()
-                                if _created_row and _created_row[0]:
-                                    _age = int(time.time()) - _created_row[0]
-                                    if _age < 15:
-                                        logger.debug(
-                                            "kanban notifier: skipping auto-sub for %s — "
-                                            "created %ds ago (age gate)", _tid, _age,
-                                        )
-                                        continue
-                                _gw_cfg = _load_gw_cfg() if _load_gw_cfg else None
-                                if _gw_cfg is None:
-                                    logger.warning(
-                                        "kanban notifier: cannot auto-subscribe %s — gateway config unavailable",
-                                        _tid,
-                                    )
-                                    continue
-                                for _plat, _pcfg in _gw_cfg.platforms.items():
-                                    if not _pcfg or not _pcfg.enabled:
-                                        continue
-                                    # 1. Check origin routing comment first —
-                                    #    stored by slash_commands.py on create.
-                                    #    This is the ground truth for where the
-                                    #    task was created from.
-                                    _origin = _kb.get_origin_routing(conn, _tid)
-                                    if _origin and _origin.get("platform") == _plat.value:
-                                        _chat_id = _origin["chat_id"]
-                                        _thread_id = str(_origin.get("thread_id") or "")
-                                        logger.info(
-                                            "kanban notifier: origin routing for %s → %s/%s/%s",
-                                            _tid, _plat.value, _chat_id, _thread_id,
-                                        )
-                                    # 2. Check board→topic mapping
-                                    #    (kanban.board_topics in config.yaml).
-                                    elif (_bt := (_board_topics.get(slug, {}).get(_plat.value) if _board_topics else None)) and isinstance(_bt, dict) and _bt.get("chat_id"):
-                                        _chat_id = _bt["chat_id"]
-                                        _thread_id = str(_bt.get("thread_id") or "")
-                                        logger.info(
-                                            "kanban notifier: board_topic mapping %s/%s → %s/%s",
-                                            slug, _plat.value, _chat_id, _thread_id,
-                                        )
-                                    # 3. Fall back to home channel.
-                                    else:
-                                        _home = _gw_cfg.get_home_channel(_plat)
-                                        if not _home or not _home.chat_id:
-                                            logger.debug(
-                                                "kanban notifier: no home channel for %s on platform %s, skipping auto-sub",
-                                                _tid, _plat.value,
-                                            )
-                                            continue
-                                        _chat_id = _home.chat_id
-                                        _thread_id = _home.thread_id or ""
-                                    try:
-                                        # Start the cursor at the tip of history
-                                        # so we don't replay old events.
-                                        _latest_ev = conn.execute(
-                                            "SELECT MAX(id) FROM task_events WHERE task_id = ?",
-                                            (_tid,),
-                                        ).fetchone()
-                                        _start = int(_latest_ev[0]) if (_latest_ev and _latest_ev[0] is not None) else 0
-                                        conn.execute(
-                                            "INSERT INTO kanban_notify_subs"
-                                            " (task_id, platform, chat_id, thread_id, user_id, notifier_profile, created_at, last_event_id)"
-                                            " VALUES (?,?,?,?,?,NULL,?,?)",
-                                            (_tid, _plat.value, _chat_id,
-                                             _thread_id, "", int(time.time()), _start),
-                                        )
-                                        conn.commit()
-                                        logger.info("kanban notifier: auto-subscribed %s → %s/%s",
-                                                    _tid, _plat.value, _chat_id)
-                                    except Exception as _sub_exc:
-                                        logger.warning(
-                                            "kanban notifier: auto-subscribe FAILED for %s on %s/%s: %s",
-                                            _tid, _plat.value, _chat_id, _sub_exc,
-                                        )
-                        finally:
-                            conn.close()
+                            if not rows:
+                                continue
+
+                            events: list = []
+                            max_id = cursor
+                            for r in rows:
+                                try:
+                                    payload = json.loads(r["payload"]) if r["payload"] else None
+                                except Exception:
+                                    payload = None
+                                from hermes_cli.kanban_db import Event as _Event
+                                events.append(_Event(
+                                    id=r["id"], task_id=r["task_id"], kind=r["kind"],
+                                    payload=payload, created_at=r["created_at"],
+                                    run_id=(int(r["run_id"]) if r["run_id"] is not None else None),
+                                ))
+                                max_id = max(max_id, int(r["id"]))
+
+                            task = _kb.get_task(conn, _tid)
+                            # Build synthetic sub dict for the delivery section.
+                            sub = {
+                                "task_id": _tid,
+                                "platform": platform,
+                                "chat_id": chat_id,
+                                "thread_id": thread_id,
+                                "notifier_profile": notifier_profile,
+                            }
+                            deliveries.append({
+                                "sub": sub,
+                                "old_cursor": cursor,
+                                "cursor": max_id,
+                                "events": events,
+                                "task": task,
+                                "board": None,  # flat DB, no boards
+                            })
+                            logger.info(
+                                "kanban notifier: claimed %d event(s) for %s cursor %s→%s",
+                                len(events), _tid, cursor, max_id,
+                            )
+                    finally:
+                        conn.close()
                     return deliveries
 
                 deliveries = await asyncio.to_thread(_collect)
@@ -1027,38 +838,26 @@ class GatewayKanbanWatchersMixin:
     def _kanban_advance(
         self, sub: dict, cursor: int, board: Optional[str] = None,
     ) -> None:
-        """Sync helper: advance a subscription's cursor. Runs in to_thread.
+        """Sync helper: advance in-memory cursor for a task's origin routing.
 
-        ``board`` scopes the DB connection to the board that owns this
-        subscription. Unsub cursors in one board can't touch another's.
+        With the flat kanban.db + origin routing, cursors are tracked
+        in memory (``_kanban_task_cursors``). On gateway restart, we
+        start from the current max event id so nothing replays.
         """
-        from hermes_cli import kanban_db as _kb
-        conn = _kb.connect(board=board)
-        try:
-            _kb.advance_notify_cursor(
-                conn,
-                task_id=sub["task_id"],
-                platform=sub["platform"],
-                chat_id=sub["chat_id"],
-                thread_id=sub.get("thread_id") or "",
-                new_cursor=cursor,
-            )
-        finally:
-            conn.close()
+        _task_cursors: dict[str, int] = getattr(
+            self, "_kanban_task_cursors", {}
+        )
+        self._kanban_task_cursors = _task_cursors
+        _task_cursors[sub["task_id"]] = cursor
 
     def _kanban_unsub(self, sub: dict, board: Optional[str] = None) -> None:
-        from hermes_cli import kanban_db as _kb
-        conn = _kb.connect(board=board)
-        try:
-            _kb.remove_notify_sub(
-                conn,
-                task_id=sub["task_id"],
-                platform=sub["platform"],
-                chat_id=sub["chat_id"],
-                thread_id=sub.get("thread_id") or "",
-            )
-        finally:
-            conn.close()
+        """No-op: origin routing is stored as a system comment on the task.
+
+        There are no subscription rows to remove. The cursor is left in
+        ``_kanban_task_cursors`` so completed/archived tasks don't replay
+        events, but they are naturally excluded from the poll because
+        ``_collect`` only queries active tasks.
+        """
 
     def _kanban_rewind(
         self,
@@ -1067,21 +866,16 @@ class GatewayKanbanWatchersMixin:
         old_cursor: int,
         board: Optional[str] = None,
     ) -> None:
-        """Sync helper: undo a claimed notification cursor after send failure."""
-        from hermes_cli import kanban_db as _kb
-        conn = _kb.connect(board=board)
-        try:
-            _kb.rewind_notify_cursor(
-                conn,
-                task_id=sub["task_id"],
-                platform=sub["platform"],
-                chat_id=sub["chat_id"],
-                thread_id=sub.get("thread_id") or "",
-                claimed_cursor=claimed_cursor,
-                old_cursor=old_cursor,
-            )
-        finally:
-            conn.close()
+        """Sync helper: reset in-memory cursor after send failure.
+
+        When delivery fails (adapter disconnected, etc.), reset the cursor
+        so the next tick retries the same events.
+        """
+        _task_cursors: dict[str, int] = getattr(
+            self, "_kanban_task_cursors", {}
+        )
+        self._kanban_task_cursors = _task_cursors
+        _task_cursors[sub["task_id"]] = old_cursor
 
     async def _deliver_kanban_artifacts(
         self,

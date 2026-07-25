@@ -495,16 +495,8 @@ class GatewaySlashCommandsMixin:
                             from hermes_cli import kanban_db as _kb
                             conn = _kb.connect(board=requested_board)
                             try:
-                                _kb.add_notify_sub(
-                                    conn, task_id=task_id,
-                                    platform=platform_str, chat_id=chat_id,
-                                    thread_id=thread_id or None,
-                                    user_id=user_id,
-                                    notifier_profile=getattr(self, "_kanban_notifier_profile", None) or self._active_profile_name(),
-                                )
                                 # Store origin routing as a system comment so
-                                # the watcher can always find the right channel,
-                                # even if the subscription race is lost.
+                                # the watcher can always find the right channel.
                                 try:
                                     _kb.store_origin_routing(
                                         conn, task_id,

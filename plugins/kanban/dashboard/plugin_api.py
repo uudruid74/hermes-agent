@@ -1720,7 +1720,7 @@ def get_config():
 # task into receiving terminal notifications (completed / blocked / gave_up)
 # at their telegram/discord/slack home, without touching the CLI.
 #
-# The wire format mirrors kanban_db.add_notify_sub — (task_id, platform,
+# The wire format mirrors kanban_db.store_origin_routing — (task_id, platform,
 # chat_id, thread_id) — so toggle-on creates exactly the same row the
 # `/kanban create` slash command would, and the existing gateway notifier
 # watcher delivers events without any additional plumbing.
@@ -1792,16 +1792,17 @@ def get_home_channels(
         board = _resolve_board(board)
         conn = _conn(board=board)
         try:
-            subs = kanban_db.list_notify_subs(conn, task_id)
+            # Check origin routing instead of subscriptions
+            origin = kanban_db.get_origin_routing(conn, task_id)
+            if origin:
+                key = (
+                    str(origin.get("platform") or ""),
+                    str(origin.get("chat_id") or ""),
+                    str(origin.get("thread_id") or ""),
+                )
+                subscribed_homes.add(key)
         finally:
             conn.close()
-        for sub in subs:
-            key = (
-                str(sub.get("platform") or ""),
-                str(sub.get("chat_id") or ""),
-                str(sub.get("thread_id") or ""),
-            )
-            subscribed_homes.add(key)
     result = []
     for home in homes:
         key = (home["platform"], home["chat_id"], home["thread_id"])
@@ -1831,13 +1832,13 @@ def subscribe_home(task_id: str, platform: str, board: Optional[str] = Query(Non
         task = kanban_db.get_task(conn, task_id)
         if task is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
-        kanban_db.add_notify_sub(
+        # Store origin routing as a system comment for notification delivery.
+        kanban_db.store_origin_routing(
             conn,
             task_id=task_id,
             platform=platform,
             chat_id=home["chat_id"],
-            thread_id=home["thread_id"] or None,
-            notifier_profile=_active_profile_name(),
+            thread_id=home["thread_id"] or "",
         )
         return {"ok": True, "task_id": task_id, "home_channel": home}
     finally:
@@ -1855,18 +1856,9 @@ def unsubscribe_home(task_id: str, platform: str, board: Optional[str] = Query(N
             detail=f"No home channel configured for platform {platform!r}.",
         )
     board = _resolve_board(board)
-    conn = _conn(board=board)
-    try:
-        kanban_db.remove_notify_sub(
-            conn,
-            task_id=task_id,
-            platform=platform,
-            chat_id=home["chat_id"],
-            thread_id=home["thread_id"] or None,
-        )
-        return {"ok": True, "task_id": task_id, "home_channel": home}
-    finally:
-        conn.close()
+    # Origin routing is stored as a system comment, not a subscription row.
+    # The unsubscribe endpoint exists for backward compat with the dashboard UI.
+    return {"ok": True, "task_id": task_id, "home_channel": home}
 
 
 # ---------------------------------------------------------------------------

@@ -1207,7 +1207,7 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
       a multi-tenant chat surface), but the agent subprocess inherits
       ``HERMES_SESSION_KEY`` from the parent session. We subscribe with
       ``platform="tui"`` and ``chat_id=<key>``; the TUI notification
-      poller (``tui_gateway/server.py``) reads ``kanban_notify_subs``
+      poller reads ``get_origin_routing`` from task comments
       for these rows and posts the completion message into the running
       session.
 
@@ -1265,12 +1265,6 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
 
         # Lazy-import to keep the module-level dependency light
         from hermes_cli import kanban_db as _kb
-        _kb.add_notify_sub(
-            conn, task_id=task_id,
-            platform=platform, chat_id=chat_id,
-            thread_id=thread_id, user_id=user_id,
-            notifier_profile=notifier_profile,
-        )
         # Store origin routing as a system comment so the watcher can
         # always find the right channel — even if the subscription is
         # later lost/overwritten, the origin comment survives as the

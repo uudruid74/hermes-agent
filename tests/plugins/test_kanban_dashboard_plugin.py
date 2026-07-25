@@ -1758,9 +1758,8 @@ def test_home_channels_no_task_id_all_unsubscribed(client, with_home_channels):
     assert all(not h["subscribed"] for h in r.json()["home_channels"])
 
 
-def test_home_subscribe_creates_notify_sub_row(client, with_home_channels):
-    """POST .../home-subscribe/telegram writes a kanban_notify_subs row
-    keyed to the telegram home's (chat_id, thread_id)."""
+def test_home_subscribe_stores_origin_routing(client, with_home_channels):
+    """POST .../home-subscribe/telegram stores origin routing as system comment."""
     from hermes_cli import kanban_db as kb
     t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
 
@@ -1770,14 +1769,13 @@ def test_home_subscribe_creates_notify_sub_row(client, with_home_channels):
 
     conn = kb.connect()
     try:
-        subs = kb.list_notify_subs(conn, t["id"])
+        origin = kb.get_origin_routing(conn, t["id"])
     finally:
         conn.close()
-    assert len(subs) == 1
-    assert subs[0]["platform"] == "telegram"
-    assert subs[0]["chat_id"] == "1234567"
-    assert subs[0]["thread_id"] == "42"
-    assert subs[0]["notifier_profile"] == "default"
+    assert origin is not None
+    assert origin["platform"] == "telegram"
+    assert origin["chat_id"] == "1234567"
+    assert origin["thread_id"] == "42"
 
 
 def test_home_subscribe_flips_subscribed_flag_in_subsequent_get(client, with_home_channels):
@@ -1790,9 +1788,8 @@ def test_home_subscribe_flips_subscribed_flag_in_subsequent_get(client, with_hom
     flags = {h["platform"]: h["subscribed"] for h in r.json()["home_channels"]}
     assert flags == {"telegram": True, "discord": False}
 
-
 def test_home_subscribe_is_idempotent(client, with_home_channels):
-    """Re-subscribing keeps a single row at the DB layer."""
+    """Re-subscribing stores the same origin routing comment (idempotent)."""
     from hermes_cli import kanban_db as kb
     t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
     client.post(f"/api/plugins/kanban/tasks/{t['id']}/home-subscribe/telegram")
@@ -1800,19 +1797,21 @@ def test_home_subscribe_is_idempotent(client, with_home_channels):
     client.post(f"/api/plugins/kanban/tasks/{t['id']}/home-subscribe/telegram")
     conn = kb.connect()
     try:
-        assert len(kb.list_notify_subs(conn, t["id"])) == 1
+        origin = kb.get_origin_routing(conn, t["id"])
     finally:
         conn.close()
+    assert origin is not None
+    assert origin["platform"] == "telegram"
 
 
-def test_home_subscribe_backfills_owner_on_legacy_row(client, with_home_channels):
-    """Re-subscribing should backfill notifier ownership on ownerless rows."""
+def test_merge_sub_does_not_duplicate(client, with_home_channels):
+    """Subscribing when origin routing already exists is idempotent."""
     from hermes_cli import kanban_db as kb
     t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
 
     conn = kb.connect()
     try:
-        kb.add_notify_sub(
+        kb.store_origin_routing(
             conn,
             task_id=t["id"],
             platform="telegram",
@@ -1827,12 +1826,12 @@ def test_home_subscribe_backfills_owner_on_legacy_row(client, with_home_channels
 
     conn = kb.connect()
     try:
-        subs = kb.list_notify_subs(conn, t["id"])
+        origin = kb.get_origin_routing(conn, t["id"])
     finally:
         conn.close()
 
-    assert len(subs) == 1
-    assert subs[0]["notifier_profile"] == "default"
+    assert origin is not None
+    assert origin["platform"] == "telegram"
 
 
 def test_home_subscribe_unknown_platform_returns_404(client, with_home_channels):
@@ -1848,8 +1847,9 @@ def test_home_subscribe_unknown_task_returns_404(client, with_home_channels):
     assert r.status_code == 404
 
 
-def test_home_unsubscribe_removes_notify_sub_row(client, with_home_channels):
-    """DELETE .../home-subscribe/telegram removes the matching row."""
+def test_home_unsubscribe_is_noop(client, with_home_channels):
+    """DELETE .../home-subscribe/telegram returns ok. Origin routing is a
+    system comment — unsubscribing doesn't remove it (no-op for backward compat)."""
     from hermes_cli import kanban_db as kb
     t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
     client.post(f"/api/plugins/kanban/tasks/{t['id']}/home-subscribe/telegram")
@@ -1858,13 +1858,15 @@ def test_home_unsubscribe_removes_notify_sub_row(client, with_home_channels):
 
     conn = kb.connect()
     try:
-        assert kb.list_notify_subs(conn, t["id"]) == []
+        origin = kb.get_origin_routing(conn, t["id"])
     finally:
         conn.close()
+    # Origin routing persists — it's a system comment, not a subscription.
+    assert origin is not None
 
 
-def test_home_subscribe_multiple_platforms_independent(client, with_home_channels):
-    """Subscribing on telegram does not affect discord and vice versa."""
+def test_home_subscribe_multiple_platforms_overwrites(client, with_home_channels):
+    """Origin routing stores one platform per task — last subscribe wins."""
     from hermes_cli import kanban_db as kb
     t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
 
@@ -1873,19 +1875,23 @@ def test_home_subscribe_multiple_platforms_independent(client, with_home_channel
 
     conn = kb.connect()
     try:
-        subs = {s["platform"]: s for s in kb.list_notify_subs(conn, t["id"])}
+        origin = kb.get_origin_routing(conn, t["id"])
     finally:
         conn.close()
-    assert set(subs) == {"telegram", "discord"}
+    # Last subscribe wins — origin routing stores one origin per task.
+    assert origin is not None
+    assert origin["platform"] == "discord"
 
-    # Unsubscribe telegram only.
+    # Unsubscribe telegram — no-op for origin routing.
     client.delete(f"/api/plugins/kanban/tasks/{t['id']}/home-subscribe/telegram")
     conn = kb.connect()
     try:
-        subs = {s["platform"]: s for s in kb.list_notify_subs(conn, t["id"])}
+        origin2 = kb.get_origin_routing(conn, t["id"])
     finally:
         conn.close()
-    assert set(subs) == {"discord"}
+    # Origin routing persists regardless of unsubscribe.
+    assert origin2 is not None
+    assert origin2["platform"] == "discord"
 
 
 def test_home_channels_empty_when_no_homes_configured(client, monkeypatch):
