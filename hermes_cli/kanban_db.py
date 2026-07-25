@@ -8555,6 +8555,26 @@ def _default_spawn(
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
     env["HERMES_KANBAN_WORKSPACE"] = workspace
+    # Propagate origin routing from parent task to child via env vars.
+    # The child's CLI will pick these up and store origin routing on any
+    # tasks it creates, creating a chain back to the original chat.
+    # Falls back to the dispatcher's own session env if the task has no
+    # stored origin (e.g. CLI-created root task without --channel).
+    try:
+        _origin_conn = connect(board=board)
+        try:
+            _origin = get_origin_routing(_origin_conn, task.id)
+            if _origin:
+                if _origin.get("platform"):
+                    env.setdefault("HERMES_SESSION_PLATFORM", _origin["platform"])
+                if _origin.get("chat_id"):
+                    env.setdefault("HERMES_SESSION_CHAT_ID", _origin["chat_id"])
+                if _origin.get("thread_id"):
+                    env.setdefault("HERMES_SESSION_THREAD_ID", _origin["thread_id"])
+        finally:
+            _origin_conn.close()
+    except Exception:
+        pass  # origin propagation is best-effort
     # Pin TERMINAL_CWD to the task's workspace so the worker's file tools and
     # context-file loader anchor on the workspace, not whatever cwd the
     # dispatching gateway happened to export. The worker subprocess is already

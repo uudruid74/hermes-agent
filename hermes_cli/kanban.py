@@ -1201,10 +1201,24 @@ def _cmd_create(args: argparse.Namespace) -> int:
             initial_status=getattr(args, "initial_status", "running"),
         )
         task = kb.get_task(conn, task_id)
-        # Store origin routing for CLI-created tasks when --channel is set.
+        # Store origin routing for CLI-created tasks.
+        # Priority: --channel flag > env vars > nothing.
         channel_flag = getattr(args, "channel", None)
         if channel_flag:
             _store_cli_origin_routing(conn, task_id, channel_flag)
+        else:
+            _platform = os.environ.get("HERMES_SESSION_PLATFORM", "").strip()
+            _chat_id = os.environ.get("HERMES_SESSION_CHAT_ID", "").strip()
+            _thread_id = os.environ.get("HERMES_SESSION_THREAD_ID", "").strip()
+            if _platform and _chat_id:
+                try:
+                    kb.store_origin_routing(
+                        conn, task_id,
+                        platform=_platform, chat_id=_chat_id,
+                        thread_id=_thread_id or "",
+                    )
+                except Exception as exc:
+                    print(f"kanban: failed to store origin routing from env: {exc}", file=sys.stderr)
     if getattr(args, "json", False):
         print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))
     else:
