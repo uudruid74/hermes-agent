@@ -734,6 +734,77 @@ def run_conversation(
         agent._api_call_count = api_call_count
         agent._touch_activity(f"starting API call #{api_call_count}")
 
+        # ── Mid-turn memory re-injection (POC) ──
+        # On iterations 2+, re-fire the pre_llm_call plugin hook and
+        # re-prefetch external memory so the model sees fresh context
+        # during sequential thinking instead of the frozen turn-start
+        # snapshot.  Controlled by memory.mid_turn_reinject config
+        # (default false).  Clearing the api_content sidecar forces
+        # the live composition path at the api_messages build below.
+        if (
+            api_call_count > 1
+            and getattr(agent, "_mid_turn_reinject", False)
+        ):
+            _prev_plugin = _plugin_user_context
+            _prev_prefetch = _ext_prefetch_cache
+
+            # Re-fire pre_llm_call plugin hook
+            try:
+                from hermes_cli.plugins import invoke_hook as _invoke_hook
+                _pre_results = _invoke_hook(
+                    "pre_llm_call",
+                    session_id=agent.session_id,
+                    task_id=effective_task_id,
+                    turn_id=turn_id,
+                    user_message=original_user_message,
+                    conversation_history=list(messages),
+                    is_first_turn=False,
+                    model=agent.model,
+                    platform=getattr(agent, "platform", None) or "",
+                    sender_id=getattr(agent, "_user_id", None) or "",
+                )
+                _ctx_parts: list[str] = []
+                for r in _pre_results:
+                    _piece: str = ""
+                    if isinstance(r, dict) and r.get("context"):
+                        _piece = str(r["context"])
+                    elif isinstance(r, str) and r.strip():
+                        _piece = r
+                    else:
+                        continue
+                    _ctx_parts.append(_piece)
+                _plugin_user_context = "\n\n".join(_ctx_parts) if _ctx_parts else ""
+            except Exception:
+                pass  # Non-fatal; keep previous context
+
+            # Re-run external memory prefetch
+            if agent._memory_manager:
+                try:
+                    _query = original_user_message if isinstance(original_user_message, str) else ""
+                    _ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
+                except Exception:
+                    pass
+
+            # Clear the prologue-stamped api_content sidecar so the
+            # api_messages build below takes the live composition path
+            # (compose_user_api_content) instead of replaying frozen bytes.
+            _turn_msg = (
+                messages[current_turn_user_idx]
+                if 0 <= current_turn_user_idx < len(messages)
+                else None
+            )
+            if isinstance(_turn_msg, dict):
+                _turn_msg.pop("api_content", None)
+
+            _plugin_changed = _plugin_user_context != _prev_plugin
+            _prefetch_changed = _ext_prefetch_cache != _prev_prefetch
+            logger.info(
+                "mid-turn injection: iteration %d, plugin_context changed=%s, prefetch changed=%s",
+                api_call_count,
+                "yes" if _plugin_changed else "no",
+                "yes" if _prefetch_changed else "no",
+            )
+
         # Grace call: the budget is exhausted but we gave the model one
         # more chance.  Consume the grace flag so the loop exits after
         # this iteration regardless of outcome.

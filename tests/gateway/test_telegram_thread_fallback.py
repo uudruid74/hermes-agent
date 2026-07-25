@@ -195,9 +195,9 @@ def test_forum_group_topic_message_preserves_thread_session_key():
     event = adapter._build_message_event(message, msg_type=MessageType.TEXT)
 
     assert event.source.chat_id == "-100123"
-    assert event.source.chat_type == "group"
+    assert event.source.chat_type == "forum"
     assert event.source.thread_id == "17585"
-    assert build_session_key(event.source) == "agent:main:telegram:group:-100123:17585"
+    assert build_session_key(event.source) == "agent:main:telegram:forum:-100123:17585"
 
 
 def test_forum_general_topic_without_message_thread_id_keeps_thread_context():
@@ -224,7 +224,7 @@ def test_forum_general_topic_without_message_thread_id_keeps_thread_context():
     event = adapter._build_message_event(message, msg_type=SimpleNamespace(value="text"))
 
     assert event.source.chat_id == "-100123"
-    assert event.source.chat_type == "group"
+    assert event.source.chat_type == "forum"
     assert event.source.thread_id == "1"
 
 

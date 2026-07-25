@@ -195,17 +195,19 @@ def _handle_unwatch(runner, cmd: dict, writer: asyncio.StreamWriter) -> None:
 
 
 async def _handle_inject(runner, cmd: dict, writer: asyncio.StreamWriter) -> None:
-    """Inject a message as an agent wake event via adapter.handle_message().
+    """Inject a message via adapter.handle_message().
 
     Used by external processes (e.g. ``hermes send`` CLI) to route messages
     through the gateway's session manager when the in-process adapter is
-    unavailable.  The message arrives as an ``internal=True`` MessageEvent so
-    the agent sees it as a wake event in its active session.
+    unavailable.  Without ``user_context`` the message arrives as an
+    ``internal=True`` wake event.  With ``user_context`` (``hermes send -u``)
+    it arrives as a simulated user message with full user identity.
     """
     platform_name = cmd.get("platform", "")
     chat_id = cmd.get("chat_id", "")
     text = cmd.get("text", "")
     thread_id = cmd.get("thread_id")
+    user_context = cmd.get("user_context")
 
     if not platform_name or not chat_id or not text:
         _respond(writer, {"error": "Missing required fields: platform, chat_id, text"})
@@ -234,12 +236,21 @@ async def _handle_inject(runner, cmd: dict, writer: asyncio.StreamWriter) -> Non
             thread_id=thread_id,
             chat_type="group",
         )
+        # Build internal flag and user identity
+        is_internal = True
+        event_metadata = {}
+        if user_context:
+            is_internal = False
+            session_source.user_id = user_context.get("user_id")
+            session_source.user_name = user_context.get("sender_name")
+            event_metadata["platform_user_id"] = user_context.get("platform_user_id")
         notify_event = MessageEvent(
             text=text,
             source=session_source,
             message_type=MessageType.TEXT,
-            internal=True,
+            internal=is_internal,
             timestamp=datetime.now(),
+            metadata=event_metadata,
         )
         await adapter.handle_message(notify_event)
         _respond(writer, {"ok": True})

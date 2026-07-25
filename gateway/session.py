@@ -989,7 +989,14 @@ def build_session_key(
     if isolate_user and participant_id:
         key_parts.append(str(participant_id))
 
-    return ":".join(key_parts)
+    result = ":".join(key_parts)
+    logger.debug(
+        "build_session_key: key=%s chat_type=%s chat_id=%s thread_id=%s "
+        "user_id=%s isolate_user=%s",
+        result, source.chat_type, source.chat_id, source.thread_id,
+        participant_id, isolate_user,
+    )
+    return result
 
 
 class _SessionFlight:

@@ -233,7 +233,7 @@ def test_list_human_output(monkeypatch, capsys):
     import types as _types
 
     fake_dir = _types.ModuleType("gateway.channel_directory")
-    fake_dir.format_directory_for_display = lambda: "Available messaging targets:\n\nTelegram:\n  telegram:-100123\n"
+    fake_dir.format_directory_for_display = lambda: "Available messaging targets:\n\nTelegram:\n  telegram:-100123 — Test Group\n"
     fake_dir.load_directory = lambda: {
         "platforms": {"telegram": [{"id": "-100123", "name": "Test Group"}]}
     }

@@ -112,7 +112,8 @@ class TestLoadConfigDefaults:
     def test_returns_defaults_when_no_file(self, tmp_path):
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
             config = load_config()
-            assert config["model"] == DEFAULT_CONFIG["model"]
+            # model is normalized to a dict (empty when no config file)
+            assert config["model"] == {}
             assert config["agent"]["max_turns"] == DEFAULT_CONFIG["agent"]["max_turns"]
             assert "max_turns" not in config
             assert "terminal" in config
@@ -156,7 +157,8 @@ class TestLoadConfigParseFailure:
                 config = load_config()
 
             # Falls back to defaults — confirms the silent-fallback we're warning about
-            assert config["model"] == DEFAULT_CONFIG["model"]
+            # model is normalized to a dict (empty when falling back to defaults)
+            assert config["model"] == {}
 
             # WARNING-level log was emitted with file path + reason
             assert any(
@@ -338,7 +340,8 @@ class TestLoadConfigParseFailure:
                 str(tmp_path / "config.yaml"), None
             )
             config = load_config()
-            assert config["model"] == DEFAULT_CONFIG["model"]
+            # model is normalized to a dict (empty when falling back to defaults)
+            assert config["model"] == {}
 
     def test_last_known_good_cached_no_rewarn_spam(self, tmp_path, capsys):
         """Repeated loads of the same broken file serve the cached LKG and
@@ -409,7 +412,8 @@ class TestSaveAndLoadRoundtrip:
             save_config(config)
 
             reloaded = load_config()
-            assert reloaded["model"] == "test/custom-model"
+            # model is normalized to a dict with 'default' key
+            assert reloaded["model"] == {"default": "test/custom-model"}
             assert reloaded["agent"]["max_turns"] == 42
 
             saved = yaml.safe_load((tmp_path / "config.yaml").read_text())
@@ -500,7 +504,8 @@ class TestSaveAndLoadRoundtrip:
             )
 
             saved = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
-            assert saved["model"] == "test/custom-model"
+            # model is normalized to a dict with 'default' key
+            assert saved["model"] == {"default": "test/custom-model"}
             assert saved["platforms"]["email"]["unauthorized_dm_behavior"] == "pair"
 
 
@@ -903,7 +908,8 @@ class TestSaveConfigAtomicity:
 
             # Original file must still be intact
             reloaded = load_config()
-            assert reloaded["model"] == "original-model"
+            # model is normalized to a dict with 'default' key
+            assert reloaded["model"] == {"default": "original-model"}
 
     def test_no_leftover_temp_files(self, tmp_path):
         """Failed writes must clean up their temp files."""
@@ -933,7 +939,8 @@ class TestSaveConfigAtomicity:
             config_path = tmp_path / "config.yaml"
             with open(config_path, encoding="utf-8") as f:
                 raw = yaml.safe_load(f)
-            assert raw["model"] == "test/atomic-model"
+            # model is normalized to a dict with 'default' key
+            assert raw["model"] == {"default": "test/atomic-model"}
             assert raw["agent"]["max_turns"] == 77
 
 
@@ -2170,7 +2177,12 @@ class TestConfigNormalizationDoesNotOverwriteUserValues:
             save_config(load_config())
             raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
 
-        assert raw == {"_config_version": DEFAULT_CONFIG["_config_version"]}
+        # model is normalized to an empty dict (not omitted)
+        expected = {
+            "_config_version": DEFAULT_CONFIG["_config_version"],
+            "model": {},
+        }
+        assert raw == expected
 
     def test_save_config_honors_caller_preserve_keys(self, tmp_path):
         config_path = tmp_path / "config.yaml"

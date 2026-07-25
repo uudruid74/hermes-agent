@@ -479,16 +479,19 @@ def format_directory_for_display() -> str:
             for guild_name, guild_channels in sorted(guilds.items()):
                 lines.append(f"Discord ({guild_name}):")
                 for ch in sorted(guild_channels, key=lambda c: c["name"]):
-                    lines.append(f"  discord:{_channel_target_name(plat_name, ch)}")
+                    target_id = ch.get("id", "?")
+                    lines.append(f"  discord:{target_id} — {ch['name']}")
             if dms:
                 lines.append("Discord (DMs):")
                 for ch in dms:
-                    lines.append(f"  discord:{_channel_target_name(plat_name, ch)}")
+                    target_id = ch.get("id", "?")
+                    lines.append(f"  discord:{target_id} — {ch['name']}")
             lines.append("")
         else:
             lines.append(f"{plat_name.title()}:")
             for ch in channels:
-                lines.append(f"  {plat_name}:{_channel_target_name(plat_name, ch)}")
+                target_id = ch.get("id", "?")
+                lines.append(f"  {plat_name}:{target_id} — {ch['name']}")
             lines.append("")
 
     lines.append('Use these as the "target" parameter when sending.')

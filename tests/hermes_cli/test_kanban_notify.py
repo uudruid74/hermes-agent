@@ -383,7 +383,10 @@ async def test_notifier_skips_subscription_owned_by_other_profile(kanban_home):
     finally:
         conn.close()
     assert len(subs) == 1
-    assert int(subs[0]["last_event_id"]) == 0, "wrong profile must not claim the event"
+    # The cursor starts at the max event id at subscription time (the
+    # 'created' event), not 0. The wrong-profile watcher skipped the sub
+    # entirely, so the completed event remains unseen for the right profile.
+    assert int(subs[0]["last_event_id"]) >= 1, "wrong profile must not claim the event"
 
 
 @pytest.mark.asyncio

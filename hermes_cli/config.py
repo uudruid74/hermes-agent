@@ -2918,6 +2918,10 @@ DEFAULT_CONFIG = {
         # Set to None (or omit) to let workers inherit the profile's
         # default temperature.
         "worker_temperature": 0.1,
+        # Temperature map — a single float multiplier applied to the resolved
+        # temperature before it's sent to the LLM. Default 1.0 means no
+        # change. Values > 1.0 increase temperature; < 1.0 decrease it.
+        "temperature_map": 1.0,
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.
@@ -6909,6 +6913,18 @@ def _normalize_root_model_keys(config: Dict[str, Any]) -> Dict[str, Any]:
     the next save. Precedence: ``default`` > ``model`` > ``name`` (never
     overrides an explicit ``default``, so existing configs are unaffected).
     """
+    # Always normalize the model key to a dict. The migration logic below
+    # (moving root-level provider/base_url/context_length into model) only
+    # runs when there's something to migrate, but the model dict normalization
+    # must happen unconditionally so downstream code can rely on model being a dict.
+    config = dict(config)
+    model = config.get("model")
+    if not isinstance(model, dict):
+        model = {"default": model} if model else {}
+    else:
+        model = dict(model)
+    config["model"] = model
+
     # Only act if there's something to migrate: root-level keys, an api_base
     # alias, or a model dict whose id lives under a non-canonical key.
     model_in = config.get("model")
@@ -6925,14 +6941,6 @@ def _normalize_root_model_keys(config: Dict[str, Any]) -> Dict[str, Any]:
     )
     if not has_root and not model_has_alias and not model_needs_canon:
         return config
-
-    config = dict(config)
-    model = config.get("model")
-    if not isinstance(model, dict):
-        model = {"default": model} if model else {}
-    else:
-        model = dict(model)
-    config["model"] = model
 
     for key in ("provider", "base_url", "context_length"):
         root_val = config.get(key)

@@ -4,8 +4,8 @@ Temperature Tool Module — Session-scoped temperature adjustment.
 
 Lets the agent set its own sampling temperature mid-session via
 ``adjust_temperature(temperature)`` (absolute value). The value is stored
-on the agent as ``_session_temperature`` and takes priority in
-``resolve_temperature()`` over profile defaults and worker temperature.
+on the agent as ``_session_temperature`` and is the single source of truth
+for temperature — sent to the LLM after multiplying by ``_temperature_map``.
 
 Kimi / Moonshot providers do not support temperature — the tool returns
 ``null`` (no-op) for those providers.
@@ -57,30 +57,13 @@ def adjust_temperature_tool(temperature: float, agent) -> str:
             "previous": previous,
         })
 
-    # Out of range → no change. Get the actual running temperature.
-    current = _get_current_temperature(agent)
+    # Out of range → no change. Return current _session_temperature.
+    current = agent._session_temperature
     return json.dumps({
         "temperature": current,
         "changed": False,
         "previous": current,
     })
-
-
-def _get_current_temperature(agent) -> Optional[float]:
-    """Resolve the agent's actual current temperature."""
-    # Session override (set by this tool)
-    session = getattr(agent, "_session_temperature", None)
-    if session is not None:
-        return session
-    # Profile default
-    profile = getattr(agent, "_temperature", None)
-    if profile is not None:
-        return profile
-    # Worker temperature (kanban/delegated)
-    worker = getattr(agent, "worker_temperature", None)
-    if worker is not None:
-        return worker
-    return None
 
 
 # --- Schema ---

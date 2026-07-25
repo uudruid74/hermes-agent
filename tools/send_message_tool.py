@@ -357,10 +357,87 @@ def _handle_react(args, remove=False):
 
 def _handle_send(args):
     """Send a message to a platform target."""
-    target = args.get("target", "")
     message = args.get("message", "")
+    target = args.get("target", "")
     if not target or not message:
         return tool_error("Both 'target' and 'message' are required when action='send'")
+
+    # Internal delivery (hermes send -u) — route via _send_via_adapter
+    # as a simulated user message.  The target is parsed the same way as
+    # normal sends (platform:chat_id[:thread_id]) but the message arrives
+    # with full user identity so handle_message() treats it like a real
+    # inbound message from that user.
+    if args.get("internal"):
+        parts = target.split(":", 1)
+        platform_name = parts[0].strip().lower()
+        if platform_name == "agent":
+            # Backward compat: --to agent resolves home channel
+            try:
+                from gateway.config import load_gateway_config
+                config = load_gateway_config()
+                home = None
+                for p, pconfig_candidate in config.platforms.items():
+                    if pconfig_candidate and pconfig_candidate.enabled and pconfig_candidate.home_channel:
+                        home = pconfig_candidate.home_channel
+                        break
+                if not home:
+                    return tool_error("No home channel configured for agent wake delivery.")
+                platform_name = home.platform.value
+                chat_id = home.chat_id
+                thread_id = home.thread_id
+            except Exception as e:
+                return json.dumps(_error(f"Failed to load gateway config: {e}"))
+        else:
+            target_ref = parts[1].strip() if len(parts) > 1 else ""
+            if not target_ref:
+                return tool_error(
+                    f"Internal delivery requires a channel. "
+                    f"Format: '{platform_name}:chat_id[:thread_id]'."
+                )
+            chat_id, thread_id, _ = _parse_target_ref(platform_name, target_ref)
+            if not chat_id:
+                return tool_error(
+                    f"Could not parse channel from '{target}'. "
+                    f"Use format: '{platform_name}:chat_id[:thread_id]'."
+                )
+
+        # Build user identity for simulated user message
+        user_id = os.environ.get("HERMES_SESSION_USER_ID") or os.environ.get("HERMES_SESSION_TELEGRAM_ID")
+        sender_name = os.environ.get("HERMES_SESSION_USER_NAME", "")
+        if not user_id:
+            user_id = "cli"
+        if not sender_name:
+            sender_name = "CLI User"
+        user_context = {
+            "user_id": user_id,
+            "platform_user_id": user_id,
+            "sender_name": sender_name,
+        }
+
+        from tools.interrupt import is_interrupted
+        if is_interrupted():
+            return tool_error("Interrupted")
+        try:
+            from gateway.config import load_gateway_config, Platform
+            config = load_gateway_config()
+        except Exception as e:
+            return json.dumps(_error(f"Failed to load gateway config: {e}"))
+        platform = Platform(platform_name)
+        pconfig = config.platforms.get(platform)
+        if not pconfig or not pconfig.enabled:
+            return tool_error(
+                f"Platform '{platform_name}' is not configured. "
+                f"Set up credentials in ~/.hermes/config.yaml or environment variables."
+            )
+        from model_tools import _run_async
+        result = _run_async(
+            _send_via_adapter(
+                platform, pconfig, chat_id, message,
+                thread_id=thread_id or None,
+                user_context=user_context,
+            )
+        )
+        return json.dumps(result)
 
     parts = target.split(":", 1)
     platform_name = parts[0].strip().lower()
@@ -403,19 +480,23 @@ def _handle_send(args):
 
     # `--to agent` — intercept BEFORE Platform() parsing: "agent" is not a
     # platform enum member. Resolve the real home channel and redirect to it.
+    #
+    # `internal=True` (hermes send -u) — also uses the agent_wake path, but
+    # with an explicitly specified platform instead of auto-discovery.
     agent_wake = False
-    if platform_name == "agent":
-        home = None
-        for p, pconfig_candidate in config.platforms.items():
-            if pconfig_candidate and pconfig_candidate.enabled and pconfig_candidate.home_channel:
-                home = pconfig_candidate.home_channel
-                break
-        if not home:
-            return tool_error("No home channel configured — cannot determine which platform to use for agent wake delivery.")
-        platform_name = home.platform.value
+    if platform_name == "agent" or args.get("internal"):
         agent_wake = True
-        chat_id = home.chat_id
-        thread_id = home.thread_id
+        if platform_name == "agent":
+            home = None
+            for p, pconfig_candidate in config.platforms.items():
+                if pconfig_candidate and pconfig_candidate.enabled and pconfig_candidate.home_channel:
+                    home = pconfig_candidate.home_channel
+                    break
+            if not home:
+                return tool_error("No home channel configured — cannot determine which platform to use for agent wake delivery.")
+            platform_name = home.platform.value
+            chat_id = home.chat_id
+            thread_id = home.thread_id
 
     # Accept any platform name — built-in names resolve to their enum
     # member, plugin platform names create dynamic members via _missing_().
@@ -712,15 +793,20 @@ async def _send_via_adapter(
     media_files=None,
     force_document=False,
     try_adapter_only=False,
+    user_context=None,
 ):
-    """Inject a message into the agent's session as an internal wake event.
+    """Inject a message into the agent's session.
 
-    Uses ``adapter.handle_message()`` with ``internal=True`` so the message
-    arrives in the agent's active session context — the same pattern as
-    kanban wake events. Falls back to the plugin's ``standalone_sender_fn``
-    for out-of-process callers (e.g. cron running separately from the
-    gateway), unless ``try_adapter_only`` is True (used when the caller
-    has its own platform-specific fallback).
+    Without ``user_context`` the message arrives as an internal wake event
+    (``internal=True``, no user identity) — the same pattern as kanban
+    wake events.  With ``user_context`` (``hermes send -u``) the message
+    is injected as a simulated user message: ``internal=False`` with full
+    user identity so ``handle_message()`` treats it like a real inbound.
+
+    Falls back to the plugin's ``standalone_sender_fn`` for out-of-process
+    callers (e.g. cron running separately from the gateway), unless
+    ``try_adapter_only`` is True (used when the caller has its own
+    platform-specific fallback).
     """
     platform_name = platform.value if hasattr(platform, "value") else str(platform)
     runner = None
@@ -743,12 +829,21 @@ async def _send_via_adapter(
                     thread_id=thread_id,
                     chat_type="group",
                 )
+                # Build internal flag and user identity
+                is_internal = True
+                event_metadata = {}
+                if user_context:
+                    is_internal = False
+                    session_source.user_id = user_context.get("user_id")
+                    session_source.user_name = user_context.get("sender_name")
+                    event_metadata["platform_user_id"] = user_context.get("platform_user_id")
                 notify_event = MessageEvent(
                     text=chunk,
                     source=session_source,
                     message_type=MessageType.TEXT,
-                    internal=True,
+                    internal=is_internal,
                     timestamp=datetime.now(),
+                    metadata=event_metadata,
                 )
                 await adapter.handle_message(notify_event)
                 return {"success": True, "queued": True}
@@ -759,7 +854,8 @@ async def _send_via_adapter(
 
     if try_adapter_only:
         bridge_result = await _send_via_bridge(
-            platform, chat_id, chunk, thread_id=thread_id
+            platform, chat_id, chunk, thread_id=thread_id,
+            user_context=user_context,
         )
         if bridge_result.get("success") and bridge_result.get("queued"):
             return bridge_result
@@ -811,13 +907,17 @@ async def _send_via_adapter(
 BRIDGE_SOCKET = "/tmp/hermes/mcp_bridge.sock"
 
 
-async def _send_via_bridge(platform, chat_id, text, *, thread_id=None):
-    """Inject a message as a wake event via the gateway's MCP bridge socket.
+async def _send_via_bridge(platform, chat_id, text, *, thread_id=None, user_context=None):
+    """Inject a message via the gateway's MCP bridge socket.
 
     Used when the in-process adapter is unavailable (e.g. ``hermes send`` CLI
     running in a separate process) but the gateway is running.  Connects to
     the gateway's Unix socket and sends an ``inject`` command so the gateway
-    injects the message via ``adapter.handle_message(internal=True)``.
+    injects the message via ``adapter.handle_message()``.
+
+    Without ``user_context`` the message arrives as an internal wake event
+    (``internal=True``).  With ``user_context`` the message is injected as a
+    simulated user message with full user identity.
 
     Returns ``{"success": True, "queued": True}`` on success, or an error
     dict on failure.
@@ -833,6 +933,8 @@ async def _send_via_bridge(platform, chat_id, text, *, thread_id=None):
     }
     if thread_id is not None:
         payload["thread_id"] = thread_id
+    if user_context:
+        payload["user_context"] = user_context
 
     try:
         sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)

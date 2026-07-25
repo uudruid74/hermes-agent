@@ -379,9 +379,9 @@ class TestFormatDirectoryForDisplay:
             result = format_directory_for_display()
 
         assert "Telegram:" in result
-        assert "telegram:Alice" in result
-        assert "telegram:Dev Group" in result
-        assert "telegram:Coaching Chat / topic 17585" in result
+        assert "telegram:123 — Alice" in result
+        assert "telegram:456 — Dev Group" in result
+        assert "telegram:-1001:17585 — Coaching Chat / topic 17585" in result
 
     def test_discord_grouped_by_guild(self, tmp_path):
         cache_file = _write_directory(tmp_path, {
@@ -396,7 +396,7 @@ class TestFormatDirectoryForDisplay:
 
         assert "Discord (Server1):" in result
         assert "Discord (Server2):" in result
-        assert "discord:#general" in result
+        assert "discord:1 — general" in result
 
 
 class TestLookupChannelType:

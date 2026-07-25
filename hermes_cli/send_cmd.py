@@ -35,7 +35,7 @@ from typing import Optional
 
 _USAGE_EXIT = 2
 _FAILURE_EXIT = 1
-_SUCCESS_EXIT = 0
+_SUCESS_EXIT = 0
 
 
 def _read_message_body(
@@ -132,9 +132,9 @@ def _emit_result(
     if payload.get("error"):
         return _FAILURE_EXIT
     if payload.get("skipped"):
-        return _SUCCESS_EXIT
+        return _SUCESS_EXIT
     if payload.get("success"):
-        return _SUCCESS_EXIT
+        return _SUCESS_EXIT
     # Unknown / unexpected — treat as failure so scripts notice.
     return _FAILURE_EXIT
 
@@ -178,19 +178,19 @@ def _list_targets(platform_filter: Optional[str], *, json_mode: bool) -> int:
 
     if json_mode:
         print(json.dumps({"platforms": platforms}, indent=2, default=str))
-        return _SUCCESS_EXIT
+        return _SUCESS_EXIT
 
     if not any(platforms.values()):
         print("No messaging platforms configured or no channels discovered yet.")
         print("Set one up with `hermes gateway setup`, or run the gateway once so")
         print("channel discovery can populate ~/.hermes/channel_directory.json.")
-        return _SUCCESS_EXIT
+        return _SUCESS_EXIT
 
     # Human display — when unfiltered, reuse the shared formatter the agent
     # already sees. When filtered, build a minimal view ourselves.
     if platform_filter is None:
         print(format_directory_for_display())
-        return _SUCCESS_EXIT
+        return _SUCESS_EXIT
 
     for plat_name in sorted(platforms):
         channels = platforms[plat_name]
@@ -199,13 +199,12 @@ def _list_targets(platform_filter: Optional[str], *, json_mode: bool) -> int:
             print("  (no channels discovered yet)")
             continue
         for ch in channels:
+            target_id = ch.get("id", "?")
             name = ch.get("name", "?")
-            chat_id = ch.get("id") or ch.get("chat_id") or ""
-            suffix = f"  [{chat_id}]" if chat_id and chat_id != name else ""
-            print(f"  {plat_name}:{name}{suffix}")
+            print(f"  {plat_name}:{target_id} — {name}")
         print()
 
-    return _SUCCESS_EXIT
+    return _SUCESS_EXIT
 
 
 def _load_hermes_env() -> None:
@@ -312,12 +311,16 @@ def cmd_send(args: argparse.Namespace) -> None:
         sys.exit(exit_code)
 
     target = _resolve_target(getattr(args, "to", None))
-    if not target:
+    user_flag = _resolve_target(getattr(args, "user", None))
+    if not target and not user_flag:
         print(
-            "hermes send: --to PLATFORM[:channel[:thread]] is required\n"
+            "hermes send: -t/--to PLATFORM[:channel[:thread]] or "
+            "-u/--user PLATFORM[:channel[:thread]] is required\n"
             "Examples:\n"
-            "  hermes send --to telegram \"hello\"\n"
-            "  hermes send --to discord:#ops --file report.md\n"
+            "  hermes send -t telegram \"hello\"\n"
+            "  hermes send -t discord:#ops --file report.md\n"
+            "  hermes send -u telegram \"agent wake event\"\n"
+            "  hermes send -u telegram:-1001234567890:17585 \"cmd\"\n"
             "  hermes send --list      # list available targets",
             file=sys.stderr,
         )
@@ -349,12 +352,17 @@ def cmd_send(args: argparse.Namespace) -> None:
     # appropriate platform adapter (bot-token path for Telegram/Discord/Slack/
     # Signal/SMS/WhatsApp; live-adapter path for plugin platforms).
     #
-    # It expects the standard tool-call dict and returns a JSON string.
-    tool_args = {
+    # When -u/--user is set, deliver as an agent wake event (internal=True)
+    # to the specified origin channel instead of a platform message.
+    tool_args: dict = {
         "action": "send",
-        "target": target,
         "message": message,
     }
+    if user_flag:
+        tool_args["target"] = user_flag
+        tool_args["internal"] = True
+    else:
+        tool_args["target"] = target
 
     result = send_message_tool(tool_args)
     exit_code = _emit_result(
@@ -384,11 +392,13 @@ def register_send_subparser(subparsers) -> argparse.ArgumentParser:
         ),
         epilog=(
             "Examples:\n"
-            "  hermes send --to telegram \"deploy finished\"\n"
-            "  echo \"RAM 92%\" | hermes send --to telegram:-1001234567890\n"
-            "  hermes send --to discord:#ops --file /tmp/report.md\n"
-            "  hermes send --to slack:#eng --subject \"[CI]\" --file build.log\n"
-            "  hermes send --to telegram \"MEDIA:/tmp/chart.png\"   # send a media attachment\n"
+            "  hermes send -t telegram \"deploy finished\"\n"
+            "  echo \"RAM 92%\" | hermes send -t telegram:-1001234567890\n"
+            "  hermes send -t discord:#ops --file /tmp/report.md\n"
+            "  hermes send -t slack:#eng --subject \"[CI]\" --file build.log\n"
+            "  hermes send -t telegram \"MEDIA:/tmp/chart.png\"   # send a media attachment\n"
+            "  hermes send -u telegram \"agent wake event\"      # deliver as agent wake\n"
+            "  hermes send -u telegram:-1001234567890:17585 \"cmd\"\n"
             "  hermes send --list                  # all platforms\n"
             "  hermes send --list telegram         # filter by platform\n"
             "\n"
@@ -397,18 +407,33 @@ def register_send_subparser(subparsers) -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
-    parser.add_argument(
+    # -t and -u are mutually exclusive — you deliver to a platform OR route
+    # as a user→agent wake event.
+    target_group = parser.add_mutually_exclusive_group()
+
+    target_group.add_argument(
         "-t",
         "--to",
         metavar="TARGET",
         default=None,
         help=(
-            "Delivery target. Format: 'platform' (home channel), "
-            "'platform:chat_id', 'platform:chat_id:thread_id', or "
-            "'platform:#channel-name'. Use 'agent' to deliver as an "
-            "agent wake event (internal=True). Examples: telegram, "
-            "telegram:-1001234567890:17585, discord:#ops, slack:C0123ABCD, "
-            "agent."
+            "Delivery target (agent → platform). Format: 'platform' (home "
+            "channel), 'platform:chat_id', 'platform:chat_id:thread_id', or "
+            "'platform:#channel-name'. Examples: telegram, "
+            "telegram:-1001234567890:17585, discord:#ops, slack:C0123ABCD."
+        ),
+    )
+
+    target_group.add_argument(
+        "-u",
+        "--user",
+        metavar="ORIGIN",
+        default=None,
+        help=(
+            "User→agent delivery (agent wake event, internal=True). Format: "
+            "'platform' (home channel), 'platform:chat_id', or "
+            "'platform:chat_id:thread_id'. Examples: -u telegram, "
+            "-u telegram:-1001234567890:17585."
         ),
     )
 
@@ -418,8 +443,6 @@ def register_send_subparser(subparsers) -> argparse.ArgumentParser:
         default=None,
         help="Message text. If omitted, read from --file or stdin.",
     )
-
-    # Legacy / convenience positional removed — use --to for clarity.
 
     parser.add_argument(
         "-f",

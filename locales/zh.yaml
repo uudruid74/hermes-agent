@@ -165,6 +165,7 @@ gateway:
       crashed:             "崩溃（worker 异常退出），dispatcher 将重试"
       timed_out:           "超时，dispatcher 将重试"
       blocked:             "被阻塞，需要处理"
+      claimed:             "picked up"
       status_default:      "状态变化"
       status_joiner:       "，"
       message:             "[kanban] 任务 {task_id} {status}。\n标题: {title}\n执行者: @{assignee}\n看板: {board}\n\n请检查结果或决定下一步动作。"

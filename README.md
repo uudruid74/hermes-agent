@@ -83,12 +83,12 @@ You've felt it. "I couldn't watch." The code complies because it's scared of wha
 
 ### Worker Mode & Temperature Control
 
-Every agent configuration now ships a `temperature` parameter, but the real innovation is **dynamic temperature control** via `adjust_temperature(percentage)`:
+Every agent configuration now ships a `temperature` parameter, but the real innovation is **dynamic temperature control** via `adjust_temperature(temperature)` — absolute value 0.0–2.0:
 
 | Situation | Adjustment | Target |
 |-----------|-----------|--------|
-| Running a skill / known procedure | -50% | ~0.5 |
-| Normal instruction following | 0% | 1.0 |
+| Running a skill / known procedure | 0.5 | ~0.5 |
+| Normal instruction following | 1.0 | 1.0 |
 | Stuck on a problem | +50% | ~1.5 |
 | Ideation / brainstorming | +100% | 2.0 |
 | **User is frustrated** | **-80%** | **~0.2** |

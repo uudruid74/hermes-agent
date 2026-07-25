@@ -981,29 +981,19 @@ def interruptible_api_call(agent, api_kwargs: dict):
 
 
 
-def resolve_temperature(agent) -> Optional[float]:
-    """Resolve temperature with priority: session > task-type > profile > None.
+def _send_temperature(agent) -> Optional[float]:
+    """Return the temperature to send to the LLM.
 
-    Returns:
-        float if resolved, None to omit (let provider decide).
+    Multiplies _session_temperature by _temperature_map and clamps to [0.0, 2.0].
+    Returns None if _session_temperature is None (let provider decide).
     """
-    # 1. Session override (from adjust_temperature tool)
-    if getattr(agent, '_session_temperature', None) is not None:
-        return agent._session_temperature
-
-    # 2. Task-type: kanban/delegated → worker_temperature
-    is_kanban = os.environ.get("HERMES_KANBAN_TASK") is not None
-    is_delegated = getattr(agent, '_subagent_id', None) is not None
-
-    if (is_kanban or is_delegated) and getattr(agent, 'worker_temperature', None) is not None:
-        return agent.worker_temperature
-
-    # 3. Profile default (interactive temperature)
-    if getattr(agent, '_temperature', None) is not None:
-        return agent._temperature
-
-    # 4. None = omit (provider default)
-    return None
+    t = getattr(agent, '_session_temperature', None)
+    if t is None:
+        return None
+    m = getattr(agent, '_temperature_map', None)
+    if m is not None:
+        t = max(0.0, min(2.0, t * m))
+    return t
 
 
 def build_api_kwargs(agent, api_messages: list) -> dict:
@@ -1144,9 +1134,10 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
         _omit_temp = False
         _fixed_temp = None
 
-    # Resolved temperature: session > worker > profile > None.
+    # Resolved temperature: _session_temperature * _temperature_map, clamped [0.0, 2.0].
     # Fixed-temperature models override; omit-temperature models suppress.
-    _resolved_temp = resolve_temperature(agent)
+    _resolved_temp = _send_temperature(agent)
+
     if _omit_temp:
         _resolved_temp = None
     elif _fixed_temp is not None:
@@ -3871,7 +3862,6 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 __all__ = [
     "interruptible_api_call",
     "build_api_kwargs",
-    "resolve_temperature",
     "build_assistant_message",
     "try_activate_fallback",
     "handle_max_iterations",

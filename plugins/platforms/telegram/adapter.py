@@ -949,28 +949,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     )
 
         chat_id = str(getattr(chat, "id", "")).strip() or user_id
-        chat_type = str(getattr(chat, "type", "dm")).strip().lower() or "dm"
-        if chat_type == "private":
-            chat_type = "dm"
-        elif chat_type == "supergroup":
-            thread_id_raw = getattr(message, "message_thread_id", None)
-            is_topic_message = bool(getattr(message, "is_topic_message", False))
-            is_forum_group = getattr(chat, "is_forum", False) is True
-            chat_type = (
-                "forum"
-                if thread_id_raw is not None and (is_topic_message or is_forum_group)
-                else "group"
-            )
-
-        thread_id = None
-        thread_id_raw = getattr(message, "message_thread_id", None)
-        if thread_id_raw is not None:
-            is_topic_message = bool(getattr(message, "is_topic_message", False))
-            is_forum_group = getattr(chat, "is_forum", False) is True
-            if chat_type == "forum" and (is_topic_message or is_forum_group):
-                thread_id = str(thread_id_raw)
-            elif chat_type == "dm" and is_topic_message:
-                thread_id = str(thread_id_raw)
+        chat_type, thread_id = self._resolve_chat_type_and_thread_id(message)
 
         return SessionSource(
             platform=Platform.TELEGRAM,
@@ -7527,6 +7506,50 @@ class TelegramAdapter(BasePlatformAdapter):
             return cls._GENERAL_TOPIC_THREAD_ID
         return None
 
+    def _resolve_chat_type_and_thread_id(self, message: Message) -> tuple[str, Optional[str]]:
+        """Return a consistent (chat_type, thread_id) for session routing.
+
+        This is the single source of truth for deciding whether a Telegram
+        chat is a DM, group, forum, or channel — and what routing thread_id
+        applies. Both ``_build_message_event`` and
+        ``_source_from_message_for_auth`` must route through this method so
+        session keys never fragment across different code paths.
+        """
+        chat = getattr(message, "chat", None)
+        telegram_chat_type = str(getattr(chat, "type", "")).split(".")[-1].lower() if chat else ""
+        chat_id = str(getattr(chat, "id", "")) if chat else ""
+
+        if telegram_chat_type == "private":
+            chat_type = "dm"
+        elif telegram_chat_type == "channel":
+            chat_type = "channel"
+        elif telegram_chat_type in {"group", "supergroup"}:
+            is_forum = getattr(chat, "is_forum", False) is True
+            thread_id_raw = getattr(message, "message_thread_id", None)
+            is_topic_message = bool(getattr(message, "is_topic_message", False))
+            if is_forum or (thread_id_raw is not None and is_topic_message):
+                chat_type = "forum"
+            else:
+                chat_type = "group"
+        else:
+            chat_type = "dm"
+
+        thread_id = self._effective_message_thread_id(message)
+        user_id = str(getattr(getattr(message, "from_user", None), "id", "")).strip() or None
+
+        is_forum = getattr(chat, "is_forum", False) is True
+        raw_thread_id = getattr(message, "message_thread_id", None)
+        is_topic_message = bool(getattr(message, "is_topic_message", False))
+
+        logger.debug(
+            "telegram routing: chat_id=%s chat_type=%s thread_id=%s user_id=%s "
+            "is_forum=%s is_topic_message=%s message_thread_id=%s",
+            chat_id, chat_type, thread_id, user_id,
+            is_forum, is_topic_message, raw_thread_id,
+        )
+
+        return chat_type, thread_id
+
     def _is_reply_to_bot(self, message: Message) -> bool:
         if not self._bot or not getattr(message, "reply_to_message", None):
             return False
@@ -8987,24 +9010,9 @@ class TelegramAdapter(BasePlatformAdapter):
         chat = message.chat
         user = message.from_user
         
-        # Determine chat type.  Normalize through ``str`` so tests/mocks and
-        # python-telegram-bot enum values both work (``ChatType.CHANNEL`` is
-        # string-like, but mocks often provide plain strings).
-        telegram_chat_type = str(getattr(chat, "type", "")).split(".")[-1].lower()
-        chat_type = "dm"
-        if telegram_chat_type in {"group", "supergroup"}:
-            chat_type = "group"
-        elif telegram_chat_type == "channel":
-            chat_type = "channel"
-
-        # Resolve routable thread id for DM topics and forum group topics via
-        # the shared normalizer, so gating and session routing agree on one
-        # value. Only real topic/forum messages keep a thread id; ordinary
-        # reply-UI anchors are dropped (they are not durable session threads
-        # and sends against them hit 'Message thread not found', #3206), while
-        # forum General-topic messages (message_thread_id=None) normalize to
-        # the General-topic id so replies route back to General (#22423).
-        thread_id_str = self._effective_message_thread_id(message)
+        # Resolve chat_type and thread_id through the single-source-of-truth
+        # normalizer so gating, session routing, and auth paths all agree.
+        chat_type, thread_id_str = self._resolve_chat_type_and_thread_id(message)
         chat_topic = None
         topic_skill = None
 
@@ -9022,7 +9030,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     if not chat_topic:
                         chat_topic = created_name
 
-        elif chat_type == "group" and thread_id_str:
+        elif chat_type in {"group", "forum"} and thread_id_str:
             # Group/supergroup forum topic skill binding via config.extra['group_topics'].
             # Accept both supported shapes:
             #   [{"chat_id": "-100...", "topics": [...]}]

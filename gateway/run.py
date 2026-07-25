@@ -3884,6 +3884,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             try:
                 session_key = self.session_store._generate_session_key(source)
                 if isinstance(session_key, str) and session_key:
+                    logger.debug(
+                        "session_key_for_source (via store): key=%s platform=%s chat_type=%s "
+                        "chat_id=%s thread_id=%s user_id=%s",
+                        session_key, source.platform.value if source.platform else "?",
+                        source.chat_type, source.chat_id, source.thread_id, source.user_id,
+                    )
                     return session_key
             except Exception:
                 pass
@@ -12066,6 +12072,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _platform_name, source.user_name or source.user_id or "unknown",
             source.chat_id or "unknown", _msg_preview, _reply_id, _reply_txt,
         )
+        logger.debug(
+            "routing trace: platform=%s chat_type=%s chat_id=%s thread_id=%s "
+            "user_id=%s is_internal=%s",
+            _platform_name, source.chat_type, source.chat_id,
+            source.thread_id, source.user_id,
+            getattr(event, "internal", False),
+        )
 
         # Get or create session
         # Topic-mode DMs: rewrite a stale/foreign thread_id to the user's
@@ -12085,6 +12098,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         session_entry = await self.async_session_store.get_or_create_session(source)
         session_key = session_entry.session_key
+        logger.info(
+            "session resolved: key=%s session_id=%s chat_type=%s thread_id=%s",
+            session_key, session_entry.session_id,
+            source.chat_type, source.thread_id,
+        )
         pinned_session_id = str(
             (getattr(event, "metadata", None) or {}).get("gateway_session_id") or ""
         ).strip()

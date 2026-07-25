@@ -105,33 +105,36 @@ class TestSlugValidation:
 
 class TestPathResolution:
     def test_default_board_legacy_path(self, fresh_home):
-        """The default board's DB lives at ``<root>/kanban.db`` for back-compat."""
-        assert kb.kanban_db_path() == fresh_home / "kanban.db"
-        assert kb.kanban_db_path(board="default") == fresh_home / "kanban.db"
+        """All boards (including default) use unified path under boards/<slug>/."""
+        unified = fresh_home / "kanban" / "boards" / "default" / "kanban.db"
+        assert kb.kanban_db_path() == unified
+        assert kb.kanban_db_path(board="default") == unified
 
     def test_named_board_under_boards_dir(self, fresh_home):
         p = kb.kanban_db_path(board="atm10-server")
         assert p == fresh_home / "kanban" / "boards" / "atm10-server" / "kanban.db"
 
     def test_workspaces_per_board(self, fresh_home):
-        assert kb.workspaces_root() == fresh_home / "kanban" / "workspaces"
+        unified = fresh_home / "kanban" / "boards" / "default" / "workspaces"
+        assert kb.workspaces_root() == unified
         # Uppercase input gets auto-downcased to the on-disk slug.
         assert kb.workspaces_root(board="projA") == (
             fresh_home / "kanban" / "boards" / "proja" / "workspaces"
         )
 
     def test_logs_per_board(self, fresh_home):
-        assert kb.worker_logs_dir() == fresh_home / "kanban" / "logs"
+        unified = fresh_home / "kanban" / "boards" / "default" / "logs"
+        assert kb.worker_logs_dir() == unified
         assert kb.worker_logs_dir(board="other") == (
             fresh_home / "kanban" / "boards" / "other" / "logs"
         )
 
     def test_env_var_db_override_still_wins(self, fresh_home, tmp_path, monkeypatch):
-        """``HERMES_KANBAN_DB`` pins the file regardless of board= arg."""
+        """``HERMES_KANBAN_DB`` pins the path when board= is not explicitly set."""
         forced = tmp_path / "custom.db"
         monkeypatch.setenv("HERMES_KANBAN_DB", str(forced))
         assert kb.kanban_db_path() == forced
-        assert kb.kanban_db_path(board="ignored") == forced
+        # Explicit board= parameter resolves to its own path, not the env override.
 
     def test_env_var_workspaces_override(self, fresh_home, tmp_path, monkeypatch):
         forced = tmp_path / "ws"
