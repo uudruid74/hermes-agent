@@ -432,10 +432,7 @@ class GatewayKanbanWatchersMixin:
                             "commented": "💬",
                         }
                         emoji = _EMOJI.get(status, "❓")
-                        parts = [f"[hermes] {emoji} {sub['task_id']}"]
-                        if title:
-                            parts.append(f": {title}")
-                        parts.append(f" — {status}")
+                        parts = [f"[Hermes] A kanban task you created ({sub['task_id']}), assigned to {sub.get('assignee', 'unassigned')}, has changed status to {status} - {title}"]
                         summary = ""
                         if kind == "completed" and ev.payload and ev.payload.get("summary"):
                             summary = str(ev.payload["summary"])
