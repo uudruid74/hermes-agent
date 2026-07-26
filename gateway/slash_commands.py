@@ -3198,6 +3198,65 @@ class GatewaySlashCommandsMixin:
 
         return _apply_fast_selection(args, persist=persist_global)
 
+    async def _handle_temperature_command(self, event: MessageEvent) -> str:
+        """Handle /temperature — show or set agent sampling temperature.
+
+        ``/temperature`` shows the current temperature plus the effective
+        value after the profile's ``_temperature_map`` multiplier.
+        ``/temperature N`` sets the session temperature to *N* and
+        persists it to ``model.worker_temperature`` so the value survives
+        restarts.
+
+        *N* must be in [0.0, 2.0].
+        """
+        raw_args = (event.get_command_args() or "").strip()
+        session_key = self._session_key_for_source(event.source)
+
+        # Resolve the cached agent so we can read/write _session_temperature.
+        agent = None
+        _cache_lock = getattr(self, "_agent_cache_lock", None)
+        _cache = getattr(self, "_agent_cache", None)
+        if _cache_lock and _cache is not None:
+            with _cache_lock:
+                cached_entry = _cache.get(session_key)
+            if cached_entry and cached_entry[0] is not None:
+                agent = cached_entry[0]
+
+        if not raw_args:
+            # ── show current temperature ──
+            agent_temp = getattr(agent, "_session_temperature", None) if agent else None
+            if agent_temp is not None:
+                temp_map = getattr(agent, "_temperature_map", None)
+                if temp_map is not None:
+                    effective = max(0.0, min(2.0, agent_temp * temp_map))
+                    return (
+                        f"🌡️ Temperature: {agent_temp:.2f} "
+                        f"(effective: {effective:.2f} — after profile map ×{temp_map:.2f})"
+                    )
+                return f"🌡️ Temperature: {agent_temp:.2f}"
+            return "🌡️ Temperature: 0.70 (default)\nUsage: /temperature <0.0–2.0>"
+
+        # ── set temperature ──
+        try:
+            val = float(raw_args.split()[0])
+        except ValueError:
+            return (
+                f"✗ Invalid temperature: {raw_args.split()[0]!r} — "
+                f"must be a number 0.0–2.0"
+            )
+
+        if not (0.0 <= val <= 2.0):
+            return f"✗ Temperature must be 0.0–2.0 (got {val})"
+
+        # Apply to the running agent immediately.
+        if agent:
+            agent._session_temperature = val
+
+        # Persist so the choice survives restarts.
+        self._save_gateway_config_key("model.worker_temperature", val)
+
+        return f"🌡️ Temperature set to {val:.2f} (saved)"
+
     async def _handle_yolo_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
         """Handle /yolo — toggle dangerous command approval bypass for this session only."""
         from tools.approval import (
