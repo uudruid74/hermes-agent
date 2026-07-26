@@ -8697,8 +8697,8 @@ def _default_spawn(
     # attributed correctly regardless of how the child loads config.
     env["HERMES_PROFILE"] = profile_arg
 
-    # Inject worker_temperature from the profile's kanban config so the
-    # worker's init_agent can set agent.worker_temperature for
+    # Inject worker_temperature from the profile's model config so the
+    # worker's init_agent can set model.worker_temperature for
     # resolve_temperature() to pick up. Falls back gracefully when the
     # config key is absent or unreadable.
     try:
@@ -8708,7 +8708,7 @@ def _default_spawn(
         token = set_hermes_home_override(env["HERMES_HOME"])
         try:
             cfg = load_config()
-            worker_temp = (cfg.get("kanban") or {}).get("worker_temperature")
+            worker_temp = (cfg.get("model") or {}).get("worker_temperature")
             if worker_temp is not None:
                 env["HERMES_WORKER_TEMPERATURE"] = str(worker_temp)
         finally:

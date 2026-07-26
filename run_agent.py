@@ -500,7 +500,7 @@ class AIAgent:
         if temperature is None:
             try:
                 from hermes_cli.config import load_config as _load_cfg, cfg_get as _cfg_get
-                temperature = _cfg_get(_load_cfg(), "agent", "worker_temperature", default=None)
+                temperature = _cfg_get(_load_cfg(), "model", "worker_temperature", default=None)
             except Exception:
                 pass
         from agent.agent_init import init_agent

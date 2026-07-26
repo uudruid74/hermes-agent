@@ -1400,10 +1400,10 @@ def init_agent(
         _agent_cfg = {}
 
     # Session temperature — if still unset, fall back to config.
-    # Priority: worker_temperature (kanban) > agent.temperature (profile) > model.temperature
+    # Priority: model.worker_temperature > model.temperature > default 0.7
     if agent._session_temperature is None:
         try:
-            agent._session_temperature = cfg_get(_agent_cfg, "agent", "worker_temperature", default=None)
+            agent._session_temperature = cfg_get(_agent_cfg, "model", "worker_temperature", default=None)
         except Exception:
             pass
     if agent._session_temperature is None:
@@ -1414,7 +1414,7 @@ def init_agent(
     # Temperature map — multiplier applied to _session_temperature before
     # sending to the LLM. Loaded from config, defaults to 1.0 (no change).
     try:
-        agent._temperature_map = cfg_get(_agent_cfg, "kanban", "temperature_map", default=1.0)
+        agent._temperature_map = cfg_get(_agent_cfg, "model", "temperature_map", default=1.0)
     except Exception:
         agent._temperature_map = 1.0
 

@@ -680,7 +680,7 @@ def _run_review_in_thread(
             _review_temp = None
             try:
                 from hermes_cli.config import load_config as _br_cfg_load, cfg_get as _br_cfg_get
-                _review_temp = _br_cfg_get(_br_cfg_load(), "agent", "worker_temperature", default=None)
+                _review_temp = _br_cfg_get(_br_cfg_load(), "model", "worker_temperature", default=None)
             except Exception:
                 pass
             # skip_memory=True keeps the review fork from

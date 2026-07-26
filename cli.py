@@ -2478,7 +2478,7 @@ def _get_profile_color() -> str | None:
         if profile and profile not in ("default", "custom"):
             import os
             from hermes_constants import get_hermes_home
-            cfg_path = os.path.join(str(get_hermes_home()), "config.yaml")
+            cfg_path = os.path.join(str(get_hermes_home()), "profiles", profile, "config.yaml")
             if os.path.exists(cfg_path):
                 import yaml
                 with open(cfg_path) as f:
@@ -4679,7 +4679,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         ``/temperature`` shows the current temperature plus the effective
         value after the profile's ``_temperature_map`` multiplier.
         ``/temperature N`` sets the session temperature to *N* and
-        persists it to ``agent.worker_temperature`` so the value survives
+        persists it to ``model.worker_temperature`` so the value survives
         restarts.
 
         *N* must be in [0.0, 2.0].
@@ -4735,7 +4735,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self.agent._session_temperature = val
 
         # Persist so the choice survives restarts.
-        save_config_value("agent.worker_temperature", val)
+        save_config_value("model.worker_temperature", val)
 
         self._console_print(
             f"  ✓ Temperature set to {val:.2f} (saved)"
