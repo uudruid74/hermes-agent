@@ -154,6 +154,49 @@ def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None
         _log.debug("kanban lifecycle hook %s failed: %s", event, exc)
 
 
+def _write_kanban_fabric_entry(
+    task_id: str,
+    title: str,
+    body: str,
+    assignee: Optional[str] = None,
+) -> None:
+    """Write a fabric entry for a newly created kanban task.
+
+    Best-effort — all failures are swallowed so a missing or broken
+    fabric plugin never blocks task creation. The entry carries the
+    task id, title, body, and assignee so downstream agents and
+    reviewers can discover it via fabric_recall.
+    """
+    try:
+        from hermes_constants import get_hermes_home
+        plugin_dir = Path(get_hermes_home()).parent / "plugins" / "icarus"
+        if not plugin_dir.is_dir():
+            # Try the repo-bundled plugin path.
+            plugin_dir = Path(get_hermes_home()) / "plugins" / "icarus"
+        if not plugin_dir.is_dir():
+            return
+        sys.path.insert(0, str(plugin_dir.parent))
+        try:
+            from icarus.state import write_entry
+        finally:
+            sys.path.pop(0)
+        content_lines = [f"# {title}"]
+        if body:
+            content_lines.append("")
+            content_lines.append(body)
+        content = "\n".join(content_lines)
+        summary = f"kanban-task-{task_id}-{title[:40]}"
+        write_entry(
+            entry_type="task",
+            content=content,
+            summary=summary,
+            status="open",
+            assigned_to=assignee or "",
+        )
+    except Exception:
+        pass  # best-effort
+
+
 # A running task's claim is valid for 15 minutes by default; after that the
 # next dispatcher tick reclaims it. Workers that outlive this window should
 # call ``heartbeat_claim(task_id)`` periodically. In practice most kanban
@@ -2885,6 +2928,23 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                     },
                 )
+            _fire_kanban_lifecycle_hook(
+                "kanban_task_created",
+                task_id,
+                title=title.strip(),
+                body=body or "",
+                assignee=assignee,
+            )
+            # Write a fabric entry so agents have context about this task.
+            try:
+                _write_kanban_fabric_entry(
+                    task_id=task_id,
+                    title=title.strip(),
+                    body=body or "",
+                    assignee=assignee,
+                )
+            except Exception:
+                pass  # best-effort — never break task creation
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:

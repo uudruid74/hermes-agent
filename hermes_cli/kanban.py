@@ -61,7 +61,7 @@ def _notify_kanban_status_change(
 
     # Build the message payload.
     emoji = _NOTIFY_EMOJI.get(new_status, "❓")
-    parts = [f"{emoji} {task_id}"]
+    parts = [f"[hermes] {emoji} {task_id}"]
     if title:
         parts.append(f": {title}")
     parts.append(f" — {new_status}")

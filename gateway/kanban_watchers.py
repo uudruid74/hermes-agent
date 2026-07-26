@@ -432,7 +432,7 @@ class GatewayKanbanWatchersMixin:
                             "commented": "💬",
                         }
                         emoji = _EMOJI.get(status, "❓")
-                        parts = [f"{emoji} {sub['task_id']}"]
+                        parts = [f"[hermes] {emoji} {sub['task_id']}"]
                         if title:
                             parts.append(f": {title}")
                         parts.append(f" — {status}")
@@ -593,7 +593,7 @@ class GatewayKanbanWatchersMixin:
                                     text=msg,
                                     source=session_source,
                                     message_type=MessageType.TEXT,
-                                    internal=True,
+                                    internal=False,
                                     timestamp=datetime.now(),
                                 )
                                 logger.info(
