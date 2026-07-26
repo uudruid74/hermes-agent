@@ -2474,22 +2474,22 @@ def _get_profile_cfg_path() -> str | None:
     """Return the path to the active profile's config.yaml, or None."""
     try:
         from hermes_cli.profiles import get_active_profile_name
-        from hermes_constants import get_hermes_home
+        from hermes_constants import get_default_hermes_root
         from pathlib import Path
         profile = get_active_profile_name()
         if profile and profile not in ("custom",):
-            hh = Path(str(get_hermes_home()))
+            root = get_default_hermes_root()
             if profile == "default":
-                # Default profile — config is directly at HERMES_HOME/config.yaml
-                cfg_path = hh / "config.yaml"
+                # Default profile — config is directly at root/config.yaml
+                cfg_path = root / "config.yaml"
             else:
-                # Named profile — config is at HERMES_HOME/profiles/<name>/config.yaml
-                cfg_path = hh / "profiles" / profile / "config.yaml"
+                # Named profile — config is at root/profiles/<name>/config.yaml
+                cfg_path = root / "profiles" / profile / "config.yaml"
             if cfg_path.exists():
                 return str(cfg_path)
             # Fallback: also try the matching profile config from multi-profile layout
             # even when get_active_profile_name returns "default"
-            for candidate in sorted(hh.glob("profiles/*/config.yaml")):
+            for candidate in sorted(root.glob("profiles/*/config.yaml")):
                 if candidate.exists():
                     return str(candidate)
     except Exception:
