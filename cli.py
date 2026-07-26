@@ -4673,6 +4673,74 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         else:
             self._console_print("  Battery indicator off")
 
+    def _handle_temperature_command(self, cmd_original: str) -> None:
+        """Handle /temperature — show or set agent sampling temperature.
+
+        ``/temperature`` shows the current temperature plus the effective
+        value after the profile's ``_temperature_map`` multiplier.
+        ``/temperature N`` sets the session temperature to *N* and
+        persists it to ``agent.worker_temperature`` so the value survives
+        restarts.
+
+        *N* must be in [0.0, 2.0].
+        """
+        parts = (cmd_original or "").strip().split()
+
+        if len(parts) < 2 or parts[1] == "":
+            # ── show current temperature ──
+            agent_temp = None
+            temp_map = None
+            if self.agent:
+                agent_temp = getattr(self.agent, "_session_temperature", None)
+                temp_map = getattr(self.agent, "_temperature_map", None)
+
+            if agent_temp is not None:
+                if temp_map is not None:
+                    effective = max(0.0, min(2.0, agent_temp * temp_map))
+                    self._console_print(
+                        f"  Temperature: {agent_temp:.2f} "
+                        f"(effective: {effective:.2f} — "
+                        f"after profile map ×{temp_map:.2f})"
+                    )
+                else:
+                    self._console_print(
+                        f"  Temperature: {agent_temp:.2f}"
+                    )
+            else:
+                self._console_print(
+                    "  Temperature: 0.70 (default)"
+                )
+            self._console_print(
+                f'  {_DIM}Usage: /temperature <0.0–2.0>{_RST}'
+            )
+            return
+
+        # ── set temperature ──
+        try:
+            val = float(parts[1])
+        except ValueError:
+            self._console_print(
+                f"  ✗ Invalid temperature: {parts[1]!r} — must be a number 0.0–2.0"
+            )
+            return
+
+        if not (0.0 <= val <= 2.0):
+            self._console_print(
+                f"  ✗ Temperature must be 0.0–2.0 (got {val})"
+            )
+            return
+
+        # Apply to the running agent immediately.
+        if self.agent:
+            self.agent._session_temperature = val
+
+        # Persist so the choice survives restarts.
+        save_config_value("agent.worker_temperature", val)
+
+        self._console_print(
+            f"  ✓ Temperature set to {val:.2f} (saved)"
+        )
+
     @staticmethod
     def _compression_count_style(count: int) -> str:
         """Return a style class reflecting context compression pressure."""
@@ -9085,6 +9153,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._handle_model_switch(cmd_original)
         elif canonical == "codex-runtime":
             self._handle_codex_runtime(cmd_original)
+        elif canonical == "temperature":
+            self._handle_temperature_command(cmd_original)
 
         elif canonical == "personality":
             # Use original case (handler lowercases the personality name itself)
