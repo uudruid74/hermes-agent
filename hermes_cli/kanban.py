@@ -36,7 +36,7 @@ _log = logging.getLogger(__name__)
 # Status-change notification hook
 # ---------------------------------------------------------------------------
 
-_STATUS_NOTIFY_ENABLED = False  # Watcher handles all notifications via handle_message()
+_STATUS_NOTIFY_ENABLED = True  # CLI-level notification via origin routing → bridge socket → handle_message()
 
 
 def _notify_kanban_status_change(
@@ -48,9 +48,13 @@ def _notify_kanban_status_change(
 ) -> None:
     """Send a best-effort notification about a kanban task state change.
 
-    Pure code — no LLM, no agent invocation.  Tries every configured
-    gateway platform's home channel.  Fails silently on all errors so a
-    broken notification can never block a task transition.
+    Uses the task's origin routing (``__kanban_origin__`` system comment)
+    to deliver via ``hermes send -u`` through the bridge socket, which
+    calls ``adapter.handle_message()`` on the running gateway — the same
+    proven path as ``hermes send -u``.  Falls back to home-channel sends.
+
+    Fails silently on all errors so a broken notification can never block
+    a task transition.
     """
     if not _STATUS_NOTIFY_ENABLED:
         return
@@ -66,11 +70,34 @@ def _notify_kanban_status_change(
         parts.append(f" ({first_line})")
     message = "".join(parts)
 
+    # Try origin routing first — delivers to the task's source channel
+    # via bridge socket → handle_message().
+    try:
+        conn = kb.connect()
+        try:
+            origin = kb.get_origin_routing(conn, task_id)
+        finally:
+            conn.close()
+        if origin and origin.get("platform") and origin.get("chat_id"):
+            platform = origin["platform"].lower()
+            chat_id = origin["chat_id"]
+            thread_id = origin.get("thread_id", "")
+            target = f"{platform}:{chat_id}"
+            if thread_id:
+                target = f"{target}:{thread_id}"
+            import subprocess
+            subprocess.run(
+                ["hermes", "send", "-u", target, message],
+                capture_output=True, timeout=10,
+            )
+            return
+    except Exception:
+        pass
+
+    # Fallback: send to home channels via gateway config.
     try:
         _notify_via_gateway(message)
     except Exception:
-        # Telemetry-free silent fallback — a broken notifier is not a
-        # broken command.  The user can still inspect the board directly.
         pass
 
 
