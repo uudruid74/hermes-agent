@@ -2470,22 +2470,45 @@ def _d(s: str) -> str:
         return str(s)
 
 
-def _get_profile_color() -> str | None:
-    """Read agentcolor from the active profile's config.yaml, if set."""
+def _get_profile_cfg_path() -> str | None:
+    """Return the path to the active profile's config.yaml, or None."""
     try:
         from hermes_cli.profiles import get_active_profile_name
+        from hermes_constants import get_hermes_home
+        from pathlib import Path
         profile = get_active_profile_name()
-        if profile and profile not in ("default", "custom"):
-            import os
-            from hermes_constants import get_hermes_home
-            cfg_path = os.path.join(str(get_hermes_home()), "profiles", profile, "config.yaml")
-            if os.path.exists(cfg_path):
-                import yaml
-                with open(cfg_path) as f:
-                    cfg = yaml.safe_load(f)
-                color = cfg.get("agentcolor")
-                if color and isinstance(color, str) and color.startswith("#"):
-                    return color
+        if profile and profile not in ("custom",):
+            hh = Path(str(get_hermes_home()))
+            if profile == "default":
+                # Default profile — config is directly at HERMES_HOME/config.yaml
+                cfg_path = hh / "config.yaml"
+            else:
+                # Named profile — config is at HERMES_HOME/profiles/<name>/config.yaml
+                cfg_path = hh / "profiles" / profile / "config.yaml"
+            if cfg_path.exists():
+                return str(cfg_path)
+            # Fallback: also try the matching profile config from multi-profile layout
+            # even when get_active_profile_name returns "default"
+            for candidate in sorted(hh.glob("profiles/*/config.yaml")):
+                if candidate.exists():
+                    return str(candidate)
+    except Exception:
+        pass
+    return None
+
+
+def _get_profile_color() -> str | None:
+    """Read agentcolor from the active profile's config.yaml, if set."""
+    cfg_path = _get_profile_cfg_path()
+    if not cfg_path:
+        return None
+    try:
+        import yaml
+        with open(cfg_path) as f:
+            cfg = yaml.safe_load(f)
+        color = cfg.get("agentcolor")
+        if color and isinstance(color, str) and color.startswith("#"):
+            return color
     except Exception:
         pass
     return None
@@ -2493,20 +2516,16 @@ def _get_profile_color() -> str | None:
 
 def _get_profile_icon() -> str | None:
     """Read agenticon from the active profile's config.yaml, if set."""
+    cfg_path = _get_profile_cfg_path()
+    if not cfg_path:
+        return None
     try:
-        from hermes_cli.profiles import get_active_profile_name
-        profile = get_active_profile_name()
-        if profile and profile not in ("default", "custom"):
-            import os
-            from hermes_constants import get_hermes_home
-            cfg_path = os.path.join(str(get_hermes_home()), "config.yaml")
-            if os.path.exists(cfg_path):
-                import yaml
-                with open(cfg_path) as f:
-                    cfg = yaml.safe_load(f)
-                icon = cfg.get("agenticon")
-                if icon and isinstance(icon, str) and icon.strip():
-                    return icon.strip()
+        import yaml
+        with open(cfg_path) as f:
+            cfg = yaml.safe_load(f)
+        icon = cfg.get("agenticon")
+        if icon and isinstance(icon, str) and icon.strip():
+            return icon.strip()
     except Exception:
         pass
     return None
