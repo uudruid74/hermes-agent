@@ -363,10 +363,9 @@ def _handle_send(args):
         return tool_error("Both 'target' and 'message' are required when action='send'")
 
     # Internal delivery (hermes send -u) — route via _send_via_adapter
-    # as a simulated user message.  The target is parsed the same way as
-    # normal sends (platform:chat_id[:thread_id]) but the message arrives
-    # with full user identity so handle_message() treats it like a real
-    # inbound message from that user.
+    # as an internal wake event (internal=True), same pattern as kanban
+    # wake events.  The target is parsed the same way as normal sends
+    # (platform:chat_id[:thread_id]).
     if args.get("internal"):
         parts = target.split(":", 1)
         platform_name = parts[0].strip().lower()
@@ -401,19 +400,6 @@ def _handle_send(args):
                     f"Use format: '{platform_name}:chat_id[:thread_id]'."
                 )
 
-        # Build user identity for simulated user message
-        user_id = os.environ.get("HERMES_SESSION_USER_ID") or os.environ.get("HERMES_SESSION_TELEGRAM_ID")
-        sender_name = os.environ.get("HERMES_SESSION_USER_NAME", "")
-        if not user_id:
-            user_id = "cli"
-        if not sender_name:
-            sender_name = "CLI User"
-        user_context = {
-            "user_id": user_id,
-            "platform_user_id": user_id,
-            "sender_name": sender_name,
-        }
-
         from tools.interrupt import is_interrupted
         if is_interrupted():
             return tool_error("Interrupted")
@@ -434,7 +420,6 @@ def _handle_send(args):
             _send_via_adapter(
                 platform, pconfig, chat_id, message,
                 thread_id=thread_id or None,
-                user_context=user_context,
             )
         )
         return json.dumps(result)
@@ -799,7 +784,7 @@ async def _send_via_adapter(
 
     Without ``user_context`` the message arrives as an internal wake event
     (``internal=True``, no user identity) — the same pattern as kanban
-    wake events.  With ``user_context`` (``hermes send -u``) the message
+    wake events and ``hermes send -u``.  With ``user_context`` the message
     is injected as a simulated user message: ``internal=False`` with full
     user identity so ``handle_message()`` treats it like a real inbound.
 
