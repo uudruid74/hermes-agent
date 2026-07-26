@@ -2936,6 +2936,7 @@ def list_tasks(
     include_archived: bool = False,
     limit: Optional[int] = None,
     order_by: Optional[str] = None,
+    project_id: Optional[str] = None,
     workflow_template_id: Optional[str] = None,
     current_step_key: Optional[str] = None,
 ) -> list[Task]:
@@ -2955,6 +2956,9 @@ def list_tasks(
     if session_id is not None:
         query += " AND session_id = ?"
         params.append(session_id)
+    if project_id is not None:
+        query += " AND project_id = ?"
+        params.append(project_id)
     if workflow_template_id is not None:
         query += " AND workflow_template_id = ?"
         params.append(workflow_template_id)

@@ -195,7 +195,8 @@ def _fmt_task_line(t: kb.Task) -> str:
     icon = _STATUS_ICONS.get(t.status, "?")
     assignee = t.assignee or "(unassigned)"
     tenant = f" [{t.tenant}]" if t.tenant else ""
-    return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}"
+    board = f"  #{t.project_id}" if t.project_id else ""
+    return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{board}{tenant}  {t.title}"
 
 
 def _task_to_dict(t: kb.Task) -> dict[str, Any]:
@@ -478,6 +479,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         metavar="ID",
         help="Restrict to tasks with this workflow_template_id",
     )
+    p_list.add_argument(
+        "--project",
+        default=None,
+        help="Filter by project scope (resolved from slug, e.g. ragamuffin)",
+    )
+    p_list.set_defaults(func=_cmd_list)
     p_list.add_argument(
         "--step-key",
         default=None,
@@ -1304,6 +1311,18 @@ def _cmd_list(args: argparse.Namespace) -> int:
     assignee = args.assignee
     if args.mine and not assignee:
         assignee = _profile_author()
+    # Resolve project slug → project_id for filtering
+    project_filter = getattr(args, "project", None)
+    if project_filter:
+        try:
+            from hermes_cli import projects_db as _pdb
+            with _pdb.connect_closing() as _pconn:
+                proj = _pdb.get_project(_pconn, project_filter)
+                if proj:
+                    project_filter = proj.id
+                # If slug doesn't resolve, pass as-is (may match project_id directly)
+        except Exception:
+            pass
     with kb.connect_closing(board=None) as conn:
         # dependencies that may have cleared since the last dispatcher tick.
         kb.recompute_ready(conn)
@@ -1313,6 +1332,7 @@ def _cmd_list(args: argparse.Namespace) -> int:
             status=args.status,
             tenant=args.tenant,
             session_id=args.session,
+            project_id=project_filter,
             include_archived=args.archived,
             order_by=getattr(args, "sort", None),
             workflow_template_id=args.workflow_template_id,
