@@ -435,6 +435,7 @@ def _handle_send(args):
                 platform, pconfig, chat_id, message,
                 thread_id=thread_id or None,
                 user_context=user_context,
+                try_adapter_only=True,
             )
         )
         return json.dumps(result)
