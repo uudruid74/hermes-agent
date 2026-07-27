@@ -132,17 +132,19 @@ def _stamp_worker_session_metadata(
     return stamped
 
 
-def _notify_kanban_completion(tid: str, summary: Optional[str], task) -> None:
-    """Fire a best-effort notification when a task completes.
+def _notify_kanban_event(tid: str, status: str, summary: Optional[str], task) -> None:
+    """Fire a best-effort notification when a task changes status.
+
+    Sends directly via ``hermes send -u`` so the notification reaches the
+    origin channel immediately — no polling, no cursor, no race.
 
     Mirrors ``_notify_kanban_status_change`` in ``hermes_cli/kanban.py`` so the
-    worker-side ``kanban_complete`` tool call triggers the same notification as the
-    CLI ``hermes kanban complete`` command.
+    worker-side tool calls trigger the same notification as the CLI commands.
     """
     try:
         from hermes_cli import kanban_db as _kb
         task_title = task.title if task else tid
-        parts = [f"[Hermes] A kanban task you created ({tid}) has changed status to done - {task_title}"]
+        parts = [f"[Hermes] A kanban task you created ({tid}) has changed status to {status} - {task_title}"]
         if summary:
             first_line = summary.splitlines()[0][:300]
             parts.append(f" ({first_line})")
@@ -168,6 +170,14 @@ def _notify_kanban_completion(tid: str, summary: Optional[str], task) -> None:
             )
     except Exception:
         pass
+
+
+def _notify_kanban_completion(tid: str, summary: Optional[str], task) -> None:
+    """Fire a best-effort notification when a task completes.
+
+    Convenience wrapper around ``_notify_kanban_event``.
+    """
+    _notify_kanban_event(tid, "done", summary, task)
 
 
 def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
@@ -777,6 +787,8 @@ def _handle_block(args: dict, **kw) -> str:
                     f"running/ready)"
                 )
             run = kb.latest_run(conn, tid)
+            # Notify origin channel about the block
+            _notify_kanban_event(tid, "blocked", reason, task)
             # Tell the worker where the task actually landed so it doesn't
             # assume it's sitting in 'blocked' when routing sent it elsewhere.
             landed = kb.get_task(conn, tid)
@@ -873,6 +885,9 @@ def _handle_comment(args: dict, **kw) -> str:
         kb, conn = _connect(board=board)
         try:
             cid = kb.add_comment(conn, tid, author=author, body=str(body))
+            # Notify origin channel about the comment
+            task = kb.get_task(conn, tid)
+            _notify_kanban_event(tid, "commented", body, task)
             return _ok(task_id=tid, comment_id=cid)
         finally:
             conn.close()
