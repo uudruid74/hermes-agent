@@ -1150,6 +1150,7 @@ def _store_cli_origin_routing(conn, task_id: str, channel_flag: str) -> None:
     platform = parts[0].strip().lower()
     chat_id = ""
     thread_id = ""
+    chat_type = ""
     if len(parts) > 1:
         remaining = parts[1].strip()
         # Try to extract thread_id from the remaining part.
@@ -1180,6 +1181,7 @@ def _store_cli_origin_routing(conn, task_id: str, channel_flag: str) -> None:
             conn, task_id,
             platform=platform, chat_id=chat_id,
             thread_id=thread_id or "",
+            chat_type=chat_type or "",
         )
     except Exception as exc:
         print(f"kanban: failed to store origin routing: {exc}", file=sys.stderr)
@@ -1241,12 +1243,14 @@ def _cmd_create(args: argparse.Namespace) -> int:
             _platform = os.environ.get("HERMES_SESSION_PLATFORM", "").strip()
             _chat_id = os.environ.get("HERMES_SESSION_CHAT_ID", "").strip()
             _thread_id = os.environ.get("HERMES_SESSION_THREAD_ID", "").strip()
+            _chat_type = os.environ.get("HERMES_SESSION_CHAT_TYPE", "").strip()
             if _platform and _chat_id:
                 try:
                     kb.store_origin_routing(
                         conn, task_id,
                         platform=_platform, chat_id=_chat_id,
                         thread_id=_thread_id or "",
+                        chat_type=_chat_type or "",
                     )
                 except Exception as exc:
                     print(f"kanban: failed to store origin routing from env: {exc}", file=sys.stderr)
@@ -1934,6 +1938,11 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
             else:
                 print(f"Completed {tid}")
+                _notify_kanban_status_change(
+                    tid, "done",
+                    summary=summary,
+                    title=title_before,
+                )
     return 0 if not failed else 1
 
 

@@ -1839,6 +1839,7 @@ def subscribe_home(task_id: str, platform: str, board: Optional[str] = Query(Non
             platform=platform,
             chat_id=home["chat_id"],
             thread_id=home["thread_id"] or "",
+            chat_type=home.get("chat_type", ""),
         )
         return {"ok": True, "task_id": task_id, "home_channel": home}
     finally:

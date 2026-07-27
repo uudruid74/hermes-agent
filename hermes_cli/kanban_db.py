@@ -3241,6 +3241,7 @@ def store_origin_routing(
     platform: str,
     chat_id: str,
     thread_id: str = "",
+    chat_type: str = "",
 ) -> None:
     """Persist the chat origin that created this task as a system comment.
 
@@ -3268,7 +3269,12 @@ def store_origin_routing(
         return  # already stored; idempotent
 
     payload = json.dumps(
-        {"platform": platform, "chat_id": chat_id, "thread_id": thread_id or ""}
+        {
+            "platform": platform,
+            "chat_id": chat_id,
+            "thread_id": thread_id or "",
+            "chat_type": chat_type or "",
+        }
     )
     body = f"{_ORIGIN_MARKER}{payload}"
     now = int(time.time())
@@ -3285,7 +3291,8 @@ def get_origin_routing(
 ) -> "dict | None":
     """Extract origin routing info from a task's system comments.
 
-    Returns a dict with ``platform``, ``chat_id``, ``thread_id`` if the
+    Returns a dict with ``platform``, ``chat_id``, ``thread_id``,
+    and ``chat_type`` if the
     task was created from a chat with origin tracking, or ``None`` for
     CLI-created / legacy tasks.
     """

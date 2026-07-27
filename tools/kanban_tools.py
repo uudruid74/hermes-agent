@@ -132,6 +132,44 @@ def _stamp_worker_session_metadata(
     return stamped
 
 
+def _notify_kanban_completion(tid: str, summary: Optional[str], task) -> None:
+    """Fire a best-effort notification when a task completes.
+
+    Mirrors ``_notify_kanban_status_change`` in ``hermes_cli/kanban.py`` so the
+    worker-side ``kanban_complete`` tool call triggers the same notification as the
+    CLI ``hermes kanban complete`` command.
+    """
+    try:
+        from hermes_cli import kanban_db as _kb
+        task_title = task.title if task else tid
+        parts = [f"[Hermes] A kanban task you created ({tid}) has changed status to done - {task_title}"]
+        if summary:
+            first_line = summary.splitlines()[0][:300]
+            parts.append(f" ({first_line})")
+        message = "".join(parts)
+
+        conn = _kb.connect()
+        try:
+            origin = _kb.get_origin_routing(conn, tid)
+        finally:
+            conn.close()
+
+        if origin and origin.get("platform") and origin.get("chat_id"):
+            platform = origin["platform"].lower()
+            chat_id = origin["chat_id"]
+            thread_id = origin.get("thread_id", "")
+            target = f"{platform}:{chat_id}"
+            if thread_id:
+                target = f"{target}:{thread_id}"
+            import subprocess
+            subprocess.run(
+                ["hermes", "send", "-u", target, message],
+                capture_output=True, timeout=10,
+            )
+    except Exception:
+        pass
+
+
 def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
     """Reject worker-driven destructive calls on foreign task IDs.
 
@@ -667,6 +705,8 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"could not complete {tid} (unknown id or already terminal)"
                 )
             run = kb.latest_run(conn, tid)
+            # Notify origin channel about completion
+            _notify_kanban_completion(tid, summary, task)
             return _ok(task_id=tid, run_id=run.id if run else None)
         finally:
             conn.close()
@@ -1257,6 +1297,7 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
             platform = "tui"
             chat_id = session_key
         thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or None
+        chat_type = get_session_env("HERMES_SESSION_CHAT_TYPE", "") or None
         user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
         notifier_profile = (
             get_session_env("HERMES_SESSION_PROFILE", "")
@@ -1274,6 +1315,7 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
             conn, task_id=task_id,
             platform=platform, chat_id=chat_id,
             thread_id=thread_id or "",
+            chat_type=chat_type or "",
         )
         return True
     except Exception as _exc:
