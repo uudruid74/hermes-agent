@@ -194,14 +194,6 @@ class GatewayKanbanWatchersMixin:
             notifier_profile = self._active_profile_name()
             self._kanban_notifier_profile = notifier_profile
 
-        # Running-task tracking for periodic typing refreshes.
-        # Maps (task_id, platform, chat_id, thread_id) → (adapter, metadata).
-        # Populated as tasks enter "running" and cleaned on terminal states.
-        _running_task_subs: dict[tuple, tuple] = getattr(
-            self, "_kanban_running_task_subs", {}
-        )
-        self._kanban_running_task_subs = _running_task_subs
-
         # Initial delay so the gateway can finish wiring adapters.
         await asyncio.sleep(5)
 
@@ -345,61 +337,10 @@ class GatewayKanbanWatchersMixin:
                             board_slug,
                         )
                         continue
-                    # Pulse typing indicator so the user sees "thinking" while
-                    # the kanban worker starts up or continues running, even
-                    # though no direct-message processing is in flight.
-                    # Covers: claimed (worker picked up task), spawned
-                    # (worker process started), ready (task queued), and
-                    # status→running (task entered running state).
-                    _kanban_event_kinds = [e.kind for e in d.get("events", [])]
-                    _has_active_event = any(
-                        k in ("claimed", "ready", "spawned")
-                        for k in _kanban_event_kinds
-                    ) or any(
-                        e.kind == "status"
-                        and isinstance(getattr(e, "payload", None), dict)
-                        and e.payload.get("status") in ("running",)
-                        for e in d.get("events", [])
-                    )
-                    if _has_active_event:
-                        try:
-                            await adapter.send_typing(
-                                sub["chat_id"],
-                                metadata=(
-                                    {"thread_id": sub["thread_id"]}
-                                    if sub.get("thread_id")
-                                    else None
-                                ),
-                            )
-                        except Exception:
-                            pass  # typing is best-effort; never block delivery
-                    # Track running tasks so the watcher can periodically
-                    # refresh typing while work is in progress.  A task is
-                    # "running" if its latest status is running OR any of
-                    # the current events indicate it entered running.
-                    _sub_key = (
-                        sub["task_id"], platform_str,
-                        sub["chat_id"], sub.get("thread_id") or "",
-                    )
+                    # Typing indicator for kanban worker events removed.
+                    # Keep _is_terminal for unsub logic below.
                     _task_status = getattr(task, "status", None)
-                    _has_running_event = any(
-                        e.kind == "status"
-                        and isinstance(getattr(e, "payload", None), dict)
-                        and e.payload.get("status") == "running"
-                        for e in d.get("events", [])
-                    )
                     _is_terminal = _task_status in ("done", "archived")
-                    _is_not_running = _task_status in (
-                        "blocked", "gave_up", "crashed", "timed_out",
-                        "done", "archived",
-                    )
-                    if (_task_status == "running" or _has_running_event) and adapter is not None:
-                        _running_task_subs[_sub_key] = (
-                            adapter, platform_str,
-                            sub["chat_id"], sub.get("thread_id") or "",
-                        )
-                    elif _is_not_running:
-                        _running_task_subs.pop(_sub_key, None)
                     title = (task.title if task else sub["task_id"])[:120]
                     board_tag = f"[{board_slug}] " if board_slug else ""
                     for ev in d["events"]:
@@ -808,22 +749,6 @@ class GatewayKanbanWatchersMixin:
                             await asyncio.to_thread(
                                 self._kanban_unsub, sub, board_slug,
                             )
-                # Refresh typing for all currently-running tasks so the
-                # user sees an ongoing "thinking" indicator for the full
-                # duration of kanban task execution, not just the initial
-                # claim/spawn pulse.  Each sendChatAction lasts ~5s on
-                # Telegram, and the watcher polls every 5s, so one refresh
-                # per tick keeps the typing indicator lit continuously.
-                for _rt_key, (_rt_adapter, _rt_platform, _rt_chat_id, _rt_thread_id) in list(_running_task_subs.items()):
-                    try:
-                        _rt_metadata: dict[str, Any] | None = (
-                            {"thread_id": _rt_thread_id}
-                            if _rt_thread_id
-                            else None
-                        )
-                        await _rt_adapter.send_typing(_rt_chat_id, metadata=_rt_metadata)
-                    except Exception:
-                        pass  # best-effort; don't block on typing failures
             except Exception as exc:
                 logger.warning("kanban notifier tick failed: %s", exc)
             # Sleep with cancellation checks.
