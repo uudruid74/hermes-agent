@@ -17375,7 +17375,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         logger.debug("Process watcher ended: %s", session_id)
 
-    _MAX_INTERRUPT_DEPTH = 3  # Cap recursive interrupt handling (#816)
+    _MAX_INTERRUPT_DEPTH = 20  # Cap recursive interrupt handling (#816)
 
     # Config keys whose values MUST invalidate the gateway's cached agent
     # when they change.  The agent bakes these into its compressor / context
