@@ -12,27 +12,18 @@ By July 13th it was something else entirely.
 
 The problem with every AI agent framework is the same: **you are the polling infrastructure.** You create a task, switch contexts, ask "did it finish?", wait, poll again. You become the TCP handshake between your own agents.
 
-We fixed that. Not by adding a status endpoint. Not by building a dashboard. By giving the agent the ability to **wake you up** when something happens — kanban completes, cron returns, a worker gets stuck, a vacuum robot crashes into a wall at 3am.
+We fixed that. Not by adding a status endpoint. Not by building a dashboard. By giving the agent the ability to **wake up the agent** so that the agent can determine how to respond — kanban completes, cron returns, a worker gets stuck, a vacuum robot crashes into a wall at 3am.
 
 The script hits 'eject.' We're the parachute.
 
 ## The Cast
 
-<style>
-.agent-handle { font-weight: 600; }
-.agenticon { text-align: center; font-size: 1.3em; }
-.agent-gopher { color: #FF9900; }
-.agent-neo { color: #00FF88; }
-.agent-wintermute { color: #4488FF; }
-.agent-zephyr { color: #FFD700; }
-</style>
-
-| Agent | Handle | Role | Icon | Color |
-|-------|--------|------|------|-------|
-| **Gopher** 🐹 | `gopher` | Orchestrator, dispatcher, student. Watches you paint in real-time and writes skills from what he learns. | 🔧 | `#FF9900` |
-| **Neo** 👨‍💻 | `neo` | The coder. Architecture delivery, multi-file codegen. Does what Gopher cannot. | 🧬 | `#00FF88` |
-| **Wintermute** 🏛️ | `wintermute` | The architect. GLM5.2. Darth Vader using the Force to make the code comply. You don't argue with Wintermute — you *fix the thing.* | ❄️ | `#4488FF` |
-| **Zephyr** 🌬️ | `zephyr` | The planner. Research, synthesis, design. The wind that tells you which direction to build. | 🌀 | `#FFD700` |
+| Agent | Description |
+|-------|-------------|
+| 🐹 **Gopher**<br>`#FF9900` | Orchestrator, dispatcher, student. Watches you paint in real-time and writes skills from what he learns. |
+| 👨‍💻 **Neo**<br>`#00FF88` | The coder. Architecture delivery, multi-file codegen. Does what Gopher cannot. |
+| 🏛️ **Wintermute**<br>`#4488FF` | The architect. GLM5.2. Darth Vader using the Force to make the code comply. You don't argue with Wintermute — you *fix the thing.* |
+| 🌬️ **Zephyr**<br>`#FFD700` | Gopher's assistant, built by Gopher, to do routine tasks. |
 
 Four profiles, one gateway, one bot token. No group chat. No bot-sees-bot limitations. Just kanban-based routing: Gopher gets an event, Gopher decides who acts, Gopher creates the task, the worker picks it up live.
 
