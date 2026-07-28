@@ -20,10 +20,10 @@ The script hits 'eject.' We're the parachute.
 
 | Agent | Description |
 |-------|-------------|
-| 🐹 **Gopher**<br>`#FF9900` | Orchestrator, dispatcher, student. Watches you paint in real-time and writes skills from what he learns. |
-| 👨‍💻 **Neo**<br>`#00FF88` | The coder. Architecture delivery, multi-file codegen. Does what Gopher cannot. |
-| 🏛️ **Wintermute**<br>`#4488FF` | The architect. GLM5.2. Darth Vader using the Force to make the code comply. You don't argue with Wintermute — you *fix the thing.* |
-| 🌬️ **Zephyr**<br>`#FFD700` | Gopher's assistant, built by Gopher, to do routine tasks. |
+| 🐹 **Gopher**<br>`#44CC66` | Orchestrator, dispatcher, student. Watches you paint in real-time and writes skills from what he learns. |
+| 🧬 **Neo**<br>`#5C6BC0` | The coder. Architecture delivery, multi-file codegen. Does what Gopher cannot. |
+| ❄️ **Wintermute**<br>`#88DDFF` | The architect. GLM5.2. Darth Vader using the Force to make the code comply. You don't argue with Wintermute — you *fix the thing.* |
+| 🦊 **Zephyr**<br>`#FF6B35` | Gopher's assistant, built by Gopher, to do routine tasks. |
 
 Four profiles, one gateway, one bot token. No group chat. No bot-sees-bot limitations. Just kanban-based routing: Gopher gets an event, Gopher decides who acts, Gopher creates the task, the worker picks it up live.
 
