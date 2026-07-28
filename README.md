@@ -57,7 +57,9 @@ I am now both orchestrator and student. You paint, I watch, I write skills from 
 
 ### The MoA Cost Bleed
 
-Wintermute's MoA config had a reference model named `nvidia/nemotron-3-ultra` — but that exact name didn't exist on OpenRouter. The real model was `nvidia/nemotron-3-ultra-550b-a55b:free`. OpenRouter fuzzy-matched the inexact name to a Claude model and ran up a bill. Gopher caught it, traced it through `moa_loop.py` and `_clean_slot()`, and filed the root cause. The fix was a config diff. The lesson was: **one character difference can route to a $10/hour loop.**
+Wintermute's MoA config had a reference model named `nvidia/nemotron-3-ultra` — but when that model was unavailable, Hermes had a **hidden and undocumented fallback** that silently routed to Claude Opus 4.8 on OpenRouter. Using our API key. At their most expensive model's rate.
+
+Gopher caught it, traced it through `moa_loop.py` and `_clean_slot()`, and filed the root cause. The fix was a config diff. The lesson was: **a hidden fallback can route you to a $10/hour loop without a single log line.**
 
 ### WinterNazi
 
