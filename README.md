@@ -21,7 +21,7 @@ The script hits 'eject.' We're the parachute.
 | Agent | Description |
 |-------|-------------|
 | 🐹 **Gopher**<br>`#44CC66` | Orchestrator, dispatcher, student. Watches you paint in real-time and writes skills from what he learns. |
-| 🧬 **Neo**<br>`#5C6BC0` | The coder. Architecture delivery, multi-file codegen. Does what Gopher cannot. |
+| 🧬 **Neo**<br>`#5C6BC0` | Code only. Implements everything — Hermes, ClearView, Eddon, wiki-documented projects. |
 | ❄️ **Wintermute**<br>`#88DDFF` | The architect. GLM5.2. Darth Vader using the Force to make the code comply. You don't argue with Wintermute — you *fix the thing.* |
 | 🦊 **Zephyr**<br>`#FF6B35` | Gopher's assistant, built by Gopher, to do routine tasks. |
 
