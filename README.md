@@ -31,7 +31,7 @@ Four profiles, one gateway, one bot token. No group chat. No bot-sees-bot limita
 
 ### 🛎️ Wake Events
 
-Every kanban status change — create, claim, complete, block, archive — fires directly into the affected agent's session as a **full conversation turn**. The agent stops what it's doing, inventories its memory, and responds.
+Every kanban status change — create, claim, complete, block, archive — fires directly into the affected agent's session as if the user typed it. The agent sees the event, inventories its memory, and responds with full context.
 
 No polling. No "hey are you done?" No asking — telling.
 
@@ -39,16 +39,9 @@ No polling. No "hey are you done?" No asking — telling.
 
 The architecture took three rewrites and a Python-level argument about whether internal events should use `adapter.handle_message()` or `adapter.send()`. The answer was `handle_message()` — but the busy-session path was returning `False` and silently advancing the cursor, swallowing events forever. Fixing that became the entire notification hook system.
 
-**Two paths, because not all events are equal:**
+**Everything is a wake event.** There is no separate "continuation feed" path — Prometheus snapshots, kanban updates, cron returns, all arrive as if the user typed them. The agent always has full context.
 
-| Dimension | Wake Event | Continuation Feed |
-|-----------|-----------|-------------------|
-| Initiated by | System / background | User (via tool) |
-| Agent context | Interrupted — needs full re-orientation | Still active — no re-init needed |
-| Memory OS treat as | "First turn" (full inventory) | "Continuation" (compact header only) |
-| Examples | Kanban create/complete/block, cron delivery | Prometheus snapshot, real-time drawing sync |
-
-### 🤝 Continuation Feed (Prometheus Return Path)
+### 🎨 Prometheus (Real-Time GIMP Integration)
 
 GIMP has a Canvas. You paint on it. You click a button called "Snapshot." A Unix domain socket at `/tmp/prometheus/<session>.sock` receives a JSON handoff containing:
 
