@@ -293,6 +293,17 @@ def _load_hermes_env() -> None:
             continue
         os.environ[key] = str(val)
 
+    # Step 3: derive session identity from TELEGRAM_ALLOWED_USERS so that
+    # ``hermes send -u`` carries the real user identity even when called from
+    # a subprocess (kanban hook, cron job) that lacks HERMES_SESSION_* env vars.
+    # Without this, _handle_send falls back to user_id="cli" and the auth gate
+    # in _is_user_authorized() drops the message.
+    telegram_id = os.environ.get("HERMES_SESSION_TELEGRAM_ID") or os.environ.get("TELEGRAM_ALLOWED_USERS", "").split(",")[0].strip()
+    if telegram_id:
+        os.environ.setdefault("HERMES_SESSION_TELEGRAM_ID", telegram_id)
+        os.environ.setdefault("HERMES_SESSION_USER_ID", telegram_id)
+        os.environ.setdefault("HERMES_SESSION_USER_NAME", "CLI User")
+
 
 def cmd_send(args: argparse.Namespace) -> None:
     """Entry point wired into the top-level argparse dispatcher."""
