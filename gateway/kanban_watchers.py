@@ -164,7 +164,7 @@ class GatewayKanbanWatchersMixin:
 
         # Kinds that produce no user-facing notification.
         SILENT_KINDS = frozenset({
-            "heartbeat", "archived", "unblocked",
+            "heartbeat", "archived", "unblocked", "ready",
             "assigned", "specified", "linked", "unlinked",
             "claim_rejected", "suspected_hallucinated_references",
         })
@@ -373,7 +373,7 @@ class GatewayKanbanWatchersMixin:
                             "commented": "💬",
                         }
                         emoji = _EMOJI.get(status, "❓")
-                        parts = [f"{emoji} KANBAN NOTIFICATION — info only, do not act. {sub['task_id']} → {status}: {title} (assigned to {sub.get('assignee', 'unassigned')})"]
+                        parts = [f"[Hermes] A kanban task you created ({sub['task_id']}), assigned to {sub.get('assignee', 'unassigned')}, has changed status to {status} - {title}"]
                         summary = ""
                         if kind == "completed" and ev.payload and ev.payload.get("summary"):
                             summary = str(ev.payload["summary"])

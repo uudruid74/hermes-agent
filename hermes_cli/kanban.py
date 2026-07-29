@@ -36,7 +36,7 @@ _log = logging.getLogger(__name__)
 # Status-change notification hook
 # ---------------------------------------------------------------------------
 
-_STATUS_NOTIFY_ENABLED = True  # CLI-level notification via origin routing → bridge socket → handle_message()
+_STATUS_NOTIFY_ENABLED = False  # Disabled — gateway kanban watcher handles notifications now
 
 
 def _notify_kanban_status_change(
