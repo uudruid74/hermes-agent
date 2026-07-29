@@ -48,10 +48,12 @@ def _notify_kanban_status_change(
 ) -> None:
     """Send a best-effort notification about a kanban task state change.
 
+    Sends two messages:
+    - Human-readable via ``hermes send -t`` with old-style icons, no [Hermes] prefix
+    - JSON payload via ``hermes send -u`` for AI consumption
+
     Uses the task's origin routing (``__kanban_origin__`` system comment)
-    to deliver via ``hermes send -u`` through the bridge socket, which
-    calls ``adapter.handle_message()`` on the running gateway — the same
-    proven path as ``hermes send -u``.  Falls back to home-channel sends.
+    to determine the target channel. Falls back to home-channel sends.
 
     Fails silently on all errors so a broken notification can never block
     a task transition.
@@ -59,41 +61,63 @@ def _notify_kanban_status_change(
     if not _STATUS_NOTIFY_ENABLED:
         return
 
-    # Build the message payload.
-    parts = [f"[Hermes] A kanban task you created ({task_id}) has changed status to {new_status} - {title or task_id}"]
-
-    if summary:
-        first_line = summary.splitlines()[0][:300]
-        parts.append(f" ({first_line})")
-    message = "".join(parts)
-
-    # Try origin routing first — delivers to the task's source channel
-    # via bridge socket → handle_message().
+    # Resolve origin routing
     try:
         conn = kb.connect()
         try:
             origin = kb.get_origin_routing(conn, task_id)
         finally:
             conn.close()
-        if origin and origin.get("platform") and origin.get("chat_id"):
-            platform = origin["platform"].lower()
-            chat_id = origin["chat_id"]
-            thread_id = origin.get("thread_id", "")
-            target = f"{platform}:{chat_id}"
-            if thread_id:
-                target = f"{target}:{thread_id}"
-            import subprocess
-            subprocess.run(
-                ["hermes", "send", "-u", target, message],
-                capture_output=True, timeout=10,
-            )
-            return
+    except Exception:
+        origin = None
+
+    if not (origin and origin.get("platform") and origin.get("chat_id")):
+        return
+
+    platform = origin["platform"].lower()
+    chat_id = origin["chat_id"]
+    thread_id = origin.get("thread_id", "")
+    target = f"{platform}:{chat_id}"
+    if thread_id:
+        target = f"{target}:{thread_id}"
+
+    icon = _NOTIFY_EMOJI.get(new_status, "❓")
+    task_label = title or task_id
+    summary_line = ""
+    if summary:
+        summary_line = summary.splitlines()[0][:300]
+
+    # Human-readable message via -t (old icons, no [Hermes] prefix)
+    human_parts = [f"{icon} {task_label} → {new_status}"]
+    if summary_line:
+        human_parts.append(f" — {summary_line}")
+    if new_status == "blocked":
+        human_parts.append(" — Investigate this blocked task")
+    human_msg = "".join(human_parts)
+
+    # JSON payload via -u
+    json_payload = json.dumps({
+        "source": "kanban",
+        "type": new_status,
+        "task_id": task_id,
+        "title": title or task_id,
+        "summary": summary_line or None,
+    })
+
+    import subprocess
+    try:
+        subprocess.run(
+            ["hermes", "send", "-t", target, human_msg],
+            capture_output=True, timeout=10,
+        )
     except Exception:
         pass
 
-    # Fallback: send to home channels via gateway config.
     try:
-        _notify_via_gateway(message)
+        subprocess.run(
+            ["hermes", "send", "-u", target, json_payload],
+            capture_output=True, timeout=10,
+        )
     except Exception:
         pass
 
@@ -2011,6 +2035,11 @@ def _cmd_block(args: argparse.Namespace) -> int:
                     )
                 else:
                     print(f"Blocked {tid}{suffix}")
+                _notify_kanban_status_change(
+                    tid, where,
+                    summary=reason,
+                    title=title_before,
+                )
     return 0 if not failed else 1
 
 

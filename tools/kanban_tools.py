@@ -135,20 +135,21 @@ def _stamp_worker_session_metadata(
 def _notify_kanban_event(tid: str, status: str, summary: Optional[str], task) -> None:
     """Fire a best-effort notification when a task changes status.
 
-    Sends directly via ``hermes send -u`` so the notification reaches the
-    origin channel immediately — no polling, no cursor, no race.
+    Sends two messages:
+    - Human-readable via ``hermes send -t`` with old-style icons, no [Hermes] prefix
+    - JSON payload via ``hermes send -u`` for AI consumption
 
     Mirrors ``_notify_kanban_status_change`` in ``hermes_cli/kanban.py`` so the
     worker-side tool calls trigger the same notification as the CLI commands.
     """
     try:
         from hermes_cli import kanban_db as _kb
+        from hermes_cli.kanban import _NOTIFY_EMOJI
+        import json
         task_title = task.title if task else tid
-        parts = [f"[Hermes] A kanban task you created ({tid}) has changed status to {status} - {task_title}"]
+        summary_line = ""
         if summary:
-            first_line = summary.splitlines()[0][:300]
-            parts.append(f" ({first_line})")
-        message = "".join(parts)
+            summary_line = summary.splitlines()[0][:300]
 
         conn = _kb.connect()
         try:
@@ -156,18 +157,44 @@ def _notify_kanban_event(tid: str, status: str, summary: Optional[str], task) ->
         finally:
             conn.close()
 
-        if origin and origin.get("platform") and origin.get("chat_id"):
-            platform = origin["platform"].lower()
-            chat_id = origin["chat_id"]
-            thread_id = origin.get("thread_id", "")
-            target = f"{platform}:{chat_id}"
-            if thread_id:
-                target = f"{target}:{thread_id}"
-            import subprocess
-            subprocess.run(
-                ["hermes", "send", "-u", target, message],
-                capture_output=True, timeout=10,
-            )
+        if not (origin and origin.get("platform") and origin.get("chat_id")):
+            return
+
+        platform = origin["platform"].lower()
+        chat_id = origin["chat_id"]
+        thread_id = origin.get("thread_id", "")
+        target = f"{platform}:{chat_id}"
+        if thread_id:
+            target = f"{target}:{thread_id}"
+
+        icon = _NOTIFY_EMOJI.get(status, "❓")
+
+        # Human-readable message via -t (old icons, no [Hermes] prefix)
+        human_parts = [f"{icon} {task_title} → {status}"]
+        if summary_line:
+            human_parts.append(f" — {summary_line}")
+        if status == "blocked":
+            human_parts.append(" — Investigate this blocked task")
+        human_msg = "".join(human_parts)
+
+        # JSON payload via -u
+        json_payload = json.dumps({
+            "source": "kanban",
+            "type": status,
+            "task_id": tid,
+            "title": task_title,
+            "summary": summary_line or None,
+        })
+
+        import subprocess
+        subprocess.run(
+            ["hermes", "send", "-t", target, human_msg],
+            capture_output=True, timeout=10,
+        )
+        subprocess.run(
+            ["hermes", "send", "-u", target, json_payload],
+            capture_output=True, timeout=10,
+        )
     except Exception:
         pass
 
