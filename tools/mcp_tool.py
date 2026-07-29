@@ -2287,7 +2287,7 @@ class MCPServerTask:
                     t.cancel()
                     try:
                         await t
-                    except (asyncio.CancelledError, Exception):
+                    except (asyncio.CancelledError, RuntimeError, Exception):
                         pass
 
         if self._shutdown_event.is_set():
@@ -2331,7 +2331,7 @@ class MCPServerTask:
                     t.cancel()
                     try:
                         await t
-                    except (asyncio.CancelledError, Exception):
+                    except (asyncio.CancelledError, RuntimeError, Exception):
                         pass
         if self._shutdown_event.is_set():
             return "shutdown"
