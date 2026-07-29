@@ -163,9 +163,11 @@ class GatewayKanbanWatchersMixin:
             return
 
         # Kinds that produce no user-facing notification.
+        # Status-change events (archived, unblocked, assigned) are
+        # intentionally NOT silent — users want to know when a task's
+        # status changes. Only truly operational/internal events stay.
         SILENT_KINDS = frozenset({
-            "heartbeat", "archived", "unblocked",
-            "assigned", "specified", "linked", "unlinked",
+            "heartbeat", "specified", "linked", "unlinked",
             "claim_rejected", "suspected_hallucinated_references",
         })
         # Subscriptions are removed only when the task reaches a truly final
@@ -366,7 +368,7 @@ class GatewayKanbanWatchersMixin:
                             "done": "✅", "completed": "✅", "archived": "📦",
                             "gave_up": "✖", "crashed": "💥", "timed_out": "⏱",
                             "unblocked": "🔓", "created": "🆕", "claimed": "🔄",
-                            "spawned": "🔄", "heartbeat": "", "status": "🔄",
+                            "assigned": "📋", "spawned": "🔄", "heartbeat": "", "status": "🔄",
                             "dependency_wait": "🔗", "block_loop_detected": "🔁",
                             "reclaimed": "🔂", "promoted": "⬆️",
                             "promoted_manual": "⬆️", "protocol_violation": "⚠️",
