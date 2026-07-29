@@ -3703,6 +3703,27 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
 
             if should_deliver:
                 try:
+                    # ── Build JSON metadata for AI consumption ──
+                    import json as _cron_json_mod
+                    from datetime import datetime as _cron_dt
+                    _cron_status = "completed" if success else "failed"
+                    _cron_output_preview = ""
+                    if deliver_content and isinstance(deliver_content, str):
+                        _lines = deliver_content.strip().split("\n")
+                        _preview = "\n".join(_lines[-10:])  # last 10 lines
+                        _cron_output_preview = _preview[:2000]
+                    _cron_json_payload = _cron_json_mod.dumps({
+                        "source": "cron",
+                        "type": "tick",
+                        "job_id": job.get("id", ""),
+                        "name": job.get("name") or job.get("id", ""),
+                        "status": _cron_status,
+                        "exit_code": 0 if success else 1,
+                        "timestamp": _cron_dt.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "output_preview": _cron_output_preview,
+                    })
+                    deliver_content = _cron_json_payload + "\n\n" + (deliver_content or "")
+                    # ── End JSON metadata ──
                     delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
                 except Exception as de:
                     delivery_error = str(de)

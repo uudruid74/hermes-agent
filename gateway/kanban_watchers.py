@@ -396,6 +396,60 @@ class GatewayKanbanWatchersMixin:
                             first_line = summary.splitlines()[0][:300]
                             parts.append(f" ({first_line})")
                         msg = "".join(parts)
+                        # ── Build JSON payload for AI consumption ──
+                        _json_payload: dict[str, Any] = {
+                            "source": "kanban",
+                            "timestamp": datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        }
+                        _payload = ev.payload or {}
+                        if kind == "commented":
+                            _json_payload.update({
+                                "type": "comment_added",
+                                "task_id": sub["task_id"],
+                                "title": title,
+                                "comment_preview": summary[:80] if summary else "",
+                            })
+                        elif kind == "completed":
+                            _json_payload.update({
+                                "type": "completed",
+                                "task_id": sub["task_id"],
+                                "title": title,
+                                "completed_by": (task.assignee if task and task.assignee else "unassigned") if status == "completed" else "",
+                            })
+                        elif kind == "status" and _payload.get("status") == "assigned":
+                            _json_payload.update({
+                                "type": "assigned",
+                                "task_id": sub["task_id"],
+                                "title": title,
+                                "old_assignee": str(_payload.get("old_assignee", "") or ""),
+                                "new_assignee": str(_payload.get("assignee", "") or ""),
+                            })
+                        elif kind in ("claimed", "spawned", "reclaimed", "promoted", "promoted_manual"):
+                            _json_payload.update({
+                                "type": "assigned",
+                                "task_id": sub["task_id"],
+                                "title": title,
+                                "old_assignee": str(_payload.get("old_assignee", "") or ""),
+                                "new_assignee": str(_payload.get("assignee", "") or ""),
+                            })
+                        elif kind == "status":
+                            _json_payload.update({
+                                "type": "status_change",
+                                "task_id": sub["task_id"],
+                                "title": title,
+                                "old_status": str(_payload.get("old_status", "") or ""),
+                                "new_status": str(_payload.get("status", "") or ""),
+                            })
+                        else:
+                            _json_payload.update({
+                                "type": "status_change",
+                                "task_id": sub["task_id"],
+                                "title": title,
+                                "old_status": str(_payload.get("old_status", "") or ""),
+                                "new_status": str(status),
+                            })
+                        json_msg = json.dumps(_json_payload)
+                        # ── End JSON payload ──
                         metadata: dict[str, Any] = {}
                         if sub.get("thread_id"):
                             metadata["thread_id"] = sub["thread_id"]
@@ -539,6 +593,26 @@ class GatewayKanbanWatchersMixin:
                                     sub["task_id"], msg[:80], platform_str, sub["chat_id"],
                                 )
                                 await adapter.handle_message(notify_event)
+                                # ── Deliver JSON payload to AI (internal=True) ──
+                                try:
+                                    json_event = MessageEvent(
+                                        text=json_msg,
+                                        source=session_source,
+                                        message_type=MessageType.TEXT,
+                                        internal=True,
+                                        timestamp=datetime.now(),
+                                    )
+                                    await adapter.handle_message(json_event)
+                                    logger.info(
+                                        "kanban notifier: pushed JSON for %s to agent via handle_message (internal)",
+                                        sub["task_id"],
+                                    )
+                                except Exception as _json_exc:
+                                    logger.debug(
+                                        "kanban notifier: JSON delivery for %s failed (non-fatal): %s",
+                                        sub["task_id"], _json_exc,
+                                    )
+                                # ── End JSON delivery ──
                                 logger.info(
                                     "kanban notifier: pushed %s event for %s to agent via handle_message "
                                     "(%s/%s) on board %s",
