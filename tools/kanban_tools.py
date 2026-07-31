@@ -163,7 +163,6 @@ def _notify_kanban_event(tid: str, status: str, summary: Optional[str], task) ->
         platform = origin["platform"].lower()
         chat_id = origin["chat_id"]
         thread_id = origin.get("thread_id", "")
-        chat_type = origin.get("chat_type", "group")
         target = f"{platform}:{chat_id}"
         if thread_id:
             target = f"{target}:{thread_id}"
@@ -174,14 +173,15 @@ def _notify_kanban_event(tid: str, status: str, summary: Optional[str], task) ->
         human_parts = [f"{icon} {task_title} → {status}"]
         if summary_line:
             human_parts.append(f" — {summary_line}")
+        if status == "blocked":
+            human_parts.append(" — Investigate this blocked task")
         human_msg = "".join(human_parts)
 
-        # JSON payload via -u — includes explicit instruction not to execute
+        # JSON payload via -u
         json_payload = json.dumps({
             "source": "kanban",
             "type": status,
             "task_id": tid,
-            "instruction": "Note the kanban task has changed status.  Do not execute this task yourself.",
             "title": task_title,
             "summary": summary_line or None,
         })
@@ -191,21 +191,9 @@ def _notify_kanban_event(tid: str, status: str, summary: Optional[str], task) ->
             ["hermes", "send", "-t", target, human_msg],
             capture_output=True, timeout=10,
         )
-        if status == "blocked":
-            prompt = "Investigate why this task failed: "
-        else:
-            prompt = "Print the following json verbatim, do **NOT** execute the task: "
-
-        # Pass chat_type via environment so the bridge/adapter handlers
-        # construct the SessionSource with the correct chat_type instead
-        # of hardcoding "group" — prevents session-key mismatch (fork)
-        # that causes notification responses to vanish from the main
-        # session's transcript (context-window counter bug).
-        notify_env = os.environ.copy()
-        notify_env["HERMES_NOTIFY_CHAT_TYPE"] = chat_type
         subprocess.run(
-            ["hermes", "send", "-u", target, prompt + json_payload],
-            capture_output=True, timeout=10, env=notify_env,
+            ["hermes", "send", "-u", target, json_payload],
+            capture_output=True, timeout=10,
         )
     except Exception:
         pass

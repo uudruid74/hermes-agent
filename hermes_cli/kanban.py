@@ -77,7 +77,6 @@ def _notify_kanban_status_change(
     platform = origin["platform"].lower()
     chat_id = origin["chat_id"]
     thread_id = origin.get("thread_id", "")
-    chat_type = origin.get("chat_type", "group")
     target = f"{platform}:{chat_id}"
     if thread_id:
         target = f"{target}:{thread_id}"
@@ -92,14 +91,15 @@ def _notify_kanban_status_change(
     human_parts = [f"{icon} {task_label} → {new_status}"]
     if summary_line:
         human_parts.append(f" — {summary_line}")
+    if new_status == "blocked":
+        human_parts.append(" — Investigate this blocked task")
     human_msg = "".join(human_parts)
 
-    # JSON payload via -u — includes explicit instruction not to execute
+    # JSON payload via -u
     json_payload = json.dumps({
         "source": "kanban",
         "type": new_status,
         "task_id": task_id,
-        "instruction": "INFORMATION ONLY — do NOT execute this task. A separate session is handling it. Do not claim, complete, block, or modify this task. Only act if the user follows up with a direct command.",
         "title": title or task_id,
         "summary": summary_line or None,
     })
@@ -114,21 +114,9 @@ def _notify_kanban_status_change(
         pass
 
     try:
-        if new_status == "blocked":
-            prompt = "Investigate why this task blocked: "
-        else:
-            prompt = "Print this json verbatim, do NOT execute the task: "
-
-        # Pass chat_type via environment so the bridge/adapter handlers
-        # construct the SessionSource with the correct chat_type instead
-        # of hardcoding "group" — prevents session-key mismatch (fork)
-        # that causes notification responses to vanish from the main
-        # session's transcript (context-window counter bug).
-        notify_env = os.environ.copy()
-        notify_env["HERMES_NOTIFY_CHAT_TYPE"] = chat_type
         subprocess.run(
-            ["hermes", "send", "-u", target, prompt + json_payload],
-            capture_output=True, timeout=10, env=notify_env,
+            ["hermes", "send", "-u", target, json_payload],
+            capture_output=True, timeout=10,
         )
     except Exception:
         pass
