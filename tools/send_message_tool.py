@@ -412,6 +412,7 @@ def _handle_send(args):
             "user_id": user_id,
             "platform_user_id": user_id,
             "sender_name": sender_name,
+            "chat_type": os.environ.get("HERMES_NOTIFY_CHAT_TYPE", "group"),
         }
 
         from tools.interrupt import is_interrupted
@@ -824,11 +825,19 @@ async def _send_via_adapter(
             adapter = None
         if adapter is not None:
             try:
+                # Resolve chat_type: prefer user_context (hermes send -u),
+                # then the env var (set by kanban notification hooks),
+                # fall back to "group" for backward compatibility.
+                _chat_type = "group"
+                if user_context and user_context.get("chat_type"):
+                    _chat_type = str(user_context["chat_type"])
+                else:
+                    _chat_type = os.environ.get("HERMES_NOTIFY_CHAT_TYPE", "group")
                 session_source = SessionSource(
                     platform=platform,
                     chat_id=chat_id,
                     thread_id=thread_id,
-                    chat_type="group",
+                    chat_type=_chat_type,
                 )
                 # Build internal flag and user identity
                 is_internal = True
@@ -936,6 +945,12 @@ async def _send_via_bridge(platform, chat_id, text, *, thread_id=None, user_cont
         payload["thread_id"] = thread_id
     if user_context:
         payload["user_context"] = user_context
+        # Propagate chat_type so the bridge handler constructs
+        # the SessionSource with the correct chat_type instead of
+        # hardcoding "group" (context-window counter bug).
+        _ct = user_context.get("chat_type") or os.environ.get("HERMES_NOTIFY_CHAT_TYPE")
+        if _ct:
+            payload["chat_type"] = _ct
 
     try:
         sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
