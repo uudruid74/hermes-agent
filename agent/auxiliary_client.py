@@ -5496,12 +5496,13 @@ def _normalize_vision_provider(provider: Optional[str]) -> str:
 def _resolve_strict_vision_backend(
     provider: str,
     model: Optional[str] = None,
+    api_key: Optional[str] = None,
 ) -> Tuple[Optional[Any], Optional[str]]:
     provider = _normalize_vision_provider(provider)
     if provider == "copilot":
         return resolve_provider_client("copilot", model, is_vision=True)
     if provider == "openrouter":
-        return _try_openrouter(model=model)
+        return _try_openrouter(model=model, explicit_api_key=api_key)
     if provider == "nous":
         return _try_nous(vision=True)
     if provider == "openai-codex":
@@ -5736,7 +5737,7 @@ def resolve_vision_provider_client(
 
     if requested in _VISION_AUTO_PROVIDER_ORDER:
         sync_client, default_model = _resolve_strict_vision_backend(
-            requested, resolved_model
+            requested, resolved_model, api_key=resolved_api_key
         )
         return _finalize(requested, sync_client, default_model)
 
@@ -5771,6 +5772,7 @@ def resolve_vision_provider_client(
 
     client, final_model = _get_cached_client(requested, resolved_model, async_mode,
                                              api_mode=resolved_api_mode,
+                                             api_key=resolved_api_key,
                                              main_runtime=runtime,
                                              is_vision=True)
     if client is None:
@@ -6333,7 +6335,12 @@ def _resolve_task_provider_model(
     if base_url:
         return "custom", resolved_model, base_url, api_key, resolved_api_mode
     if provider:
-        return provider, resolved_model, base_url, api_key, resolved_api_mode
+        # An explicit provider with no explicit api_key argument should still
+        # honor the task's configured api_key (e.g. auxiliary.vision.api_key
+        # = ${VISION_OPENROUTER_KEY}). Without this, the configured key is
+        # dropped and the provider falls back to its default env-var key
+        # (e.g. OPENROUTER_API_KEY), which may be a different account.
+        return provider, resolved_model, base_url, api_key or cfg_api_key, resolved_api_mode
 
     if task:
         # Config.yaml is the primary source for per-task overrides.
