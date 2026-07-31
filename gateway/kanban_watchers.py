@@ -343,6 +343,10 @@ class GatewayKanbanWatchersMixin:
                     _is_terminal = _task_status in ("done", "archived")
                     title = (task.title if task else sub["task_id"])[:120]
                     board_tag = f"[{board_slug}] " if board_slug else ""
+                    # Resolve delivery coordinates with origin routing for BOTH
+                    # the direct notification and the wakeup notification below.
+                    _delivery_chat_id = sub["chat_id"]
+                    _delivery_thread_id = sub.get("thread_id") or ""
                     for ev in d["events"]:
                         kind = ev.kind
                         # Silent kinds: claim advances the cursor but no
@@ -418,8 +422,6 @@ class GatewayKanbanWatchersMixin:
                                 # subscription says so that tasks created
                                 # from a topic always route back to that
                                 # topic, regardless of subscription state.
-                                _delivery_chat_id = sub["chat_id"]
-                                _delivery_thread_id = sub.get("thread_id") or ""
                                 _origin = None  # pre-bind for type checker; set inside try
                                 try:
                                     from hermes_cli import kanban_db as _kb2
@@ -677,9 +679,9 @@ class GatewayKanbanWatchersMixin:
                                     _wake_chat_type = _sub_chat_type  # reuse resolution from primary notification
                                     _source = SessionSource(
                                         platform=plat,
-                                        chat_id=sub["chat_id"],
+                                        chat_id=_delivery_chat_id,
                                         chat_type=_wake_chat_type,
-                                        thread_id=sub.get("thread_id") or None,
+                                        thread_id=_delivery_thread_id or None,
                                         user_id=sub.get("user_id"),
                                         profile=sub_profile or None,
                                     )
