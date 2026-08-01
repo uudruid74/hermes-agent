@@ -8622,6 +8622,22 @@ def _default_spawn(
         # This only happens in test fixtures where the isolated
         # HERMES_HOME never had profiles created.
         pass
+    # Load the profile's .env into the worker's environment so API keys
+    # (OPENROUTER_API_KEY, etc.) are available in the subprocess before
+    # main.py's module-level load_hermes_dotenv() runs. The module-level
+    # load depends on sys.argv parsing via _apply_profile_override(),
+    # which can race with other imports that read config. Loading here
+    # guarantees the worker has credentials from the first instruction.
+    _profile_home = env.get("HERMES_HOME", "").strip()
+    if _profile_home:
+        _profile_env_path = Path(_profile_home) / ".env"
+        if _profile_env_path.exists():
+            try:
+                from agent.secret_scope import load_env_file as _load_env_file
+                _profile_secrets = _load_env_file(_profile_env_path)
+                env.update(_profile_secrets)
+            except Exception:
+                pass  # never block worker spawn on env loading
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
