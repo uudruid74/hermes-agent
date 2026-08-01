@@ -295,6 +295,7 @@ def _run_reference(
     from agent.usage_pricing import CanonicalUsage, estimate_usage_cost, normalize_usage
 
     label = _slot_label(slot)
+    effective_temperature = slot.get("temperature", temperature)
     runtime = _slot_runtime(slot)
     try:
         # Prepend the advisory-role system prompt so the reference understands
@@ -317,7 +318,7 @@ def _run_reference(
         response = call_llm(
             task="moa_reference",
             messages=messages,
-            temperature=temperature,
+            temperature=effective_temperature,
             max_tokens=max_tokens,
             reasoning_config=_slot_reasoning_config(slot),
             **runtime,
@@ -363,7 +364,7 @@ def _run_reference(
             output=_output_text,
             model=slot.get("model"),
             provider=runtime.get("provider") or slot.get("provider"),
-            temperature=temperature,
+            temperature=effective_temperature,
         )
         return label, _output_text, acct
     except Exception as exc:
@@ -374,7 +375,7 @@ def _run_reference(
             output=f"[failed: {exc}]",
             model=slot.get("model"),
             provider=runtime.get("provider") or slot.get("provider"),
-            temperature=temperature,
+            temperature=effective_temperature,
         )
 
 
@@ -710,6 +711,8 @@ def aggregate_moa_context(
     )
 
     agg_label = _slot_label(aggregator)
+    # Per-slot aggregator temperature overrides the preset-level default.
+    aggregator_temperature = aggregator.get("temperature", aggregator_temperature)
     agg_runtime = _slot_runtime(aggregator)
     try:
         # Same cache_control decoration as _run_reference's advisor calls
@@ -935,10 +938,14 @@ class MoAChatCompletions:
         # applies, matching single-model agent behavior. Presets may pin
         # explicit values. See _preset_temperature.
         temperature = _preset_temperature(preset, "reference_temperature")
-        aggregator_temperature = _preset_temperature(preset, "aggregator_temperature")
+        # Aggregator temperature: per-slot > preset-level > agent default.
+        # The aggregator slot (already cleaned by _clean_slot) may carry a
+        # per-slot `temperature` override; if absent, fall back to the
+        # preset-level value, then the acting agent's own configured temp.
+        aggregator_temperature = aggregator.get("temperature") if "temperature" in aggregator else None
+        if aggregator_temperature is None:
+            aggregator_temperature = _preset_temperature(preset, "aggregator_temperature")
         if aggregator_temperature is None and api_kwargs.get("temperature") is not None:
-            # The acting agent's own configured temperature (if any) still
-            # applies to the aggregator, which IS the acting model.
             aggregator_temperature = api_kwargs.get("temperature")
 
         # When the preset is disabled, skip the reference fan-out and let the

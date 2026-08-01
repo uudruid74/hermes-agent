@@ -461,3 +461,140 @@ def test_validate_moa_payload_rejects_non_dict():
     assert validate_moa_payload(None)
     assert validate_moa_payload([1, 2])
     assert validate_moa_payload({"presets": {"p": "not-a-dict"}})
+
+
+# ── Per-slot temperature (reference and aggregator) ─────────────────────
+
+
+def test_per_slot_reference_temperature_preserved():
+    """A reference slot with temperature:1.8 keeps it; a slot without gets none."""
+    cfg = normalize_moa_config(
+        {
+            "presets": {
+                "p": {
+                    "reference_models": [
+                        {"provider": "openrouter", "model": "deepseek/deepseek-v4-pro", "temperature": 1.8},
+                        {"provider": "openrouter", "model": "anthropic/claude-opus-4.8"},
+                    ],
+                    "aggregator": {"provider": "openrouter", "model": "anthropic/claude-opus-4.8"},
+                }
+            }
+        }
+    )
+    refs = cfg["presets"]["p"]["reference_models"]
+    assert refs[0]["temperature"] == 1.8
+    assert "temperature" not in refs[1]
+
+
+def test_per_slot_aggregator_temperature_preserved():
+    """An aggregator slot with temperature:0.3 preserves it."""
+    cfg = normalize_moa_config(
+        {
+            "presets": {
+                "p": {
+                    "reference_models": [{"provider": "openrouter", "model": "deepseek/deepseek-v4-pro"}],
+                    "aggregator": {
+                        "provider": "openrouter",
+                        "model": "anthropic/claude-opus-4.8",
+                        "temperature": 0.3,
+                    },
+                }
+            }
+        }
+    )
+    assert cfg["presets"]["p"]["aggregator"]["temperature"] == 0.3
+
+
+def test_per_slot_temperature_invalid_dropped():
+    """Non-numeric temperature ('hot') is dropped, not stored."""
+    cfg = normalize_moa_config(
+        {
+            "presets": {
+                "p": {
+                    "reference_models": [
+                        {"provider": "openrouter", "model": "deepseek/deepseek-v4-pro", "temperature": "hot"},
+                    ],
+                    "aggregator": {"provider": "openrouter", "model": "anthropic/claude-opus-4.8"},
+                }
+            }
+        }
+    )
+    assert "temperature" not in cfg["presets"]["p"]["reference_models"][0]
+
+
+def test_per_slot_temperature_numeric_string_coerced():
+    """String '0.7' in a slot coerces to float 0.7."""
+    cfg = normalize_moa_config(
+        {
+            "presets": {
+                "p": {
+                    "reference_models": [
+                        {"provider": "openrouter", "model": "deepseek/deepseek-v4-pro", "temperature": "0.7"},
+                    ],
+                    "aggregator": {"provider": "openrouter", "model": "anthropic/claude-opus-4.8"},
+                }
+            }
+        }
+    )
+    assert cfg["presets"]["p"]["reference_models"][0]["temperature"] == 0.7
+
+
+def test_per_slot_temperature_zero_preserved():
+    """Temperature 0 (deterministic) is a valid value and is preserved."""
+    cfg = normalize_moa_config(
+        {
+            "presets": {
+                "p": {
+                    "reference_models": [
+                        {"provider": "openrouter", "model": "deepseek/deepseek-v4-pro", "temperature": 0},
+                    ],
+                    "aggregator": {"provider": "openrouter", "model": "anthropic/claude-opus-4.8"},
+                }
+            }
+        }
+    )
+    assert cfg["presets"]["p"]["reference_models"][0]["temperature"] == 0.0
+
+
+def test_validate_moa_payload_accepts_per_slot_temperature():
+    """validate_moa_payload accepts slots with a valid temperature."""
+    from hermes_cli.moa_config import validate_moa_payload
+
+    payload = {
+        "presets": {
+            "p": {
+                "reference_models": [
+                    {"provider": "openrouter", "model": "deepseek/deepseek-v4-pro", "temperature": 1.8},
+                ],
+                "aggregator": {"provider": "openrouter", "model": "anthropic/claude-opus-4.8"},
+            }
+        }
+    }
+    assert validate_moa_payload(payload) == []
+
+
+def test_validate_per_slot_temperature_survives_normalize():
+    """Contract: per-slot temperature passes validate and survives normalize."""
+    from hermes_cli.moa_config import validate_moa_payload
+
+    payload = {
+        "presets": {
+            "p": {
+                "reference_models": [
+                    {"provider": "openrouter", "model": "deepseek/deepseek-v4-pro", "temperature": 1.8},
+                    {"provider": "openrouter", "model": "anthropic/claude-opus-4.8"},
+                ],
+                "aggregator": {
+                    "provider": "openrouter",
+                    "model": "anthropic/claude-opus-4.8",
+                    "temperature": 0.3,
+                },
+            }
+        }
+    }
+    assert validate_moa_payload(payload) == []
+    cfg = normalize_moa_config(payload)
+    refs = cfg["presets"]["p"]["reference_models"]
+    assert refs[0]["temperature"] == 1.8
+    assert "temperature" not in refs[1]
+    assert cfg["presets"]["p"]["aggregator"]["temperature"] == 0.3

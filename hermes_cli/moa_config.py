@@ -105,6 +105,9 @@ def _clean_slot(slot: Any) -> dict[str, Any] | None:
     effort = _clean_reasoning_effort(slot.get("reasoning_effort"))
     if effort:
         clean["reasoning_effort"] = effort
+    temperature = _coerce_float_or_none(slot.get("temperature"))
+    if temperature is not None:
+        clean["temperature"] = temperature
     return clean
 
 
