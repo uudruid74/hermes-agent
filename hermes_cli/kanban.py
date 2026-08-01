@@ -77,6 +77,7 @@ def _notify_kanban_status_change(
     platform = origin["platform"].lower()
     chat_id = origin["chat_id"]
     thread_id = origin.get("thread_id", "")
+    chat_type = origin.get("chat_type", "group")
     target = f"{platform}:{chat_id}"
     if thread_id:
         target = f"{target}:{thread_id}"
@@ -114,9 +115,14 @@ def _notify_kanban_status_change(
         pass
 
     try:
+        # Pass chat_type via environment so the bridge/adapter handlers
+        # construct the SessionSource with the correct chat_type instead
+        # of hardcoding "group" — prevents session-key mismatch (fork).
+        notify_env = os.environ.copy()
+        notify_env["HERMES_NOTIFY_CHAT_TYPE"] = chat_type
         subprocess.run(
             ["hermes", "send", "-u", target, json_payload],
-            capture_output=True, timeout=10,
+            capture_output=True, timeout=10, env=notify_env,
         )
     except Exception:
         pass

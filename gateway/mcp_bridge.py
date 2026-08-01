@@ -230,11 +230,15 @@ async def _handle_inject(runner, cmd: dict, writer: asyncio.StreamWriter) -> Non
         from gateway.platforms.base import MessageEvent, MessageType
         from datetime import datetime
 
+        # Resolve chat_type: prefer the explicit field (set by
+        # kanban/cron notification hooks via bridge payload),
+        # fall back to "group" for backward compatibility.
+        _chat_type = cmd.get("chat_type") or "group"
         session_source = SessionSource(
             platform=platform,
             chat_id=chat_id,
             thread_id=thread_id,
-            chat_type="group",
+            chat_type=_chat_type,
         )
         # Build internal flag and user identity
         is_internal = True

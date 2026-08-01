@@ -1675,6 +1675,13 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 adapter_ok = True
                 timed_out = False
                 if text_to_send:
+                    # Propagate chat_type from origin routing so the
+                    # bridge/adapter constructs the SessionSource with the
+                    # correct chat_type — prevents session-key mismatch (fork)
+                    # when delivering to forum/DM topics.
+                    _origin_ct = origin.get("chat_type")
+                    if _origin_ct:
+                        os.environ["HERMES_NOTIFY_CHAT_TYPE"] = str(_origin_ct)
                     from agent.async_utils import safe_schedule_threadsafe
 
                     future = safe_schedule_threadsafe(
