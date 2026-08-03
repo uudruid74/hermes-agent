@@ -408,8 +408,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "durations (90s, 30m, 2h, 1d). When exceeded, "
                                "the dispatcher SIGTERMs (then SIGKILLs) the worker "
                                "and re-queues the task.")
-    p_create.add_argument("--created-by", default="user",
-                          help="Author name recorded on the task (default: user)")
+    p_create.add_argument("--created-by", default=None,
+                          help="Author name recorded on the task (default: HERMES_AGENT_NAME/profile or 'user')")
     p_create.add_argument("--skill", action="append", default=[], dest="skills",
                           help="Skill to force-load into the worker "
                                "(repeatable). The kanban lifecycle is already "
@@ -1062,7 +1062,15 @@ def kanban_command(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 def _profile_author() -> str:
-    """Best-effort author name for an interactive CLI call."""
+    """Best-effort author name for an interactive CLI call.
+
+    Precedence: HERMES_AGENT_NAME (the running agent's identity, when set)
+    overrides the profile name so kanban records who actually created a task
+    rather than defaulting to the interactive user.
+    """
+    agent = os.environ.get("HERMES_AGENT_NAME")
+    if agent:
+        return agent
     for env in ("HERMES_PROFILE_NAME", "HERMES_PROFILE"):
         v = os.environ.get(env)
         if v:
