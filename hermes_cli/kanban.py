@@ -36,8 +36,6 @@ _log = logging.getLogger(__name__)
 # Status-change notification hook
 # ---------------------------------------------------------------------------
 
-_STATUS_NOTIFY_ENABLED = False  # Disabled — gateway kanban watcher handles notifications now
-
 
 def _notify_kanban_status_change(
     task_id: str,
@@ -58,9 +56,6 @@ def _notify_kanban_status_change(
     Fails silently on all errors so a broken notification can never block
     a task transition.
     """
-    if not _STATUS_NOTIFY_ENABLED:
-        return
-
     # Resolve origin routing
     try:
         conn = kb.connect()
