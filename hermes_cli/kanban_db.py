@@ -3972,6 +3972,7 @@ def claim_task(
         _notify_kanban_status_change(
             task_id, "running",
             title=claimed.title if claimed else None,
+            assignee=claimed.assignee if claimed else None,
         )
     except Exception:
         pass
@@ -4679,6 +4680,7 @@ def complete_task(
             task_id, "done",
             summary=summary or result,
             title=_done_task.title if _done_task else None,
+            assignee=_done_task.assignee if _done_task else None,
         )
     except Exception:
         pass
@@ -5363,6 +5365,7 @@ def block_task(
                     task_id, "todo",
                     summary=reason,
                     title=_blocked_task.title if _blocked_task else None,
+                    assignee=_blocked_task.assignee if _blocked_task else None,
                 )
             except Exception:
                 pass
@@ -5484,6 +5487,7 @@ def block_task(
             task_id, "blocked",
             summary=reason,
             title=_blocked_task.title if _blocked_task else None,
+            assignee=_blocked_task.assignee if _blocked_task else None,
         )
     except Exception:
         pass
