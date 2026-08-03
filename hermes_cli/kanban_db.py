@@ -13,19 +13,10 @@ parameter is accepted by many functions for backward compatibility
 with callers that still pass it, but is ignored — all tasks live
 in the flat ``kanban.db``.
 
-Board resolution order (highest precedence first, all optional):
-
-* ``board=`` argument passed directly to :func:`connect` / :func:`init_db`
-  (explicit — used by the CLI ``--board`` flag and the dashboard
-  ``?board=...`` query param).
-* ``HERMES_KANBAN_BOARD`` env var (used by the dispatcher to pin workers
-  to the board their task lives on — workers cannot see other boards).
-* ``HERMES_KANBAN_DB`` env var (pins the DB file path directly — legacy
-  override still honoured; highest precedence when the file path itself
-  is what the caller wants to force).
-* ``<root>/kanban/current`` — a one-line text file holding the slug of
-  the "currently selected" board. Written by ``hermes kanban boards
-  switch <slug>``. When absent, the active board is ``default``.
+There is no active-board selector. Legacy ``board=`` arguments are accepted
+only as storage-compatible aliases for the sole database, and named-board
+creation/switch/removal calls are rejected. ``HERMES_KANBAN_DB`` remains the
+supported file-path override for tests and custom deployments.
 
 In standard installs ``<root>`` is ``~/.hermes``. In Docker / custom
 deployments where ``HERMES_HOME`` points outside ``~/.hermes`` (e.g.
@@ -37,11 +28,10 @@ overrides still work:
 * ``HERMES_KANBAN_HOME`` — pin the umbrella root that anchors kanban
   paths. Useful for tests and unusual deployments.
 
-The dispatcher injects ``HERMES_KANBAN_DB``,
-``HERMES_KANBAN_WORKSPACES_ROOT``, and ``HERMES_KANBAN_BOARD`` into
-worker subprocess env so workers converge on the exact DB the
-dispatcher used to claim their task — even under unusual symlink or
-Docker layouts.
+The dispatcher injects ``HERMES_KANBAN_DB`` and
+``HERMES_KANBAN_WORKSPACES_ROOT`` into worker subprocess env so workers
+converge on the exact DB the dispatcher used to claim their task — even
+under unusual symlink or Docker layouts.
 
 Schema is intentionally small: tasks, task_links, task_comments,
 task_events.  The ``workspace_kind`` field decouples coordination from git
@@ -152,6 +142,26 @@ def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None
         invoke_hook(event, task_id=task_id, profile_name=profile_name, **fields)
     except Exception as exc:  # pragma: no cover - defensive
         _log.debug("kanban lifecycle hook %s failed: %s", event, exc)
+
+
+def _notify_closed_after_commit(
+    task_id: str,
+    status: str,
+    *,
+    summary: Optional[str],
+    title: Optional[str],
+    origin: Optional[dict[str, Any]],
+) -> bool:
+    """Late-bind the transport while keeping transition ownership local."""
+    from hermes_cli.kanban_notify import notify_task_closed
+
+    return notify_task_closed(
+        task_id,
+        status,
+        summary=summary,
+        title=title,
+        origin=origin,
+    )
 
 
 def _write_kanban_fabric_entry(
@@ -446,85 +456,17 @@ def current_board_path() -> Path:
 
 
 def get_current_board() -> str:
-    """Return the active board slug, honouring the resolution chain.
-
-    Order (highest precedence first):
-
-    1. In-process scoped override (``--board`` flag via
-       :func:`scoped_current_board`).
-    2. ``<root>/kanban/current`` on disk (set by ``hermes kanban boards
-       switch``), but only when that board still exists. The file takes
-       priority over the env var because a user running ``boards switch``
-       writes the file and expects it to persist — the env var is an
-       implementation detail for dispatcher isolation and chat-session
-       pinning, not a user-facing override.
-    3. ``HERMES_KANBAN_BOARD`` env var (set by the dispatcher on worker
-       spawn, or for ad-hoc overrides).
-    4. ``DEFAULT_BOARD`` (``"default"``).
-
-    A malformed or stale slug at any step falls through to the next layer
-    with a best-effort warning — the dispatcher must never crash because a
-    user hand-edited a file or removed a board directory.
-    """
-    scoped = (_CURRENT_BOARD_OVERRIDE.get() or "").strip()
-    if scoped:
-        try:
-            normed = _normalize_board_slug(scoped)
-            if normed and board_exists(normed):
-                return normed
-        except ValueError:
-            pass
-
-    # The ``current`` file takes priority over the env var (step 2 vs 3).
-    # ``hermes kanban boards switch`` writes this file; a user who runs
-    # ``boards switch`` expects subsequent CLI commands to respect it.
-    # The env var is infrastructure (dispatcher, gateway) that should not
-    # shadow the user's explicit switch. Workers are protected by
-    # ``HERMES_KANBAN_DB`` (exact file path, highest priority in
-    # ``kanban_db_path``), not by this env var.
-    try:
-        f = current_board_path()
-        if f.exists():
-            val = f.read_text(encoding="utf-8").strip()
-            if val:
-                try:
-                    normed = _normalize_board_slug(val)
-                    if normed and board_exists(normed):
-                        return normed
-                except ValueError:
-                    pass
-    except OSError:
-        pass
-
-    env = os.environ.get("HERMES_KANBAN_BOARD", "").strip()
-    if env:
-        try:
-            normed = _normalize_board_slug(env)
-            if normed and board_exists(normed):
-                return normed
-        except ValueError:
-            pass
+    """Return the sole compatibility label for the unified Kanban database."""
     return DEFAULT_BOARD
 
 
 def set_current_board(slug: str) -> Path:
-    """Persist ``slug`` as the active board. Returns the file written.
-
-    Writes ``<root>/kanban/current``. The caller should validate the slug
-    exists first (via :func:`board_exists`) — this function does not —
-    so that ``hermes kanban boards switch <typo>`` returns an error
-    instead of silently pointing at nothing.
-    """
+    """Compatibility shim: only the single ``default`` board is valid."""
     normed = _normalize_board_slug(slug)
-    if not normed:
-        raise ValueError("board slug is required")
+    if normed != DEFAULT_BOARD:
+        raise ValueError("Kanban uses one database; only the 'default' board exists")
     path = current_board_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(normed + "\n", encoding="utf-8")
-    # Belt-and-suspenders: update the process env var as well so that any
-    # code checking ``HERMES_KANBAN_BOARD`` directly (not through
-    # ``get_current_board()``) also sees the switch immediately.
-    os.environ["HERMES_KANBAN_BOARD"] = normed
+    clear_current_board()
     return path
 
 
@@ -551,8 +493,11 @@ def board_dir(board: Optional[str] = None) -> Path:
 
 
 def board_exists(board: Optional[str] = None) -> bool:
-    """Return True — backward-compat stub, all tasks live in flat DB."""
-    return True
+    """Return whether ``board`` names the sole compatibility board."""
+    try:
+        return (_normalize_board_slug(board) or DEFAULT_BOARD) == DEFAULT_BOARD
+    except ValueError:
+        return False
 
 
 def kanban_db_path(board: Optional[str] = None) -> Path:
@@ -723,15 +668,10 @@ def create_board(
     color: Optional[str] = None,
     default_workdir: Optional[str] = None,
 ) -> dict:
-    """Create a new board directory + DB + metadata. Idempotent.
-
-    Returns the resulting metadata. Raises :class:`ValueError` for a
-    malformed slug; returns the existing metadata (not an error) if the
-    board already exists — matching ``mkdir -p`` semantics.
-    """
+    """Compatibility shim that initializes the sole ``default`` board."""
     normed = _normalize_board_slug(slug)
-    if not normed:
-        raise ValueError("board slug is required")
+    if normed != DEFAULT_BOARD:
+        raise ValueError("Kanban uses one database; named boards are not supported")
     meta = write_board_metadata(
         normed,
         name=name,
@@ -740,7 +680,6 @@ def create_board(
         color=color,
         default_workdir=default_workdir,
     )
-    # Touch the DB so list_boards() sees it immediately.
     init_db(board=normed)
     return meta
 
@@ -755,50 +694,8 @@ def list_boards(*, include_archived: bool = True) -> list[dict]:
 
 
 def remove_board(slug: str, *, archive: bool = True) -> dict:
-    """Remove or archive a board.
-
-    ``archive=True`` (default) moves the board's directory to
-    ``<root>/kanban/boards/_archived/<slug>-<timestamp>/`` so the data
-    is recoverable. ``archive=False`` deletes the directory outright.
-
-    The ``default`` board cannot be removed — raises :class:`ValueError`.
-    Returns a summary dict describing what happened (``{"slug", "action",
-    "new_path"}``).
-    """
-    normed = _normalize_board_slug(slug)
-    if not normed:
-        raise ValueError("board slug is required")
-    if normed == DEFAULT_BOARD:
-        raise ValueError("the 'default' board cannot be removed")
-    d = board_dir(normed)
-    if not d.exists():
-        raise ValueError(f"board {normed!r} does not exist")
-
-    # If the user removed the currently-active board, revert to default.
-    if get_current_board() == normed:
-        clear_current_board()
-
-    # A concurrent connect(board=normed) after the rename/delete recreates
-    # an empty sqlite file via mkdir(exist_ok=True); the cache entry must be
-    # dropped first so the schema init pass re-runs on that fresh file.
-    _INITIALIZED_PATHS.discard(str((d / "kanban.db").resolve()))
-
-    if archive:
-        archive_root = boards_root() / "_archived"
-        archive_root.mkdir(parents=True, exist_ok=True)
-        ts = int(time.time())
-        target = archive_root / f"{normed}-{ts}"
-        # Avoid collision on rapid double-archives.
-        suffix = 1
-        while target.exists():
-            target = archive_root / f"{normed}-{ts}-{suffix}"
-            suffix += 1
-        d.rename(target)
-        return {"slug": normed, "action": "archived", "new_path": str(target)}
-    else:
-        import shutil
-        shutil.rmtree(d)
-        return {"slug": normed, "action": "deleted", "new_path": ""}
+    """Reject removal because the single database is not a removable board."""
+    raise ValueError("Kanban uses one database; the 'default' board cannot be removed")
 
 
 # ---------------------------------------------------------------------------
@@ -1978,13 +1875,9 @@ def connect(
     directly don't have to remember a separate init step. Subsequent
     connections skip the schema check via a module-level path cache.
 
-    Path resolution:
-
-    * ``db_path`` explicit → used as-is (legacy callers, tests).
-    * ``board`` explicit → resolves to that board's DB.
-    * Neither → :func:`kanban_db_path` resolves via
-      ``HERMES_KANBAN_DB`` env → ``HERMES_KANBAN_BOARD`` env →
-      ``<root>/kanban/current`` → ``default``.
+    ``db_path`` is an explicit file override for legacy callers and tests.
+    Otherwise :func:`kanban_db_path` returns the single shared database;
+    ``board`` is accepted but does not select or partition storage.
     """
     if db_path is not None:
         path = db_path
@@ -3966,15 +3859,6 @@ def claim_task(
         assignee=claimed.assignee if claimed else None,
         run_id=run_id,
     )
-    # Notify via Telegram on claim (ready→running) — catches both CLI and dispatcher paths
-    try:
-        from hermes_cli.kanban import _notify_kanban_status_change
-        _notify_kanban_status_change(
-            task_id, "running",
-            title=claimed.title if claimed else None,
-        )
-    except Exception:
-        pass
     return claimed
 
 
@@ -4674,14 +4558,15 @@ def complete_task(
         summary=(summary if summary is not None else result),
     )
     try:
-        from hermes_cli.kanban import _notify_kanban_status_change
-        _notify_kanban_status_change(
-            task_id, "done",
+        _notify_closed_after_commit(
+            task_id,
+            "done",
             summary=summary or result,
             title=_done_task.title if _done_task else None,
+            origin=get_origin_routing(conn, task_id),
         )
     except Exception:
-        pass
+        _log.debug("kanban completion notification failed", exc_info=True)
     return True
 
 
@@ -5357,15 +5242,6 @@ def block_task(
                 run_id=run_id,
                 reason=reason,
             )
-            try:
-                from hermes_cli.kanban import _notify_kanban_status_change
-                _notify_kanban_status_change(
-                    task_id, "todo",
-                    summary=reason,
-                    title=_blocked_task.title if _blocked_task else None,
-                )
-            except Exception:
-                pass
             return True
 
         # Truly-blocked kinds. Increment the unblock-loop counter when this is a
@@ -5478,15 +5354,17 @@ def block_task(
         run_id=run_id,
         reason=reason,
     )
-    try:
-        from hermes_cli.kanban import _notify_kanban_status_change
-        _notify_kanban_status_change(
-            task_id, "blocked",
-            summary=reason,
-            title=_blocked_task.title if _blocked_task else None,
-        )
-    except Exception:
-        pass
+    if routed_to == "blocked":
+        try:
+            _notify_closed_after_commit(
+                task_id,
+                "blocked",
+                summary=reason,
+                title=_blocked_task.title if _blocked_task else None,
+                origin=get_origin_routing(conn, task_id),
+            )
+        except Exception:
+            _log.debug("kanban blocked notification failed", exc_info=True)
     return True
 
 
@@ -8588,10 +8466,8 @@ def _default_spawn(
     via the ``complete`` / ``block`` transitions the worker writes itself;
     the PID check is a safety net for crashes, OOM kills, and Ctrl+C.
 
-    ``board`` pins the child's kanban context to that board: the child's
-    ``HERMES_KANBAN_DB`` / ``HERMES_KANBAN_BOARD`` / workspaces_root env
-    vars all resolve to the same board the dispatcher claimed the task
-    from. Workers cannot accidentally see other boards.
+    ``board`` is retained for call-site compatibility but does not partition
+    task storage.
     """
     import subprocess
     if not task.assignee:
@@ -8603,6 +8479,17 @@ def _default_spawn(
 
     prompt = f"work kanban task {task.id}"
     env = dict(os.environ)
+
+    # The child switches to the assignee profile below, but a terminal-state
+    # wake must return through the gateway profile that dispatched it.
+    if not env.get("HERMES_KANBAN_NOTIFY_PROFILE"):
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+            notify_profile = get_active_profile_name()
+            if notify_profile not in {"", "custom"}:
+                env["HERMES_KANBAN_NOTIFY_PROFILE"] = notify_profile
+        except Exception:
+            pass
 
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
     # (fallback_providers, toolsets, agent settings, etc.) instead of the root
@@ -8693,12 +8580,8 @@ def _default_spawn(
     # but unusual symlink / Docker layouts are caught here too.
     env["HERMES_KANBAN_DB"] = str(kanban_db_path(board=board))
     env["HERMES_KANBAN_WORKSPACES_ROOT"] = str(workspaces_root(board=board))
-    # Board slug — the final defense-in-depth pin. If the worker ever
-    # resolves kanban paths without the DB / workspaces env vars, the
-    # board slug still forces it to the right directory.
-    resolved_board = _normalize_board_slug(board) or get_current_board()
-    env["HERMES_KANBAN_BOARD"] = resolved_board
-    # HERMES_PROFILE is the author the kanban_comment tool defaults to.
+
+    # Preserve the dispatching gateway profile before HERMES_HOME is switched
     # `hermes -p <assignee>` activates the profile, but the env var is
     # what the tool reads — set it explicitly here so comments are
     # attributed correctly regardless of how the child loads config.
@@ -8766,10 +8649,7 @@ def _default_spawn(
         # turn, prints text, exits rc=0, and the dispatcher records a
         # protocol violation (incident 2026-06-09 t_d9cbe312).
         cmd.append("-Q")
-    # Redirect output to a per-task log under <board-root>/logs/.
-    # Anchored at the board root (not the shared kanban root), so
-    # `hermes kanban log` on a specific board reads its own file and
-    # logs don't collide across boards that happen to share task ids.
+    # Redirect output to a per-task log under the shared Kanban log root.
     log_dir = worker_logs_dir(board=board)
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{task.id}.log"

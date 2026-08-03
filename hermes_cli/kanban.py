@@ -32,102 +32,6 @@ import logging
 _log = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Status-change notification hook
-# ---------------------------------------------------------------------------
-
-_STATUS_NOTIFY_ENABLED = False  # Disabled — gateway kanban watcher handles notifications now
-
-
-def _notify_kanban_status_change(
-    task_id: str,
-    new_status: str,
-    *,
-    summary: Optional[str] = None,
-    title: Optional[str] = None,
-) -> None:
-    """Send a best-effort notification about a kanban task state change.
-
-    Sends two messages:
-    - Human-readable via ``hermes send -t`` with old-style icons, no [Hermes] prefix
-    - JSON payload via ``hermes send -u`` for AI consumption
-
-    Uses the task's origin routing (``__kanban_origin__`` system comment)
-    to determine the target channel. Falls back to home-channel sends.
-
-    Fails silently on all errors so a broken notification can never block
-    a task transition.
-    """
-    if not _STATUS_NOTIFY_ENABLED:
-        return
-
-    # Resolve origin routing
-    try:
-        conn = kb.connect()
-        try:
-            origin = kb.get_origin_routing(conn, task_id)
-        finally:
-            conn.close()
-    except Exception:
-        origin = None
-
-    if not (origin and origin.get("platform") and origin.get("chat_id")):
-        return
-
-    platform = origin["platform"].lower()
-    chat_id = origin["chat_id"]
-    thread_id = origin.get("thread_id", "")
-    chat_type = origin.get("chat_type", "group")
-    target = f"{platform}:{chat_id}"
-    if thread_id:
-        target = f"{target}:{thread_id}"
-
-    icon = _NOTIFY_EMOJI.get(new_status, "❓")
-    task_label = title or task_id
-    summary_line = ""
-    if summary:
-        summary_line = summary.splitlines()[0][:300]
-
-    # Human-readable message via -t (old icons, no [Hermes] prefix)
-    human_parts = [f"{icon} {task_label} → {new_status}"]
-    if summary_line:
-        human_parts.append(f" — {summary_line}")
-    if new_status == "blocked":
-        human_parts.append(" — Investigate this blocked task")
-    human_msg = "".join(human_parts)
-
-    # JSON payload via -u
-    json_payload = json.dumps({
-        "source": "kanban",
-        "type": new_status,
-        "task_id": task_id,
-        "title": title or task_id,
-        "summary": summary_line or None,
-    })
-
-    import subprocess
-    try:
-        subprocess.run(
-            ["hermes", "send", "-t", target, human_msg],
-            capture_output=True, timeout=10,
-        )
-    except Exception:
-        pass
-
-    try:
-        # Pass chat_type via environment so the bridge/adapter handlers
-        # construct the SessionSource with the correct chat_type instead
-        # of hardcoding "group" — prevents session-key mismatch (fork).
-        notify_env = os.environ.copy()
-        notify_env["HERMES_NOTIFY_CHAT_TYPE"] = chat_type
-        subprocess.run(
-            ["hermes", "send", "-u", target, json_payload],
-            capture_output=True, timeout=10, env=notify_env,
-        )
-    except Exception:
-        pass
-
-
 def _notify_via_gateway(message: str) -> None:
     """Send *message* to every enabled gateway platform's home channel.
 
@@ -1308,10 +1212,6 @@ def _cmd_create(args: argparse.Namespace) -> int:
             running, message = _check_dispatcher_presence()
             if not running and message:
                 print(f"\n⚠  {message}", file=sys.stderr)
-    _notify_kanban_status_change(
-        task.id, task.status,
-        title=task.title,
-    )
     return 0
 
 
@@ -1380,8 +1280,6 @@ def _cmd_list(args: argparse.Namespace) -> int:
     if getattr(args, "json", False):
         print(json.dumps([_task_to_dict(t) for t in tasks], indent=2, ensure_ascii=False))
         return 0
-    # Passive discoverability: when the user has multiple boards, surface
-    # which one they're looking at in the list header. Single-board users
     if not tasks:
         print("(no matching tasks)")
         return 0
@@ -1962,9 +1860,6 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                         failed.append(tid)
                         continue
 
-            # Capture task info before completing for notification
-            task_before = kb.get_task(conn, tid)
-            title_before = task_before.title if task_before else None
             if not kb.complete_task(
                 conn, tid,
                 result=args.result,
@@ -1976,11 +1871,6 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
             else:
                 print(f"Completed {tid}")
-                _notify_kanban_status_change(
-                    tid, "done",
-                    summary=summary,
-                    title=title_before,
-                )
     return 0 if not failed else 1
 
 
@@ -2020,9 +1910,6 @@ def _cmd_block(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
-            # Capture task info before blocking for notification
-            task_before = kb.get_task(conn, tid)
-            title_before = task_before.title if task_before else None
             if reason:
                 kb.add_comment(conn, tid, author, f"BLOCKED: {reason}")
             if not kb.block_task(
@@ -2049,11 +1936,6 @@ def _cmd_block(args: argparse.Namespace) -> int:
                     )
                 else:
                     print(f"Blocked {tid}{suffix}")
-                _notify_kanban_status_change(
-                    tid, where,
-                    summary=reason,
-                    title=title_before,
-                )
     return 0 if not failed else 1
 
 
@@ -2064,9 +1946,6 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
-            # Capture task info before scheduling for notification
-            task_before = kb.get_task(conn, tid)
-            title_before = task_before.title if task_before else None
             if reason:
                 kb.add_comment(conn, tid, author, f"SCHEDULED: {reason}")
             if not kb.schedule_task(
@@ -2079,11 +1958,6 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
                 print(f"cannot schedule {tid}", file=sys.stderr)
             else:
                 print(f"Scheduled {tid}" + (f": {reason}" if reason else ""))
-                _notify_kanban_status_change(
-                    tid, "scheduled",
-                    summary=reason,
-                    title=title_before,
-                )
     return 0 if not failed else 1
 
 
@@ -2099,9 +1973,6 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
-            # Capture task info before unblocking for notification
-            task_before = kb.get_task(conn, tid)
-            title_before = task_before.title if task_before else None
             if reason:
                 kb.add_comment(conn, tid, author, f"UNBLOCK: {reason}")
             if not kb.unblock_task(conn, tid):
@@ -2109,11 +1980,6 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
                 print(f"cannot unblock {tid} (not blocked/scheduled?)", file=sys.stderr)
             else:
                 print(f"Unblocked {tid}" + (f": {reason}" if reason else ""))
-                _notify_kanban_status_change(
-                    tid, "ready",
-                    summary=reason,
-                    title=title_before,
-                )
     return 0 if not failed else 1
 
 
@@ -2133,9 +1999,6 @@ def _cmd_promote(args: argparse.Namespace) -> int:
     results: list[dict[str, object]] = []
     with kb.connect_closing() as conn:
         for tid in ids:
-            # Capture task info before promoting for notification
-            task_before = kb.get_task(conn, tid)
-            title_before = task_before.title if task_before else None
             ok, err = kb.promote_task(
                 conn,
                 tid,
@@ -2152,13 +2015,6 @@ def _cmd_promote(args: argparse.Namespace) -> int:
                 "reason": reason,
                 "error": err,
             })
-            if ok and not args.dry_run:
-                _notify_kanban_status_change(
-                    tid, "ready",
-                    summary=reason,
-                    title=title_before,
-                )
-
     failed = [r for r in results if not r["promoted"]]
     if as_json:
         # Single-id stays a flat object for back-compat; bulk emits a list.
@@ -2893,7 +2749,6 @@ Common subcommands:
   `complete <id>…`      Mark task(s) done
   `block <id> [reason]` Mark blocked; `schedule <id> [reason]` parks time-delay work; `unblock <id>` to revive
   `assign <id> <profile>`  Reassign
-  `boards list`         Show all boards
   `assignees`           Known profiles + counts
   `context <id>`        Full worker-context dump
   `runs <id>`           Attempt history

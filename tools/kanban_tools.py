@@ -36,7 +36,6 @@ from typing import Any, Optional
 from agent.redact import redact_sensitive_text
 from hermes_cli.goals import judge_goal
 from tools.registry import registry, tool_error
-from hermes_cli.config import cfg_get, load_config
 
 logger = logging.getLogger(__name__)
 
@@ -132,87 +131,6 @@ def _stamp_worker_session_metadata(
     return stamped
 
 
-def _notify_kanban_event(tid: str, status: str, summary: Optional[str], task) -> None:
-    """Fire a best-effort notification when a task changes status.
-
-    Sends two messages:
-    - Human-readable via ``hermes send -t`` with old-style icons, no [Hermes] prefix
-    - JSON payload via ``hermes send -u`` for AI consumption
-
-    Mirrors ``_notify_kanban_status_change`` in ``hermes_cli/kanban.py`` so the
-    worker-side tool calls trigger the same notification as the CLI commands.
-    """
-    try:
-        from hermes_cli import kanban_db as _kb
-        from hermes_cli.kanban import _NOTIFY_EMOJI
-        import json
-        task_title = task.title if task else tid
-        summary_line = ""
-        if summary:
-            summary_line = summary.splitlines()[0][:300]
-
-        conn = _kb.connect()
-        try:
-            origin = _kb.get_origin_routing(conn, tid)
-        finally:
-            conn.close()
-
-        if not (origin and origin.get("platform") and origin.get("chat_id")):
-            return
-
-        platform = origin["platform"].lower()
-        chat_id = origin["chat_id"]
-        thread_id = origin.get("thread_id", "")
-        chat_type = origin.get("chat_type", "group")
-        target = f"{platform}:{chat_id}"
-        if thread_id:
-            target = f"{target}:{thread_id}"
-
-        icon = _NOTIFY_EMOJI.get(status, "❓")
-
-        # Human-readable message via -t (old icons, no [Hermes] prefix)
-        human_parts = [f"{icon} {task_title} → {status}"]
-        if summary_line:
-            human_parts.append(f" — {summary_line}")
-        if status == "blocked":
-            human_parts.append(" — Investigate this blocked task")
-        human_msg = "".join(human_parts)
-
-        # JSON payload via -u
-        json_payload = json.dumps({
-            "source": "kanban",
-            "type": status,
-            "task_id": tid,
-            "title": task_title,
-            "summary": summary_line or None,
-        })
-
-        import subprocess
-        subprocess.run(
-            ["hermes", "send", "-t", target, human_msg],
-            capture_output=True, timeout=10,
-        )
-        # Pass chat_type via environment so the bridge/adapter handlers
-        # construct the SessionSource with the correct chat_type instead
-        # of hardcoding "group" — prevents session-key mismatch (fork).
-        notify_env = os.environ.copy()
-        notify_env["HERMES_NOTIFY_CHAT_TYPE"] = chat_type
-        subprocess.run(
-            ["hermes", "send", "-u", target, json_payload],
-            capture_output=True, timeout=10, env=notify_env,
-        )
-    except Exception:
-        pass
-
-
-def _notify_kanban_completion(tid: str, summary: Optional[str], task) -> None:
-    """Fire a best-effort notification when a task completes.
-
-    Convenience wrapper around ``_notify_kanban_event``.
-    """
-    _notify_kanban_event(tid, "done", summary, task)
-
-
 def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
     """Reject worker-driven destructive calls on foreign task IDs.
 
@@ -249,12 +167,8 @@ def _connect(board: Optional[str] = None):
     """Import + connect lazily so the module imports cleanly in non-kanban
     contexts (e.g. test rigs that import every tool module).
 
-    When ``board`` is provided it's forwarded to :func:`kb.connect`, which
-    routes the connection to that board's sqlite file. ``None`` (the
-    default) preserves the legacy resolution chain
-    (``HERMES_KANBAN_DB`` → ``HERMES_KANBAN_BOARD`` env → current symlink
-    → ``default``). Per-tool ``board`` lets a Telegram-side agent override
-    the env-pinned active board without restarting Hermes.
+    ``board`` is retained as a compatibility argument and forwarded to
+    :func:`kb.connect`; every value resolves to the same SQLite database.
     """
     from hermes_cli import kanban_db as kb
     return kb, kb.connect(board=board)
@@ -748,8 +662,6 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"could not complete {tid} (unknown id or already terminal)"
                 )
             run = kb.latest_run(conn, tid)
-            # Notify origin channel about completion
-            _notify_kanban_completion(tid, summary, task)
             return _ok(task_id=tid, run_id=run.id if run else None)
         finally:
             conn.close()
@@ -820,8 +732,6 @@ def _handle_block(args: dict, **kw) -> str:
                     f"running/ready)"
                 )
             run = kb.latest_run(conn, tid)
-            # Notify origin channel about the block
-            _notify_kanban_event(tid, "blocked", reason, task)
             # Tell the worker where the task actually landed so it doesn't
             # assume it's sitting in 'blocked' when routing sent it elsewhere.
             landed = kb.get_task(conn, tid)
@@ -918,9 +828,6 @@ def _handle_comment(args: dict, **kw) -> str:
         kb, conn = _connect(board=board)
         try:
             cid = kb.add_comment(conn, tid, author=author, body=str(body))
-            # Notify origin channel about the comment
-            task = kb.get_task(conn, tid)
-            _notify_kanban_event(tid, "commented", body, task)
             return _ok(task_id=tid, comment_id=cid)
         finally:
             conn.close()
@@ -1254,11 +1161,11 @@ def _handle_create(args: dict, **kw) -> str:
                 session_id=session_id,
             )
             new_task = kb.get_task(conn, new_tid)
-            subscribed = _maybe_auto_subscribe(conn, new_tid)
+            origin_stored = _maybe_store_origin(conn, new_tid)
             return _ok(
                 task_id=new_tid,
                 status=new_task.status if new_task else None,
-                subscribed=subscribed,
+                origin_stored=origin_stored,
             )
         finally:
             conn.close()
@@ -1269,107 +1176,50 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(f"kanban_create: {e}")
 
 
-def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
-    """Auto-subscribe the calling session to task completion / block events.
+def _maybe_store_origin(conn: Any, task_id: str) -> bool:
+    """Persist the calling session as the task's optional return route.
 
-    Returns True if a subscription row was written, False otherwise (no
-    session context, config gate disabled, or best-effort failure). The
-    caller surfaces this in the ``subscribed`` field of the kanban_create
-    response so an orchestrator can decide whether to fall back to an
-    explicit ``kanban_notify-subscribe`` or to polling.
-
-    Gated by ``kanban.auto_subscribe_on_create`` in config.yaml (default
-    True). Disable to mirror pre-feature behaviour, e.g. when the
-    originating user/chat opted out via the per-platform notification
-    toggle (see ``hermes dashboard``).
-
-    Subscription paths:
-
-    - **Gateway** (telegram/discord/slack/etc): ``HERMES_SESSION_PLATFORM``
-      and ``HERMES_SESSION_CHAT_ID`` are set in ContextVars by the
-      messaging gateway before agent dispatch. The notification poller
-      already keys off these, so we just register a row.
-
-    - **TUI** (herm desktop / herm TUI): the platform/chat_id ContextVars
-      are intentionally cleared (TUI is a single-channel local UI, not
-      a multi-tenant chat surface), but the agent subprocess inherits
-      ``HERMES_SESSION_KEY`` from the parent session. We subscribe with
-      ``platform="tui"`` and ``chat_id=<key>``; the TUI notification
-      poller reads ``get_origin_routing`` from task comments
-      for these rows and posts the completion message into the running
-      session.
-
-    - **CLI / cron / test / unattached**: no persistent delivery channel,
-      no-op.
-
-    Failure mode: any exception inside the function is logged at WARNING
-    with the offending exception + diagnostic env vars and swallowed.
-    We never want a notification bookkeeping failure to fail the
-    kanban_create that the agent is mid-conversation about.
+    This is not a subscription: it writes one ``__kanban_origin__`` system
+    comment that the post-commit close hook reads exactly once. CLI, cron, and
+    other unattached callers have no origin and therefore use the Telegram
+    home-channel fallback.
     """
-    try:
-        cfg = load_config()
-        if not cfg_get(cfg, "kanban", "auto_subscribe_on_create", default=True):
-            return False
-    except Exception:
-        # If config can't load we still default to True — this is the
-        # user-friendly behaviour that mirrors the pre-gate implementation.
-        pass
-
     platform = ""
     chat_id = ""
     try:
         from gateway.session_context import get_session_env
+
         platform = get_session_env("HERMES_SESSION_PLATFORM", "")
         chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
         if not platform or not chat_id:
-            # TUI / desktop fallback: platform/chat_id ContextVars are
-            # cleared for TUI sessions, but the parent process exports
-            # HERMES_SESSION_KEY into the subprocess env. Treat that
-            # as a "tui" subscription so the TUI notification poller
-            # (tui_gateway/server.py) can pick it up.
-            #
-            # HERMES_SESSION_ID is intentionally NOT a fallback here:
-            # it is set by ACP / the agent subprocess for telemetry
-            # regardless of whether the parent is a TUI or a CLI, so
-            # treating it as a notification target would auto-subscribe
-            # every CLI invocation, which is exactly the over-eager
-            # behaviour that got #19718 reverted upstream. The TUI
-            # poller keys on HERMES_SESSION_KEY.
             session_key = (
                 get_session_env("HERMES_SESSION_KEY", "")
                 or os.environ.get("HERMES_SESSION_KEY", "")
             )
             if not session_key:
-                return False  # CLI / cron / test — no persistent channel
+                return False
             platform = "tui"
             chat_id = session_key
-        thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or None
-        chat_type = get_session_env("HERMES_SESSION_CHAT_TYPE", "") or None
-        user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
-        notifier_profile = (
-            get_session_env("HERMES_SESSION_PROFILE", "")
-            or os.environ.get("HERMES_PROFILE")
-        )
+        thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or ""
+        chat_type = get_session_env("HERMES_SESSION_CHAT_TYPE", "") or ""
 
-        # Lazy-import to keep the module-level dependency light
         from hermes_cli import kanban_db as _kb
-        # Store origin routing as a system comment so the watcher can
-        # always find the right channel — even if the subscription is
-        # later lost/overwritten, the origin comment survives as the
-        # source of truth.  Mirrors what slash_commands.py does for
-        # /kanban create in gateway sessions.
+
         _kb.store_origin_routing(
-            conn, task_id=task_id,
-            platform=platform, chat_id=chat_id,
-            thread_id=thread_id or "",
-            chat_type=chat_type or "",
+            conn,
+            task_id=task_id,
+            platform=platform,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            chat_type=chat_type,
         )
         return True
-    except Exception as _exc:
+    except Exception as exc:
         logger.warning(
-            "_maybe_auto_subscribe failed: %r (platform=%r key_set=%r)",
-            _exc, platform, bool(chat_id),
+            "_maybe_store_origin failed: %r (platform=%r key_set=%r)",
+            exc,
+            platform,
+            bool(chat_id),
         )
         return False
 
@@ -1435,12 +1285,8 @@ _DESC_TASK_ID_DEFAULT = (
 )
 
 _DESC_BOARD = (
-    "Kanban board slug to target. When omitted, the call resolves the "
-    "active board the usual way: HERMES_KANBAN_DB env → "
-    "HERMES_KANBAN_BOARD env → the 'current' symlink under the kanban "
-    "home → 'default'. Pass an explicit slug only when the caller (e.g. "
-    "a Telegram routing layer) needs to override the env-pinned active "
-    "board for this one call."
+    "Deprecated compatibility label. All values resolve to the single "
+    "Kanban database; this argument does not select or partition storage."
 )
 
 

@@ -456,8 +456,8 @@ class GatewaySlashCommandsMixin:
             action = tok
             break
 
-        # Resolve the board the same way the CLI does so the subscription
-        # and origin routing always land on the correct board.
+        # Preserve the compatibility board argument while all task storage
+        # resolves to the single Kanban database.
         if not requested_board:
             try:
                 from hermes_cli.kanban_db import get_current_board
@@ -472,10 +472,8 @@ class GatewaySlashCommandsMixin:
         except Exception as exc:  # pragma: no cover - defensive
             return t("gateway.kanban.error_prefix", error=exc)
 
-        # Auto-subscribe on create. Parse the task id from the CLI's standard
-        # success line ("Created t_abcd  (ready, assignee=...)"). If the user
-        # passed --json we don't subscribe; they're clearly scripting and
-        # can call /kanban notify-subscribe explicitly.
+        # Persist the creating chat as an optional return route. This is a
+        # single system comment read by the close hook, not a subscription.
         if is_create and output:
             m = re.search(r"Created\s+(t_[0-9a-f]+)\b", output)
             if m:
@@ -491,12 +489,10 @@ class GatewaySlashCommandsMixin:
                     chat_type = str(getattr(source, "chat_type", "") or "")
                     user_id = str(getattr(source, "user_id", "") or "") or None
                     if platform_str and chat_id:
-                        def _sub():
+                        def _store_origin():
                             from hermes_cli import kanban_db as _kb
                             conn = _kb.connect(board=requested_board)
                             try:
-                                # Store origin routing as a system comment so
-                                # the watcher can always find the right channel.
                                 try:
                                     _kb.store_origin_routing(
                                         conn, task_id,
@@ -511,14 +507,9 @@ class GatewaySlashCommandsMixin:
                                     )
                             finally:
                                 conn.close()
-                        await asyncio.to_thread(_sub)
-                        output = (
-                            output.rstrip()
-                            + "\n"
-                            + t("gateway.kanban.subscribed_suffix", task_id=task_id)
-                        )
+                        await asyncio.to_thread(_store_origin)
                 except Exception as exc:
-                    logger.warning("kanban create auto-subscribe failed: %s", exc)
+                    logger.warning("kanban create origin-routing store failed: %s", exc)
 
         # Gateway messages have practical length caps; truncate long
         # listings to keep the UX reasonable.

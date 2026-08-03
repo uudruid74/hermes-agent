@@ -370,6 +370,7 @@ def _handle_send(args):
     if args.get("internal"):
         parts = target.split(":", 1)
         platform_name = parts[0].strip().lower()
+        resolved_chat_type = ""
         if platform_name == "agent":
             # Backward compat: --to agent resolves home channel
             try:
@@ -385,21 +386,31 @@ def _handle_send(args):
                 platform_name = home.platform.value
                 chat_id = home.chat_id
                 thread_id = home.thread_id
+                resolved_chat_type = getattr(home, "chat_type", None) or ""
             except Exception as e:
                 return json.dumps(_error(f"Failed to load gateway config: {e}"))
         else:
             target_ref = parts[1].strip() if len(parts) > 1 else ""
             if not target_ref:
-                return tool_error(
-                    f"Internal delivery requires a channel. "
-                    f"Format: '{platform_name}:chat_id[:thread_id]'."
-                )
-            chat_id, thread_id, _ = _parse_target_ref(platform_name, target_ref)
-            if not chat_id:
-                return tool_error(
-                    f"Could not parse channel from '{target}'. "
-                    f"Use format: '{platform_name}:chat_id[:thread_id]'."
-                )
+                try:
+                    from gateway.config import load_gateway_config, Platform
+                    home = load_gateway_config().get_home_channel(Platform(platform_name))
+                except Exception as e:
+                    return json.dumps(_error(f"Failed to resolve {platform_name} home channel: {e}"))
+                if not home:
+                    return tool_error(
+                        f"No home channel configured for platform '{platform_name}'."
+                    )
+                chat_id = home.chat_id
+                thread_id = home.thread_id
+                resolved_chat_type = getattr(home, "chat_type", None) or ""
+            else:
+                chat_id, thread_id, _ = _parse_target_ref(platform_name, target_ref)
+                if not chat_id:
+                    return tool_error(
+                        f"Could not parse channel from '{target}'. "
+                        f"Use format: '{platform_name}:chat_id[:thread_id]'."
+                    )
 
         # Build user identity for simulated user message
         user_id = os.environ.get("HERMES_SESSION_USER_ID") or os.environ.get("HERMES_SESSION_TELEGRAM_ID")
@@ -412,7 +423,11 @@ def _handle_send(args):
             "user_id": user_id,
             "platform_user_id": user_id,
             "sender_name": sender_name,
-            "chat_type": os.environ.get("HERMES_NOTIFY_CHAT_TYPE", "group"),
+            "chat_type": (
+                os.environ.get("HERMES_NOTIFY_CHAT_TYPE")
+                or resolved_chat_type
+                or ("group" if thread_id else "dm")
+            ),
         }
 
         from tools.interrupt import is_interrupted

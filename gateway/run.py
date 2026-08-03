@@ -3316,7 +3316,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Last voice-channel context delivered per session — the VC note is
         # injected only when the live state differs from this value.
         self._session_vc_last: Dict[str, str] = {}
-        self._kanban_notifier_profile = self._active_profile_name()
+
         # Teams meeting pipeline runtime (bound later when msgraph_webhook adapter exists).
         self._teams_pipeline_runtime = None
         self._teams_pipeline_runtime_error: Optional[str] = None
@@ -8087,8 +8087,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Start background session expiry watcher to finalize expired sessions
         self._spawn_supervised(self._session_expiry_watcher, "session_expiry_watcher")
 
-        # Kanban notifications handled by hook system (_notify_kanban_status_change)
-        # which calls hermes send -t/-u directly. No watcher needed.
+        # Kanban close notifications are post-commit mutation hooks that call
+        # `hermes send -u` directly. No gateway polling watcher is needed.
 
         # Start background kanban dispatcher — spawns workers for ready
         # tasks. Gated by `kanban.dispatch_in_gateway` (default True).
