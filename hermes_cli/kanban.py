@@ -43,6 +43,7 @@ def _notify_kanban_status_change(
     *,
     summary: Optional[str] = None,
     title: Optional[str] = None,
+    assignee: Optional[str] = None,
 ) -> None:
     """Send a best-effort notification about a kanban task state change.
 
@@ -98,6 +99,7 @@ def _notify_kanban_status_change(
         "task_id": task_id,
         "title": title or task_id,
         "summary": summary_line or None,
+        "assignee": assignee or "unassigned",
     })
 
     import subprocess
@@ -1306,6 +1308,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
     _notify_kanban_status_change(
         task.id, task.status,
         title=task.title,
+        assignee=task.assignee,
     )
     return 0
 
@@ -1975,6 +1978,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                     tid, "done",
                     summary=summary,
                     title=title_before,
+                    assignee=task_before.assignee if task_before else None,
                 )
     return 0 if not failed else 1
 
@@ -2048,6 +2052,7 @@ def _cmd_block(args: argparse.Namespace) -> int:
                     tid, where,
                     summary=reason,
                     title=title_before,
+                    assignee=task_before.assignee if task_before else None,
                 )
     return 0 if not failed else 1
 
@@ -2078,6 +2083,7 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
                     tid, "scheduled",
                     summary=reason,
                     title=title_before,
+                    assignee=task_before.assignee if task_before else None,
                 )
     return 0 if not failed else 1
 
@@ -2108,6 +2114,7 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
                     tid, "ready",
                     summary=reason,
                     title=title_before,
+                    assignee=task_before.assignee if task_before else None,
                 )
     return 0 if not failed else 1
 
@@ -2152,6 +2159,7 @@ def _cmd_promote(args: argparse.Namespace) -> int:
                     tid, "ready",
                     summary=reason,
                     title=title_before,
+                    assignee=task_before.assignee if task_before else None,
                 )
 
     failed = [r for r in results if not r["promoted"]]

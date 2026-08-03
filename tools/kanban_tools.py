@@ -185,6 +185,7 @@ def _notify_kanban_event(tid: str, status: str, summary: Optional[str], task) ->
             "task_id": tid,
             "title": task_title,
             "summary": summary_line or None,
+            "assignee": getattr(task, "assignee", None) or "unassigned",
         })
 
         import subprocess
