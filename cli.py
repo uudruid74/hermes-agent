@@ -6785,6 +6785,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             except Exception:
                 label = "⚕ Hermes"
                 _text_hex = "#FFF8DC"
+            # Override label with active profile name and icon if not default
+            try:
+                from hermes_cli.profiles import get_active_profile_name
+                _profile = get_active_profile_name()
+                if _profile and _profile not in ("default", "custom"):
+                    _icon = _get_profile_icon() or "⚕"
+                    label = f"{_icon} {_profile.title()} "
+            except Exception:
+                pass
+            # Override accent color with profile agentcolor if set
+            _profile_color = _get_profile_color()
+            _accent_override = _ansi_hex(_profile_color) if _profile_color else _ACCENT
+            self._stream_accent = _accent_override  # Save for close box
             # Build a true-color ANSI escape for the response text color
             # so streamed content matches the Rich Panel appearance.
             try:
@@ -6795,10 +6808,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             except (ValueError, IndexError):
                 self._stream_text_ansi = ""
             if self.show_timestamps:
-                label = f"{label} {datetime.now().strftime(getattr(self, 'timestamp_format', '%H:%M'))}"
-            w = self._scrollback_box_width()
-            fill = w - 2 - HermesCLI._status_bar_display_width(label)
-            _cprint(f"\n{_ACCENT}╭─{label}{'─' * max(fill - 1, 0)}╮{_RST}")
+                now = datetime.now()
+                label_ts = f" {now.strftime('%a')} {now.strftime('%I:%M')}{now.strftime('%p')[0].lower()} "
+                w = self._scrollback_box_width()
+                name_width = HermesCLI._status_bar_display_width(label)
+                ts_width = len(label_ts)
+                fill = w - 2 - name_width - ts_width
+                _cprint(f"\n{_accent_override}╭─ {label}{'─' * max(fill - 2, 0)}{label_ts}╮{_RST}")
+            else:
+                w = self._scrollback_box_width()
+                fill = w - 2 - HermesCLI._status_bar_display_width(label)
+                _cprint(f"\n{_accent_override}╭─ {label}{'─' * max(fill - 2, 0)}╮{_RST}")
 
         self._stream_buf += text
 
@@ -6927,7 +6947,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Close the response box
         if self._stream_box_opened:
             w = self._scrollback_box_width()
-            _cprint(f"{_ACCENT}╰{'─' * (w - 2)}╯{_RST}")
+            _close_accent = getattr(self, "_stream_accent", _ACCENT)
+            _cprint(f"{_close_accent}╰{'─' * (w - 2)}╯{_RST}")
 
     def _reset_stream_state(self) -> None:
         """Reset streaming state before each agent invocation."""
@@ -14330,12 +14351,27 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     _resp_color = _maybe_remap_for_light_mode("#CD7F32")
                     _resp_text = _maybe_remap_for_light_mode("#FFF8DC")
 
+                # Override label with profile name and icon
+                try:
+                    from hermes_cli.profiles import get_active_profile_name
+                    _profile = get_active_profile_name()
+                    if _profile and _profile not in ("default", "custom"):
+                        _icon = _get_profile_icon() or "⚕"
+                        label = f"{_icon} {_profile.title()} "
+                except Exception:
+                    pass
+                # Override response color with profile agentcolor if set
+                _profile_color = _get_profile_color()
+                if _profile_color:
+                    _resp_color = _profile_color
+
                 is_error_response = result and (result.get("failed") or result.get("partial"))
                 already_streamed = self._stream_started and self._stream_box_opened and not is_error_response
                 if use_streaming_tts and _streaming_box_opened and not is_error_response:
                     # Text was already printed sentence-by-sentence; just close the box
                     w = self._scrollback_box_width()
-                    _cprint(f"\n{_ACCENT}╰{'─' * (w - 2)}╯{_RST}")
+                    _close_accent = getattr(self, "_stream_accent", _ACCENT)
+                    _cprint(f"\n{_close_accent}╰{'─' * (w - 2)}╯{_RST}")
                 elif already_streamed:
                     # Response was already streamed token-by-token with box framing;
                     # _flush_stream() already closed the box. Skip Rich Panel.
