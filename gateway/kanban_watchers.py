@@ -364,6 +364,14 @@ class GatewayKanbanWatchersMixin:
                             status = str(ev.payload["status"])
                         else:
                             status = kind
+                        # If the task's actual status is triage, report triage
+                        # regardless of the event kind. The block-loop breaker
+                        # routes a task to triage while emitting a
+                        # block_loop_detected event, and create_task(triage=True)
+                        # emits a created event — in both cases the user must be
+                        # told the task landed in triage, not the event name.
+                        if _task_status == "triage":
+                            status = "triage"
                         _EMOJI = {
                             "todo": "⬜", "ready": "▶️", "running": "🔄",
                             "triage": "🔍", "scheduled": "⏳", "blocked": "🔴",

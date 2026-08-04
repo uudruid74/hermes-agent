@@ -1749,6 +1749,7 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             chat_id=telegram_home,
             name=getenv("TELEGRAM_HOME_CHANNEL_NAME", "Home"),
             thread_id=getenv("TELEGRAM_HOME_CHANNEL_THREAD_ID") or None,
+            chat_type=getenv("TELEGRAM_HOME_CHANNEL_CHAT_TYPE") or "group",
         )
     
     # Discord

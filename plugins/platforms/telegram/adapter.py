@@ -668,6 +668,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._mention_patterns = self._compile_mention_patterns()
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
         self._disable_link_previews: bool = self._coerce_bool_extra("disable_link_previews", False)
+        self._chat_type_cache: Dict[str, str] = {}  # chat_id → chat_type from real messages
         # Bot API 10.1 Rich Messages: render constructs the legacy MarkdownV2
         # path degrades (tables → bullet lists, task lists, <details>, block
         # math) via sendRichMessage / editMessageText's rich_message param using
@@ -7550,6 +7551,16 @@ class TelegramAdapter(BasePlatformAdapter):
 
         return chat_type, thread_id
 
+    def get_chat_type(self, chat_id: str) -> Optional[str]:
+        """Return the cached chat_type for a chat_id from real Telegram messages.
+
+        Used by synthetic injection paths (hermes send -u, kanban notifications)
+        to build correct session keys without relying on static env vars.
+        Returns None if this chat_id hasn't been seen yet.
+        """
+        return self._chat_type_cache.get(chat_id)
+
+
     def _is_reply_to_bot(self, message: Message) -> bool:
         if not self._bot or not getattr(message, "reply_to_message", None):
             return False
@@ -9013,6 +9024,9 @@ class TelegramAdapter(BasePlatformAdapter):
         # Resolve chat_type and thread_id through the single-source-of-truth
         # normalizer so gating, session routing, and auth paths all agree.
         chat_type, thread_id_str = self._resolve_chat_type_and_thread_id(message)
+        # Cache chat_type per chat_id so synthetic injection paths (hermes send -u,
+        # kanban notifications) can build correct session keys dynamically.
+        self._chat_type_cache[str(chat.id)] = chat_type
         chat_topic = None
         topic_skill = None
 

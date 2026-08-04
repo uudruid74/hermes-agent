@@ -2566,14 +2566,16 @@ class GatewaySlashCommandsMixin:
 
     async def _handle_set_home_command(self, event: MessageEvent) -> str:
         """Handle /sethome command -- set the current chat as the platform's home channel."""
-        from gateway.run import _home_target_env_var, _home_thread_env_var
+        from gateway.run import _home_target_env_var, _home_thread_env_var, _home_chat_type_env_var
         source = event.source
         platform_name = source.platform.value if source.platform else "unknown"
         chat_id = source.chat_id
         chat_name = source.chat_name or chat_id
+        chat_type = source.chat_type or "group"
 
         env_key = _home_target_env_var(platform_name)
         thread_env_key = _home_thread_env_var(platform_name)
+        chat_type_env_key = _home_chat_type_env_var(platform_name)
         thread_id = source.thread_id
 
         # Save to .env so it persists across restarts
@@ -2583,6 +2585,7 @@ class GatewaySlashCommandsMixin:
             # Keep thread/topic routing explicit and clear stale values when
             # /sethome is run from the parent chat instead of a thread.
             save_env_value(thread_env_key, str(thread_id or ""))
+            save_env_value(chat_type_env_key, chat_type)
         except Exception as e:
             return t("gateway.set_home.save_failed", error=e)
 

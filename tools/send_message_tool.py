@@ -831,12 +831,17 @@ async def _send_via_adapter(
             adapter = None
         if adapter is not None:
             try:
-                # Resolve chat_type: prefer user_context, then HomeChannel
-                # config, then env var (set by kanban/cron notification
-                # hooks), fall back to "group" for backward compatibility.
+                # Resolve chat_type dynamically: prefer user_context (explicit
+                # from caller), then ask the live adapter (cached from real
+                # messages), then HomeChannel config, then env var, fall back
+                # to "group".
                 _chat_type = "group"
                 if user_context and user_context.get("chat_type"):
                     _chat_type = str(user_context["chat_type"])
+                elif hasattr(adapter, "get_chat_type"):
+                    _adapter_ct = adapter.get_chat_type(chat_id)
+                    if _adapter_ct:
+                        _chat_type = _adapter_ct
                 elif pconfig and getattr(pconfig, "home_channel", None):
                     _chat_type = pconfig.home_channel.chat_type
                 else:

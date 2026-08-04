@@ -1386,6 +1386,11 @@ def _home_thread_env_var(platform_name: str) -> str:
     return f"{_home_target_env_var(platform_name)}_THREAD_ID"
 
 
+def _home_chat_type_env_var(platform_name: str) -> str:
+    """Return the optional chat_type env var for a platform home target."""
+    return f"{_home_target_env_var(platform_name)}_CHAT_TYPE"
+
+
 def _restart_notification_pending() -> bool:
     """Return True when a /restart completion marker is waiting to be delivered."""
     return (_hermes_home / ".restart_notify.json").exists()
@@ -5958,6 +5963,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.info(
                 "Demoting busy_input_mode 'interrupt' to 'queue' for session %s "
                 "because context compression is in flight (#56391)",
+                session_key,
+            )
+            effective_mode = "queue"
+        # Kanban status-change notifications arrive via hermes send -u
+        # with a JSON payload containing "source":"kanban". They must
+        # never interrupt the running agent — queue silently like /steer.
+        demoted_for_kanban = (
+            effective_mode == "interrupt"
+            and event.text
+            and '"source": "kanban"' in event.text
+        )
+        if demoted_for_kanban:
+            logger.debug(
+                "Demoting busy_input_mode 'interrupt' to 'queue' for session %s "
+                "because the message is a kanban notification",
                 session_key,
             )
             effective_mode = "queue"
