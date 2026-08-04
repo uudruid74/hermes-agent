@@ -485,6 +485,59 @@ def _handle_send(args):
                 return json.dumps(_resolve_err)
             chat_id = _resolved
 
+    # When internal=True (-u/--user flag), inject a synthetic user message
+    # through the live gateway adapter instead of delivering to the platform.
+    # This simulates a real user→agent message with full user identity.
+    if args.get("internal"):
+        from gateway.session import SessionSource
+        from gateway.platforms.base import MessageEvent, MessageType
+        from gateway.session_context import get_session_env
+        from model_tools import _run_async as _ra
+
+        user_id = get_session_env("HERMES_SESSION_USER_ID", "") or "cli"
+        platform_user_id = get_session_env("HERMES_SESSION_TELEGRAM_ID", "") or user_id
+        sender_name = get_session_env("HERMES_SESSION_USER_NAME", "") or "CLI User"
+
+        # Try to get the live gateway adapter and deliver through handle_message.
+        runner = None
+        try:
+            from gateway.run import _gateway_runner_ref
+            runner = _gateway_runner_ref()
+        except Exception:
+            runner = None
+        adapter = runner.adapters.get(platform) if runner is not None else None
+
+        if adapter is not None:
+            source = SessionSource(
+                platform=platform,
+                chat_id=chat_id,
+                chat_type="dm",
+                user_id=platform_user_id,
+                user_name=sender_name,
+                thread_id=thread_id,
+            )
+            synth_event = MessageEvent(
+                text=cleaned_message,
+                message_type=MessageType.TEXT,
+                source=source,
+                internal=False,
+            )
+            try:
+                _ra(adapter.handle_message(synth_event))
+                return json.dumps({
+                    "success": True,
+                    "note": (
+                        f"User wake event delivered to {platform_name}:{chat_id}"
+                        + (f":{thread_id}" if thread_id else "")
+                    ),
+                })
+            except Exception as e:
+                return json.dumps(_error(f"Wake event delivery failed: {e}"))
+
+        # No live adapter — the message cannot be injected without a running
+        # gateway. Fall through to platform delivery (preserves existing
+        # behaviour for cron/standalone callers).
+
     try:
         from model_tools import _run_async
         result = _run_async(

@@ -441,7 +441,8 @@ def register_send_subparser(subparsers) -> argparse.ArgumentParser:
         metavar="ORIGIN",
         default=None,
         help=(
-            "User→agent delivery (agent wake event, internal=True). Format: "
+            "Simulate user→agent message (routes through handle_message with "
+            "full user identity). Format: "
             "'platform' (home channel), 'platform:chat_id', or "
             "'platform:chat_id:thread_id'. Examples: -u telegram, "
             "-u telegram:-1001234567890:17585."
