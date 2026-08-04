@@ -232,8 +232,11 @@ async def _handle_inject(runner, cmd: dict, writer: asyncio.StreamWriter) -> Non
 
         # Resolve chat_type: prefer the explicit field (set by
         # kanban/cron notification hooks via bridge payload),
-        # fall back to "group" for backward compatibility.
-        _chat_type = cmd.get("chat_type") or "group"
+        # then HomeChannel config, fall back to "group".
+        _chat_type = cmd.get("chat_type")
+        if not _chat_type:
+            home = runner.config.get_home_channel(platform) if runner.config else None
+            _chat_type = home.chat_type if home else "group"
         session_source = SessionSource(
             platform=platform,
             chat_id=chat_id,

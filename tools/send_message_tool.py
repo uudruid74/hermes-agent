@@ -425,6 +425,12 @@ def _handle_send(args):
             return json.dumps(_error(f"Failed to load gateway config: {e}"))
         platform = Platform(platform_name)
         pconfig = config.platforms.get(platform)
+        # Resolve chat_type from HomeChannel config to prevent session-key
+        # fork — DMs default to "group" otherwise, creating a different key
+        # than the real adapter session (kanban hook already sets
+        # HERMES_NOTIFY_CHAT_TYPE; this fixes the ad-hoc `hermes send -u` path).
+        if pconfig and pconfig.home_channel:
+            user_context["chat_type"] = pconfig.home_channel.chat_type
         if not pconfig or not pconfig.enabled:
             return tool_error(
                 f"Platform '{platform_name}' is not configured. "
@@ -825,12 +831,14 @@ async def _send_via_adapter(
             adapter = None
         if adapter is not None:
             try:
-                # Resolve chat_type: prefer user_context, then env var
-                # (set by kanban/cron notification hooks), fall back to
-                # "group" for backward compatibility.
+                # Resolve chat_type: prefer user_context, then HomeChannel
+                # config, then env var (set by kanban/cron notification
+                # hooks), fall back to "group" for backward compatibility.
                 _chat_type = "group"
                 if user_context and user_context.get("chat_type"):
                     _chat_type = str(user_context["chat_type"])
+                elif pconfig and getattr(pconfig, "home_channel", None):
+                    _chat_type = pconfig.home_channel.chat_type
                 else:
                     _chat_type = os.environ.get("HERMES_NOTIFY_CHAT_TYPE", "group")
                 session_source = SessionSource(
