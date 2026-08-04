@@ -17949,6 +17949,69 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     )
 
 
+
+def _get_profile_color() -> str | None:
+    """Read agentcolor from the active profile's config.yaml, if set."""
+    cfg_path = _get_profile_cfg_path()
+    if not cfg_path:
+        return None
+    try:
+        import yaml
+        with open(cfg_path) as f:
+            cfg = yaml.safe_load(f)
+        color = cfg.get("agentcolor")
+        if color and isinstance(color, str) and color.startswith("#"):
+            return color
+    except Exception:
+        pass
+    return None
+
+def _get_profile_icon() -> str | None:
+    """Read agenticon from the active profile's config.yaml, if set."""
+    cfg_path = _get_profile_cfg_path()
+    if not cfg_path:
+        return None
+    try:
+        import yaml
+        with open(cfg_path) as f:
+            cfg = yaml.safe_load(f)
+        icon = cfg.get("agenticon")
+        if icon and isinstance(icon, str) and icon.strip():
+            return icon.strip()
+    except Exception:
+        pass
+    return None
+
+def _ansi_hex(hex_color: str) -> str:
+    """Convert '#RRGGBB' to ANSI 24-bit foreground escape."""
+    r, g, b = int(hex_color[1:3], 16), int(hex_color[3:5], 16), int(hex_color[5:7], 16)
+    return f"\x1b[38;2;{r};{g};{b}m"
+
+def _get_profile_cfg_path() -> str | None:
+    """Return the path to the active profile's config.yaml, or None."""
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+        from hermes_constants import get_default_hermes_root
+        from pathlib import Path
+        profile = get_active_profile_name()
+        if profile and profile not in ("custom",):
+            root = get_default_hermes_root()
+            if profile == "default":
+                # Default profile — config is directly at root/config.yaml
+                cfg_path = root / "config.yaml"
+            else:
+                # Named profile — config is at root/profiles/<name>/config.yaml
+                cfg_path = root / "profiles" / profile / "config.yaml"
+            if cfg_path.exists():
+                return str(cfg_path)
+            # Fallback: also try the matching profile config from multi-profile layout
+            # even when get_active_profile_name returns "default"
+            for candidate in sorted(root.glob("profiles/*/config.yaml")):
+                if candidate.exists():
+                    return str(candidate)
+    except Exception:
+        pass
+    return None
 def main(
     query: str = None,
     q: str = None,

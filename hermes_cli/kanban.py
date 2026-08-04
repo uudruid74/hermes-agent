@@ -1220,6 +1220,149 @@ def _board_task_counts(slug: str) -> dict[str, int]:
         return {}
 
 
+
+_NOTIFY_EMOJI = {
+    "todo":     "⬜",
+    "ready":    "▶️",
+    "running":  "🔄",
+    "scheduled":"⏳",
+    "blocked":  "🔴",
+    "done":     "✅",
+    "archived": "📦",
+}
+
+def _notify_kanban_status_change(
+    task_id: str,
+    new_status: str,
+    *,
+    summary: Optional[str] = None,
+    title: Optional[str] = None,
+    assignee: Optional[str] = None,
+) -> None:
+    """Send a best-effort notification about a kanban task state change.
+
+    Sends two messages:
+    - Human-readable via ``hermes send -t`` with old-style icons, no [Hermes] prefix
+    - JSON payload via ``hermes send -u`` for AI consumption
+
+    Uses the task's origin routing (``__kanban_origin__`` system comment)
+    to determine the target channel. Falls back to home-channel sends.
+
+    Fails silently on all errors so a broken notification can never block
+    a task transition.
+    """
+    # Resolve origin routing
+    try:
+        conn = kb.connect()
+        try:
+            origin = kb.get_origin_routing(conn, task_id)
+        finally:
+            conn.close()
+    except Exception:
+        origin = None
+
+    if not (origin and origin.get("platform") and origin.get("chat_id")):
+        return
+
+    platform = origin["platform"].lower()
+    chat_id = origin["chat_id"]
+    thread_id = origin.get("thread_id", "")
+    chat_type = origin.get("chat_type", "group")
+    target = f"{platform}:{chat_id}"
+    if thread_id:
+        target = f"{target}:{thread_id}"
+
+    icon = _NOTIFY_EMOJI.get(new_status, "❓")
+    task_label = title or task_id
+    summary_line = ""
+    if summary:
+        summary_line = summary.splitlines()[0][:300]
+
+    # Human-readable message via -t (old icons, no [Hermes] prefix)
+    human_parts = [f"{icon} {task_label} → {new_status}"]
+    if summary_line:
+        human_parts.append(f" — {summary_line}")
+    if new_status == "blocked":
+        human_parts.append(" — Investigate this blocked task")
+    human_msg = "".join(human_parts)
+
+    # JSON payload via -u
+    json_payload = json.dumps({
+        "source": "kanban",
+        "type": new_status,
+        "task_id": task_id,
+        "title": title or task_id,
+        "summary": summary_line or None,
+        "assignee": assignee or "unassigned",
+    })
+
+    import subprocess
+    try:
+        subprocess.run(
+            ["hermes", "send", "-t", target, human_msg],
+            capture_output=True, timeout=10,
+        )
+    except Exception:
+        pass
+
+    try:
+        # Pass chat_type via environment so the bridge/adapter handlers
+        # construct the SessionSource with the correct chat_type instead
+        # of hardcoding "group" — prevents session-key mismatch (fork).
+        notify_env = os.environ.copy()
+        notify_env["HERMES_NOTIFY_CHAT_TYPE"] = chat_type
+        subprocess.run(
+            ["hermes", "send", "-u", target, json_payload],
+            capture_output=True, timeout=10, env=notify_env,
+        )
+    except Exception:
+        pass
+
+def _notify_via_gateway(message: str) -> None:
+    """Send *message* to every enabled gateway platform's home channel.
+
+    Falls back to direct Telegram send via ``TELEGRAM_BOT_TOKEN`` +
+    ``TELEGRAM_HOME_CHANNEL`` env vars when the gateway config does not
+    have Telegram enabled (e.g. the bot token lives on another profile).
+    """
+    try:
+        from gateway.config import load_gateway_config
+        cfg = load_gateway_config()
+    except Exception:
+        cfg = None
+
+    sent_any = False
+    if cfg is not None:
+        for platform, pconfig in cfg.platforms.items():
+            if not pconfig or not pconfig.enabled:
+                continue
+            home = cfg.get_home_channel(platform)
+            if not home:
+                continue
+            try:
+                _notify_one_platform(platform, pconfig, home.chat_id, message)
+                sent_any = True
+            except Exception:
+                pass
+
+    if not sent_any:
+        # Fallback — direct Telegram send without the gateway.
+        _notify_via_env_telegram(message)
+
+def _notify_via_env_telegram(message: str) -> None:
+    """Send via ``TELEGRAM_BOT_TOKEN`` + ``TELEGRAM_HOME_CHANNEL`` env vars."""
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.environ.get("TELEGRAM_HOME_CHANNEL", "").strip()
+    if not token or not chat_id:
+        return
+    # Build a minimal synthetic PlatformConfig so _send_to_platform works.
+    from gateway.config import PlatformConfig
+    pconfig = PlatformConfig(enabled=True, token=token)
+    from gateway.config import Platform
+    try:
+        _notify_one_platform(Platform.TELEGRAM, pconfig, chat_id, message)
+    except Exception:
+        pass
 def _cmd_boards_list(args: argparse.Namespace) -> int:
     include_archived = bool(getattr(args, "all", False))
     boards = kb.list_boards(include_archived=include_archived)
