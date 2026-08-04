@@ -9642,6 +9642,34 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if result.success and result.requires_new_session:
             _cprint("    Tip: `/reset` starts a new session immediately.")
 
+    def _handle_temperature_command(self, cmd_original: str) -> None:
+        """Handle /temperature — show or set agent temperature in TUI."""
+        parts = cmd_original.split(None, 1)
+        raw_args = parts[1].strip() if len(parts) > 1 else ""
+        if not raw_args:
+            agent = getattr(self, "agent", None)
+            temp = getattr(agent, "_session_temperature", None) if agent else None
+            if temp is not None:
+                _cprint(f"  🌡️ Temperature: {temp:.2f}")
+            else:
+                _cprint(f"  🌡️ Temperature: 0.70 (default)")
+                _cprint(f"    Usage: /temperature <0.0–2.0>")
+            return
+        try:
+            val = float(raw_args.split()[0])
+        except ValueError:
+            _cprint(f"  ✗ Invalid: {raw_args.split()[0]!r} — must be 0.0–2.0")
+            return
+        if not (0.0 <= val <= 2.0):
+            _cprint(f"  ✗ Must be 0.0–2.0 (got {val})")
+            return
+        agent = getattr(self, "agent", None)
+        if agent:
+            agent._session_temperature = val
+            _cprint(f"  🌡️ Temperature set to {val:.2f}")
+        else:
+            _cprint(f"  🌡️ Set to {val:.2f} (applies next turn)")
+
     def _should_handle_model_command_inline(self, text: str, has_images: bool = False) -> bool:
         """Return True when /model should be handled immediately on the UI thread."""
         if not text or has_images or not _looks_like_slash_command(text):
@@ -10059,6 +10087,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._handle_model_switch(cmd_original)
         elif canonical == "codex-runtime":
             self._handle_codex_runtime(cmd_original)
+        elif canonical == "temperature":
+            self._handle_temperature_command(cmd_original)
 
         elif canonical == "personality":
             # Use original case (handler lowercases the personality name itself)
