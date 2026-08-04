@@ -377,6 +377,7 @@ def _relative_age(ts: Optional[int], now: Optional[int] = None) -> str:
 # ---------------------------------------------------------------------------
 
 DEFAULT_BOARD = "default"
+DEFAULT_MAX_SPAWN = 4  # max concurrent kanban workers when max_spawn not configured
 _CURRENT_BOARD_OVERRIDE: ContextVar[str | None] = ContextVar(
     "hermes_kanban_current_board_override",
     default=None,
