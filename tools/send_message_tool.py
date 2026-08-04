@@ -10,27 +10,25 @@ import json
 import logging
 import os
 import re
-import ssl
 import time
-from datetime import datetime
-from email.utils import formatdate
 
 from agent.redact import redact_sensitive_text
 from agent.secret_scope import get_secret
-from gateway.platforms.base import MessageEvent, MessageType
-from gateway.session import SessionSource
 
 logger = logging.getLogger(__name__)
 
 _TELEGRAM_TOPIC_TARGET_RE = re.compile(r"^\s*(-?\d+)(?::(\d+))?\s*$")
 _FEISHU_TARGET_RE = re.compile(r"^\s*((?:oc|ou|on|chat|open)_[-A-Za-z0-9]+)(?::([-A-Za-z0-9_]+))?\s*$")
 # Slack conversation IDs: C (public channel), G (private/group channel), D (DM).
-# Must be uppercase alphanumeric, 9+ chars. User IDs (U...) and workspace IDs
-# (W...) are NOT valid chat.postMessage channel values — posting to them fails
-# because the API requires a conversation ID. To DM a user you must first call
-# conversations.open to obtain a D... ID. Without this gate, Slack IDs fall
-# through to channel-name resolution, which only matches by name and fails.
-_SLACK_TARGET_RE = re.compile(r"^\s*([CGDU][A-Z0-9]{8,})\s*$")
+# Must be uppercase alphanumeric, 9+ chars. User IDs (U...) are parsed as
+# explicit user targets (``user:U...``) and are converted to D... conversations
+# via conversations.open before chat.postMessage — posting directly to a U/W
+# ID fails because the API requires a conversation ID. ``@handle`` targets are
+# resolved through users.list first (``user_name:...``).
+_SLACK_TARGET_RE = re.compile(r"^\s*([CGD][A-Z0-9]{8,})\s*$")
+_SLACK_USER_ID_RE = re.compile(r"^\s*(U[A-Z0-9]{8,})\s*$")
+_SLACK_USER_NAME_RE = re.compile(r"^\s*@([A-Za-z0-9._-]{1,80})\s*$")
+_SLACK_MENTION_RE = re.compile(r"^\s*<@(U[A-Z0-9]{8,})(?:\|[^>]+)?>\s*$")
 # Session-derived Slack thread targets use "<conversation_id>:<thread_ts>".
 _SLACK_THREAD_TARGET_RE = re.compile(r"^\s*([CGD][A-Z0-9]{8,}):([^\s:]+)\s*$")
 _WEIXIN_TARGET_RE = re.compile(r"^\s*((?:wxid|gh|v\d+|wm|wb)_[A-Za-z0-9_-]+|[A-Za-z0-9._-]+@chatroom|filehelper)\s*$")
@@ -44,6 +42,8 @@ _NUMERIC_TOPIC_RE = _TELEGRAM_TOPIC_TARGET_RE
 # downstream adapters (signal, etc.) expect.
 _PHONE_PLATFORMS = frozenset({"photon", "signal", "sms", "whatsapp"})
 _E164_TARGET_RE = re.compile(r"^\s*\+(\d{7,15})\s*$")
+# Photon DM chat GUID (mirrors _DM_CHAT_GUID_RE in the photon adapter).
+_PHOTON_DM_GUID_RE = re.compile(r"^any;-;\+\d{6,}$")
 # WhatsApp JIDs: group chats (<digits>@g.us), individual users
 # (<phone>@s.whatsapp.net), linked identities (<id>@lid), and broadcast /
 # newsletter chats. These are explicit native targets the bridge accepts
@@ -62,8 +62,8 @@ _EMAIL_TARGET_RE = re.compile(r"^\s*[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2
 # never read. Map the exceptions so the error guidance is actually actionable.
 _HOME_CHANNEL_ENV_OVERRIDES = {"email": "EMAIL_HOME_ADDRESS"}
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
-_VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".3gp"}
-_AUDIO_EXTS = {".ogg", ".opus", ".mp3", ".wav", ".m4a", ".flac"}
+_VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
+_AUDIO_EXTS = {".ogg", ".opus", ".mp3", ".m2a", ".wav", ".m4a", ".flac"}
 _VOICE_EXTS = {".ogg", ".opus"}
 # Telegram's Bot API sendAudio only accepts MP3 / M4A. Other audio
 # formats either route through sendVoice (Opus/OGG) or fall back to
@@ -357,95 +357,10 @@ def _handle_react(args, remove=False):
 
 def _handle_send(args):
     """Send a message to a platform target."""
-    message = args.get("message", "")
     target = args.get("target", "")
+    message = args.get("message", "")
     if not target or not message:
         return tool_error("Both 'target' and 'message' are required when action='send'")
-
-    # Internal delivery (hermes send -u) — route via _send_via_adapter
-    # as a simulated user message.  The target is parsed the same way as
-    # normal sends (platform:chat_id[:thread_id]) but the message arrives
-    # with full user identity so handle_message() treats it like a real
-    # inbound message from that user.
-    if args.get("internal"):
-        parts = target.split(":", 1)
-        platform_name = parts[0].strip().lower()
-        if platform_name == "agent":
-            # Backward compat: --to agent resolves home channel
-            try:
-                from gateway.config import load_gateway_config
-                config = load_gateway_config()
-                home = None
-                for p, pconfig_candidate in config.platforms.items():
-                    if pconfig_candidate and pconfig_candidate.enabled and pconfig_candidate.home_channel:
-                        home = pconfig_candidate.home_channel
-                        break
-                if not home:
-                    return tool_error("No home channel configured for agent wake delivery.")
-                platform_name = home.platform.value
-                chat_id = home.chat_id
-                thread_id = home.thread_id
-            except Exception as e:
-                return json.dumps(_error(f"Failed to load gateway config: {e}"))
-        else:
-            target_ref = parts[1].strip() if len(parts) > 1 else ""
-            if not target_ref:
-                return tool_error(
-                    f"Internal delivery requires a channel. "
-                    f"Format: '{platform_name}:chat_id[:thread_id]'."
-                )
-            chat_id, thread_id, _ = _parse_target_ref(platform_name, target_ref)
-            if not chat_id:
-                return tool_error(
-                    f"Could not parse channel from '{target}'. "
-                    f"Use format: '{platform_name}:chat_id[:thread_id]'."
-                )
-
-        # Build user identity for simulated user message
-        user_id = os.environ.get("HERMES_SESSION_USER_ID") or os.environ.get("HERMES_SESSION_TELEGRAM_ID")
-        sender_name = os.environ.get("HERMES_SESSION_USER_NAME", "")
-        if not user_id:
-            user_id = "cli"
-        if not sender_name:
-            sender_name = "CLI User"
-        user_context = {
-            "user_id": user_id,
-            "platform_user_id": user_id,
-            "sender_name": sender_name,
-            "chat_type": os.environ.get("HERMES_NOTIFY_CHAT_TYPE", "group"),
-        }
-
-        from tools.interrupt import is_interrupted
-        if is_interrupted():
-            return tool_error("Interrupted")
-        try:
-            from gateway.config import load_gateway_config, Platform
-            config = load_gateway_config()
-        except Exception as e:
-            return json.dumps(_error(f"Failed to load gateway config: {e}"))
-        platform = Platform(platform_name)
-        pconfig = config.platforms.get(platform)
-        # Resolve chat_type from HomeChannel config to prevent session-key
-        # fork — DMs default to "group" otherwise, creating a different key
-        # than the real adapter session (kanban hook already sets
-        # HERMES_NOTIFY_CHAT_TYPE; this fixes the ad-hoc `hermes send -u` path).
-        if pconfig and pconfig.home_channel:
-            user_context["chat_type"] = pconfig.home_channel.chat_type
-        if not pconfig or not pconfig.enabled:
-            return tool_error(
-                f"Platform '{platform_name}' is not configured. "
-                f"Set up credentials in ~/.hermes/config.yaml or environment variables."
-            )
-        from model_tools import _run_async
-        result = _run_async(
-            _send_via_adapter(
-                platform, pconfig, chat_id, message,
-                thread_id=thread_id or None,
-                user_context=user_context,
-                try_adapter_only=True,
-            )
-        )
-        return json.dumps(result)
 
     parts = target.split(":", 1)
     platform_name = parts[0].strip().lower()
@@ -466,15 +381,15 @@ def _handle_send(args):
             if resolved:
                 chat_id, thread_id, _ = _parse_target_ref(platform_name, resolved)
             else:
-                return json.dumps({
-                    "error": f"Could not resolve '{target_ref}' on {platform_name}. "
+                return tool_error(
+                    f"Could not resolve '{target_ref}' on {platform_name}. "
                     f"Use send_message(action='list') to see available targets."
-                })
+                )
         except Exception:
-            return json.dumps({
-                "error": f"Could not resolve '{target_ref}' on {platform_name}. "
+            return tool_error(
+                f"Could not resolve '{target_ref}' on {platform_name}. "
                 f"Try using a numeric channel ID instead."
-            })
+            )
 
     from tools.interrupt import is_interrupted
     if is_interrupted():
@@ -485,26 +400,6 @@ def _handle_send(args):
         config = load_gateway_config()
     except Exception as e:
         return json.dumps(_error(f"Failed to load gateway config: {e}"))
-
-    # `--to agent` — intercept BEFORE Platform() parsing: "agent" is not a
-    # platform enum member. Resolve the real home channel and redirect to it.
-    #
-    # `internal=True` (hermes send -u) — also uses the agent_wake path, but
-    # with an explicitly specified platform instead of auto-discovery.
-    agent_wake = False
-    if platform_name == "agent" or args.get("internal"):
-        agent_wake = True
-        if platform_name == "agent":
-            home = None
-            for p, pconfig_candidate in config.platforms.items():
-                if pconfig_candidate and pconfig_candidate.enabled and pconfig_candidate.home_channel:
-                    home = pconfig_candidate.home_channel
-                    break
-            if not home:
-                return tool_error("No home channel configured — cannot determine which platform to use for agent wake delivery.")
-            platform_name = home.platform.value
-            chat_id = home.chat_id
-            thread_id = home.thread_id
 
     # Accept any platform name — built-in names resolve to their enum
     # member, plugin platform names create dynamic members via _missing_().
@@ -563,37 +458,32 @@ def _handle_send(args):
             home_env = _HOME_CHANNEL_ENV_OVERRIDES.get(
                 platform_name, f"{platform_name.upper()}_HOME_CHANNEL"
             )
-            return json.dumps({
-                "error": f"No home channel set for {platform_name} to determine where to send the message. "
+            return tool_error(
+                f"No home channel set for {platform_name} to determine where to send the message. "
                 f"Either specify a channel directly with '{platform_name}:CHANNEL_NAME', "
                 f"or set a home channel via: hermes config set {home_env} <channel_id>"
-            })
+            )
 
     duplicate_skip = _maybe_skip_cron_duplicate_send(platform_name, chat_id, thread_id)
     if duplicate_skip:
         return json.dumps(duplicate_skip)
 
-    # Slack: resolve user IDs (U...) to DM channel IDs via conversations.open
-    if platform_name == "slack" and chat_id and chat_id.startswith("U"):
-        try:
-            import aiohttp
-            async def _open_slack_dm(token, user_id):
-                url = "https://slack.com/api/conversations.open"
-                headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
-                    async with session.post(url, headers=headers, json={"users": [user_id]}) as resp:
-                        data = await resp.json()
-                        if data.get("ok"):
-                            return data["channel"]["id"]
-                        return None
+    # Slack: resolve user targets to DM channel IDs before sending.
+    # _parse_target_ref emits internal ``user:U...`` / ``user_name:@handle``
+    # targets; a bare U... id can also arrive from session metadata or the
+    # home-channel config. All are opened via conversations.open (fixes #19236).
+    if platform_name == "slack" and chat_id:
+        _slack_dm_target = chat_id
+        if _slack_dm_target.startswith("U") and _SLACK_USER_ID_RE.fullmatch(_slack_dm_target):
+            _slack_dm_target = f"user:{_slack_dm_target}"
+        if _slack_dm_target.startswith(("user:", "user_name:")):
             from model_tools import _run_async
-            dm_channel = _run_async(_open_slack_dm(pconfig.token, chat_id))
-            if dm_channel:
-                chat_id = dm_channel
-            else:
-                return json.dumps({"error": f"Could not open DM with Slack user {chat_id}. Check bot permissions (im:write)."})
-        except Exception as e:
-            return json.dumps({"error": f"Failed to open Slack DM: {e}"})
+            _resolved, _resolve_err = _run_async(
+                _resolve_slack_user_target(pconfig.token, _slack_dm_target)
+            )
+            if _resolve_err:
+                return json.dumps(_resolve_err)
+            chat_id = _resolved
 
     try:
         from model_tools import _run_async
@@ -606,7 +496,6 @@ def _handle_send(args):
                 thread_id=thread_id,
                 media_files=media_files,
                 force_document=force_document_attachments,
-                agent_wake=agent_wake,
             )
         )
         if used_home_channel and isinstance(result, dict) and result.get("success"):
@@ -665,14 +554,13 @@ def _parse_target_ref(platform_name: str, target_ref: str):
             return match.group(1), match.group(2), True
         match = _SLACK_TARGET_RE.fullmatch(target_ref)
         if match:
-            chat_id = match.group(1)
-            # Slack user IDs (U...) and workspace IDs (W...) are NOT valid
-            # explicit send targets — chat.postMessage rejects them. A DM
-            # must be opened first via conversations.open to get a D...
-            # conversation ID. Caller still gets the chat_id so the U→D
-            # resolution path in send_message() can run.
-            is_explicit = chat_id[0] not in {"U", "W"}
-            return chat_id, None, is_explicit
+            return match.group(1), None, True
+        match = _SLACK_USER_ID_RE.fullmatch(target_ref) or _SLACK_MENTION_RE.fullmatch(target_ref)
+        if match:
+            return f"user:{match.group(1)}", None, True
+        match = _SLACK_USER_NAME_RE.fullmatch(target_ref)
+        if match:
+            return f"user_name:{match.group(1)}", None, True
     if platform_name == "matrix":
         trimmed = target_ref.strip()
         split_idx = trimmed.rfind(":$")
@@ -714,6 +602,12 @@ def _parse_target_ref(platform_name: str, target_ref: str):
         if match:
             # Preserve the leading '+' — signal-cli and sms/whatsapp adapters
             # expect E.164 format for direct recipients.
+            return target_ref.strip(), None, True
+    if platform_name == "photon":
+        # Photon DM chat GUIDs ('any;-;+1555...') are platform-native ids the
+        # adapter resolves itself — pass through verbatim instead of bouncing
+        # them off the channel directory (mirrors the react handler).
+        if _PHOTON_DM_GUID_RE.fullmatch(target_ref.strip()):
             return target_ref.strip(), None, True
     if target_ref.lstrip("-").isdigit():
         return target_ref, None, True
@@ -800,21 +694,17 @@ async def _send_via_adapter(
     thread_id=None,
     media_files=None,
     force_document=False,
-    try_adapter_only=False,
-    user_context=None,
 ):
-    """Inject a message into the agent's session.
+    """Send a message via a live gateway adapter, with a standalone fallback
+    for out-of-process callers (e.g. cron running separately from the gateway).
 
-    Without ``user_context`` the message arrives as an internal wake event
-    (``internal=True``, no user identity) — the same pattern as kanban
-    wake events.  With ``user_context`` (``hermes send -u``) the message
-    is injected as a simulated user message: ``internal=False`` with full
-    user identity so ``handle_message()`` treats it like a real inbound.
-
-    Falls back to the plugin's ``standalone_sender_fn`` for out-of-process
-    callers (e.g. cron running separately from the gateway), unless
-    ``try_adapter_only`` is True (used when the caller has its own
-    platform-specific fallback).
+    Order of attempts:
+      1. Live in-process adapter via ``_gateway_runner_ref()`` (the path that
+         existed before this change).
+      2. The plugin's ``standalone_sender_fn`` registered on its
+         ``PlatformEntry`` (used when the gateway is not in this process, so
+         the runner weakref is ``None``).
+      3. A descriptive error explaining both options.
     """
     platform_name = platform.value if hasattr(platform, "value") else str(platform)
     runner = None
@@ -831,53 +721,21 @@ async def _send_via_adapter(
             adapter = None
         if adapter is not None:
             try:
-                # Resolve chat_type: prefer user_context, then HomeChannel
-                # config, then env var (set by kanban/cron notification
-                # hooks), fall back to "group" for backward compatibility.
-                _chat_type = "group"
-                if user_context and user_context.get("chat_type"):
-                    _chat_type = str(user_context["chat_type"])
-                elif pconfig and getattr(pconfig, "home_channel", None):
-                    _chat_type = pconfig.home_channel.chat_type
-                else:
-                    _chat_type = os.environ.get("HERMES_NOTIFY_CHAT_TYPE", "group")
-                session_source = SessionSource(
-                    platform=platform,
-                    chat_id=chat_id,
-                    thread_id=thread_id,
-                    chat_type=_chat_type,
-                )
-                # Build internal flag and user identity
-                is_internal = True
-                event_metadata = {}
-                if user_context:
-                    is_internal = False
-                    session_source.user_id = user_context.get("user_id")
-                    session_source.user_name = user_context.get("sender_name")
-                    event_metadata["platform_user_id"] = user_context.get("platform_user_id")
-                notify_event = MessageEvent(
-                    text=chunk,
-                    source=session_source,
-                    message_type=MessageType.TEXT,
-                    internal=is_internal,
-                    timestamp=datetime.now(),
-                    metadata=event_metadata,
-                )
-                await adapter.handle_message(notify_event)
-                return {"success": True, "queued": True}
+                metadata = {}
+                if thread_id:
+                    metadata["thread_id"] = thread_id
+                if platform_name == "ntfy" and chat_id:
+                    metadata["publish_topic"] = chat_id
+                if not metadata:
+                    metadata = None
+                result = await adapter.send(chat_id=chat_id, content=chunk, metadata=metadata)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                return {"error": f"Plugin platform wake event failed: {e}"}
-
-    if try_adapter_only:
-        bridge_result = await _send_via_bridge(
-            platform, chat_id, chunk, thread_id=thread_id,
-            user_context=user_context,
-        )
-        if bridge_result.get("success") and bridge_result.get("queued"):
-            return bridge_result
-        return {"error": f"No live adapter for platform '{platform_name}'"}
+                return {"error": f"Plugin platform send failed: {e}"}
+            if result.success:
+                return {"success": True, "message_id": result.message_id}
+            return {"error": f"Adapter send failed: {result.error}"}
 
     entry = None
     try:
@@ -922,80 +780,7 @@ async def _send_via_adapter(
     }
 
 
-BRIDGE_SOCKET = "/tmp/hermes/mcp_bridge.sock"
-
-
-async def _send_via_bridge(platform, chat_id, text, *, thread_id=None, user_context=None):
-    """Inject a message via the gateway's MCP bridge socket.
-
-    Used when the in-process adapter is unavailable (e.g. ``hermes send`` CLI
-    running in a separate process) but the gateway is running.  Connects to
-    the gateway's Unix socket and sends an ``inject`` command so the gateway
-    injects the message via ``adapter.handle_message()``.
-
-    Without ``user_context`` the message arrives as an internal wake event
-    (``internal=True``).  With ``user_context`` the message is injected as a
-    simulated user message with full user identity.
-
-    Returns ``{"success": True, "queued": True}`` on success, or an error
-    dict on failure.
-    """
-    import socket as _socket
-
-    platform_name = platform.value if hasattr(platform, "value") else str(platform)
-    payload = {
-        "action": "inject",
-        "platform": platform_name,
-        "chat_id": chat_id,
-        "text": text,
-    }
-    if thread_id is not None:
-        payload["thread_id"] = thread_id
-    if user_context:
-        payload["user_context"] = user_context
-        # Propagate chat_type so the bridge handler constructs
-        # the SessionSource with the correct chat_type instead of
-        # hardcoding "group" (prevents session-key mismatch/fork).
-        _ct = user_context.get("chat_type") or os.environ.get("HERMES_NOTIFY_CHAT_TYPE")
-        if _ct:
-            payload["chat_type"] = _ct
-
-    try:
-        sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
-        sock.settimeout(5.0)
-        sock.connect(BRIDGE_SOCKET)
-        sock.sendall((json.dumps(payload) + "\n").encode("utf-8"))
-        data = b""
-        while True:
-            chunk_data = sock.recv(4096)
-            if not chunk_data:
-                break
-            data += chunk_data
-            if b"\n" in data:
-                break
-        sock.close()
-
-        if not data:
-            return {"error": "Bridge returned empty response"}
-        try:
-            response = json.loads(data.decode("utf-8"))
-        except json.JSONDecodeError:
-            return {"error": f"Bridge returned invalid JSON: {data[:200]!r}"}
-
-        if response.get("ok"):
-            return {"success": True, "queued": True}
-        return {"error": f"Bridge inject failed: {response.get('error', 'unknown')}"}
-    except _socket.timeout:
-        return {"error": "Bridge socket timed out — gateway may not be running"}
-    except FileNotFoundError:
-        return {"error": f"Bridge socket not found at {BRIDGE_SOCKET} — gateway may not be running"}
-    except ConnectionRefusedError:
-        return {"error": f"Bridge socket connection refused at {BRIDGE_SOCKET} — gateway may not be running"}
-    except Exception as e:
-        return {"error": f"Bridge send failed: {e}"}
-
-
-async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False, agent_wake=False):
+async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False):
     """Route a message to the appropriate platform sender.
 
     Long messages are automatically chunked to fit within platform limits
@@ -1005,22 +790,6 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     from gateway.config import Platform
 
     media_files = media_files or []
-
-    # Agent wake path — when `--to agent` is used, deliver as an
-    # internal wake event instead of direct Bot API delivery.
-    if agent_wake:
-        try:
-            wake_result = await _send_via_adapter(
-                platform, pconfig, chat_id, message,
-                thread_id=thread_id,
-                media_files=media_files,
-                force_document=force_document,
-                try_adapter_only=True,
-            )
-            if wake_result.get("success") and wake_result.get("queued"):
-                return wake_result
-        except Exception:
-            pass
 
     # Weixin handles text/media delivery inside its native helper and does not
     # need the optional platform adapter imports below. Keep this branch early
@@ -1216,6 +985,48 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             last_result = result
         return last_result
 
+    # --- Slack: native media via files_upload_v2 in the plugin's
+    # standalone_sender_fn (plugins/platforms/slack/adapter.py::_standalone_send).
+    # Gateway in-channel MEDIA: delivery already worked; send_message previously
+    # omitted Slack attachments and told the model media was unsupported.
+    if platform == Platform.SLACK and media_files:
+        from gateway.platform_registry import platform_registry as _pr_slack
+        from hermes_cli.plugins import discover_plugins as _dp_slack
+        _dp_slack()
+        _slack_entry = _pr_slack.get("slack")
+        if _slack_entry is None or _slack_entry.standalone_sender_fn is None:
+            return {"error": "Slack plugin not registered or missing standalone_sender_fn"}
+        _sl_caption, _ = _media_caption_split(
+            message, media_files,
+            max_caption_len=(max_len or _DEFAULT_CAPTION_LIMIT),
+        )
+        if _sl_caption is not None:
+            result = await _slack_entry.standalone_sender_fn(
+                pconfig,
+                chat_id,
+                "",
+                thread_id=thread_id,
+                media_files=media_files,
+                caption=_sl_caption,
+            )
+            if isinstance(result, dict) and result.get("error"):
+                return result
+            return result
+        last_result = None
+        for i, chunk in enumerate(chunks):
+            is_last = (i == len(chunks) - 1)
+            result = await _slack_entry.standalone_sender_fn(
+                pconfig,
+                chat_id,
+                chunk,
+                thread_id=thread_id,
+                media_files=media_files if is_last else [],
+            )
+            if isinstance(result, dict) and result.get("error"):
+                return result
+            last_result = result
+        return last_result
+
     # --- WhatsApp: native media attachment support via the registry's
     # standalone_sender_fn (plugins/platforms/whatsapp/adapter.py::_standalone_send).
     # The plugin uploads each file through the local Baileys bridge /send-media
@@ -1266,11 +1077,37 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             last_result = result
         return last_result
 
+    # --- Slack: prefer the live gateway adapter, then the plugin's
+    # standalone sender.  The live adapter is multi-workspace aware (it maps
+    # channels to the workspace client that owns them) and honors adapter-side
+    # gates like ignored_channels; the standalone Web-API path may only have a
+    # comma-separated token list.  ``_send_via_adapter`` tries the in-process
+    # adapter first and falls back to the registry standalone sender for
+    # out-of-process cron runs, preserving MEDIA delivery on the fallback
+    # (media-bearing sends were already intercepted by the branch above).
+    if platform == Platform.SLACK:
+        last_result = None
+        for i, chunk in enumerate(chunks):
+            is_last = i == len(chunks) - 1
+            result = await _send_via_adapter(
+                platform,
+                pconfig,
+                chat_id,
+                chunk,
+                thread_id=thread_id,
+                media_files=media_files if is_last else [],
+                force_document=force_document,
+            )
+            if isinstance(result, dict) and result.get("error"):
+                return result
+            last_result = result
+        return last_result
+
     # --- Non-media platforms ---
     if media_files and not message.strip():
         return {
             "error": (
-                f"send_message MEDIA delivery is currently only supported for telegram, discord, matrix, weixin, signal, yuanbao, feishu and whatsapp; "
+                f"send_message MEDIA delivery is currently only supported for telegram, discord, matrix, weixin, signal, yuanbao, feishu, whatsapp and slack; "
                 f"target {platform.value} had only media attachments"
             )
         }
@@ -1278,24 +1115,12 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     if media_files:
         warning = (
             f"MEDIA attachments were omitted for {platform.value}; "
-            "native send_message media delivery is currently only supported for telegram, discord, matrix, weixin, signal, yuanbao, feishu and whatsapp"
+            "native send_message media delivery is currently only supported for telegram, discord, matrix, weixin, signal, yuanbao, feishu, whatsapp and slack"
         )
 
     last_result = None
     for chunk in chunks:
-        if platform == Platform.SLACK:
-            # Slack migrated to a bundled plugin (#41112); delivery flows
-            # through the registry's standalone_sender_fn, which applies
-            # mrkdwn formatting and posts via the Slack Web API.
-            from gateway.platform_registry import platform_registry
-            _slack_entry = platform_registry.get("slack")
-            if _slack_entry is None or _slack_entry.standalone_sender_fn is None:
-                result = {"error": "Slack plugin not registered or missing standalone_sender_fn"}
-            else:
-                result = await _slack_entry.standalone_sender_fn(
-                    pconfig, chat_id, chunk, thread_id=thread_id
-                )
-        elif platform == Platform.WHATSAPP:
+        if platform == Platform.WHATSAPP:
             result = await _registry_standalone_send("whatsapp", pconfig, chat_id, chunk, thread_id)
         elif platform == Platform.SIGNAL:
             result = await _send_signal(pconfig.extra, chat_id, chunk)
@@ -1690,6 +1515,84 @@ async def _registry_standalone_send(platform_name, pconfig, chat_id, message, th
 
 # _send_whatsapp moved to plugins/platforms/whatsapp/adapter.py::_standalone_send,
 # wired via standalone_sender_fn and reached through _registry_standalone_send. #41112.
+
+
+async def _resolve_slack_user_target(token, chat_id):
+    """Resolve a Slack user target to a D... DM conversation ID.
+
+    ``chat_id`` may be a Slack conversation ID (C/G/D...) — returned unchanged —
+    or an internal user target (``user:U...`` / ``user_name:<handle>``). User
+    targets are opened as DMs via conversations.open because Slack
+    chat.postMessage requires a conversation ID. ``user_name:`` targets are
+    first resolved to a user ID through users.list (stable handle match only).
+
+    Returns ``(chat_id, None)`` on success or ``(None, error_dict)`` on failure.
+    """
+    if not (chat_id.startswith("user:") or chat_id.startswith("user_name:")):
+        return chat_id, None
+    try:
+        import aiohttp
+    except ImportError:
+        return None, {"error": "aiohttp not installed. Run: pip install aiohttp"}
+    try:
+        from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_aiohttp
+        _proxy = resolve_proxy_url()
+        _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(_proxy)
+        base_url = "https://slack.com/api"
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+        async def post_api(session, method, payload):
+            async with session.post(f"{base_url}/{method}", headers=headers, json=payload, **_req_kw) as resp:
+                return await resp.json()
+
+        async def resolve_user_name(session, name):
+            query = name.strip().lstrip("@").lower()
+            matches = []
+            cursor = None
+            for _page in range(20):
+                payload = {"limit": 200}
+                if cursor:
+                    payload["cursor"] = cursor
+                data = await post_api(session, "users.list", payload)
+                if not data.get("ok"):
+                    return None, f"Slack users.list error: {data.get('error', 'unknown')}"
+                for member in data.get("members", []):
+                    if member.get("deleted") or member.get("is_bot"):
+                        continue
+                    # ``@name`` should match the stable Slack handle only. Display
+                    # and real names are mutable/non-unique enough that using them
+                    # could DM the wrong person with sensitive content.
+                    if str(member.get("name", "")).strip().lower() == query:
+                        matches.append(member)
+                cursor = (data.get("response_metadata") or {}).get("next_cursor")
+                if not cursor:
+                    break
+            if not matches:
+                return None, f"Could not resolve Slack user '@{name}'."
+            if len(matches) > 1:
+                return None, f"Slack user '@{name}' matched multiple Slack users. Use a Slack user ID instead."
+            return matches[0].get("id"), None
+
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), **_sess_kw) as session:
+            if chat_id.startswith("user_name:"):
+                user_id, error = await resolve_user_name(session, chat_id[len("user_name:"):])
+                if error:
+                    return None, _error(error)
+                chat_id = f"user:{user_id}"
+
+            user_id = chat_id[len("user:"):]
+            opened = await post_api(session, "conversations.open", {"users": user_id})
+            if not opened.get("ok"):
+                return None, _error(
+                    f"Slack conversations.open error: {opened.get('error', 'unknown')}. "
+                    "Check bot permissions (im:write)."
+                )
+            dm_id = (opened.get("channel") or {}).get("id")
+            if not dm_id:
+                return None, _error("Slack conversations.open did not return a DM channel ID")
+            return dm_id, None
+    except Exception as e:
+        return None, _error(f"Slack DM resolution failed: {e}")
 
 
 async def _send_signal(extra, chat_id, message, media_files=None):
@@ -2103,10 +2006,15 @@ async def _send_qqbot(pconfig, chat_id, message):
     except ImportError:
         return _error("QQBot direct send requires httpx. Run: pip install httpx")
 
+    # Resolve credential fallbacks through the profile secret scope (with the
+    # plain-environ fallback for unscoped single-profile runs) so a multiplex
+    # profile's direct send never borrows another profile's QQ credentials.
+    from gateway.config import _getenv
+
     extra = pconfig.extra or {}
-    appid = extra.get("app_id") or os.getenv("QQ_APP_ID", "")
+    appid = extra.get("app_id") or _getenv("QQ_APP_ID", "")
     secret = (pconfig.token or extra.get("client_secret")
-              or os.getenv("QQ_CLIENT_SECRET", ""))
+              or _getenv("QQ_CLIENT_SECRET", ""))
     if not appid or not secret:
         return _error("QQBot: QQ_APP_ID / QQ_CLIENT_SECRET not configured.")
 
