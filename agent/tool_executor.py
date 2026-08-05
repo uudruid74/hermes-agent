@@ -520,6 +520,24 @@ def _run_agent_tool_execution_middleware(
             agent._iters_since_skill = 0
 
         _advance_start_order(_begin)
+
+        # ── sequential_thinking temperature/reasoning wrapper ──
+        # When sequentialthinking is called with an optional temperature arg,
+        # temporarily disable reasoning (so DeepSeek models respect the temp)
+        # and set the requested temperature, then restore after the tool runs.
+        if function_name in ("sequentialthinking", "sequential_thinking"):
+            _temp_val = final_args.pop("temperature", None)
+            if _temp_val is not None:
+                _saved_reasoning = agent.reasoning_config
+                _saved_temp = getattr(agent, "_session_temperature", None)
+                agent.reasoning_config = {"enabled": False}
+                agent._session_temperature = float(_temp_val)
+                try:
+                    return execute(final_args)
+                finally:
+                    agent.reasoning_config = _saved_reasoning
+                    agent._session_temperature = _saved_temp
+
         return execute(final_args)
 
     def _hermes_pipeline(relay_args: dict[str, Any]) -> Any:

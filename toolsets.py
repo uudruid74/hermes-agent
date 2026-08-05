@@ -68,8 +68,8 @@ _HERMES_CORE_TOOLS = [
     "clarify",
     # Code execution + delegation
     "execute_code", "delegate_task",
-    # Temperature control
-    "adjust_temperature",
+    # Session metadata
+    "set_session",
     # Cronjob management
     "cronjob",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
@@ -265,9 +265,9 @@ TOOLSETS = {
         "includes": []
     },
 
-    "temperature": {
-        "description": "Adjust the agent's sampling temperature mid-session via adjust_temperature",
-        "tools": ["adjust_temperature"],
+    "session": {
+        "description": "Set session metadata — temperature, subject, facts, emotional state",
+        "tools": ["set_session"],
         "includes": []
     },
 

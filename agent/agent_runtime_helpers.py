@@ -98,7 +98,7 @@ def _ra():
 
 
 AGENT_RUNTIME_POST_HOOK_TOOL_NAMES = frozenset(
-    {"todo", "session_search", "memory", "clarify", "read_terminal", "delegate_task", "adjust_temperature"}
+    {"todo", "session_search", "memory", "clarify", "read_terminal", "delegate_task", "set_session"}
 )
 
 
@@ -2975,13 +2975,20 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     elif function_name == "delegate_task":
         def _execute(next_args: dict) -> Any:
             return _finish_agent_tool(agent._dispatch_delegate_task(next_args), next_args)
-    elif function_name == "adjust_temperature":
+    elif function_name == "set_session":
         def _execute(next_args: dict) -> Any:
-            from tools.temperature_tool import adjust_temperature_tool as _adj_temp
+            from tools.set_session_tool import set_session_tool as _set_sess
             return _finish_agent_tool(
-                _adj_temp(
-                    temperature=next_args.get("temperature", 0.7),
+                _set_sess(
                     agent=agent,
+                    subject=next_args.get("subject"),
+                    fact=next_args.get("fact"),
+                    temperature=next_args.get("temperature"),
+                    safe=next_args.get("safe"),
+                    hope=next_args.get("hope"),
+                    inclusion=next_args.get("inclusion"),
+                    self_val=next_args.get("self"),
+                    bearing=next_args.get("bearing"),
                 ),
                 next_args,
             )

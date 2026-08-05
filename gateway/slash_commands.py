@@ -2489,8 +2489,8 @@ class GatewaySlashCommandsMixin:
         prefix = "✓" if result.success else "✗"
         return f"{prefix} {result.message}"
 
-    async def _handle_temperature_command(self, event: MessageEvent) -> str:
-        """Handle /temperature — show or set agent sampling temperature."""
+    async def _handle_session_command(self, event: MessageEvent) -> str:
+        """Handle /session — set session metadata via the set_session tool."""
         raw_args = (event.get_command_args() or "").strip()
         session_key = self._session_key_for_source(event.source)
         agent = None
@@ -2504,18 +2504,18 @@ class GatewaySlashCommandsMixin:
         if not raw_args:
             agent_temp = getattr(agent, "_session_temperature", None) if agent else None
             if agent_temp is not None:
-                return f"\U0001f321\ufe0f Temperature: {agent_temp:.2f}"
-            return "\U0001f321\ufe0f Temperature: 0.70 (default)\nUsage: /temperature <0.0\u20132.0>"
+                return f"\U0001f4dd Temperature: {agent_temp:.2f}"
+            return "\U0001f4dd Session: use /session temperature=N or set_session tool"
         try:
             val = float(raw_args.split()[0])
         except ValueError:
-            return f"\u2717 Invalid temperature: {raw_args.split()[0]!r} — must be a number 0.0\u20132.0"
+            return f"\u2717 Invalid: {raw_args.split()[0]!r} — use /session <0.0\u20132.0> for temperature"
         if not (0.0 <= val <= 2.0):
             return f"\u2717 Temperature must be 0.0\u20132.0 (got {val})"
         if agent:
             agent._session_temperature = val
         self._save_gateway_config_key("model.worker_temperature", val)
-        return f"\U0001f321\ufe0f Temperature set to {val:.2f} (saved)"
+        return f"\U0001f4dd Temperature set to {val:.2f} (saved)"
 
     async def _handle_personality_command(self, event: MessageEvent) -> str:
         """Handle /personality command - list or set a personality."""
