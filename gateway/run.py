@@ -10994,6 +10994,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter.set_message_handler(self._primary_message_handler())
             adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
             adapter.set_session_store(self.session_store)
+            adapter.set_session_db(self._session_db)
             adapter.set_busy_session_handler(self._handle_active_session_busy_message)
             _set_reaction = getattr(adapter, "set_reaction_handler", None)
             if callable(_set_reaction):
@@ -12366,6 +12367,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     adapter.set_message_handler(self._primary_message_handler())
                     adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
                     adapter.set_session_store(self.session_store)
+                    adapter.set_session_db(self._session_db)
                     adapter.set_busy_session_handler(self._handle_active_session_busy_message)
                     _set_reaction = getattr(adapter, "set_reaction_handler", None)
                     if callable(_set_reaction):
@@ -13308,6 +13310,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._make_profile_fatal_error_handler(profile_name, platform)
         )
         adapter.set_session_store(self.session_store)
+        adapter.set_session_db(self._session_db)
         adapter.set_busy_session_handler(self._handle_active_session_busy_message)
         _set_reaction = getattr(adapter, "set_reaction_handler", None)
         if callable(_set_reaction):

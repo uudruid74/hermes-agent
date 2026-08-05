@@ -3412,6 +3412,10 @@ class BasePlatformAdapter(ABC):
         thread replies without explicit mentions).
         """
         self._session_store = session_store
+
+    def set_session_db(self, session_db: Any) -> None:
+        """Set the session DB for querying session metadata (emotion axes, subject)."""
+        self._session_db = session_db
     
     def _history_media_paths_for_session(self, session_key: str) -> Optional[set]:
         """Return media paths already delivered in prior turns of this session.
