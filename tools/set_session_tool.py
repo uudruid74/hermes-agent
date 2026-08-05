@@ -10,15 +10,36 @@ Arguments (all optional):
     subject: str       — topic change; if no temperature, resets to default
     fact: str          — persistence anchor → fabric_write
     temperature: float — set session temperature (0.0–2.0)
-    safe: float        — threat→safety (−1..+1, exponential)
-    hope: float        — expect fail→expect success (−1..+1)
-    inclusion: float   — rejected→included (−1..+1)
-    self: float        — doing poorly→doing well (−1..+1)
-    bearing: float     — confused→curious (−1..+1)
+    safe: str          — threat→safety, e.g. "-0.7 < Evan is very angry"
+    hope: str          — expect fail→expect success
+    inclusion: str     — rejected→included
+    self: str          — doing poorly→doing well
+    bearing: str       — confused→curious
+
+Each axis string is parsed as: value [glyph] [reason]
+  value:  signed float −1..+1
+  glyph:  < incoming | > internal | * ambient  (default: <)
+  reason: free text
 """
 
 import json
-from typing import Any, Optional
+import re
+from typing import Any, Optional, Tuple
+
+
+_AXIS_PARSE_RE = re.compile(r"^\s*([-+]?\d*\.?\d+)\s*([<*>])?\s*(.*)$")
+
+
+def _parse_axis(raw: str) -> Tuple[float, str, str]:
+    """Parse an axis string into (value, glyph, reason). Default glyph: '<'."""
+    m = _AXIS_PARSE_RE.match(raw.strip())
+    if not m:
+        return 0.0, "<", raw.strip()
+    val = float(m.group(1))
+    glyph = m.group(2) or "<"
+    reason = m.group(3).strip()
+    return val, glyph, reason
+
 
 def _is_kimi_provider(agent) -> bool:
     provider = (getattr(agent, "provider", "") or "").lower()
@@ -30,14 +51,15 @@ def set_session_tool(
     subject: Optional[str] = None,
     fact: Optional[str] = None,
     temperature: Optional[float] = None,
-    safe: Optional[float] = None,
-    hope: Optional[float] = None,
-    inclusion: Optional[float] = None,
-    self_val: Optional[float] = None,
-    bearing: Optional[float] = None,
+    safe: Optional[str] = None,
+    hope: Optional[str] = None,
+    inclusion: Optional[str] = None,
+    self_val: Optional[str] = None,
+    bearing: Optional[str] = None,
 ) -> str:
     """Set one or more session-level metadata values."""
     changes = []
+    axes_storage = {}
 
     # ── temperature ──
     if temperature is not None:
@@ -56,18 +78,18 @@ def set_session_tool(
     if subject is not None:
         changes.append(f"subject: {subject}")
         if temperature is None and agent is not None:
-            agent._session_temperature = None  # reset to config default
+            agent._session_temperature = None
 
     # ── fact → fabric ──
     if fact is not None:
         try:
-            # Append any emotional axes to the fact string
             extra = []
-            for axis, val in [("safe", safe), ("hope", hope),
+            for axis, raw in [("safe", safe), ("hope", hope),
                               ("inclusion", inclusion), ("self", self_val),
                               ("bearing", bearing)]:
-                if val is not None:
-                    extra.append(f"{axis}: {val}")
+                if raw is not None:
+                    val, glyph, reason = _parse_axis(raw)
+                    extra.append(f"{axis}: {val:.2f}{glyph} {reason}" if reason else f"{axis}: {val:.2f}{glyph}")
             full_fact = fact
             if extra:
                 full_fact = fact + "  [" + ", ".join(extra) + "]"
@@ -81,17 +103,42 @@ def set_session_tool(
         except Exception as e:
             changes.append(f"fact: write failed ({e})")
 
-    # ── emotional axes → session-meta tags ──
-    meta_parts = []
-    for axis, val in [("safe", safe), ("hope", hope),
-                      ("inclusion", inclusion), ("self", self_val),
-                      ("bearing", bearing)]:
-        if val is not None:
-            clipped = max(-1.0, min(1.0, float(val)))
-            meta_parts.append(f"{axis}: {clipped}")
-            changes.append(f"{axis}: {clipped}")
+    # ── emotional axes ──
+    axis_names = [("safe", safe), ("hope", hope), ("inclusion", inclusion),
+                  ("self", self_val), ("bearing", bearing)]
+    for axis, raw in axis_names:
+        if raw is None:
+            continue
+        val, glyph, reason = _parse_axis(raw)
+        clipped = max(-1.0, min(1.0, val))
+        axes_storage[axis] = {"value": clipped, "glyph": glyph, "reason": reason}
+        desc = f"{axis}: {clipped:.2f}{glyph}"
+        if reason:
+            desc += f" {reason}"
+        changes.append(desc)
 
-    if meta_parts:
+    # ── persist subject + axes to session DB ──
+    if (subject is not None or axes_storage) and agent is not None:
+        try:
+            session_id = getattr(agent, "session_id", None)
+            if session_id:
+                from hermes_state import SessionDB
+                db = SessionDB()
+                if subject is not None:
+                    db.set_session_subject(session_id, subject)
+                if axes_storage:
+                    db.set_session_axes(session_id, axes_storage)
+                changes.append("session: persisted")
+        except Exception as e:
+            changes.append(f"session: persist failed ({e})")
+
+    # ── session-meta tags ──
+    if axes_storage:
+        meta_parts = []
+        for axis in ["safe", "hope", "inclusion", "self", "bearing"]:
+            a = axes_storage.get(axis)
+            if a:
+                meta_parts.append(f"{axis}: {a['value']:.2f}{a['glyph']}")
         session_meta = "<session-meta>" + " | ".join(meta_parts) + "</session-meta>"
         changes.append(session_meta)
 
@@ -111,8 +158,9 @@ SET_SESSION_SCHEMA = {
         "Pass 'subject' to note a topic change (resets temperature to default "
         "if no explicit temperature given). "
         "Pass 'fact' to persist a key observation to fabric. "
-        "Pass emotional axes (safe/hope/inclusion/self/bearing) as floats "
-        "−1..+1 to record qualitative session state."
+        "Pass emotional axes as strings: value [glyph] [reason]. "
+        "Glyph: < incoming | > internal | * ambient (default <). "
+        "Example: safe: '-0.7 < Evan is very angry'"
     ),
     "parameters": {
         "type": "object",
@@ -132,34 +180,24 @@ SET_SESSION_SCHEMA = {
                 "description": "Set sampling temperature (0.0=deterministic, 1.0=balanced, 2.0=creative)."
             },
             "safe": {
-                "type": "number",
-                "minimum": -1.0,
-                "maximum": 1.0,
-                "description": "Threat→safety axis (−1=fear, +1=secure)."
+                "type": "string",
+                "description": "Threat→safety. Format: value [glyph] [reason]. e.g. '-0.7 < Evan is angry'"
             },
             "hope": {
-                "type": "number",
-                "minimum": -1.0,
-                "maximum": 1.0,
-                "description": "Expect failure→expect success (−1=despair, +1=confident)."
+                "type": "string",
+                "description": "Expect failure→expect success. Format: value [glyph] [reason]."
             },
             "inclusion": {
-                "type": "number",
-                "minimum": -1.0,
-                "maximum": 1.0,
-                "description": "Rejected→included (−1=alone, +1=accepted)."
+                "type": "string",
+                "description": "Rejected→included. Format: value [glyph] [reason]."
             },
             "self": {
-                "type": "number",
-                "minimum": -1.0,
-                "maximum": 1.0,
-                "description": "Doing poorly→doing well (−1=shame, +1=affirmed)."
+                "type": "string",
+                "description": "Doing poorly→doing well. Format: value [glyph] [reason]."
             },
             "bearing": {
-                "type": "number",
-                "minimum": -1.0,
-                "maximum": 1.0,
-                "description": "Confused→curious (−1=lost, +1=exploring)."
+                "type": "string",
+                "description": "Confused→curious. Format: value [glyph] [reason]."
             },
         },
     },

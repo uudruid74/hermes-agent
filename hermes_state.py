@@ -4453,6 +4453,71 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return False
         return bool(raw.get("yolo_mode"))
 
+    def set_session_subject(self, session_id: str, subject: str) -> None:
+        """Persist the current session subject into model_config JSON."""
+        if not session_id:
+            return
+        self._merge_model_config(session_id, {"_session_subject": subject})
+
+    def set_session_axes(self, session_id: str, axes: Dict[str, float]) -> None:
+        """Persist the 5 emotional axes into model_config JSON."""
+        if not session_id:
+            return
+        self._merge_model_config(session_id, {"_session_axes": axes})
+
+    def _merge_model_config(self, session_id: str, updates: Dict[str, Any]) -> None:
+        """Merge keys into the session's model_config JSON."""
+        def _do(conn):
+            row = conn.execute(
+                "SELECT model_config FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                return
+            raw = row["model_config"] if isinstance(row, sqlite3.Row) else row[0]
+            config: Dict[str, Any] = {}
+            if isinstance(raw, str) and raw.strip():
+                try:
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, dict):
+                        config = parsed
+                except Exception:
+                    config = {}
+            elif isinstance(raw, dict):
+                config = dict(raw)
+            config.update(updates)
+            conn.execute(
+                "UPDATE sessions SET model_config = ? WHERE id = ?",
+                (json.dumps(config), session_id),
+            )
+        self._execute_write(_do)
+
+    @staticmethod
+    def get_session_subject(session_meta: Optional[Dict[str, Any]]) -> Optional[str]:
+        """Read the persisted subject from a session row dict."""
+        raw = (session_meta or {}).get("model_config")
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except Exception:
+                return None
+        if not isinstance(raw, dict):
+            return None
+        return raw.get("_session_subject")
+
+    @staticmethod
+    def get_session_axes(session_meta: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """Read the persisted emotional axes from a session row dict."""
+        raw = (session_meta or {}).get("model_config")
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except Exception:
+                return {}
+        if not isinstance(raw, dict):
+            return {}
+        return raw.get("_session_axes", {})
+
     def update_session_billing_route(
         self,
         session_id: str,
