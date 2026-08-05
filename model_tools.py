@@ -1203,6 +1203,35 @@ def handle_function_call(
                 return _probe_err
             # Recurse with the underlying tool. All hooks fire against the
             # real tool name. The bridge is invisible to hooks by design.
+            # ── sequential_thinking temperature/reasoning wrapper ──
+            if underlying_name == "sequentialthinking" and "temperature" in underlying_args:
+                from agent.agent_runtime_helpers import _current_agent as _ca
+                _ag = _ca
+                if _ag is not None:
+                    _temp_val = underlying_args.pop("temperature")
+                    _saved_reasoning = _ag.reasoning_config
+                    _saved_temp = getattr(_ag, "_session_temperature", None)
+                    _ag.reasoning_config = {"enabled": False}
+                    _ag._session_temperature = float(_temp_val)
+                    try:
+                        return handle_function_call(
+                            function_name=underlying_name,
+                            function_args=underlying_args,
+                            task_id=task_id,
+                            tool_call_id=tool_call_id,
+                            session_id=session_id,
+                            user_task=user_task,
+                            enabled_tools=enabled_tools,
+                            skip_pre_tool_call_hook=skip_pre_tool_call_hook,
+                            skip_tool_request_middleware=skip_tool_request_middleware,
+                            skip_tool_execution_middleware=skip_tool_execution_middleware,
+                            tool_request_middleware_trace=list(_tool_middleware_trace),
+                            enabled_toolsets=enabled_toolsets,
+                            disabled_toolsets=disabled_toolsets,
+                        )
+                    finally:
+                        _ag.reasoning_config = _saved_reasoning
+                        _ag._session_temperature = _saved_temp
             return handle_function_call(
                 function_name=underlying_name,
                 function_args=underlying_args,

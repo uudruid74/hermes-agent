@@ -97,6 +97,9 @@ def _ra():
     return run_agent
 
 
+_current_agent = None  # set by invoke_tool, read by handle_function_call for seq-thinking wrapper
+
+
 AGENT_RUNTIME_POST_HOOK_TOOL_NAMES = frozenset(
     {"todo", "session_search", "memory", "clarify", "read_terminal", "delegate_task", "set_session"}
 )
@@ -2807,6 +2810,9 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     """
     if not isinstance(function_args, dict):
         function_args = {}
+
+    global _current_agent
+    _current_agent = agent
 
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
     try:
