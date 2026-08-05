@@ -2511,7 +2511,7 @@ def _prune_orphaned_branches(repo_root: str) -> None:
 _ACCENT_ANSI_DEFAULT = "\033[1;38;2;255;215;0m"  # True-color #FFD700 bold — fallback
 _BOLD = "\033[1m"
 _RST = "\033[0m"
-_STREAM_PAD = "    "  # 4-space indent for streamed response text (matches Panel padding)
+_STREAM_PAD = "  "  # 2-space indent for streamed response text (matches Panel padding)
 _STREAM_PARTIAL_PREVIEW_LEN = 60  # tail of an unfinished logical line mirrored
 # into the spinner while streaming (TTFT perception without hard-wrapping)
 
@@ -6784,12 +6784,56 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 label = "⚕ Hermes"
                 _text_hex = "#FFF8DC"
             # Override label with active profile name and icon if not default
+            _internal_icons = []
+            _incoming_icons = []
+            _ambient_icons = []
+            _subject = None
             try:
                 from hermes_cli.profiles import get_active_profile_name
                 _profile = get_active_profile_name()
-                if _profile and _profile not in ("default", "custom"):
-                    _icon = _get_profile_icon() or "⚕"
-                    label = f"{_icon} {_profile.title()} "
+                _icon = _get_profile_icon() or "⚕"
+                _name = _profile.title() if _profile and _profile not in ("default", "custom") else "Hermes"
+
+                # ── Emotion icons from session axes ──
+                _axes = _read_session_axes(getattr(self, "session_id", None))
+                _internal_icons = []  # glyph '>' — replaces agenticon
+                _incoming_icons = []  # glyph '<' — before subject
+                _ambient_icons = []   # glyph '*' — after subject
+                _subject = _read_session_subject(getattr(self, "session_id", None))
+
+                for axis in ["safe", "hope", "inclusion", "self", "bearing"]:
+                    a = _axes.get(axis)
+                    if a and isinstance(a, dict):
+                        val = a.get("value", 0)
+                        glyph = a.get("glyph", "<")
+                        icon = _emotion_icon(axis, val)
+                        if icon:
+                            if glyph == ">":
+                                _internal_icons.append((abs(val), icon))
+                            elif glyph == "<":
+                                _incoming_icons.append((abs(val), icon))
+                            elif glyph == "*":
+                                _ambient_icons.append((abs(val), icon))
+
+                if _internal_icons:
+                    # Sort by descending magnitude, build icon string
+                    _internal_icons.sort(key=lambda x: x[0], reverse=True)
+                    _icon_str = "".join(i[1] for i in _internal_icons)
+                    label = f"{_icon_str} {_name} "
+                else:
+                    label = f"{_icon} {_name} "
+
+                # Add incoming icons before subject
+                if _subject and _incoming_icons:
+                    _inc_str = "".join(i[1] for i in sorted(_incoming_icons, key=lambda x: x[0], reverse=True))
+                    label = f"{_inc_str} {_subject} " + label
+
+                # If subject but no incoming, place subject after name
+                if _subject and not _incoming_icons:
+                    label = f"{label}· {_subject} "
+
+                # Ambient icons go toward the clock side — we append after fill calculation
+
             except Exception:
                 pass
             # Override accent color with profile agentcolor if set
@@ -6808,6 +6852,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             if self.show_timestamps:
                 now = datetime.now()
                 label_ts = f" {now.strftime('%a')} {now.strftime('%I:%M')}{now.strftime('%p')[0].lower()} "
+                # Append ambient icons before clock
+                if _ambient_icons:
+                    _amb_str = "".join(i[1] for i in sorted(_ambient_icons, key=lambda x: x[0], reverse=True))
+                    label_ts = f"{_amb_str} {label_ts}"
                 w = self._scrollback_box_width()
                 name_width = HermesCLI._status_bar_display_width(label)
                 ts_width = len(label_ts)
@@ -18029,6 +18077,50 @@ def _get_profile_icon() -> str | None:
         icon = cfg.get("agenticon")
         if icon and isinstance(icon, str) and icon.strip():
             return icon.strip()
+    except Exception:
+        pass
+    return None
+
+# ── Emotion icon mapping for session TUI ──
+_EMOTION_GLYPHS = {
+    "safe":    {"-": ("😰", "⚠️"),  "+": ("✨", "🛡️")},
+    "hope":    {"-": ("🌧️", "💀"),  "+": ("🔆", "🌟")},
+    "inclusion": {"-": ("〽️", "🧍"),  "+": ("🤝", "👥")},
+    "self":    {"-": ("📉", "✖️"),  "+": ("📈", "💪")},
+    "bearing": {"-": ("🌀", "❓"),  "+": ("🧐", "🕵️")},
+}
+
+def _emotion_icon(axis: str, value: float) -> str | None:
+    av = abs(value)
+    if av <= 0.1:
+        return None
+    sign = "+" if value >= 0 else "-"
+    tier = 1 if av >= 0.5 else 0
+    pair = _EMOTION_GLYPHS.get(axis, {}).get(sign)
+    return pair[tier] if pair else None
+
+def _read_session_axes(session_id: str | None) -> dict:
+    if not session_id:
+        return {}
+    try:
+        from hermes_state import SessionDB
+        db = SessionDB()
+        row = db.get_session(session_id)
+        if row:
+            return SessionDB.get_session_axes(row)
+    except Exception:
+        pass
+    return {}
+
+def _read_session_subject(session_id: str | None) -> str | None:
+    if not session_id:
+        return None
+    try:
+        from hermes_state import SessionDB
+        db = SessionDB()
+        row = db.get_session(session_id)
+        if row:
+            return SessionDB.get_session_subject(row)
     except Exception:
         pass
     return None
