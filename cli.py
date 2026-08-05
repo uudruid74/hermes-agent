@@ -6853,7 +6853,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 # Append ambient icons before clock
                 if _ambient_icons:
                     _amb_str = "".join(i[1] for i in sorted(_ambient_icons, key=lambda x: x[0], reverse=True))
-                    label_ts = f"{_amb_str} {label_ts}"
+                    label_ts = f" {_amb_str}{label_ts}"
                 w = self._scrollback_box_width()
                 name_width = HermesCLI._status_bar_display_width(label)
                 ts_width = len(label_ts)
