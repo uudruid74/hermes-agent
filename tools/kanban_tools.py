@@ -165,6 +165,88 @@ def _stamp_worker_session_metadata(
     return stamped
 
 
+def _notify_kanban_event(tid: str, status: str, summary: Optional[str], task) -> None:
+    """Fire a best-effort notification when a task changes status.
+
+    Sends two messages:
+    - Human-readable via ``hermes send -t`` with old-style icons, no [Hermes] prefix
+    - JSON payload via ``hermes send -u`` for AI consumption
+
+    Mirrors ``_notify_kanban_status_change`` in ``hermes_cli/kanban.py`` so the
+    worker-side tool calls trigger the same notification as the CLI commands.
+    """
+    try:
+        from hermes_cli import kanban_db as _kb
+        from hermes_cli.kanban import _NOTIFY_EMOJI
+        import json
+        task_title = task.title if task else tid
+        summary_line = ""
+        if summary:
+            summary_line = summary.splitlines()[0][:300]
+
+        conn = _kb.connect()
+        try:
+            origin = _kb.get_origin_routing(conn, tid)
+        finally:
+            conn.close()
+
+        if not (origin and origin.get("platform") and origin.get("chat_id")):
+            return
+
+        platform = origin["platform"].lower()
+        chat_id = origin["chat_id"]
+        thread_id = origin.get("thread_id", "")
+        chat_type = origin.get("chat_type", "group")
+        target = f"{platform}:{chat_id}"
+        if thread_id:
+            target = f"{target}:{thread_id}"
+
+        icon = _NOTIFY_EMOJI.get(status, "❓")
+
+        # Human-readable message via -t (old icons, no [Hermes] prefix)
+        human_parts = [f"{icon} {task_title} → {status}"]
+        if summary_line:
+            human_parts.append(f" — {summary_line}")
+        if status == "blocked":
+            human_parts.append(" — Investigate this blocked task")
+        human_msg = "".join(human_parts)
+
+        # JSON payload via -u
+        json_payload = json.dumps({
+            "source": "kanban",
+            "type": status,
+            "task_id": tid,
+            "title": task_title,
+            "summary": summary_line or None,
+            "assignee": getattr(task, "assignee", None) or "unassigned",
+        })
+
+        import subprocess
+        subprocess.run(
+            ["hermes", "send", "-t", target, human_msg],
+            capture_output=True, timeout=10,
+        )
+        # Pass chat_type via environment so the bridge/adapter handlers
+        # construct the SessionSource with the correct chat_type instead
+        # of hardcoding "group" — prevents session-key mismatch (fork).
+        notify_env = os.environ.copy()
+        notify_env["HERMES_NOTIFY_CHAT_TYPE"] = chat_type
+        subprocess.run(
+            ["hermes", "send", "-u", target, json_payload],
+            capture_output=True, timeout=10, env=notify_env,
+        )
+    except Exception:
+        pass
+
+
+def _notify_kanban_completion(tid: str, summary: Optional[str], task) -> None:
+    """Fire a best-effort notification when a task completes.
+
+    Convenience wrapper around ``_notify_kanban_event``.
+    """
+    _notify_kanban_event(tid, "done", summary, task)
+
+
 def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
     """Reject worker-driven destructive calls on foreign task IDs.
 
@@ -784,6 +866,8 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"could not complete {tid} (unknown id or already terminal)"
                 )
             run = kb.latest_run(conn, tid)
+            # Notify origin channel about completion
+            _notify_kanban_completion(tid, summary, task)
             return _ok(task_id=tid, run_id=run.id if run else None)
         finally:
             conn.close()
@@ -857,6 +941,8 @@ def _handle_block(args: dict, **kw) -> str:
                     f"running/ready)"
                 )
             run = kb.latest_run(conn, tid)
+            # Notify origin channel about the block
+            _notify_kanban_event(tid, "blocked", reason, task)
             # Tell the worker where the task actually landed so it doesn't
             # assume it's sitting in 'blocked' when routing sent it elsewhere.
             landed = kb.get_task(conn, tid)
@@ -959,6 +1045,9 @@ def _handle_comment(args: dict, **kw) -> str:
         kb, conn = _connect(board=board)
         try:
             cid = kb.add_comment(conn, tid, author=author, body=str(body))
+            # Notify origin channel about the comment
+            task = kb.get_task(conn, tid)
+            _notify_kanban_event(tid, "commented", body, task)
             return _ok(task_id=tid, comment_id=cid)
         finally:
             conn.close()
