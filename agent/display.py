@@ -1524,6 +1524,21 @@ def _get_cute_tool_message(
             count_label = task_count or len(tasks)
             return _wrap(f"┊ 🔀 delegate  {count_label}x: {_trunc(detail, 35)}  {dur}")
         return _wrap(f"┊ 🔀 delegate  {_trunc(args.get('goal', ''), 35)}  {dur}")
+    if tool_name == "set_session":
+        # Build a compact summary of what was set
+        parts = []
+        if args.get("subject"):
+            parts.append(f"subject: \"{_trunc(args['subject'], 18)}\"")
+        if args.get("temperature") is not None:
+            parts.append(f"T={args['temperature']}")
+        # Count emotional axes that were passed
+        axis_count = sum(1 for k in ("safe", "hope", "inclusion", "self", "bearing") if args.get(k))
+        if axis_count:
+            parts.append(f"{axis_count} axis{'es' if axis_count != 1 else ''}")
+        if args.get("fact"):
+            parts.append("fact")
+        detail = ", ".join(parts) if parts else "session update"
+        return _wrap(f"┊ 📝 session   {_trunc(detail, 40)}  {dur}")
 
     preview = build_tool_preview(tool_name, args) or ""
     return _wrap(f"┊ ⚡ {tool_name[:9]:9} {_trunc(preview, 35)}  {dur}")

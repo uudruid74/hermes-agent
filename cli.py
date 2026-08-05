@@ -12197,6 +12197,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     _cprint(f"\033[2m\u21a9 Background {noun} running — I'll resume when {tail}. Keep chatting.\033[0m")
                 except Exception:
                     pass
+        # set_session: echo ALL fields to the terminal (spec: emotion-icon-design.md §6)
+        if function_name == "set_session":
+            try:
+                _echo_session_fields(function_args)
+            except Exception:
+                pass
         snapshot = self._pending_edit_snapshots.pop(tool_call_id, None)
         try:
             from agent.display import render_edit_diff_with_delta
@@ -18122,6 +18128,61 @@ def _read_session_subject(session_id: str | None) -> str | None:
     except Exception:
         pass
     return None
+
+
+def _echo_session_fields(args: dict) -> None:
+    """Echo set_session fields to the terminal in a clean readable block.
+
+    Prints subject, fact, temperature, and each emotion axis (safe, hope,
+    inclusion, self, bearing) with value+glyph+reason, one per line.
+    Spec: emotion-icon-design.md §6 — /session must echo set fields.
+    """
+    if not args:
+        return
+    lines = []
+    # ── simple scalar fields ──
+    subject = args.get("subject")
+    if subject is not None:
+        lines.append(f"    · subject: \"{subject}\"")
+    fact = args.get("fact")
+    if fact is not None:
+        lines.append(f"    · fact: \"{fact}\"")
+    temperature = args.get("temperature")
+    if temperature is not None:
+        lines.append(f"    · temperature: {temperature}")
+
+    # ── emotional axes (value [glyph] [reason]) ──
+    import re
+    _axis_re = re.compile(r"^\s*([-+]?\d*\.?\d+)\s*([<*>])?\s*(.*)$")
+    axis_names = [("safe", "safe"), ("hope", "hope"), ("inclusion", "inclusion"),
+                  ("self", "self"), ("bearing", "bearing")]
+    for arg_key, display_name in axis_names:
+        raw = args.get(arg_key)
+        if raw is None:
+            continue
+        try:
+            m = _axis_re.match(str(raw).strip())
+            if m:
+                val_str = f"{float(m.group(1)):+.2f}"
+                glyph = m.group(2) or "<"
+                reason = m.group(3).strip()
+                entry = f"    · {display_name}: {val_str} {glyph}"
+                if reason:
+                    entry += f" {reason}"
+                lines.append(entry)
+            else:
+                lines.append(f"    · {display_name}: {raw}")
+        except (ValueError, TypeError):
+            lines.append(f"    · {display_name}: {raw}")
+
+    if not lines:
+        return
+    try:
+        lines.insert(0, "  📝 session:")
+        _cprint("\n".join(lines))
+    except Exception:
+        pass
+
 
 def _ansi_hex(hex_color: str) -> str:
     """Convert '#RRGGBB' to ANSI 24-bit foreground escape."""
