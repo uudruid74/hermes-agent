@@ -7036,7 +7036,10 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.debug("[%s] subject pin failed for chat %s: %s", self.name, chat_id, e)
 
     def _reactions_enabled(self) -> bool:
-        """Check if message reactions are enabled via config/env."""
+        """Check if message reactions are enabled via config (preferred) or env var (legacy fallback)."""
+        reactions = self.config.extra.get("reactions") if getattr(self.config, "extra", None) else None
+        if reactions is not None:
+            return bool(reactions)
         return os.getenv("TELEGRAM_REACTIONS", "false").lower() not in {"false", "0", "no"}
 
     async def _apply_internal_emotion_reaction(self, chat_id: str, message_ids: list) -> None:
