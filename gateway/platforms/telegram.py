@@ -6883,6 +6883,10 @@ class TelegramAdapter(BasePlatformAdapter):
         session_db = getattr(self, "_session_db", None)
         if not session_db:
             return None
+        # Unwrap AsyncSessionDB — its __getattr__ wraps every method with
+        # asyncio.to_thread, so sync callers would get coroutines instead of
+        # data.  Reach through to the raw SessionDB for direct sync access.
+        session_db = getattr(session_db, "_db", session_db)
         try:
             store = getattr(self, "_session_store", None)
             if not store:
@@ -6967,6 +6971,8 @@ class TelegramAdapter(BasePlatformAdapter):
         session_db = getattr(self, "_session_db", None)
         if not session_db:
             return None
+        # Unwrap AsyncSessionDB (see _get_emotion_data for rationale).
+        session_db = getattr(session_db, "_db", session_db)
         try:
             store = getattr(self, "_session_store", None)
             if not store:
