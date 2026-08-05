@@ -5607,6 +5607,18 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             )
             continue
 
+        # ── sequential_thinking schema augmentation ──
+        if mcp_tool.name == "sequentialthinking":
+            _params = schema.get("parameters", {})
+            _props = _params.get("properties", {})
+            if "temperature" not in _props:
+                _props["temperature"] = {
+                    "type": "number",
+                    "minimum": 0.0,
+                    "maximum": 2.0,
+                    "description": "Optional: set session temperature during thinking. Reasoning is temporarily disabled."
+                }
+
         registry.register(
             name=tool_name_prefixed,
             toolset=toolset_name,
