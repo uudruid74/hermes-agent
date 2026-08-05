@@ -6823,14 +6823,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 else:
                     label = f"{_icon} {_name} "
 
-                # Add incoming icons before subject
-                if _subject and _incoming_icons:
-                    _inc_str = "".join(i[1] for i in sorted(_incoming_icons, key=lambda x: x[0], reverse=True))
-                    label = f"{_inc_str} {_subject} " + label
-
-                # If subject but no incoming, place subject after name
-                if _subject and not _incoming_icons:
-                    label = f"{label}· {_subject} "
+                # External icons go AFTER the subject (spec: LOCKED emotion-icon-design.md)
+                if _subject:
+                    _inc_str = ""
+                    if _incoming_icons:
+                        _inc_str = " " + "".join(i[1] for i in sorted(_incoming_icons, key=lambda x: x[0], reverse=True))
+                    label = f"{label}· {_subject}{_inc_str} "
 
                 # Ambient icons go toward the clock side — we append after fill calculation
 
