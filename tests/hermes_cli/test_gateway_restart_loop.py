@@ -705,6 +705,29 @@ class TestLifecycleGuardModule:
         with pytest.raises(GatewayLifecycleBlocked):
             check_gateway_lifecycle("daily ops", str(script))
 
+    def test_null_byte_path_does_not_crash_read_referenced_script(self):
+        """os.open raises ValueError (not OSError) for paths with embedded
+        null bytes. _read_referenced_script must catch both so the guard
+        fails closed-to-safe instead of crashing the terminal tool."""
+        from pathlib import Path as _Path
+        from cron.lifecycle_guard import _read_referenced_script
+
+        result = _read_referenced_script(_Path("/tmp/\x00test"))
+        assert result == (None, False)
+
+    def test_piped_python_command_guard_safe(self):
+        """A terminal command that pipes to a Python interpreter must not
+        crash the guard — even when the Python binary path or a referenced
+        script path is unresolvable or contains binary data."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        # Pipe to absolute-path Python with -c payload (binary read path).
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            'grep pattern file | /usr/bin/python3 -c "print(1)"'
+        )
+        assert result is False
+
 
 # ---------------------------------------------------------------------------
 # Defense 2 (chokepoint): cron.jobs.create_job blocks the AGENT model-tool path
