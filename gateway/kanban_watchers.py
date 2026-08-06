@@ -301,6 +301,44 @@ class GatewayKanbanWatchersMixin:
                             )
                             if not subs:
                                 logger.debug("kanban notifier: board %s has no subscriptions", slug)
+                            # Deduplicate subscriptions by (task_id, platform, chat_id):
+                            # when both a thread-specific sub (with thread_id) and a
+                            # home-channel sub (without thread_id) exist for the same
+                            # delivery target, keep only the thread-specific one. This
+                            # prevents duplicate deliveries where the home-channel sub
+                            # routes the notification to the main group instead of the
+                            # topic/thread where the task was created (#t_693a75ed).
+                            # CLI-created tasks (no thread_id on any sub) are unaffected.
+                            _deduped: list[dict] = []
+                            _seen: dict[tuple, dict] = {}
+                            for _s in subs:
+                                _key = (
+                                    _s.get("task_id"),
+                                    (_s.get("platform") or "").lower(),
+                                    _s.get("chat_id") or "",
+                                )
+                                _prev = _seen.get(_key)
+                                if _prev is None:
+                                    _seen[_key] = _s
+                                    _deduped.append(_s)
+                                else:
+                                    _prev_has = bool(_prev.get("thread_id"))
+                                    _curr_has = bool(_s.get("thread_id"))
+                                    if _curr_has and not _prev_has:
+                                        # Replace the home-channel sub with the
+                                        # thread-specific one.
+                                        _idx = _deduped.index(_prev)
+                                        _deduped[_idx] = _s
+                                        _seen[_key] = _s
+                                    # else: keep _prev (already has thread_id, or
+                                    #   neither does — first-wins for CLI-created).
+                            if len(_deduped) < len(subs):
+                                logger.info(
+                                    "kanban notifier: deduplicated %d → %d subscriptions "
+                                    "on board %s (kept thread-specific over home-channel)",
+                                    len(subs), len(_deduped), slug,
+                                )
+                            subs = _deduped
                             for sub in subs:
                                 try:
                                     owner_profile = sub.get("notifier_profile") or None
