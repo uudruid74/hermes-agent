@@ -327,6 +327,79 @@ class TurnContext:
     preflight_compression_blocked: bool = False
 
 
+def _build_ratings_injection(agent) -> str:
+    """Build the Ratings injection block for the ego/mood system."""
+    try:
+        from hermes_state import SessionDB
+        db = SessionDB()
+        session_id = getattr(agent, "session_id", None)
+        if not session_id:
+            return ""
+
+        mood = getattr(agent, "_session_mood", 0.0)
+
+        agent_name = getattr(agent, "agent_name", None)
+        if not agent_name:
+            try:
+                from hermes_cli.profiles import get_active_profile_name
+                agent_name = get_active_profile_name() or "neo"
+            except Exception:
+                agent_name = "neo"
+        rating = db.get_agent_rating(agent_name)
+
+        block = f"Ratings: Average [{rating:.1f}], Session [{mood:.2f}], Mood [{mood:.2f}]"
+
+        if mood < 0:
+            last_ego = db.get_agent_last_ego(agent_name)
+            if last_ego:
+                block += f"\n{last_ego}"
+
+        return block
+    except Exception:
+        return ""
+
+
+def _apply_mood_gates(agent) -> None:
+    """Apply mood decay, then set temperature + file-edit lockdown when mood < -0.3."""
+    try:
+        from hermes_state import SessionDB
+        from tools.approval import _lockdown_session, _unlock_session
+
+        db = SessionDB()
+        session_id = getattr(agent, "session_id", None)
+        if not session_id:
+            return
+
+        mood = db.apply_mood_decay(session_id)
+        agent._session_mood = mood
+
+        session_key = getattr(agent, "_session_key", None) or session_id
+
+        if mood < -0.3:
+            # Worker temperature override
+            worker_temp = getattr(agent, "_worker_temperature", None)
+            if worker_temp is None:
+                try:
+                    from hermes_cli.config import cfg_get
+                    worker_temp = cfg_get(None, "model", "worker_temperature", default=0.3)
+                except Exception:
+                    worker_temp = 0.3
+            agent._session_temperature = worker_temp
+            agent._mood_temp_set = True
+
+            # File-edit lockdown
+            _lockdown_session(session_key)
+        else:
+            _unlock_session(session_key)
+
+            if getattr(agent, "_mood_temp_set", False):
+                agent._session_temperature = None
+                agent._mood_temp_set = False
+
+    except Exception:
+        pass
+
+
 def build_turn_context(
     agent,
     user_message: Any,
@@ -1124,6 +1197,17 @@ def build_turn_context(
                 if plugin_user_context
                 else _gateway_notes
             )
+
+    # ── Session mood decay + ratings injection (ego system) ──
+    _ratings_context = _build_ratings_injection(agent)
+    if _ratings_context:
+        plugin_user_context = (
+            _ratings_context + "\n\n" + plugin_user_context
+            if plugin_user_context
+            else _ratings_context
+        )
+    # Apply mood-based temperature + file-edit lockdown
+    _apply_mood_gates(agent)
 
     # Per-turn file-mutation verifier state.
     agent._turn_failed_file_mutations = {}

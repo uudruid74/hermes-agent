@@ -152,7 +152,7 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
     )
 
 
-SCHEMA_VERSION = 25
+SCHEMA_VERSION = 26
 
 
 # FTS storage-layout version, tracked INDEPENDENTLY of SCHEMA_VERSION in the
@@ -232,6 +232,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     title TEXT,
     subject TEXT,
     axes TEXT,
+    mood REAL NOT NULL DEFAULT 0.0,
     last_activity_at REAL,
     last_activity_description TEXT,
     last_activity_provenance TEXT,
@@ -317,6 +318,13 @@ CREATE TABLE IF NOT EXISTS compression_locks (
     holder TEXT NOT NULL,
     acquired_at REAL NOT NULL,
     expires_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS agent_state (
+    agent_name TEXT PRIMARY KEY,
+    rating REAL NOT NULL DEFAULT 20.0,
+    last_ego TEXT,
+    updated_at REAL NOT NULL DEFAULT (strftime('%s', 'now'))
 );
 
 CREATE TABLE IF NOT EXISTS async_delegations (

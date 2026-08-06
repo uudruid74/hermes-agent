@@ -6794,43 +6794,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 _icon = _get_profile_icon() or "⚕"
                 _name = _profile.title() if _profile and _profile not in ("default", "custom") else "Hermes"
 
-                # ── Emotion icons from session axes ──
-                _axes = _read_session_axes(getattr(self, "session_id", None))
-                _internal_icons = []  # glyph '>' — replaces agenticon
-                _incoming_icons = []  # glyph '<' — before subject
-                _ambient_icons = []   # glyph '*' — after subject
+                # ── Ego/mood icon (replaces emotion axes + agenticon) ──
+                _mood = _read_session_mood(getattr(self, "session_id", None))
                 _subject = _read_session_subject(getattr(self, "session_id", None))
 
-                for axis in ["safe", "hope", "inclusion", "self", "bearing"]:
-                    a = _axes.get(axis)
-                    if a and isinstance(a, dict):
-                        val = a.get("value", 0)
-                        glyph = a.get("glyph", "<")
-                        icon = _emotion_icon(axis, val)
-                        if icon:
-                            if glyph == ">":
-                                _internal_icons.append((abs(val), icon))
-                            elif glyph == "<":
-                                _incoming_icons.append((abs(val), icon))
-                            elif glyph == "*":
-                                _ambient_icons.append((abs(val), icon))
-
-                if _internal_icons:
-                    # Sort by descending magnitude, build icon string
-                    _internal_icons.sort(key=lambda x: x[0], reverse=True)
-                    _icon_str = "".join(i[1] for i in _internal_icons)
-                    label = f"{_icon_str} {_name} "
+                if _mood != 0.0:
+                    _ego_icon = _ego_mood_icon(_mood)
+                    label = f"{_ego_icon} {_name} "
                 else:
                     label = f"{_icon} {_name} "
 
-                # External icons go AFTER the subject (spec: LOCKED emotion-icon-design.md)
                 if _subject:
-                    _inc_str = ""
-                    if _incoming_icons:
-                        _inc_str = " " + "".join(i[1] for i in sorted(_incoming_icons, key=lambda x: x[0], reverse=True))
-                    label = f"{label}· {_subject}{_inc_str} "
-
-                # Ambient icons go toward the clock side — we append after fill calculation
+                    label = f"{label}· {_subject} "
 
             except Exception:
                 pass
@@ -18085,36 +18060,33 @@ def _get_profile_icon() -> str | None:
         pass
     return None
 
-# ── Emotion icon mapping for session TUI ──
-_EMOTION_GLYPHS = {
-    "safe":    {"-": ("😰", "⚠️"),  "+": ("✨", "🛡️")},
-    "hope":    {"-": ("🌧️", "💀"),  "+": ("🔆", "🌟")},
-    "inclusion": {"-": ("〽️", "🧍"),  "+": ("🤝", "👥")},
-    "self":    {"-": ("📉", "✖️"),  "+": ("📈", "💪")},
-    "bearing": {"-": ("🌀", "❓"),  "+": ("🧐", "🕵️")},
-}
+# ── Ego/mood icon mapping for session TUI ──
+# Ego icon replaces agenticon while mood non-zero.
+# mood < -0.5 → 😱  (shock)
+# -0.5 <= mood < 0 → 😟  (frown)
+# mood == 0 → agenticon (normal)
+# 0 < mood <= 0.5 → ☺️  (smile)
+# mood > 0.5 → 🥰  (love)
+def _ego_mood_icon(mood: float) -> str:
+    if mood < -0.5:
+        return "😱"
+    elif mood < 0:
+        return "😟"
+    elif mood <= 0.5:
+        return "☺️"
+    else:
+        return "🥰"
 
-def _emotion_icon(axis: str, value: float) -> str | None:
-    av = abs(value)
-    if av <= 0.1:
-        return None
-    sign = "+" if value >= 0 else "-"
-    tier = 1 if av >= 0.5 else 0
-    pair = _EMOTION_GLYPHS.get(axis, {}).get(sign)
-    return pair[tier] if pair else None
 
-def _read_session_axes(session_id: str | None) -> dict:
+def _read_session_mood(session_id: str | None) -> float:
     if not session_id:
-        return {}
+        return 0.0
     try:
         from hermes_state import SessionDB
         db = SessionDB()
-        row = db.get_session(session_id)
-        if row:
-            return SessionDB.get_session_axes(row)
+        return db.get_session_mood(session_id)
     except Exception:
-        pass
-    return {}
+        return 0.0
 
 def _read_session_subject(session_id: str | None) -> str | None:
     if not session_id:
@@ -18133,9 +18105,7 @@ def _read_session_subject(session_id: str | None) -> str | None:
 def _echo_session_fields(args: dict) -> None:
     """Echo set_session fields to the terminal in a clean readable block.
 
-    Prints subject, fact, temperature, and each emotion axis (safe, hope,
-    inclusion, self, bearing) with value+glyph+reason, one per line.
-    Spec: emotion-icon-design.md §6 — /session must echo set fields.
+    Prints subject, fact, temperature, and ego field.
     """
     if not args:
         return
@@ -18151,29 +18121,10 @@ def _echo_session_fields(args: dict) -> None:
     if temperature is not None:
         lines.append(f"    · temperature: {temperature}")
 
-    # ── emotional axes (value [glyph] [reason]) ──
-    import re
-    _axis_re = re.compile(r"^\s*([-+]?\d*\.?\d+)\s*([<*>])?\s*(.*)$")
-    axis_names = [("safe", "safe"), ("hope", "hope"), ("inclusion", "inclusion"),
-                  ("self", "self"), ("bearing", "bearing")]
-    for arg_key, display_name in axis_names:
-        raw = args.get(arg_key)
-        if raw is None:
-            continue
-        try:
-            m = _axis_re.match(str(raw).strip())
-            if m:
-                val_str = f"{float(m.group(1)):+.2f}"
-                glyph = m.group(2) or "<"
-                reason = m.group(3).strip()
-                entry = f"    · {display_name}: {val_str} {glyph}"
-                if reason:
-                    entry += f" {reason}"
-                lines.append(entry)
-            else:
-                lines.append(f"    · {display_name}: {raw}")
-        except (ValueError, TypeError):
-            lines.append(f"    · {display_name}: {raw}")
+    # ── ego ──
+    ego = args.get("ego")
+    if ego is not None:
+        lines.append(f"    · ego: \"{ego}\"")
 
     if not lines:
         return

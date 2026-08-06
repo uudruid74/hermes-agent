@@ -2206,6 +2206,8 @@ _lock = threading.Lock()
 _pending: dict[str, dict] = {}
 _session_approved: dict[str, set] = {}
 _session_yolo: set[str] = set()
+# Sessions in file-edit lockdown (mood-triggered): blank allow-list → nothing auto-approved.
+_session_locked_down: set[str] = set()
 _permanent_approved: set = set()
 
 # =========================================================================
@@ -2457,12 +2459,45 @@ def is_current_session_yolo_enabled() -> bool:
     return is_session_yolo_enabled(get_current_session_key(default=""))
 
 
+def _lockdown_session(session_key: str) -> None:
+    """Put a session into file-edit lockdown — blank allow-list, nothing auto-approved.
+    
+    Copied, not mutated — the permanent allow-list is untouched and will be
+    consulted again when the session is unlocked.
+    """
+    if not session_key:
+        return
+    with _lock:
+        _session_locked_down.add(session_key)
+
+
+def _unlock_session(session_key: str) -> None:
+    """Remove a session from file-edit lockdown, restoring the original allow-list."""
+    if not session_key:
+        return
+    with _lock:
+        _session_locked_down.discard(session_key)
+
+
+def is_session_locked_down(session_key: str) -> bool:
+    """Return True if this session is in file-edit lockdown."""
+    if not session_key:
+        return False
+    with _lock:
+        return session_key in _session_locked_down
+
+
 def is_approved(session_key: str, pattern_key: str) -> bool:
     """Check if a pattern is approved (session-scoped or permanent).
 
     Accept both the current canonical key and the legacy regex-derived key so
     existing command_allowlist entries continue to work after key migrations.
+
+    When the session is in file-edit lockdown (mood < -0.3), returns False
+    regardless of allow-list contents.
     """
+    if is_session_locked_down(session_key):
+        return False
     aliases = _approval_key_aliases(pattern_key)
     with _lock:
         if any(alias in _permanent_approved for alias in aliases):

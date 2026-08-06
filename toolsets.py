@@ -266,7 +266,7 @@ TOOLSETS = {
     },
 
     "session": {
-        "description": "Set session metadata — temperature, subject, facts, emotional state",
+        "description": "Set session metadata — temperature, subject, facts, ego (mood)",
         "tools": ["set_session"],
         "includes": []
     },

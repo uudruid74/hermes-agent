@@ -6823,69 +6823,37 @@ class TelegramAdapter(BasePlatformAdapter):
 
     # ── Message reactions (processing lifecycle) ──────────────────────────
 
-    # Locked 20-glyph emotion table from emotion-icon-design.md (2026-08-05).
-    # Each axis has two tiers per polarity: light (0.1 < |v| < 0.5) and solid (|v| >= 0.5).
-    # Map: (axis, sign, tier) → emoji.  Sign: + = positive pole, - = negative pole.
-    # Tier: 'light' (0.1 < |v| < 0.5), 'solid' (|v| >= 0.5).  |v| <= 0.1 → hidden.
-    _EMOTION_GLYPHS = {
-        # safe:  fear(-)  →  secure(+)
-        ("safe", "-", "light"): "\U0001f630",  # 😰
-        ("safe", "-", "solid"): "\u26a0\ufe0f",  # ⚠️
-        ("safe", "+", "light"): "\u2728",      # ✨
-        ("safe", "+", "solid"): "\U0001f6e1\ufe0f",  # 🛡️
-        # hope:  despair(-)  →  confident(+)
-        ("hope", "-", "light"): "\U0001f327\ufe0f",  # 🌧️
-        ("hope", "-", "solid"): "\U0001f480",  # 💀
-        ("hope", "+", "light"): "\U0001f506",  # 🔆
-        ("hope", "+", "solid"): "\U0001f31f",  # 🌟
-        # inclusion:  alone(-)  →  accepted(+)
-        ("inclusion", "-", "light"): "\u303d\ufe0f",  # 〽️
-        ("inclusion", "-", "solid"): "\U0001f9cd",  # 🧍
-        ("inclusion", "+", "light"): "\U0001f91d",  # 🤝
-        ("inclusion", "+", "solid"): "\U0001f465",  # 👥
-        # self:  shame(-)  →  affirmed(+)
-        ("self", "-", "light"): "\U0001f4c9",  # 📉
-        ("self", "-", "solid"): "\u2716\ufe0f",  # ✖️
-        ("self", "+", "light"): "\U0001f4c8",  # 📈
-        ("self", "+", "solid"): "\U0001f4aa",  # 💪
-        # bearing:  lost(-)  →  curious(+)
-        ("bearing", "-", "light"): "\U0001f300",  # 🌀
-        ("bearing", "-", "solid"): "\u2753",      # ❓
-        ("bearing", "+", "light"): "\U0001f9d0",  # 🧐
-        ("bearing", "+", "solid"): "\U0001f575\ufe0f",  # 🕵️
-    }
-
-    # Map glyph characters to their placement role.
-    _EMOTION_PLACEMENTS = {">": "internal", "<": "incoming", "*": "ambient"}
-
     # Track pinned subject message IDs per (chat_id, thread_id).
     _subject_pin_msg_ids: Dict[tuple, int] = {}
 
     # Track last pinned subject text per (chat_id, thread_id) to avoid re-pinning.
     _last_pinned_subject: Dict[tuple, str] = {}
 
+    # Track last ego-set session IDs so we only tag on explicit ego set.
+    _ego_tagged_sessions: set[str] = set()
+
     @staticmethod
-    def _emotion_emoji(value: float, axis: str) -> Optional[str]:
-        """Return the emoji for an emotion axis value, or None if hidden."""
-        abs_v = abs(value)
-        if abs_v <= 0.1:
-            return None
-        tier = "solid" if abs_v >= 0.5 else "light"
-        sign = "+" if value >= 0 else "-"
-        return TelegramAdapter._EMOTION_GLYPHS.get((axis, sign, tier))
+    def _ego_mood_emoji(mood: float) -> str:
+        """Return the emoji for a mood value."""
+        if mood < -0.5:
+            return "\U0001f631"  # 😱
+        elif mood < 0:
+            return "\U0001f61f"  # 😟
+        elif mood <= 0.5:
+            return "\u263a\ufe0f"  # ☺️
+        else:
+            return "\U0001f970"  # 🥰
 
-    def _get_emotion_data(self, chat_id: str) -> Optional[Dict[str, Any]]:
-        """Read emotion axes for the session tied to *chat_id*.
+    @staticmethod
+    def _ego_tag_session(session_id: str) -> None:
+        """Mark a session as having had ego explicitly set (for Telegram tagging)."""
+        TelegramAdapter._ego_tagged_sessions.add(session_id)
 
-        Returns a dict like ``{"safe": {"value": -0.7, "glyph": "<", "reason": "..."}, ...}``
-        or None when no emotion data is available.
-        """
+    def _get_session_mood_for_chat(self, chat_id: str) -> Optional[float]:
+        """Return the session mood for *chat_id*, or None if not available."""
         session_db = getattr(self, "_session_db", None)
         if not session_db:
             return None
-        # Unwrap AsyncSessionDB — its __getattr__ wraps every method with
-        # asyncio.to_thread, so sync callers would get coroutines instead of
-        # data.  Reach through to the raw SessionDB for direct sync access.
         session_db = getattr(session_db, "_db", session_db)
         try:
             store = getattr(self, "_session_store", None)
@@ -6897,74 +6865,35 @@ class TelegramAdapter(BasePlatformAdapter):
                 if src and getattr(src, "chat_id", None) == chat_id:
                     row = session_db.get_session(entry.session_id)
                     if row:
-                        return session_db.get_session_axes(row)
+                        # Only return mood if this session was ego-tagged
+                        if entry.session_id in TelegramAdapter._ego_tagged_sessions:
+                            return float(row.get("mood", 0.0))
             return None
         except Exception:
             return None
 
+    def _ego_emoji_for_chat(self, chat_id: str) -> Optional[str]:
+        """Return the ego/mood emoji for the agent's message, only if ego was explicitly set."""
+        mood = self._get_session_mood_for_chat(chat_id)
+        if mood is None or mood == 0.0:
+            return None
+        return self._ego_mood_emoji(mood)
+
+    def _get_emotion_data(self, chat_id: str) -> Optional[Dict[str, Any]]:
+        """Legacy stub — always returns None (superseded by ego/mood system)."""
+        return None
+
     def _emotion_for_incoming(self, chat_id: str) -> Optional[str]:
-        """Return the incoming (`<`) emotion emoji to react on the user's message."""
-        data = self._get_emotion_data(chat_id)
-        if not data:
-            return None
-        # Find the axis with the strongest |value| that has glyph '<'.
-        best = None
-        best_v = 0.0
-        for axis, info in data.items():
-            if not isinstance(info, dict):
-                continue
-            if info.get("glyph") != "<":
-                continue
-            v = abs(float(info.get("value", 0)))
-            if v > best_v:
-                best_v = v
-                best = axis
-        if best is None:
-            return None
-        val = float(data[best].get("value", 0))
-        return self._emotion_emoji(val, best)
+        """Legacy stub — always returns None (superseded by ego/mood system)."""
+        return None
 
     def _ambient_emoji(self, chat_id: str) -> Optional[str]:
-        """Return the ambient (`*`) emotion emoji to inject inline, or None."""
-        data = self._get_emotion_data(chat_id)
-        if not data:
-            return None
-        best = None
-        best_v = 0.0
-        for axis, info in data.items():
-            if not isinstance(info, dict):
-                continue
-            if info.get("glyph") != "*":
-                continue
-            v = abs(float(info.get("value", 0)))
-            if v > best_v:
-                best_v = v
-                best = axis
-        if best is None:
-            return None
-        val = float(data[best].get("value", 0))
-        return self._emotion_emoji(val, best)
+        """Legacy stub — always returns None (superseded by ego/mood system)."""
+        return None
 
     def _internal_emotion_emoji(self, chat_id: str) -> Optional[str]:
-        """Return the internal (`>`) emotion emoji for the agent's own message."""
-        data = self._get_emotion_data(chat_id)
-        if not data:
-            return None
-        best = None
-        best_v = 0.0
-        for axis, info in data.items():
-            if not isinstance(info, dict):
-                continue
-            if info.get("glyph") != ">":
-                continue
-            v = abs(float(info.get("value", 0)))
-            if v > best_v:
-                best_v = v
-                best = axis
-        if best is None:
-            return None
-        val = float(data[best].get("value", 0))
-        return self._emotion_emoji(val, best)
+        """Return the ego/mood emoji for the agent's own message."""
+        return self._ego_emoji_for_chat(chat_id)
 
     def _get_subject_for_chat(self, chat_id: str) -> Optional[str]:
         """Read the session subject for *chat_id* from the session DB."""

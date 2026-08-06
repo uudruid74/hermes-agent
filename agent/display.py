@@ -1531,10 +1531,8 @@ def _get_cute_tool_message(
             parts.append(f"subject: \"{_trunc(args['subject'], 18)}\"")
         if args.get("temperature") is not None:
             parts.append(f"T={args['temperature']}")
-        # Count emotional axes that were passed
-        axis_count = sum(1 for k in ("safe", "hope", "inclusion", "self", "bearing") if args.get(k))
-        if axis_count:
-            parts.append(f"{axis_count} axis{'es' if axis_count != 1 else ''}")
+        if args.get("ego"):
+            parts.append(f"ego: \"{_trunc(args['ego'], 15)}\"")
         if args.get("fact"):
             parts.append("fact")
         detail = ", ".join(parts) if parts else "session update"

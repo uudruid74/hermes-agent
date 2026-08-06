@@ -4525,6 +4525,133 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return raw
         return {}
 
+    # ── Mood (ego-based session sentiment) ──
+
+    def set_session_mood(self, session_id: str, delta: float) -> float:
+        """Add *delta* to the session mood and return the new value."""
+        if not session_id:
+            return 0.0
+        result = [0.0]
+        def _do(conn):
+            conn.execute(
+                "UPDATE sessions SET mood = mood + ? WHERE id = ?",
+                (delta, session_id),
+            )
+            row = conn.execute(
+                "SELECT mood FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            if row:
+                result[0] = float(row[0] if isinstance(row, tuple) else row["mood"])
+        self._execute_write(_do)
+        return result[0]
+
+    def get_session_mood(self, session_id: str) -> float:
+        """Return the current session mood value (0.0 if session not found)."""
+        if not session_id:
+            return 0.0
+        row = self.get_session(session_id)
+        if row:
+            return float(row.get("mood", 0.0))
+        return 0.0
+
+    def apply_mood_decay(self, session_id: str) -> float:
+        """Move session mood toward 0 by 0.1 per turn. Returns new mood."""
+        if not session_id:
+            return 0.0
+        result = [0.0]
+        def _do(conn):
+            row = conn.execute(
+                "SELECT mood FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            if not row:
+                return
+            mood = float(row[0] if isinstance(row, tuple) else row["mood"])
+            if mood > 0:
+                mood = max(0.0, mood - 0.1)
+            elif mood < 0:
+                mood = min(0.0, mood + 0.1)
+            conn.execute(
+                "UPDATE sessions SET mood = ? WHERE id = ?", (mood, session_id)
+            )
+            result[0] = mood
+        self._execute_write(_do)
+        return result[0]
+
+    # ── Agent rating (cross-session, per-agent) ──
+
+    def get_agent_rating(self, agent_name: str) -> float:
+        """Return the per-agent rating, seeding to 20.0 if no row exists."""
+        if not agent_name:
+            return 20.0
+        result = [20.0]
+        def _do(conn):
+            row = conn.execute(
+                "SELECT rating FROM agent_state WHERE agent_name = ?",
+                (agent_name,),
+            ).fetchone()
+            if row:
+                result[0] = float(row[0] if isinstance(row, tuple) else row["rating"])
+            else:
+                # Seed to 20.0 (Evan 2026-08-06)
+                conn.execute(
+                    "INSERT INTO agent_state (agent_name, rating) VALUES (?, 20.0)",
+                    (agent_name,),
+                )
+                result[0] = 20.0
+        self._execute_write(_do)
+        return result[0]
+
+    def update_agent_rating(self, agent_name: str, delta: float) -> float:
+        """Adjust agent rating by *delta*, seeding row if absent. Returns new rating."""
+        if not agent_name:
+            return 20.0
+        result = [20.0]
+        def _do(conn):
+            conn.execute(
+                "INSERT INTO agent_state (agent_name, rating) VALUES (?, 20.0) "
+                "ON CONFLICT(agent_name) DO UPDATE SET rating = rating + ?",
+                (agent_name, delta),
+            )
+            row = conn.execute(
+                "SELECT rating FROM agent_state WHERE agent_name = ?",
+                (agent_name,),
+            ).fetchone()
+            if row:
+                result[0] = float(row[0] if isinstance(row, tuple) else row["rating"])
+        self._execute_write(_do)
+        return result[0]
+
+    def set_agent_last_ego(self, agent_name: str, ego_tag: str) -> None:
+        """Record the last ego tag for an agent (for injection when mood < 0)."""
+        if not agent_name:
+            return
+        def _do(conn):
+            conn.execute(
+                "UPDATE agent_state SET last_ego = ?, updated_at = strftime('%s', 'now') "
+                "WHERE agent_name = ?",
+                (ego_tag, agent_name),
+            )
+        self._execute_write(_do)
+
+    def get_agent_last_ego(self, agent_name: str) -> Optional[str]:
+        """Return the last recorded ego tag, or None."""
+        if not agent_name:
+            return None
+        row = None
+        def _do(conn):
+            nonlocal row
+            row = conn.execute(
+                "SELECT last_ego FROM agent_state WHERE agent_name = ?",
+                (agent_name,),
+            ).fetchone()
+        try:
+            self._execute_write(_do)  # read-only but needs lock
+        except Exception:
+            return None
+        if row:
+            return (row[0] if isinstance(row, tuple) else row["last_ego"])
+        return None
+
     def update_session_billing_route(
         self,
         session_id: str,

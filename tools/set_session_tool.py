@@ -4,41 +4,43 @@ Session Metadata Tool — set session-level state.
 
 Replaces the old ``adjust_temperature`` tool with a broader ``set_session``
 that accepts optional key:value pairs for session metadata including
-temperature, subject changes, fact persistence, and emotional axes.
+temperature, subject changes, fact persistence, and ego (mood).
 
 Arguments (all optional):
     subject: str       — topic change; if no temperature, resets to default
     fact: str          — persistence anchor → fabric_write
     temperature: float — set session temperature (0.0–2.0)
-    safe: str          — threat→safety, e.g. "-0.7 < Evan is very angry"
-    hope: str          — expect fail→expect success
-    inclusion: str     — rejected→included
-    self: str          — doing poorly→doing well
-    bearing: str       — confused→curious
-
-Each axis string is parsed as: value [glyph] [reason]
-  value:  signed float −1..+1
-  glyph:  < incoming | > internal | * ambient  (default: <)
-  reason: free text
+    ego: str           — one of [poor, low, normal, happy, loved] + optional reason
+                         e.g. "happy implemented new vision system"
 """
 
 import json
 import re
-from typing import Any, Optional, Tuple
+from typing import Any, Optional
 
 
-_AXIS_PARSE_RE = re.compile(r"^\s*([-+]?\d*\.?\d+)\s*([<*>])?\s*(.*)$")
+# Map ego words to mood deltas
+_EGO_DELTA = {
+    "poor": -1.0,
+    "low": -0.5,
+    "normal": 0.0,
+    "happy": 0.5,
+    "loved": 1.0,
+}
+
+# Regex to extract the ego word from the beginning of the ego string
+_EGO_PARSE_RE = re.compile(r"^\s*(poor|low|normal|happy|loved)\b\s*(.*)$", re.IGNORECASE)
 
 
-def _parse_axis(raw: str) -> Tuple[float, str, str]:
-    """Parse an axis string into (value, glyph, reason). Default glyph: '<'."""
-    m = _AXIS_PARSE_RE.match(raw.strip())
+def _parse_ego(raw: str) -> Optional[tuple[str, float, str]]:
+    """Parse an ego string into (word_lower, delta, reason). Returns None if no match."""
+    m = _EGO_PARSE_RE.match(raw.strip())
     if not m:
-        return 0.0, "<", raw.strip()
-    val = float(m.group(1))
-    glyph = m.group(2) or "<"
-    reason = m.group(3).strip()
-    return val, glyph, reason
+        return None
+    word = m.group(1).lower()
+    reason = m.group(2).strip()
+    delta = _EGO_DELTA.get(word, 0.0)
+    return word, delta, reason
 
 
 def _is_kimi_provider(agent) -> bool:
@@ -51,15 +53,10 @@ def set_session_tool(
     subject: Optional[str] = None,
     fact: Optional[str] = None,
     temperature: Optional[float] = None,
-    safe: Optional[str] = None,
-    hope: Optional[str] = None,
-    inclusion: Optional[str] = None,
-    self_val: Optional[str] = None,
-    bearing: Optional[str] = None,
+    ego: Optional[str] = None,
 ) -> str:
     """Set one or more session-level metadata values."""
     changes = []
-    axes_storage = {}
 
     # ── temperature ──
     if temperature is not None:
@@ -83,16 +80,16 @@ def set_session_tool(
     # ── fact → fabric ──
     if fact is not None:
         try:
-            extra = []
-            for axis, raw in [("safe", safe), ("hope", hope),
-                              ("inclusion", inclusion), ("self", self_val),
-                              ("bearing", bearing)]:
-                if raw is not None:
-                    val, glyph, reason = _parse_axis(raw)
-                    extra.append(f"{axis}: {val:.2f}{glyph} {reason}" if reason else f"{axis}: {val:.2f}{glyph}")
             full_fact = fact
-            if extra:
-                full_fact = fact + "  [" + ", ".join(extra) + "]"
+            if ego is not None:
+                parsed = _parse_ego(ego)
+                if parsed:
+                    word, delta, reason = parsed
+                    tag = f"[ego: {word}"
+                    if reason:
+                        tag += f" — {reason}"
+                    tag += "]"
+                    full_fact = fact + "  " + tag
 
             from tools.registry import registry
             registry.dispatch(
@@ -103,44 +100,59 @@ def set_session_tool(
         except Exception as e:
             changes.append(f"fact: write failed ({e})")
 
-    # ── emotional axes ──
-    axis_names = [("safe", safe), ("hope", hope), ("inclusion", inclusion),
-                  ("self", self_val), ("bearing", bearing)]
-    for axis, raw in axis_names:
-        if raw is None:
-            continue
-        val, glyph, reason = _parse_axis(raw)
-        clipped = max(-1.0, min(1.0, val))
-        axes_storage[axis] = {"value": clipped, "glyph": glyph, "reason": reason}
-        desc = f"{axis}: {clipped:.2f}{glyph}"
-        if reason:
-            desc += f" {reason}"
-        changes.append(desc)
-
-    # ── persist subject + axes to session DB ──
-    if (subject is not None or axes_storage) and agent is not None:
-        try:
-            session_id = getattr(agent, "session_id", None)
-            if session_id:
+    # ── ego → mood + agent rating ──
+    if ego is not None and agent is not None:
+        parsed = _parse_ego(ego)
+        if parsed:
+            word, delta, reason = parsed
+            try:
                 from hermes_state import SessionDB
                 db = SessionDB()
-                if subject is not None:
-                    db.set_session_subject(session_id, subject)
-                if axes_storage:
-                    db.set_session_axes(session_id, axes_storage)
-                changes.append("session: persisted")
-        except Exception as e:
-            changes.append(f"session: persist failed ({e})")
+                session_id = getattr(agent, "session_id", None)
 
-    # ── session-meta tags ──
-    if axes_storage:
-        meta_parts = []
-        for axis in ["safe", "hope", "inclusion", "self", "bearing"]:
-            a = axes_storage.get(axis)
-            if a:
-                meta_parts.append(f"{axis}: {a['value']:.2f}{a['glyph']}")
-        session_meta = "<session-meta>" + " | ".join(meta_parts) + "</session-meta>"
-        changes.append(session_meta)
+                new_mood = 0.0
+                if session_id:
+                    # Update session mood
+                    new_mood = db.set_session_mood(session_id, delta)
+                    changes.append(f"mood: {delta:+.1f} → {new_mood:.2f}")
+
+                    # Persist subject if provided
+                    if subject is not None:
+                        db.set_session_subject(session_id, subject)
+
+                # Update agent rating (cross-session)
+                agent_name = getattr(agent, "agent_name", None)
+                if not agent_name:
+                    # Fall back to profile name
+                    try:
+                        from hermes_cli.profiles import get_active_profile_name
+                        agent_name = get_active_profile_name() or "neo"
+                    except Exception:
+                        agent_name = "neo"
+
+                new_rating = db.update_agent_rating(agent_name, delta)
+                db.set_agent_last_ego(agent_name, ego)
+                changes.append(f"rating: {new_rating:.1f} ({delta:+.1f})")
+
+                # Tag session for Telegram ego-tagging (only tag on explicit ego set)
+                if session_id:
+                    try:
+                        from gateway.platforms.telegram import TelegramAdapter
+                        TelegramAdapter._ego_tag_session(session_id)
+                    except Exception:
+                        pass
+
+                # Build ego tag
+                ego_tag = f"<ego>{word}"
+                if reason:
+                    ego_tag += f" — {reason}"
+                ego_tag += f" (mood {new_mood:+.2f}, rating {new_rating:.1f})</ego>"
+                # Store on agent for injection
+                agent._last_ego_tag = ego_tag
+            except Exception as e:
+                changes.append(f"ego: persist failed ({e})")
+        else:
+            changes.append(f"ego: unrecognized — must start with poor|low|normal|happy|loved")
 
     if not changes:
         return json.dumps({"message": "set_session called with no arguments"})
@@ -158,9 +170,9 @@ SET_SESSION_SCHEMA = {
         "Pass 'subject' to note a topic change (resets temperature to default "
         "if no explicit temperature given). "
         "Pass 'fact' to persist a key observation to fabric. "
-        "Pass emotional axes as strings: value [glyph] [reason]. "
-        "Glyph: < incoming | > internal | * ambient (default <). "
-        "Example: safe: '-0.7 < Evan is very angry'"
+        "Pass 'ego' to set your emotional state: one of [poor, low, normal, happy, loved] "
+        "followed by an optional reason. "
+        "Example: ego: 'happy implemented new vision system'"
     ),
     "parameters": {
         "type": "object",
@@ -179,25 +191,9 @@ SET_SESSION_SCHEMA = {
                 "maximum": 2.0,
                 "description": "Set sampling temperature (0.0=deterministic, 1.0=balanced, 2.0=creative)."
             },
-            "safe": {
+            "ego": {
                 "type": "string",
-                "description": "Threat→safety. Format: value [glyph] [reason]. e.g. '-0.7 < Evan is angry'"
-            },
-            "hope": {
-                "type": "string",
-                "description": "Expect failure→expect success. Format: value [glyph] [reason]."
-            },
-            "inclusion": {
-                "type": "string",
-                "description": "Rejected→included. Format: value [glyph] [reason]."
-            },
-            "self": {
-                "type": "string",
-                "description": "Doing poorly→doing well. Format: value [glyph] [reason]."
-            },
-            "bearing": {
-                "type": "string",
-                "description": "Confused→curious. Format: value [glyph] [reason]."
+                "description": "Emotional state: one of [poor, low, normal, happy, loved] + optional reason. e.g. 'happy implemented new feature'"
             },
         },
     },
@@ -217,11 +213,7 @@ registry.register(
         subject=args.get("subject"),
         fact=args.get("fact"),
         temperature=args.get("temperature"),
-        safe=args.get("safe"),
-        hope=args.get("hope"),
-        inclusion=args.get("inclusion"),
-        self_val=args.get("self"),
-        bearing=args.get("bearing"),
+        ego=args.get("ego"),
     ),
     emoji="📝",
 )
