@@ -172,11 +172,17 @@ def _assert_not_delegated_child_mutation() -> None:
     mutator that uses ``write_txn`` (tasks, runs, comments, attachments,
     dispatcher claims, repair events, subscriptions, GC, etc.) and every board
     metadata mutator fails closed before touching durable state.
+
+    Uses :func:`~agent.delegation_context.is_delegated_child_context` (the
+    ``ContextVar``-only check) as the primary signal so a leaked
+    ``HERMES_DELEGATED_CHILD_CONTEXT`` env var in the gateway process does not
+    cause false-positive rejection. The env-var fallback is retained only for
+    the import-failure edge case.
     """
     try:
-        from agent.delegation_context import is_delegated_child_process_context
+        from agent.delegation_context import is_delegated_child_context
 
-        delegated = is_delegated_child_process_context()
+        delegated = is_delegated_child_context()
     except Exception:
         delegated = bool(os.environ.get("HERMES_DELEGATED_CHILD_CONTEXT"))
     if delegated:

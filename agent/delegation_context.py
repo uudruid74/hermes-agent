@@ -37,8 +37,18 @@ def delegated_child_context(session_id: str | None = None) -> Iterator[None]:
     Child construction calls ``set_current_session_id`` internally, so even a
     context entered without an id must restore the parent's ContextVar.  Child
     execution passes its explicit id and receives it only for this scope.
+
+    The env marker ``HERMES_DELEGATED_CHILD_CONTEXT`` is saved/restored so it
+    is process-local to the actual delegated child and does not leak into the
+    parent gateway process environment after the child exits. Without this,
+    a stale marker poisons all terminal subprocesses spawned by the gateway
+    (they inherit gateway env), causing false-positive kanban mutation guards.
     """
+    import os
+
     token = _DELEGATED_CHILD_CONTEXT.set(True)
+    previous_env = os.environ.get(DELEGATED_CHILD_ENV_MARKER)
+    os.environ[DELEGATED_CHILD_ENV_MARKER] = "1"
     try:
         # Import lazily: session_context calls is_delegated_child_context() when
         # deciding whether the compatibility os.environ mirror is safe.
@@ -48,6 +58,10 @@ def delegated_child_context(session_id: str | None = None) -> Iterator[None]:
             yield
     finally:
         _DELEGATED_CHILD_CONTEXT.reset(token)
+        if previous_env is None:
+            os.environ.pop(DELEGATED_CHILD_ENV_MARKER, None)
+        else:
+            os.environ[DELEGATED_CHILD_ENV_MARKER] = previous_env
 
 
 def is_delegated_child_context() -> bool:

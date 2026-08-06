@@ -296,3 +296,52 @@ def test_child_attempting_default_complete_does_not_finish_parent_or_delete_work
     assert task.status == "running"
     assert run.status == "running"
     assert workspace.is_dir()
+
+
+def test_stale_env_marker_does_not_block_kanban_in_gateway(monkeypatch, tmp_path):
+    """A leaked HERMES_DELEGATED_CHILD_CONTEXT=1 in the gateway must NOT block
+    kanban reads or mutations from a non-delegated (ContextVar=False) process.
+
+    Regression for: a stale marker leaked into the gateway env (from a prior
+    delegate_task child subprocess) poisoned every ``hermes kanban`` CLI call
+    because the gate relied on ``is_delegated_child_process_context()`` which
+    checks ``os.environ``. The fix makes the gate use the ContextVar-only
+    ``is_delegated_child_context()`` as the primary signal.
+    """
+    # Simulate a leaked env marker — gateway has it but is NOT delegated
+    monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", "1")
+
+    kb, tid, workspace, _attachments_root = _make_running_kanban_task(
+        monkeypatch, tmp_path,
+    )
+
+    # --- reads must work with stale marker ---
+    from hermes_cli import kanban_db as kb_read
+    conn = kb_read.connect()
+    try:
+        task = kb_read.get_task(conn, tid)
+        assert task is not None
+        assert task.title == "parent"
+        tasks = kb_read.list_tasks(conn)
+        assert len(tasks) >= 1
+    finally:
+        conn.close()
+
+    # --- mutations must work with stale marker ---
+    conn = kb.connect()
+    try:
+        new_tid = kb.create_task(conn, title="gateway-mutation-test")
+        assert new_tid.startswith("t_")
+
+        kb.add_comment(conn, new_tid, "gateway comment should succeed")
+        comments = kb.get_comments(conn, new_tid)
+        assert len(comments) == 1
+        assert comments[0].body == "gateway comment should succeed"
+    finally:
+        conn.close()
+
+    # --- ContextVar must still report False (gateway is not delegated) ---
+    from agent.delegation_context import is_delegated_child_context
+    assert not is_delegated_child_context(), (
+        "gateway must not report as delegated child even with stale env marker"
+    )
