@@ -9670,13 +9670,55 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if not raw_args:
             agent = getattr(self, "agent", None)
             temp = getattr(agent, "_session_temperature", None) if agent else None
+            ego_tag = getattr(agent, "_last_ego_tag", None) if agent else None
             if temp is not None:
-                _cprint(f"  📝 Temperature: {temp:.2f}")
+                _cprint(f"  \U0001f4dd Temperature: {temp:.2f}")
             else:
-                _cprint(f"  📝 Session: use /session temperature=N to set")
+                _cprint(f"  \U0001f4dd Temperature: default")
+            if ego_tag:
+                _cprint(f"  \U0001f4dd Ego: {ego_tag}")
+            _cprint(f"  \U0001f4dd Usage: /session temperature=N, /session ego=happy, /session subject=topic")
             return
         # Parse key=value or key:value pairs
-        _cprint(f"  📝 Use set_session tool for complex session metadata")
+        from tools.set_session_tool import set_session_tool
+        args: dict[str, Any] = {}
+        for segment in raw_args.split():
+            if "=" in segment:
+                k, v = segment.split("=", 1)
+            elif ":" in segment:
+                k, v = segment.split(":", 1)
+            else:
+                # Plain number → temperature
+                try:
+                    val = float(segment)
+                    args["temperature"] = val
+                    continue
+                except ValueError:
+                    _cprint(f"  \u2717 Unknown arg: {segment!r}")
+                    return
+            k = k.strip().lower()
+            v = v.strip()
+            if k == "temperature":
+                try:
+                    args["temperature"] = float(v)
+                except ValueError:
+                    _cprint(f"  \u2717 Invalid temperature: {v!r}")
+                    return
+            elif k in ("ego", "mood"):
+                args["ego"] = v
+            elif k == "subject":
+                args["subject"] = v
+            elif k == "fact":
+                args["fact"] = v
+            else:
+                _cprint(f"  \u2717 Unknown key: {k!r}")
+                return
+        agent = getattr(self, "agent", None)
+        if agent and args:
+            result = set_session_tool(agent=agent, **args)
+            _cprint(f"  \U0001f4dd {result}")
+        else:
+            _cprint(f"  \u2717 No agent available")
 
     def _should_handle_model_command_inline(self, text: str, has_images: bool = False) -> bool:
         """Return True when /model should be handled immediately on the UI thread."""

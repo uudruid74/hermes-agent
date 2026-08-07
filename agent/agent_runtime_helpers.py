@@ -2990,11 +2990,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                     subject=next_args.get("subject"),
                     fact=next_args.get("fact"),
                     temperature=next_args.get("temperature"),
-                    safe=next_args.get("safe"),
-                    hope=next_args.get("hope"),
-                    inclusion=next_args.get("inclusion"),
-                    self_val=next_args.get("self"),
-                    bearing=next_args.get("bearing"),
+                    ego=next_args.get("ego"),
                 ),
                 next_args,
             )

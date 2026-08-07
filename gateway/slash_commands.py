@@ -2503,19 +2503,59 @@ class GatewaySlashCommandsMixin:
                 agent = cached_entry[0]
         if not raw_args:
             agent_temp = getattr(agent, "_session_temperature", None) if agent else None
+            ego_tag = getattr(agent, "_last_ego_tag", None) if agent else None
+            lines = []
             if agent_temp is not None:
-                return f"\U0001f4dd Temperature: {agent_temp:.2f}"
-            return "\U0001f4dd Session: use /session temperature=N or set_session tool"
-        try:
-            val = float(raw_args.split()[0])
-        except ValueError:
-            return f"\u2717 Invalid: {raw_args.split()[0]!r} — use /session <0.0\u20132.0> for temperature"
-        if not (0.0 <= val <= 2.0):
-            return f"\u2717 Temperature must be 0.0\u20132.0 (got {val})"
-        if agent:
-            agent._session_temperature = val
-        self._save_gateway_config_key("model.worker_temperature", val)
-        return f"\U0001f4dd Temperature set to {val:.2f} (saved)"
+                lines.append(f"\U0001f4dd Temperature: {agent_temp:.2f}")
+            else:
+                lines.append("\U0001f4dd Temperature: default")
+            if ego_tag:
+                lines.append(f"\U0001f4dd Ego: {ego_tag}")
+            lines.append("\U0001f4dd Usage: /session temperature=N, /session ego=happy, /session subject=topic")
+            return "\n".join(lines)
+
+        # Parse: key=value, key:value, or plain number for temperature
+        from tools.set_session_tool import set_session_tool
+        args = {}
+        for segment in raw_args.split():
+            if "=" in segment:
+                k, v = segment.split("=", 1)
+            elif ":" in segment:
+                k, v = segment.split(":", 1)
+            else:
+                # Plain number → temperature
+                try:
+                    val = float(segment)
+                    args["temperature"] = val
+                    continue
+                except ValueError:
+                    return f"\u2717 Unknown arg: {segment!r}"
+            k = k.strip().lower()
+            v = v.strip()
+            if k == "temperature":
+                try:
+                    args["temperature"] = float(v)
+                except ValueError:
+                    return f"\u2717 Invalid temperature: {v!r}"
+            elif k in ("ego", "mood"):
+                args["ego"] = v
+            elif k == "subject":
+                args["subject"] = v
+            elif k == "fact":
+                args["fact"] = v
+            else:
+                return f"\u2717 Unknown key: {k!r}"
+
+        if agent and args:
+            result = set_session_tool(agent=agent, **args)
+            return f"\U0001f4dd {result}"
+
+        # Fallback: just temperature if no agent (legacy behavior)
+        if "temperature" in args and agent:
+            agent._session_temperature = args["temperature"]
+            self._save_gateway_config_key("model.worker_temperature", args["temperature"])
+            return f"\U0001f4dd Temperature set to {args['temperature']:.2f} (saved)"
+        return "\u2717 No active agent to apply session settings"
 
     async def _handle_personality_command(self, event: MessageEvent) -> str:
         """Handle /personality command - list or set a personality."""

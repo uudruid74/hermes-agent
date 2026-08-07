@@ -347,7 +347,7 @@ def _build_ratings_injection(agent) -> str:
                 agent_name = "neo"
         rating = db.get_agent_rating(agent_name)
 
-        block = f"Ratings: Average [{rating:.1f}], Session [{mood:.2f}], Mood [{mood:.2f}]"
+        block = f"Ratings: Average [{rating:.1f}], Session [{rating:.1f}], Mood [{mood:.2f}]"
 
         if mood < 0:
             last_ego = db.get_agent_last_ego(agent_name)
