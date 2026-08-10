@@ -165,6 +165,49 @@ def _stamp_worker_session_metadata(
     return stamped
 
 
+def _load_gateway_profile_env(env: dict) -> None:
+    """Load gateway (gopher) profile credentials into *env* so notification
+    subprocesses can reach messaging platforms even when the current profile
+    (e.g. a kanban worker) doesn't have platform credentials configured.
+
+    The gopher profile lives alongside the current profile under the shared
+    ``~/.hermes/profiles/`` directory.  We derive its path from
+    ``HERMES_HOME`` (which in hermetic worker environments points to the
+    current profile's directory, e.g. ``.../profiles/neo``).
+
+    Two things are needed for ``hermes send`` to deliver:
+    1. Platform credentials (bot tokens) from ``.env``.
+    2. Platform config blocks (``telegram: enabled: true``) from
+       ``config.yaml`` — resolved via ``HERMES_HOME``.
+    We set ``HERMES_HOME`` / ``HERMES_PROFILE`` to the gateway profile so
+    both resolve correctly inside the subprocess.
+    """
+    hermes_home = os.environ.get("HERMES_HOME")
+    if not hermes_home:
+        return
+    from pathlib import Path
+    profiles_dir = Path(hermes_home).parent  # .../profiles/
+    env_path = profiles_dir / "gopher" / ".env"
+    gopher_home = str(profiles_dir / "gopher")
+
+    # Redirect the subprocess to use the gateway profile's config so
+    # ``load_gateway_config()`` finds the platform blocks.  Override (do
+    # NOT setdefault) — the current profile's HERMES_HOME must be replaced,
+    # not preserved.
+    env["HERMES_HOME"] = gopher_home
+    env["HERMES_PROFILE"] = "gopher"
+
+    if not env_path.exists():
+        return
+    try:
+        from dotenv import dotenv_values
+        for key, val in dotenv_values(str(env_path)).items():
+            if key not in env:
+                env[key] = val
+    except Exception:
+        pass
+
+
 def _notify_kanban_event(tid: str, status: str, summary: Optional[str], task) -> None:
     """Fire a best-effort notification when a task changes status.
 
@@ -222,15 +265,19 @@ def _notify_kanban_event(tid: str, status: str, summary: Optional[str], task) ->
         })
 
         import subprocess
-        subprocess.run(
-            ["hermes", "send", "-t", target, human_msg],
-            capture_output=True, timeout=10,
-        )
-        # Pass chat_type via environment so the bridge/adapter handlers
-        # construct the SessionSource with the correct chat_type instead
-        # of hardcoding "group" — prevents session-key mismatch (fork).
+
+        # Build a notification environment that carries the gateway
+        # profile's platform credentials (Telegram bot token, etc.) so
+        # ``hermes send`` can deliver even when the current profile
+        # (e.g. a kanban worker like Neo) doesn't have them configured.
         notify_env = os.environ.copy()
         notify_env["HERMES_NOTIFY_CHAT_TYPE"] = chat_type
+        _load_gateway_profile_env(notify_env)
+
+        subprocess.run(
+            ["hermes", "send", "-t", target, human_msg],
+            capture_output=True, timeout=10, env=notify_env,
+        )
         subprocess.run(
             ["hermes", "send", "-u", target, json_payload],
             capture_output=True, timeout=10, env=notify_env,

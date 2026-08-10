@@ -1231,6 +1231,36 @@ _NOTIFY_EMOJI = {
     "archived": "📦",
 }
 
+def _load_gateway_profile_env(env: dict) -> None:
+    """Load gateway (gopher) profile credentials into *env*.
+
+    See the identically-named function in ``tools/kanban_tools.py`` for docs.
+    """
+    hermes_home = os.environ.get("HERMES_HOME")
+    if not hermes_home:
+        return
+    profiles_dir = Path(hermes_home).parent  # .../profiles/
+    env_path = profiles_dir / "gopher" / ".env"
+    gopher_home = str(profiles_dir / "gopher")
+
+    # Redirect the subprocess to use the gateway profile's config so
+    # ``load_gateway_config()`` finds the platform blocks.  Override (do
+    # NOT setdefault) — the current profile's HERMES_HOME must be replaced,
+    # not preserved.
+    env["HERMES_HOME"] = gopher_home
+    env["HERMES_PROFILE"] = "gopher"
+
+    if not env_path.exists():
+        return
+    try:
+        from dotenv import dotenv_values
+        for key, val in dotenv_values(str(env_path)).items():
+            if key not in env:
+                env[key] = val
+    except Exception:
+        pass
+
+
 def _notify_kanban_status_change(
     task_id: str,
     new_status: str,
@@ -1297,20 +1327,23 @@ def _notify_kanban_status_change(
     })
 
     import subprocess
+
+    # Build a notification environment that carries the gateway
+    # profile's platform credentials so ``hermes send`` can deliver
+    # even when the current CLI profile doesn't have them configured.
+    notify_env = os.environ.copy()
+    notify_env["HERMES_NOTIFY_CHAT_TYPE"] = chat_type
+    _load_gateway_profile_env(notify_env)
+
     try:
         subprocess.run(
             ["hermes", "send", "-t", target, human_msg],
-            capture_output=True, timeout=10,
+            capture_output=True, timeout=10, env=notify_env,
         )
     except Exception:
         pass
 
     try:
-        # Pass chat_type via environment so the bridge/adapter handlers
-        # construct the SessionSource with the correct chat_type instead
-        # of hardcoding "group" — prevents session-key mismatch (fork).
-        notify_env = os.environ.copy()
-        notify_env["HERMES_NOTIFY_CHAT_TYPE"] = chat_type
         subprocess.run(
             ["hermes", "send", "-u", target, json_payload],
             capture_output=True, timeout=10, env=notify_env,
