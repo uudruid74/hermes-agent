@@ -3709,6 +3709,96 @@ def list_comments_after(
 
 
 # ---------------------------------------------------------------------------
+# Origin routing (system comments for notification delivery)
+# ---------------------------------------------------------------------------
+
+_ORIGIN_MARKER = "__kanban_origin__"
+
+
+def store_origin_routing(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    platform: str,
+    chat_id: str,
+    thread_id: str = "",
+    chat_type: str = "",
+) -> None:
+    """Persist the chat origin that created this task as a system comment.
+
+    The watcher reads this to route notifications back to the originating
+    channel instead of falling back to the generic home channel.  Uses a
+    structured marker (``__kanban_origin__`` + JSON) embedded in a system
+    comment so no schema changes are needed — the body is opaque to
+    downstream display and the watcher can extract it reliably.
+
+    Idempotent: only writes if no origin comment exists for the task yet.
+    Does NOT emit a ``commented`` event — this is infrastructure metadata,
+    not a user-visible notification.
+    """
+    import json
+
+    # Escape _ for SQLite LIKE: _ is a single-char wildcard.
+    _escaped_marker = _ORIGIN_MARKER.replace("_", "\\_")
+    existing = conn.execute(
+        "SELECT 1 FROM task_comments"
+        " WHERE task_id = ? AND author = 'system' AND body LIKE ? ESCAPE '\\'"
+        " LIMIT 1",
+        (task_id, f"{_escaped_marker}%"),
+    ).fetchone()
+    if existing:
+        return  # already stored; idempotent
+
+    payload = json.dumps(
+        {
+            "platform": platform,
+            "chat_id": chat_id,
+            "thread_id": thread_id or "",
+            "chat_type": chat_type or "",
+        }
+    )
+    body = f"{_ORIGIN_MARKER}{payload}"
+    now = int(time.time())
+    with write_txn(conn):
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at)"
+            " VALUES (?, 'system', ?, ?)",
+            (task_id, body, now),
+        )
+
+
+def get_origin_routing(
+    conn: sqlite3.Connection, task_id: str
+) -> "dict | None":
+    """Extract origin routing info from a task's system comments.
+
+    Returns a dict with ``platform``, ``chat_id``, ``thread_id``,
+    and ``chat_type`` if the
+    task was created from a chat with origin tracking, or ``None`` for
+    CLI-created / legacy tasks.
+    """
+    import json
+
+    # Escape _ for SQLite LIKE: _ is a single-char wildcard.
+    _escaped_marker = _ORIGIN_MARKER.replace("_", "\\_")
+    row = conn.execute(
+        "SELECT body FROM task_comments"
+        " WHERE task_id = ? AND author = 'system' AND body LIKE ? ESCAPE '\\'"
+        " ORDER BY created_at ASC LIMIT 1",
+        (task_id, f"{_escaped_marker}%"),
+    ).fetchone()
+    if not row:
+        return None
+    try:
+        payload = json.loads(row["body"][len(_ORIGIN_MARKER):])
+        if isinstance(payload, dict) and payload.get("platform") and payload.get("chat_id"):
+            return payload
+    except (json.JSONDecodeError, KeyError, IndexError):
+        pass
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Attachments
 # ---------------------------------------------------------------------------
 

@@ -1615,6 +1615,52 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
     return 0
 
 
+def _store_cli_origin_routing(conn, task_id: str, channel_flag: str) -> None:
+    """Parse --channel flag and store origin routing via kanban_db.
+
+    Format: platform:chat_id[:thread_id]
+    """
+    parts = channel_flag.split(":", 1)
+    platform = parts[0].strip().lower()
+    chat_id = ""
+    thread_id = ""
+    chat_type = ""
+    if len(parts) > 1:
+        remaining = parts[1].strip()
+        # Try to extract thread_id from the remaining part.
+        # Platform-specific parsing: try numeric:thread format
+        colon_idx = remaining.rfind(":")
+        if colon_idx > 0:
+            maybe_chat = remaining[:colon_idx].strip()
+            maybe_thread = remaining[colon_idx + 1:].strip()
+            # Heuristic: if the last segment looks like a thread_id
+            # (numeric, starts with -, or contains topic), use it.
+            # Otherwise treat the whole thing as chat_id.
+            if maybe_thread and (maybe_thread.lstrip("-").isdigit() or maybe_thread.startswith("topic ")):
+                chat_id = maybe_chat
+                thread_id = maybe_thread
+            else:
+                chat_id = remaining
+        else:
+            chat_id = remaining
+    if not platform or not chat_id:
+        print(
+            f"kanban: --channel requires format 'platform:chat_id[:thread_id]'. "
+            f"Got: '{channel_flag}'",
+            file=sys.stderr,
+        )
+        return
+    try:
+        kb.store_origin_routing(
+            conn, task_id,
+            platform=platform, chat_id=chat_id,
+            thread_id=thread_id or "",
+            chat_type=chat_type or "",
+        )
+    except Exception as exc:
+        print(f"kanban: failed to store origin routing: {exc}", file=sys.stderr)
+
+
 def _cmd_create(args: argparse.Namespace) -> int:
     try:
         ws_kind, ws_path = _parse_workspace_flag(args.workspace)
@@ -1664,6 +1710,26 @@ def _cmd_create(args: argparse.Namespace) -> int:
             initial_status=getattr(args, "initial_status", "running"),
         )
         task = kb.get_task(conn, task_id)
+        # Store origin routing for CLI-created tasks.
+        # Priority: --channel flag > env vars > nothing.
+        channel_flag = getattr(args, "channel", None)
+        if channel_flag:
+            _store_cli_origin_routing(conn, task_id, channel_flag)
+        else:
+            _platform = os.environ.get("HERMES_SESSION_PLATFORM", "").strip()
+            _chat_id = os.environ.get("HERMES_SESSION_CHAT_ID", "").strip()
+            _thread_id = os.environ.get("HERMES_SESSION_THREAD_ID", "").strip()
+            _chat_type = os.environ.get("HERMES_SESSION_CHAT_TYPE", "").strip()
+            if _platform and _chat_id:
+                try:
+                    kb.store_origin_routing(
+                        conn, task_id,
+                        platform=_platform, chat_id=_chat_id,
+                        thread_id=_thread_id or "",
+                        chat_type=_chat_type or "",
+                    )
+                except Exception as exc:
+                    print(f"kanban: failed to store origin routing from env: {exc}", file=sys.stderr)
     if getattr(args, "json", False):
         print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))
     else:
@@ -1680,6 +1746,10 @@ def _cmd_create(args: argparse.Namespace) -> int:
             running, message = _check_dispatcher_presence()
             if not running and message:
                 print(f"\n⚠  {message}", file=sys.stderr)
+    _notify_kanban_status_change(
+        task.id, task.status,
+        title=task.title,
+    )
     return 0
 
 

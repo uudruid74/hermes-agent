@@ -1539,6 +1539,16 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
             notifier_profile=notifier_profile,
             delivery_metadata=delivery_metadata or None,
         )
+        # Store origin routing as a system comment so the watcher can
+        # always find the right channel — even if the subscription is
+        # later lost/overwritten, the origin comment survives as the
+        # source of truth.
+        _kb.store_origin_routing(
+            conn, task_id=task_id,
+            platform=platform, chat_id=chat_id,
+            thread_id=thread_id or "",
+            chat_type=chat_type or "",
+        )
         return True
     except Exception as _exc:
         logger.warning(
