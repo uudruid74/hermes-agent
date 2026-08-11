@@ -40,16 +40,6 @@ def _get_session_id(agent) -> Optional[str]:
     return getattr(agent, "session_id", None) or os.environ.get("HERMES_SESSION_ID")
 
 
-def _find_active_session_db(sdb) -> Optional[str]:
-    """Query state.db for the most recent session id."""
-    try:
-        with sdb._read_ctx() as c:
-            row = c.execute(
-                "SELECT id, subject FROM sessions ORDER BY rowid DESC LIMIT 1"
-            ).fetchone()
-        return (row["id"], row["subject"]) if row else ("", "")
-    except Exception:
-        return (None, None)
 
 def _get_task_id(agent) -> Optional[str]:
     return os.environ.get("HERMES_KANBAN_TASK")
@@ -166,8 +156,18 @@ def _cmd_new(agent, title: str, goal: str, steps: List[str],
 
         # Set session task_id and subject (save old subject first)
         sdb = _get_session_db()
-        session_id, old_subject = _find_active_session_db(sdb)
+        old_subject = ""
         if session_id:
+            # Query the ACTUAL session, not the most recent one in the DB
+            try:
+                with sdb._read_ctx() as c:
+                    row = c.execute(
+                        "SELECT subject FROM sessions WHERE id = ?", (session_id,)
+                    ).fetchone()
+                if row:
+                    old_subject = row["subject"] or ""
+            except Exception:
+                pass
             sdb.set_session_task_id(session_id, task_id)
             sdb.set_session_subject(session_id, title)
             # Store old subject as task comment for restoration
