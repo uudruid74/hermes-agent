@@ -52,9 +52,10 @@ def _get_session_task_id(agent) -> Optional[str]:
     try:
         from hermes_state import SessionDB
         db = SessionDB()
-        row = db._execute_read(lambda c: c.execute(
-            "SELECT task_id FROM sessions WHERE id = ?", (session_id,)
-        ).fetchone())
+        with db._read_ctx() as c:
+            row = c.execute(
+                "SELECT task_id FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
         if row:
             return row["task_id"] if isinstance(row, dict) else row[0]
     except Exception:

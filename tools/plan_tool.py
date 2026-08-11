@@ -82,9 +82,10 @@ def _cmd_new(agent, title: str, goal: str, steps: List[str],
     subject = ""
     if session_id:
         sdb = _get_session_db()
-        row = sdb._execute_read(lambda c: c.execute(
-            "SELECT subject FROM sessions WHERE id = ?", (session_id,)
-        ).fetchone())
+        with sdb._read_ctx() as c:
+            row = c.execute(
+                "SELECT subject FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
         if row:
             subject = (row["subject"] if isinstance(row, dict) else row[0]) or ""
 
@@ -129,9 +130,10 @@ def _cmd_new(agent, title: str, goal: str, steps: List[str],
     current_temp = getattr(agent, "_session_temperature", None)
     if current_temp is None and session_id:
         sdb = _get_session_db()
-        row = sdb._execute_read(lambda c: c.execute(
-            "SELECT model_config FROM sessions WHERE id = ?", (session_id,)
-        ).fetchone())
+        with sdb._read_ctx() as c:
+            row = c.execute(
+                "SELECT model_config FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
         if row:
             mc = row["model_config"] if isinstance(row, dict) else row[0]
             if isinstance(mc, str):
@@ -208,9 +210,10 @@ def _cmd_done(agent, status: Optional[str] = None) -> str:
         return "ERROR: No active session"
 
     sdb = _get_session_db()
-    row = sdb._execute_read(lambda c: c.execute(
-        "SELECT task_id FROM sessions WHERE id = ?", (session_id,)
-    ).fetchone())
+    with sdb._read_ctx() as c:
+        row = c.execute(
+            "SELECT task_id FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone()
     if not row:
         return "ERROR: Session not found"
     task_id = row["task_id"] if isinstance(row, dict) else row[0]
@@ -386,9 +389,10 @@ def _cmd_remind(agent) -> str:
         return "ERROR: No active session"
 
     sdb = _get_session_db()
-    row = sdb._execute_read(lambda c: c.execute(
-        "SELECT task_id FROM sessions WHERE id = ?", (session_id,)
-    ).fetchone())
+    with sdb._read_ctx() as c:
+        row = c.execute(
+            "SELECT task_id FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone()
     if not row:
         return "ERROR: No task assigned"
     task_id = row["task_id"] if isinstance(row, dict) else row[0]
@@ -435,9 +439,10 @@ def _cmd_fail(agent, reason: str = "") -> str:
         return "ERROR: No active session"
 
     sdb = _get_session_db()
-    row = sdb._execute_read(lambda c: c.execute(
-        "SELECT task_id FROM sessions WHERE id = ?", (session_id,)
-    ).fetchone())
+    with sdb._read_ctx() as c:
+        row = c.execute(
+            "SELECT task_id FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone()
     if not row:
         return "ERROR: No task assigned"
     task_id = row["task_id"] if isinstance(row, dict) else row[0]
