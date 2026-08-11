@@ -35,16 +35,19 @@ def _get_agent_name(agent) -> str:
 
 
 def _safe_dict(row) -> dict:
-    """Convert sqlite3.Row or tuple to dict safely, catching shape errors."""
+    """Convert sqlite3.Row to dict via keys() — avoids 'length 10' dict() bug."""
+    # sqlite3.Row: dict(row) can fail with 'sequence element has length X; 2 required'
+    # Keys-based iteration is reliable.
     try:
-        return dict(row)
-    except (ValueError, TypeError) as e:
-        # Fallback: convert column-by-column
-        try:
-            keys = row.keys()
-            return {k: row[k] for k in keys}
-        except Exception:
-            return {"_error": f"safe_dict failed: {e}", "_raw": str(row)[:200]}
+        keys = row.keys()
+        return {k: row[k] for k in keys}
+    except Exception:
+        pass
+    # Fallback: index-based for plain tuples
+    try:
+        return {f"col_{i}": row[i] for i in range(len(row))}
+    except Exception:
+        return {}
 
 def _get_session_id(agent) -> Optional[str]:
     return getattr(agent, "session_id", None) or os.environ.get("HERMES_SESSION_ID")
