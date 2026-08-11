@@ -86,11 +86,9 @@ def _cmd_new(agent, title: str, goal: str, steps: List[str],
         f"**Goal:** {goal}",
         "",
         "### Steps",
-        "",
     ]
     for i, step in enumerate(steps, 1):
-        plan_lines.append(f"{i}. {step}")
-        plan_lines.append("")  # blank line after each step
+        plan_lines.append(f"{i}. {step}\n")
     if temp:
         plan_lines.append(f"\n**Temperature:** {temp}")
     if resolved_temp is not None:
