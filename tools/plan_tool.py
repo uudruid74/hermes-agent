@@ -171,17 +171,16 @@ def _cmd_new(agent, title: str, goal: str, steps: List[str],
             sdb.set_session_task_id(session_id, task_id)
             sdb.set_session_subject(session_id, title)
             # Store old subject as task comment for restoration
-            if old_subject:
-                try:
-                    kdb = _get_kanban_db()
-                    with kdb as conn:
-                        conn.execute(
-                            "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
-                            (task_id, agent_name, f"PREV_SUBJECT:{old_subject}", int(time.time())),
-                        )
-                        conn.commit()
-                except Exception:
-                    pass
+            try:
+                kdb = _get_kanban_db()
+                with kdb as conn:
+                    conn.execute(
+                        "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+                        (task_id, agent_name, f"PREV_SUBJECT:{old_subject or '__EMPTY__'}", int(time.time())),
+                    )
+                    conn.commit()
+            except Exception:
+                pass
 
         if resolved_temp is not None:
             agent._session_temperature = resolved_temp
@@ -375,7 +374,7 @@ def _cmd_done(agent, status: Optional[str] = None) -> str:
             pass
 
         # Auto-commit if in a git repo
-        commit_msg = f"done: {task["title"] or task_id}"
+        commit_msg = f"done: {task['title'] or task_id}"
         if status:
             commit_msg += f" — {status}"
         try:
@@ -491,7 +490,7 @@ def _cmd_remind(agent) -> str:
         goal = task["task_goal"] or ""
 
     lines = [
-        f"Task: {task["title"] or task_id}"
+        f"Task: {task['title'] or task_id}"
         f"Goal: {goal}",
         f"Step {stepno}/{len(steps)}",
         "",
@@ -569,7 +568,7 @@ def _cmd_fail(agent, reason: str = "") -> str:
 
             return (
                 f"Task {task_id} has failed.\n\n"
-                f"Title: {task["title"] or ""}\n"
+                f"Title: {task['title'] or ''}\n"
                 f"Goal: {goal}\n"
                 f"Failed at Step {stepno}: {step_title}\n"
                 f"Reason: {reason or 'unspecified'}\n\n"
@@ -618,7 +617,7 @@ def _cmd_approve(agent, task_id: str) -> str:
 
     # Present for approval
     lines = [
-        f"Approve plan for task {task_id}: {task["title"] or ""}"
+        f"Approve plan for task {task_id}: {task['title'] or ''}"
         f"Goal: {goal}",
         "",
         "Steps:",
