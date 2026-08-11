@@ -86,9 +86,11 @@ def _cmd_new(agent, title: str, goal: str, steps: List[str],
         f"**Goal:** {goal}",
         "",
         "### Steps",
+        "",
     ]
     for i, step in enumerate(steps, 1):
         plan_lines.append(f"{i}. {step}")
+        plan_lines.append("")  # blank line after each step
     if temp:
         plan_lines.append(f"\n**Temperature:** {temp}")
     if resolved_temp is not None:
@@ -173,9 +175,13 @@ def _cmd_new(agent, title: str, goal: str, steps: List[str],
             pass
 
         return (
-            f"Plan approved as task {task_id}: {title}\n\n"
-            f"Complete Step 1: {steps[0]}\n"
-            f"Use plan_tool 'done' to mark each step complete."
+            f"TASK APPROVED ({task_id}): {title}\n\n"
+            f"You are now working on this plan. "
+            f"The plan has been recorded. Your next action is:\n\n"
+            f">>> STEP 1: {steps[0]} <<<\n\n"
+            f"Begin working on Step 1 now. When complete, call "
+            f"plan_tool(command=\"done\") to mark it done and advance to the next step.\n"
+            f"Do NOT call plan_tool 'done' until Step 1 is actually finished."
         )
     else:
         # User denied — ask for reason
