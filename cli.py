@@ -5284,6 +5284,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         except Exception:
             pass
 
+        # Task ID from session state.db (plan_tool active tasks)
+        try:
+            task_id = os.environ.get("HERMES_KANBAN_TASK") or ""
+            if not task_id:
+                from hermes_state import SessionDB
+                sdb = SessionDB()
+                row = sdb.get_session(self.session_id)
+                if row:
+                    task_id = (row.get("task_id") or "") if isinstance(row, dict) else ""
+            if task_id:
+                # Truncate to last 8 chars for display
+                snapshot["task_id"] = task_id[-8:] if len(task_id) >= 8 else task_id
+        except Exception:
+            pass
+
         # Battery read-out (first status-bar element when enabled). Reads are
         # memoised for a few seconds inside agent.battery, so polling it on
         # every status-bar repaint is cheap.
@@ -5912,6 +5927,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             goal_segment = self._status_bar_goal_segment(snapshot)
             if width < 52:
                 text = f"{battery_prefix}⚕ {snapshot['model_short']} · {duration_label}"
+                task_id = snapshot.get("task_id")
+                if task_id:
+                    text = f"📋{task_id} {text}"
                 if goal_segment:
                     text += f" · {goal_segment}"
                 if focus_label:
@@ -5921,6 +5939,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 return self._trim_status_bar_text(text, width)
             if width < 76:
                 parts = [f"⚕ {snapshot['model_short']}", percent_label]
+                task_id = snapshot.get("task_id")
+                if task_id:
+                    parts.insert(0, f"📋{task_id}")
                 if battery_label:
                     parts.insert(0, battery_label)
                 compressions = snapshot.get("compressions", 0)
@@ -5953,6 +5974,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
             compressions = snapshot.get("compressions", 0)
             parts = [f"⚕ {snapshot['model_short']}", context_label, percent_label]
+            task_id = snapshot.get("task_id")
+            if task_id:
+                parts.insert(0, f"📋{task_id}")
             if battery_label:
                 parts.insert(0, battery_label)
             if compressions:

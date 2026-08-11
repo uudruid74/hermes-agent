@@ -153,11 +153,25 @@ def _cmd_new(agent, title: str, goal: str, steps: List[str],
         except Exception as e:
             return f"ERROR: Failed to create task: {e}"
 
-        # Set session task_id and subject
+        # Set session task_id and subject (save old subject first)
         if session_id:
             sdb = _get_session_db()
+            # Save old subject so we can restore on done
+            old_subject = sdb.get_session_subject(sdb.get_session(session_id))
             sdb.set_session_task_id(session_id, task_id)
             sdb.set_session_subject(session_id, title)
+            # Store old subject as task comment for restoration
+            if old_subject:
+                try:
+                    kdb = _get_kanban_db()
+                    with kdb as conn:
+                        conn.execute(
+                            "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+                            (task_id, agent_name, f"PREV_SUBJECT:{old_subject}", int(time.time())),
+                        )
+                        conn.commit()
+                except Exception:
+                    pass
 
         if resolved_temp is not None:
             agent._session_temperature = resolved_temp
@@ -319,8 +333,23 @@ def _cmd_done(agent, status: Optional[str] = None) -> str:
             f"Complete Step {stepno}: {steps[stepno - 1] if stepno <= len(steps) else 'review work'}"
         )
     else:
-        # No parent — clear task_id, writes will fail
+        # No parent — clear task_id, restore old subject if saved
         sdb.clear_session_task_id(session_id)
+        # Restore previous subject from task comments
+        try:
+            kdb = _get_kanban_db()
+            with kdb as conn:
+                row = conn.execute(
+                    "SELECT body FROM task_comments WHERE task_id = ? AND body LIKE 'PREV_SUBJECT:%' ORDER BY created_at DESC LIMIT 1",
+                    (task_id,)
+                ).fetchone()
+            if row:
+                body = row["body"] if isinstance(row, dict) else row[0]
+                old_subject = body.split(":", 1)[1] if ":" in str(body) else ""
+                if old_subject:
+                    sdb.set_session_subject(session_id, old_subject)
+        except Exception:
+            pass
 
         # Auto-commit if in a git repo
         commit_msg = f"done: {task.get('title', task_id)}"
