@@ -1140,7 +1140,17 @@ def handle_function_call(
         function_args = {}
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
 
-    # ── Tool Search bridge dispatch ──────────────────────────────────
+    # ── Permission gate: block writes without active task ──
+    _WRITE_TOOLS = {"write_file", "patch"}
+    if function_name in _WRITE_TOOLS or (
+        function_name in {"cronjob"} and function_args.get("action") == "create"
+    ):
+        from agent.file_safety import is_write_denied_by_task_gate
+        if is_write_denied_by_task_gate():
+            return json.dumps({
+                "error": "Write denied: No active task. "
+                         "Use plan_tool 'new' to create a task first."
+            })
     # tool_search and tool_describe are pure catalog reads — handle them
     # inline. tool_call is unwrapped to the underlying tool so that every
     # downstream hook (pre/post, edit approval, guardrails) sees the real
