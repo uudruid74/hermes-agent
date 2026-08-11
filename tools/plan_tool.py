@@ -34,21 +34,6 @@ def _get_agent_name(agent) -> str:
     return getattr(agent, "agent_name", None) or os.environ.get("HERMES_AGENT_NAME", "agent")
 
 
-def _safe_dict(row) -> dict:
-    """Convert sqlite3.Row to dict via keys() — avoids 'length 10' dict() bug."""
-    # sqlite3.Row: dict(row) can fail with 'sequence element has length X; 2 required'
-    # Keys-based iteration is reliable.
-    try:
-        keys = row.keys()
-        return {k: row[k] for k in keys}
-    except Exception:
-        pass
-    # Fallback: index-based for plain tuples
-    try:
-        return {f"col_{i}": row[i] for i in range(len(row))}
-    except Exception:
-        return {}
-
 def _get_session_id(agent) -> Optional[str]:
     return getattr(agent, "session_id", None) or os.environ.get("HERMES_SESSION_ID")
 
@@ -269,17 +254,15 @@ def _cmd_done(agent, status: Optional[str] = None) -> str:
         if not task:
             return f"ERROR: Task {task_id} not found"
 
-        task = _safe_dict(task)
-        raw_steps = task.get("task_steps")
-        if isinstance(raw_steps, str):
-            steps = json.loads(raw_steps)
-        elif isinstance(raw_steps, list):
-            steps = raw_steps
-        else:
-            steps = []
-        stepno = task.get("task_stepno")
+        # Use column names directly — sqlite3.Row supports dict and index access
+        try:
+            steps_str = task["task_steps"]
+        except (KeyError, IndexError):
+            steps_str = None
+        steps = json.loads(steps_str) if steps_str else []
+        stepno = task["task_stepno"]
         if stepno is None:
-            stepno = 1  # First step when column is NULL (legacy task)
+            stepno = 1
         goal = task.get("task_goal") or ""
         prev_task = task.get("previous_task")
         prev_temp = task.get("prev_temperature")
@@ -471,10 +454,9 @@ def _cmd_remind(agent) -> str:
         if not task:
             return f"Task {task_id} not found"
 
-        task = _safe_dict(task)
-        steps = json.loads(task.get("task_steps") or "[]")
-        stepno = task.get("task_stepno") or 1
-        goal = task.get("task_goal") or ""
+        steps = json.loads(task["task_steps"]) if task["task_steps"] else []
+        stepno = task["task_stepno"] or 1
+        goal = task["task_goal"] or ""
 
     lines = [
         f"Task: {task.get('title', task_id)}",
@@ -521,11 +503,10 @@ def _cmd_fail(agent, reason: str = "") -> str:
         if not task:
             return f"Task {task_id} not found"
 
-        task = _safe_dict(task)
-        status = task.get("status", "")
-        goal = task.get("task_goal") or ""
-        steps = json.loads(task.get("task_steps") or "[]")
-        stepno = task.get("task_stepno") or 1
+        status = task["status"]
+        goal = task["task_goal"] or ""
+        steps = json.loads(task["task_steps"]) if task["task_steps"] else []
+        stepno = task["task_stepno"] or 1
         step_title = steps[stepno - 1] if stepno <= len(steps) else "unknown"
 
         if status == "manual":
@@ -593,16 +574,15 @@ def _cmd_approve(agent, task_id: str) -> str:
         if not task:
             return f"ERROR: Task {task_id} not found"
 
-        task = _safe_dict(task)
-        if task.get("status") != "blocked":
-            return f"ERROR: Task {task_id} is not blocked (status: {task.get('status')})"
+        if task["status"] != "blocked":
+            return f"ERROR: Task {task_id} is not blocked (status: {task['status']})"
 
-        block_kind = task.get("block_kind") or ""
+        block_kind = task["block_kind"] or ""
         if block_kind != "approval":
             return f"Task {task_id} is blocked but not waiting for approval (kind: {block_kind})"
 
-        steps = json.loads(task.get("task_steps") or "[]")
-        goal = task.get("task_goal") or ""
+        steps = json.loads(task["task_steps"]) if task["task_steps"] else []
+        goal = task["task_goal"] or ""
 
     # Present for approval
     lines = [
@@ -637,9 +617,8 @@ def _cmd_approve(agent, task_id: str) -> str:
         task = conn.execute(
             "SELECT * FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
-        task = _safe_dict(task)
-        steps = json.loads(task.get("task_steps") or "[]")
-        title = task.get("title", task_id)
+        steps = json.loads(task["task_steps"]) if task["task_steps"] else []
+        title = task["title"]
 
         conn.execute(
             "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
