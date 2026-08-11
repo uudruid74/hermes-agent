@@ -16706,14 +16706,24 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             return inner + 2  # account for the single leading/trailing spaces inside borders
 
         def _wrap_panel_text(text: str, width: int, subsequent_indent: str = "") -> list[str]:
-            wrapped = textwrap.wrap(
-                text,
-                width=max(8, width),
-                break_long_words=False,
-                break_on_hyphens=False,
-                subsequent_indent=subsequent_indent,
-            )
-            return wrapped or [""]
+            """Wrap text preserving explicit newlines as line breaks."""
+            lines = []
+            for para in text.split("\n"):
+                if para == "":
+                    lines.append("")
+                else:
+                    wrapped = textwrap.wrap(
+                        para,
+                        width=max(8, width),
+                        break_long_words=False,
+                        break_on_hyphens=False,
+                        subsequent_indent=subsequent_indent,
+                    )
+                    if wrapped:
+                        lines.extend(wrapped)
+                    else:
+                        lines.append("")
+            return lines or [""]
 
         def _append_panel_line(lines, border_style: str, content_style: str, text: str, box_width: int) -> None:
             inner_width = max(0, box_width - 2)
