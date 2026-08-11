@@ -104,13 +104,16 @@ def _cmd_new(agent, title: str, goal: str, steps: List[str],
         "### Steps",
     ]
     for i, step in enumerate(steps, 1):
-        plan_lines.append(f"{i}. {step}\n")
+        plan_lines.append(f"{i}. {step}")
     if temp:
         plan_lines.append(f"\n**Temperature:** {temp}")
     if resolved_temp is not None:
         plan_lines.append(f"  → resolved: {resolved_temp}")
 
     plan_text = "\n".join(plan_lines)
+    # Compress runs of 3+ newlines down to 2
+    import re
+    plan_text = re.sub(r'\n{3,}', '\n\n', plan_text)
 
     # Generate task ID
     import uuid
