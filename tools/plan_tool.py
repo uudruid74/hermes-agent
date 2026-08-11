@@ -277,7 +277,9 @@ def _cmd_done(agent, status: Optional[str] = None) -> str:
             steps = raw_steps
         else:
             steps = []
-        stepno = task.get("task_stepno") or 1
+        stepno = task.get("task_stepno")
+        if stepno is None:
+            stepno = 1  # First step when column is NULL (legacy task)
         goal = task.get("task_goal") or ""
         prev_task = task.get("previous_task")
         prev_temp = task.get("prev_temperature")
