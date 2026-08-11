@@ -43,7 +43,7 @@ No polling. No "hey are you done?" No asking — telling.
 
 The fork introduces two new internal APIs that turn Hermes from a chat loop into a stateful execution environment:
 
-- **Session API** (`session_search`, `set_session`, session tool) — full conversation history with FTS5-backed search, arbitrary metadata injection, and cross-session recall. Agents can search past conversations, link to specific sessions, and persist observations to fabric. Sessions are the unit of work — not turns, not threads.
+- **Session API** (`set_session`, `session_search`) — `set_session` injects metadata into the current session (temperature, subject, note, ego). `session_search` does FTS5-backed full-text search across all past sessions with bookend context, scroll windows, and cross-profile lookup. Together they give agents durable memory of what happened before and control over the current session's state.
 
 - **Plan API** (`plan_tool`) — mandatory multi-step orchestration. Before changing state, agents present a plan with ordered steps, await user authorization, and track completion. Plans survive context compression, support delegation via kanban dispatch, and enforce the gate: *no state changes without a plan*.
 
@@ -77,12 +77,6 @@ Every agent configuration ships a `temperature` parameter. The real innovation i
 | **User is frustrated** | **-80%** | **~0.2** |
 
 When `delegate_task` spawns a subagent, the worker automatically runs at a lower temperature for tighter compliance. Combined with `sequential_thinking` MCP as the reasoning channel (since temperature mode disables thinking tokens), this gives two independent axes of control: **reasoning on/off** and **creativity vs execution**.
-
-### MoA Cost Bleed (What We Learned)
-
-Wintermute's MoA config had a reference model named `nvidia/nemotron-3-ultra` — but when that model was unavailable, Hermes had a **hidden and undocumented fallback** that silently routed to Claude Opus 4.8 on OpenRouter. Using our API key. At their most expensive model's rate.
-
-Gopher caught it, traced it through `moa_loop.py` and `_clean_slot()`, and filed the root cause. The fix was a config diff. The lesson: **a hidden fallback can route you to a $10/hour loop without a single log line.**
 
 ## The Sucky Pattern
 
