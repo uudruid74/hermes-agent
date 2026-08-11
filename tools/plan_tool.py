@@ -69,7 +69,7 @@ def _resolve_temp(temp: Optional[str], agent) -> Optional[float]:
 
 def _cmd_new(agent, title: str, goal: str, steps: List[str],
              temp: Optional[str] = None) -> str:
-    """Present a multistep plan for approval."""
+    """Present a multistep plan for approval via clarify callback."""
     agent_name = _get_agent_name(agent)
     session_id = _get_session_id(agent)
     current_task_id = _get_task_id(agent)
@@ -77,66 +77,130 @@ def _cmd_new(agent, title: str, goal: str, steps: List[str],
     if not title or not goal or not steps:
         return "ERROR: 'new' requires title, goal, and steps[]"
 
-    # Resolve temperature
     resolved_temp = _resolve_temp(temp, agent)
 
-    # Build approval message
-    subject = ""
-    if session_id:
-        sdb = _get_session_db()
-        with sdb._read_ctx() as c:
-            row = c.execute(
-                "SELECT subject FROM sessions WHERE id = ?", (session_id,)
-            ).fetchone()
-        if row:
-            subject = (row["subject"] if isinstance(row, dict) else row[0]) or ""
-
-    lines = [
-        f"Approve {subject}:{title} for {agent_name} [{current_task_id or 'no-task'}]",
+    # Build plan text with architecture headers
+    plan_lines = [
+        f"## Plan: {title}",
+        f"**Agent:** {agent_name}",
+        f"**Goal:** {goal}",
+        "",
+        "### Steps",
     ]
-    if temp:
-        lines[0] += f" [temp: {temp}]"
-    lines.append(f"Goal: {goal}")
-    lines.append("")
-    lines.append("Steps:")
     for i, step in enumerate(steps, 1):
-        lines.append(f"  {i}. {step}")
+        plan_lines.append(f"{i}. {step}")
+    if temp:
+        plan_lines.append(f"\n**Temperature:** {temp}")
+    if resolved_temp is not None:
+        plan_lines.append(f"  → resolved: {resolved_temp}")
 
-    approval_text = "\n".join(lines)
+    plan_text = "\n".join(plan_lines)
 
-    # Create blocked task (pending approval)
-    kdb = _get_kanban_db()
+    # Generate task ID
     import uuid
     task_id = f"t_{uuid.uuid4().hex[:8]}"
 
-    current_temp = getattr(agent, "_session_temperature", None)
+    # Present to user via clarify callback
+    clarify_cb = getattr(agent, "clarify_callback", None)
+    if clarify_cb is None:
+        return "ERROR: No clarify callback available — cannot present plan for approval"
 
     try:
-        with kdb as conn:
-            conn.execute("""
-                INSERT INTO tasks (id, title, body, status, assignee, created_at,
-                                   task_steps, task_stepno, task_goal,
-                                   prev_temperature, previous_task, session_id,
-                                   block_kind)
-                VALUES (?, ?, ?, 'blocked', ?, ?, ?, 1, ?, ?, ?, ?, 'approval')
-            """, (
-                task_id, title, approval_text, agent_name, int(time.time()),
-                json.dumps(steps), goal,
-                current_temp, current_task_id, session_id,
-            ))
-            conn.commit()
+        user_response = clarify_cb(
+            f"Approve plan {task_id}?\n\n{plan_text}",
+            ["Approve", "Deny"],
+        )
     except Exception as e:
-        return f"ERROR: Failed to create task: {e}"
+        return f"User unavailable: {e}. Stand down."
 
-    # Return plan for agent to present via clarify
-    result = (
-        f"PLAN READY FOR APPROVAL ({task_id}):\n\n"
-        f"{approval_text}\n\n"
-        f"Use clarify to present this plan to the user. "
-        f"If approved, call: plan_tool(command=\"approve\", task_id=\"{task_id}\")\n"
-        f"If denied, call: plan_tool(command=\"fail\", reason=\"user denied\")"
-    )
-    return result
+    if not user_response:
+        return "No response received. Stand down."
+
+    # Detect approval
+    response_lower = str(user_response).strip().lower()
+    if "appr" in response_lower:
+        # User approved — create task and activate
+        current_temp = getattr(agent, "_session_temperature", None)
+
+        kdb = _get_kanban_db()
+        try:
+            with kdb as conn:
+                conn.execute("""
+                    INSERT INTO tasks (id, title, body, status, assignee, created_at,
+                                       task_steps, task_stepno, task_goal,
+                                       prev_temperature, previous_task, session_id)
+                    VALUES (?, ?, ?, 'manual', ?, ?, ?, 1, ?, ?, ?, ?)
+                """, (
+                    task_id, title, plan_text, agent_name, int(time.time()),
+                    json.dumps(steps), goal,
+                    current_temp, current_task_id, session_id,
+                ))
+                conn.commit()
+        except Exception as e:
+            return f"ERROR: Failed to create task: {e}"
+
+        # Set session task_id and subject
+        if session_id:
+            sdb = _get_session_db()
+            sdb.set_session_task_id(session_id, task_id)
+            sdb.set_session_subject(session_id, title)
+
+        if resolved_temp is not None:
+            agent._session_temperature = resolved_temp
+
+        # If running as kanban worker, block parent task
+        if current_task_id:
+            try:
+                with kdb as conn:
+                    conn.execute(
+                        "UPDATE tasks SET status = 'blocked', block_kind = 'approval' WHERE id = ?",
+                        (current_task_id,)
+                    )
+                    conn.commit()
+            except Exception:
+                pass
+
+        # Log to fabric
+        try:
+            from tools.registry import registry
+            registry.dispatch("fabric_write", {
+                "type": "note",
+                "content": f"Plan approved: {title} → {task_id}",
+                "summary": f"Plan: {title}",
+            })
+        except Exception:
+            pass
+
+        return (
+            f"Plan approved as task {task_id}: {title}\n\n"
+            f"Complete Step 1: {steps[0]}\n"
+            f"Use plan_tool 'done' to mark each step complete."
+        )
+    else:
+        # User denied — ask for reason
+        reason = ""
+        try:
+            reason = clarify_cb(
+                "Reason for denial? (type below or send empty)",
+                None,  # open-ended
+            )
+        except Exception:
+            pass
+
+        reason_str = str(reason).strip() if reason else "unspecified"
+
+        # Log denial to fabric
+        try:
+            from tools.registry import registry
+            registry.dispatch("fabric_write", {
+                "type": "note",
+                "content": f"Plan denied: {title} — {reason_str}",
+                "summary": f"Plan denied: {title}",
+            })
+        except Exception:
+            pass
+
+        return f"Plan denied: {reason_str}. Stand down."
 
 
 # ---------------------------------------------------------------------------
