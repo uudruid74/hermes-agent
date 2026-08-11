@@ -240,7 +240,7 @@ def _cmd_new(agent, title: str, goal: str, steps: List[str],
         except Exception:
             pass
 
-        return f"Plan denied: {reason_str}. Stand down."
+        return f"Plan denied ({task_id}): {reason_str}. Stand down. Resubmit with plan_tool(command=\"approve\", task_id=\"{task_id}\") to approve."
 
 
 # ---------------------------------------------------------------------------
@@ -628,7 +628,7 @@ def _cmd_approve(agent, task_id: str) -> str:
         approved, reason = False, "approval gate unavailable"
 
     if not approved:
-        return f"Plan denied. Stand down and wait for further instructions. Reason: {reason or 'user denied'}"
+        return f"Plan denied ({task_id}). Stand down and wait for further instructions. Reason: {reason or 'user denied'}"
 
     # Unblock the task — set to 'manual' so dispatcher ignores it
     session_id = _get_session_id(agent)
