@@ -171,16 +171,17 @@ def _cmd_new(agent, title: str, goal: str, steps: List[str],
             sdb.set_session_task_id(session_id, task_id)
             sdb.set_session_subject(session_id, title)
             # Store old subject as task comment for restoration
-            try:
-                kdb = _get_kanban_db()
-                with kdb as conn:
-                    conn.execute(
-                        "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
-                        (task_id, agent_name, f"PREV_SUBJECT:{old_subject or '__EMPTY__'}", int(time.time())),
-                    )
-                    conn.commit()
-            except Exception:
-                pass
+            if old_subject:
+                try:
+                    kdb = _get_kanban_db()
+                    with kdb as conn:
+                        conn.execute(
+                            "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+                            (task_id, agent_name, f"PREV_SUBJECT:{old_subject}", int(time.time())),
+                        )
+                        conn.commit()
+                except Exception:
+                    pass
 
         if resolved_temp is not None:
             agent._session_temperature = resolved_temp
@@ -276,6 +277,7 @@ def _cmd_done(agent, status: Optional[str] = None) -> str:
         body = cr["body"] if isinstance(cr, dict) else cr[0]
         old_subject = body.split(":", 1)[1] if isinstance(body, str) and ":" in body else ""
 
+
     kdb = _get_kanban_db()
     with kdb as conn:
         task = conn.execute(
@@ -357,21 +359,6 @@ def _cmd_done(agent, status: Optional[str] = None) -> str:
         # No parent — clear task_id, restore old subject
         sdb.clear_session_task_id(session_id)
         sdb.set_session_subject(session_id, old_subject or "")
-        # Store old subject as task comment for restoration
-        try:
-            kdb = _get_kanban_db()
-            with kdb as conn:
-                row = conn.execute(
-                    "SELECT body FROM task_comments WHERE task_id = ? AND body LIKE 'PREV_SUBJECT:%' ORDER BY created_at DESC LIMIT 1",
-                    (task_id,)
-                ).fetchone()
-            if row:
-                body = row["body"] if isinstance(row, dict) else row[0]
-                old_subject = body.split(":", 1)[1] if ":" in str(body) else ""
-                if old_subject:
-                    sdb.set_session_subject(session_id, old_subject)
-        except Exception:
-            pass
 
         # Auto-commit if in a git repo
         commit_msg = f"done: {task['title'] or task_id}"
