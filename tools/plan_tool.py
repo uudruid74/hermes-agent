@@ -37,6 +37,18 @@ def _get_agent_name(agent) -> str:
 def _get_session_id(agent) -> Optional[str]:
     return getattr(agent, "session_id", None) or os.environ.get("HERMES_SESSION_ID")
 
+
+def _find_active_session_db(sdb) -> Optional[str]:
+    """Query state.db for the most recent session id."""
+    try:
+        with sdb._read_ctx() as c:
+            row = c.execute(
+                "SELECT id, subject FROM sessions ORDER BY rowid DESC LIMIT 1"
+            ).fetchone()
+        return (row["id"], row["subject"]) if row else ("", "")
+    except Exception:
+        return (None, None)
+
 def _get_task_id(agent) -> Optional[str]:
     return os.environ.get("HERMES_KANBAN_TASK")
 
@@ -131,24 +143,29 @@ def _cmd_new(agent, title: str, goal: str, steps: List[str],
         try:
             with kdb as conn:
                 conn.execute("""
-                    INSERT INTO tasks (id, title, body, status, assignee, created_at,
-                                       task_steps, task_stepno, task_goal,
-                                       prev_temperature, previous_task, session_id)
-                    VALUES (?, ?, ?, 'manual', ?, ?, ?, 1, ?, ?, ?, ?)
-                """, (
-                    task_id, title, plan_text, agent_name, int(time.time()),
-                    json.dumps(steps), goal,
-                    current_temp, current_task_id, session_id,
-                ))
+                    INSERT INTO tasks
+                        (id, title, body, status, assignee, created_at,
+                         task_steps, task_stepno, task_goal,
+                         prev_temperature, previous_task, session_id)
+                    VALUES
+                        (:id, :title, :body, 'manual', :assignee, :created_at,
+                         :task_steps, 1, :task_goal,
+                         :prev_temp, :prev_task, :session_id)
+                """, {
+                    "id": task_id, "title": title, "body": plan_text,
+                    "assignee": agent_name, "created_at": int(time.time()),
+                    "task_steps": json.dumps(steps), "task_goal": goal,
+                    "prev_temp": current_temp, "prev_task": current_task_id,
+                    "session_id": session_id,
+                })
                 conn.commit()
         except Exception as e:
             return f"ERROR: Failed to create task: {e}"
 
         # Set session task_id and subject (save old subject first)
+        sdb = _get_session_db()
+        session_id, old_subject = _find_active_session_db(sdb)
         if session_id:
-            sdb = _get_session_db()
-            # Save old subject so we can restore on done
-            old_subject = sdb.get_session_subject(sdb.get_session(session_id))
             sdb.set_session_task_id(session_id, task_id)
             sdb.set_session_subject(session_id, title)
             # Store old subject as task comment for restoration
@@ -238,13 +255,14 @@ def _cmd_done(agent, status: Optional[str] = None) -> str:
     sdb = _get_session_db()
     with sdb._read_ctx() as c:
         row = c.execute(
-            "SELECT task_id FROM sessions WHERE id = ?", (session_id,)
+            "SELECT task_id, subject FROM sessions WHERE id = ?", (session_id,)
         ).fetchone()
     if not row:
         return "ERROR: Session not found"
-    task_id = row["task_id"] if isinstance(row, dict) else row[0]
+    task_id = row["task_id"]
     if not task_id:
         return "ERROR: No active task"
+    old_subject = row["subject"]  # saved for restore on completion
 
     kdb = _get_kanban_db()
     with kdb as conn:
@@ -324,9 +342,10 @@ def _cmd_done(agent, status: Optional[str] = None) -> str:
             f"Complete Step {stepno}: {steps[stepno - 1] if stepno <= len(steps) else 'review work'}"
         )
     else:
-        # No parent — clear task_id, restore old subject if saved
+        # No parent — clear task_id, restore old subject
         sdb.clear_session_task_id(session_id)
-        # Restore previous subject from task comments
+        sdb.set_session_subject(session_id, old_subject or "")
+        # Store old subject as task comment for restoration
         try:
             kdb = _get_kanban_db()
             with kdb as conn:
