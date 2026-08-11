@@ -629,3 +629,93 @@ def plan_tool(
 
     else:
         return f"ERROR: Unknown plan command '{command}'. Valid: new, done, dispatch, remind, fail, approve"
+
+
+# --- Schema ---
+
+PLAN_TOOL_SCHEMA = {
+    "name": "plan_tool",
+    "description": (
+        "Mandatory Action Protocol — create and manage multistep plans. "
+        "Commands: new (present plan for approval), done (mark step complete), "
+        "dispatch (create kanban task), remind (show current plan), "
+        "fail (mark task failed), approve (unblock plan task). "
+        "Writes are blocked when no task is active."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "command": {
+                "type": "string",
+                "description": "Command: new, done, dispatch, remind, fail, or approve",
+                "enum": ["new", "done", "dispatch", "remind", "fail", "approve"],
+            },
+            "title": {
+                "type": "string",
+                "description": "Plan title (required for new, dispatch)",
+            },
+            "goal": {
+                "type": "string",
+                "description": "Success criteria / intended outcome (required for new, dispatch)",
+            },
+            "steps": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Ordered step list (required for new; optional for dispatch)",
+            },
+            "temp": {
+                "type": "string",
+                "description": "Temperature: 'chat', 'worker', 'creative', or float value",
+            },
+            "status": {
+                "type": "string",
+                "description": "Completion status for 'done' command",
+            },
+            "project": {
+                "type": "string",
+                "description": "Board name for dispatch (required)",
+            },
+            "assignee": {
+                "type": "string",
+                "description": "Agent profile name to assign (required for dispatch)",
+            },
+            "resume": {
+                "type": "string",
+                "description": "Task ID to resume after completion",
+            },
+            "reason": {
+                "type": "string",
+                "description": "Failure reason for 'fail' command",
+            },
+            "task_id": {
+                "type": "string",
+                "description": "Task ID for 'approve' command",
+            },
+        },
+        "required": ["command"],
+    },
+}
+
+
+from tools.registry import registry
+
+registry.register(
+    name="plan_tool",
+    toolset="plan",
+    schema=PLAN_TOOL_SCHEMA,
+    handler=lambda args, **kw: plan_tool(
+        agent=kw.get("agent"),
+        command=args.get("command", ""),
+        title=args.get("title"),
+        goal=args.get("goal"),
+        steps=args.get("steps"),
+        temp=args.get("temp"),
+        status=args.get("status"),
+        project=args.get("project"),
+        assignee=args.get("assignee"),
+        resume=args.get("resume"),
+        reason=args.get("reason"),
+        task_id=args.get("task_id"),
+    ),
+    emoji="📋",
+)

@@ -70,6 +70,8 @@ _HERMES_CORE_TOOLS = [
     "execute_code", "delegate_task",
     # Session metadata
     "set_session",
+    # Mandatory Action Protocol — plan tool
+    "plan_tool",
     # Cronjob management
     "cronjob",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
