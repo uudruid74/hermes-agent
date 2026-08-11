@@ -701,7 +701,7 @@ from tools.registry import registry
 
 registry.register(
     name="plan_tool",
-    toolset="plan",
+    toolset="session",
     schema=PLAN_TOOL_SCHEMA,
     handler=lambda args, **kw: plan_tool(
         agent=kw.get("agent"),
