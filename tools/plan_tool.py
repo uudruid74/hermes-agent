@@ -33,6 +33,19 @@ def _get_kanban_db():
 def _get_agent_name(agent) -> str:
     return getattr(agent, "agent_name", None) or os.environ.get("HERMES_AGENT_NAME", "agent")
 
+
+def _safe_dict(row) -> dict:
+    """Convert sqlite3.Row or tuple to dict safely, catching shape errors."""
+    try:
+        return dict(row)
+    except (ValueError, TypeError) as e:
+        # Fallback: convert column-by-column
+        try:
+            keys = row.keys()
+            return {k: row[k] for k in keys}
+        except Exception:
+            return {"_error": f"safe_dict failed: {e}", "_raw": str(row)[:200]}
+
 def _get_session_id(agent) -> Optional[str]:
     return getattr(agent, "session_id", None) or os.environ.get("HERMES_SESSION_ID")
 
@@ -236,7 +249,7 @@ def _cmd_done(agent, status: Optional[str] = None) -> str:
         if not task:
             return f"ERROR: Task {task_id} not found"
 
-        task = dict(task)
+        task = _safe_dict(task)
         raw_steps = task.get("task_steps")
         if isinstance(raw_steps, str):
             steps = json.loads(raw_steps)
@@ -421,7 +434,7 @@ def _cmd_remind(agent) -> str:
         if not task:
             return f"Task {task_id} not found"
 
-        task = dict(task)
+        task = _safe_dict(task)
         steps = json.loads(task.get("task_steps") or "[]")
         stepno = task.get("task_stepno") or 1
         goal = task.get("task_goal") or ""
@@ -471,7 +484,7 @@ def _cmd_fail(agent, reason: str = "") -> str:
         if not task:
             return f"Task {task_id} not found"
 
-        task = dict(task)
+        task = _safe_dict(task)
         status = task.get("status", "")
         goal = task.get("task_goal") or ""
         steps = json.loads(task.get("task_steps") or "[]")
@@ -543,7 +556,7 @@ def _cmd_approve(agent, task_id: str) -> str:
         if not task:
             return f"ERROR: Task {task_id} not found"
 
-        task = dict(task)
+        task = _safe_dict(task)
         if task.get("status") != "blocked":
             return f"ERROR: Task {task_id} is not blocked (status: {task.get('status')})"
 
@@ -587,7 +600,7 @@ def _cmd_approve(agent, task_id: str) -> str:
         task = conn.execute(
             "SELECT * FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
-        task = dict(task)
+        task = _safe_dict(task)
         steps = json.loads(task.get("task_steps") or "[]")
         title = task.get("title", task_id)
 
