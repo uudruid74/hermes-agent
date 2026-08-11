@@ -2988,7 +2988,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 _set_sess(
                     agent=agent,
                     subject=next_args.get("subject"),
-                    fact=next_args.get("fact"),
+                    note=next_args.get("note"),
                     temperature=next_args.get("temperature"),
                     ego=next_args.get("ego"),
                 ),
