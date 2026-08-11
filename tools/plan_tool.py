@@ -100,29 +100,16 @@ def _cmd_new(agent, title: str, goal: str, steps: List[str],
     import uuid
     task_id = f"t_{uuid.uuid4().hex[:8]}"
 
-    # Debug: check what's actually on agent
-    import logging
-    _log = logging.getLogger(__name__)
-    _log.warning("plan_tool agent type: %s, has clarify_callback: %s, dir keys: %s",
-                 type(agent).__name__,
-                 hasattr(agent, "clarify_callback"),
-                 [k for k in sorted(dir(agent)) if "callback" in k.lower() or "cli" in k.lower() or k.startswith("_cli")][:10])
-
-    # Present to user via clarify callback
-    clarify_cb = getattr(agent, "clarify_callback", None)
-    if clarify_cb is None:
-        # Fallback: try importing the callbacks module
-        try:
-            from hermes_cli.callbacks import clarify_callback
-            clarify_cb = lambda q, c, ms=False: clarify_callback(agent, q, c, ms)
-        except ImportError:
-            return "ERROR: No clarify callback available — cannot present plan for approval"
-
+    # Dispatch clarify through registry so tool_executor injects callback
     try:
-        user_response = clarify_cb(
-            f"Approve plan {task_id}?\n\n{plan_text}",
-            ["Approve", "Deny"],
-        )
+        from tools.registry import registry
+        result_json = registry.dispatch("clarify", {
+            "question": f"Approve plan {task_id}?\n\n{plan_text}",
+            "choices": ["Approve", "Deny"],
+        })
+        user_response = json.loads(result_json) if isinstance(result_json, str) else result_json
+        if isinstance(user_response, dict) and "response" in user_response:
+            user_response = user_response["response"]
     except Exception as e:
         return f"User unavailable: {e}. Stand down."
 
@@ -193,10 +180,12 @@ def _cmd_new(agent, title: str, goal: str, steps: List[str],
         # User denied — ask for reason
         reason = ""
         try:
-            reason = clarify_cb(
-                "Reason for denial? (type below or send empty)",
-                None,  # open-ended
-            )
+            reason_json = registry.dispatch("clarify", {
+                "question": "Reason for denial? (type below or send empty)",
+            })
+            reason = json.loads(reason_json) if isinstance(reason_json, str) else reason_json
+            if isinstance(reason, dict) and "response" in reason:
+                reason = reason["response"]
         except Exception:
             pass
 
