@@ -28,7 +28,9 @@ def _get_kanban_db():
     """Return a sqlite3 connection to the kanban database."""
     import sqlite3
     from hermes_cli.kanban_db import kanban_db_path
-    return sqlite3.connect(str(kanban_db_path()))
+    conn = sqlite3.connect(str(kanban_db_path()))
+    conn.row_factory = sqlite3.Row
+    return conn
 
 def _get_agent_name(agent) -> str:
     return getattr(agent, "agent_name", None) or os.environ.get("HERMES_AGENT_NAME", "agent")
