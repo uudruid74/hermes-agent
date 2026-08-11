@@ -691,3 +691,27 @@ def get_container_mirror_warning(
         f"(Defense-in-depth — not a security boundary; the terminal tool "
         f"can still bypass.)"
     )
+
+
+def _session_task_id() -> Optional[str]:
+    """Read task_id from session state.db for the current session."""
+    session_id = os.environ.get("HERMES_SESSION_ID")
+    if not session_id:
+        return None
+    try:
+        from hermes_state import SessionDB
+        db = SessionDB()
+        row = db._execute_read(lambda c: c.execute(
+            "SELECT task_id FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone())
+        if row:
+            return row["task_id"] if isinstance(row, dict) else row[0]
+    except Exception:
+        pass
+    return None
+
+
+def is_write_denied_by_task_gate() -> bool:
+    """Return True if writes are blocked because no task is active."""
+    task_id = os.environ.get("HERMES_KANBAN_TASK") or _session_task_id()
+    return not bool(task_id)
