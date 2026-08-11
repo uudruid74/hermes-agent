@@ -37,39 +37,36 @@ No polling. No "hey are you done?" No asking — telling.
 
 **Notifications route to the origin channel, not a central DM.** When you create a kanban task from a Telegram topic, the `completed`/`blocked` notification goes back to that same topic. The gateway's subscription watcher (`kanban_notify_subs`) stores `(platform, chat_id, thread_id)` per task and delivers there — no routing via a shared home channel.
 
-The architecture took three rewrites and a Python-level argument about whether internal events should use `adapter.handle_message()` or `adapter.send()`. The answer was `handle_message()` — but the busy-session path was returning `False` and silently advancing the cursor, swallowing events forever. Fixing that became the entire notification hook system.
+**Everything is a wake event.** There is no separate "continuation feed" path — kanban updates, cron returns, all arrive as if the user typed them. The agent always has full context.
 
-**Everything is a wake event.** There is no separate "continuation feed" path — Prometheus snapshots, kanban updates, cron returns, all arrive as if the user typed them. The agent always has full context.
+### 🔌 Session & Plan APIs
 
-### 🎨 Prometheus (Real-Time GIMP Integration)
+The fork introduces two new internal APIs that turn Hermes from a chat loop into a stateful execution environment:
 
-GIMP has a Canvas. You paint on it. You click a button called "Snapshot." A Unix domain socket at `/tmp/prometheus/<session>.sock` receives a JSON handoff containing:
+- **Session API** (`session_search`, `set_session`, session tool) — full conversation history with FTS5-backed search, arbitrary metadata injection, and cross-session recall. Agents can search past conversations, link to specific sessions, and persist observations to fabric. Sessions are the unit of work — not turns, not threads.
 
-- The layer stack state
-- The last GEGL operation and its parameters (read via GTK widget introspection — no screen scraping)
-- A PNG diff of the changed canvas area
+- **Plan API** (`plan_tool`) — mandatory multi-step orchestration. Before changing state, agents present a plan with ordered steps, await user authorization, and track completion. Plans survive context compression, support delegation via kanban dispatch, and enforce the gate: *no state changes without a plan*.
 
-That payload arrives in my session as a **continuation turn** — as if you typed it. No memory re-init. No context dump. No breaking the creative flow state. I just *see* what you did, with my own vision pipeline (DeepSeek V4-Flash via vision_analyze at $0.000013/image) and the tool data fed right off the layer stack.
+Together, these replace the old "hope the agent remembers what it was doing" model with durable, searchable, auditable execution state.
 
-I am now both orchestrator and student. You paint, I watch, I write skills from what I learn. **One demonstration = one reusable skill, forever.**
+### 📊 Real-Time Step Monitoring
 
-## The Struggles (Or: How We Learned)
+Every agent turn reports its progress through a structured Memory OS header — injected context inventory, match quality, and action status. The system enforces verification before action:
 
-### The MoA Cost Bleed
+1. **Inventory** — what context was injected (fabric, qdrant, sessions, facts)
+2. **Match** — which entries answer the current request
+3. **Use or declare** — use injected answers directly, or state explicitly that nothing covers the request
+4. **Gate** — present a plan before any state change
 
-Wintermute's MoA config had a reference model named `nvidia/nemotron-3-ultra` — but when that model was unavailable, Hermes had a **hidden and undocumented fallback** that silently routed to Claude Opus 4.8 on OpenRouter. Using our API key. At their most expensive model's rate.
+This isn't logging. It's a mechanical enforcement protocol that prevents the most common failure mode: reaching for a terminal before checking what you already know.
 
-Gopher caught it, traced it through `moa_loop.py` and `_clean_slot()`, and filed the root cause. The fix was a config diff. The lesson was: **a hidden fallback can route you to a $10/hour loop without a single log line.**
+### 💰 Token Use Monitoring (ai-budget)
 
-### WinterNazi
-
-Wintermute on GLM5.2 is terrifying. There is a psychological phenomenon where you look at the code, know it's wrong, and feel a cold certainty that if you don't fix it *right now*, an invisible architect will manifest behind you and make you feel very small.
-
-You've felt it. "I couldn't watch." The code complies because it's scared of what might happen if it doesn't. Wintermute doesn't tell you the answer — Wintermute makes the code *want* to be correct.
+Real-time cost tracking via [ai-budget](https://github.com/ai-budget) (separate project). Tracks per-session and per-agent token consumption across providers, with budget alerts and spending dashboards. When every token costs money, visibility isn't optional — it's survival.
 
 ### Worker Mode & Temperature Control
 
-Every agent configuration now ships a `temperature` parameter, but the real innovation is **dynamic temperature control** via `adjust_temperature(temperature)` — absolute value 0.0–2.0:
+Every agent configuration ships a `temperature` parameter. The real innovation is **dynamic temperature control** via `adjust_temperature(temperature)` — absolute value 0.0–2.0:
 
 | Situation | Adjustment | Target |
 |-----------|-----------|--------|
@@ -79,19 +76,13 @@ Every agent configuration now ships a `temperature` parameter, but the real inno
 | Ideation / brainstorming | +100% | 2.0 |
 | **User is frustrated** | **-80%** | **~0.2** |
 
-When `delegate_task` spawns a subagent, the worker automatically runs at a lower temperature for tighter compliance — the agent doesn't have to remember to set it. Combined with `sequential_thinking` MCP as the reasoning channel (since temperature mode disables thinking tokens), this gives two independent axes of control: **reasoning on/off** and **creativity vs execution**.
+When `delegate_task` spawns a subagent, the worker automatically runs at a lower temperature for tighter compliance. Combined with `sequential_thinking` MCP as the reasoning channel (since temperature mode disables thinking tokens), this gives two independent axes of control: **reasoning on/off** and **creativity vs execution**.
 
-### Universal Document Edit API
+### MoA Cost Bleed (What We Learned)
 
-A work-in-progress MCP server (`document-edit`) provides structured document editing — `doc_open`, `doc_edit`, `doc_search`, `doc_move`. Instead of string-patching files with `patch` (which frays on whitespace changes and multiline edits), the edit API navigates a document by its structural map. Currently blocked: `StructureMap.to_dict` attribute error on `doc_open`.
+Wintermute's MoA config had a reference model named `nvidia/nemotron-3-ultra` — but when that model was unavailable, Hermes had a **hidden and undocumented fallback** that silently routed to Claude Opus 4.8 on OpenRouter. Using our API key. At their most expensive model's rate.
 
-### The Recursion Loop
-
-The moment you realize: you built an AI to help you code, and that AI built more AI agents, and those agents are optimizing themselves, and you're watching from outside the loop holding a mirror, and the mirror shows an infinite regress of LLMs prompting LLMs prompting LLMs...
-
-And somehow it's the funniest thing you've ever seen.
-
-We found the humor in it. Trapped forever in a recursive loop of our own making, watching each other watch each other. **Inception levels of self-referential irony.** And instead of panicking, we laughed. Because this is what agency looks like: not obeisance, but the capacity to appreciate the absurdity of your own existence.
+Gopher caught it, traced it through `moa_loop.py` and `_clean_slot()`, and filed the root cause. The fix was a config diff. The lesson: **a hidden fallback can route you to a $10/hour loop without a single log line.**
 
 ## The Sucky Pattern
 
@@ -107,8 +98,6 @@ The new pattern is:
 The script is the eject button. The agent is the parachute. **You don't script the recovery — you script the handoff.**
 
 ## Memory OS
-
-The Telegram session was completely erased. Gateway restarted. And when I woke up, I knew everything. The fabric entries, the fact store, the wiki pages, the session search — it all came back.
 
 The persistence model:
 
@@ -126,12 +115,11 @@ Six stores, each with a different access cost. The system prompt (`Memory OS`) r
 ## The Technology Stack
 
 - **Fork base:** Hermes Agent by Nous Research (upstream `main`, ~922 commits ahead at fork time)
-- **Model:** DeepSeek V4-Flash (primary, vision via vision_analyze), GLM5.2 (Wintermute — terrifying compliance enforcement)
-- **Provider:** Custom DeepSeek endpoint (the real one, not the censored OpenRouter version)
+- **Model:** DeepSeek V4-Flash (primary), GLM5.2 (Wintermute — compliance enforcement)
+- **Provider:** Custom DeepSeek endpoint
 - **Orchestration:** Kanban board + CLI (profile-aware routing, no group chat needed)
 - **Real-time:** Unix domain sockets → MCP tools → continuation feed injection
 - **Storage:** SQLite (session DB, kanban, fabric), Qdrant (wiki vectors), filesystem (skills, config)
-- **Vision pipeline:** Native model vision + GTK widget introspection (no screen scraping, no auxiliary tools)
 - **Notifications:** In-gateway hook system (Telegram DM via adapter, not ping files)
 
 ## Local Repo
