@@ -16906,7 +16906,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             chrome_rows = chrome_tight if use_compact_chrome else chrome_full
 
             max_question_rows = max(1, available - chrome_rows - len(choice_wrapped) - len(other_wrapped))
-            max_question_rows = min(max_question_rows, 12)  # soft cap on huge terminals
+            max_question_rows = min(max_question_rows, 24)  # soft cap — room for plans with steps
 
             # When the choices alone (plus compact chrome) already exceed the
             # viewport, drop the question entirely — the choices are the only
