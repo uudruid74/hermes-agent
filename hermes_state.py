@@ -2304,6 +2304,23 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         with self._lock:
             yield self._conn
 
+    def _execute_read(
+        self,
+        fn: Callable[[sqlite3.Connection], T],
+    ) -> T:
+        """Execute a read-only query using the WAL read connection.
+
+        Mirrors :meth:`_execute_write` but uses :meth:`_read_ctx` instead
+        of the write-lock + jitter-retry flow.  WAL readers never convoy
+        behind writers, so no transaction, no lock, no retries.
+
+        *fn* receives the connection and should perform SELECT queries only.
+        Returns whatever *fn* returns.
+        """
+        with self._read_ctx() as c:
+            assert c is not None  # _read_ctx always yields a live connection
+            return fn(c)
+
     # ── Core write helper ──
 
     @staticmethod
