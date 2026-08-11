@@ -1,0 +1,631 @@
+"""
+plan_tool — Mandatory Action Protocol for Hermes agents.
+
+Commands: new, done, dispatch, remind, fail, approve
+
+Default = Deny All. Without an active task_id in the session, file
+writes, cron creation, and kanban task creation are blocked. The Plan
+tool creates 'manual' kanban tasks that carry step-by-step plans.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import time
+from typing import Any, Dict, List, Optional
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+def _get_session_db():
+    """Lazy import to avoid circular deps."""
+    from hermes_state import SessionDB
+    return SessionDB()
+
+def _get_kanban_db():
+    from hermes_cli.kanban_db import KanbanDB
+    return KanbanDB()
+
+def _get_agent_name(agent) -> str:
+    return getattr(agent, "agent_name", None) or os.environ.get("HERMES_AGENT_NAME", "agent")
+
+def _get_session_id(agent) -> Optional[str]:
+    return getattr(agent, "session_id", None) or os.environ.get("HERMES_SESSION_ID")
+
+def _get_task_id(agent) -> Optional[str]:
+    return os.environ.get("HERMES_KANBAN_TASK")
+
+def _resolve_temp(temp: Optional[str], agent) -> Optional[float]:
+    """Resolve symbolic temperature names to floats from config.yaml."""
+    if temp is None:
+        return None
+    try:
+        return float(temp)
+    except (ValueError, TypeError):
+        pass
+    # Symbolic: chat, worker, creative
+    profile = getattr(agent, "profile_name", None) or os.environ.get("HERMES_PROFILE", "neo")
+    config_path = os.path.expanduser(f"~/.hermes/profiles/{profile}/config.yaml")
+    try:
+        import yaml
+        with open(config_path) as f:
+            cfg = yaml.safe_load(f) or {}
+        temps = cfg.get("temperature_map", {}) or cfg.get("temperatures", {})
+        return temps.get(temp)
+    except Exception:
+        pass
+    # Hard defaults if config missing
+    defaults = {"chat": 0.8, "worker": 0.4, "creative": 1.2}
+    return defaults.get(temp)
+
+
+# ---------------------------------------------------------------------------
+# command: new
+# ---------------------------------------------------------------------------
+
+def _cmd_new(agent, title: str, goal: str, steps: List[str],
+             temp: Optional[str] = None) -> str:
+    """Present a multistep plan for approval."""
+    agent_name = _get_agent_name(agent)
+    session_id = _get_session_id(agent)
+    current_task_id = _get_task_id(agent)
+
+    if not title or not goal or not steps:
+        return "ERROR: 'new' requires title, goal, and steps[]"
+
+    # Resolve temperature
+    resolved_temp = _resolve_temp(temp, agent)
+
+    # Build approval message
+    subject = ""
+    if session_id:
+        sdb = _get_session_db()
+        row = sdb._execute_read(lambda c: c.execute(
+            "SELECT subject FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone())
+        if row:
+            subject = (row["subject"] if isinstance(row, dict) else row[0]) or ""
+
+    lines = [
+        f"Approve {subject}:{title} for {agent_name} [{current_task_id or 'no-task'}]",
+    ]
+    if temp:
+        lines[0] += f" [temp: {temp}]"
+    lines.append(f"Goal: {goal}")
+    lines.append("")
+    lines.append("Steps:")
+    for i, step in enumerate(steps, 1):
+        lines.append(f"  {i}. {step}")
+
+    approval_text = "\n".join(lines)
+
+    # Present for approval via auth gate
+    try:
+        from hermes_cli.auth import request_approval
+        approved, reason = request_approval(approval_text)
+    except Exception:
+        return "User unavailable. Stand down and wait for the user to return. Do nothing else."
+
+    if not approved:
+        reason_str = f" — {reason}" if reason else ""
+        # Log denial to fabric
+        try:
+            from tools.registry import registry
+            registry.dispatch("fabric_write", {
+                "type": "note",
+                "content": f"Plan denied: {title}{reason_str}",
+                "summary": f"Plan denied: {title}",
+            })
+        except Exception:
+            pass
+        return f"Your plan is denied by the user.{reason_str}"
+
+    # Create manual kanban task
+    kdb = _get_kanban_db()
+    import uuid
+    task_id = f"t_{uuid.uuid4().hex[:8]}"
+    current_temp = getattr(agent, "_session_temperature", None)
+    if current_temp is None and session_id:
+        sdb = _get_session_db()
+        row = sdb._execute_read(lambda c: c.execute(
+            "SELECT model_config FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone())
+        if row:
+            mc = row["model_config"] if isinstance(row, dict) else row[0]
+            if isinstance(mc, str):
+                try:
+                    mc = json.loads(mc)
+                except Exception:
+                    mc = {}
+            if isinstance(mc, dict):
+                current_temp = mc.get("temperature")
+
+    try:
+        with kdb._conn() as conn:
+            conn.execute("""
+                INSERT INTO tasks (id, title, body, status, assignee, created_at,
+                                   task_steps, task_stepno, task_goal,
+                                   prev_temperature, previous_task, session_id)
+                VALUES (?, ?, ?, 'manual', ?, ?, ?, 1, ?, ?, ?, ?)
+            """, (
+                task_id, title, approval_text, agent_name, int(time.time()),
+                json.dumps(steps), goal,
+                current_temp, current_task_id, session_id,
+            ))
+            conn.commit()
+    except Exception as e:
+        return f"ERROR: Failed to create task: {e}"
+
+    # Set session task_id and temperature
+    if session_id:
+        sdb = _get_session_db()
+        sdb.set_session_task_id(session_id, task_id)
+        sdb.set_session_subject(session_id, title)
+
+    if resolved_temp is not None:
+        agent._session_temperature = resolved_temp
+
+    # If running as kanban worker, block parent
+    if current_task_id:
+        try:
+            with kdb._conn() as conn:
+                conn.execute(
+                    "UPDATE tasks SET status = 'blocked', block_kind = 'approval' WHERE id = ?",
+                    (current_task_id,)
+                )
+                conn.commit()
+        except Exception:
+            pass
+
+    # Log approval to fabric
+    try:
+        from tools.registry import registry
+        registry.dispatch("fabric_write", {
+            "type": "note",
+            "content": f"Plan approved: {title} → {task_id}",
+            "summary": f"Plan: {title}",
+        })
+    except Exception:
+        pass
+
+    return (
+        f"Your plan is approved as task {task_id}\n\n"
+        f"Complete Step 1: {steps[0]}\n"
+        f"Use plan tool 'done' to mark complete. Do not proceed to Step 2."
+    )
+
+
+# ---------------------------------------------------------------------------
+# command: done
+# ---------------------------------------------------------------------------
+
+def _cmd_done(agent, status: Optional[str] = None) -> str:
+    """Mark current step complete. Advance or finish."""
+    session_id = _get_session_id(agent)
+    if not session_id:
+        return "ERROR: No active session"
+
+    sdb = _get_session_db()
+    row = sdb._execute_read(lambda c: c.execute(
+        "SELECT task_id FROM sessions WHERE id = ?", (session_id,)
+    ).fetchone())
+    if not row:
+        return "ERROR: Session not found"
+    task_id = row["task_id"] if isinstance(row, dict) else row[0]
+    if not task_id:
+        return "ERROR: No active task"
+
+    kdb = _get_kanban_db()
+    with kdb._conn() as conn:
+        task = conn.execute(
+            "SELECT * FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if not task:
+            return f"ERROR: Task {task_id} not found"
+
+        task = dict(task)
+        steps = json.loads(task.get("task_steps") or "[]")
+        stepno = task.get("task_stepno") or 1
+        goal = task.get("task_goal") or ""
+        prev_task = task.get("previous_task")
+        prev_temp = task.get("prev_temperature")
+
+        # Log completion of this step
+        note = f"Step {stepno} complete"
+        if status:
+            note += f" — {status}"
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+            (task_id, _get_agent_name(agent), note, int(time.time())),
+        )
+
+        if stepno < len(steps):
+            # Advance to next step
+            conn.execute(
+                "UPDATE tasks SET task_stepno = ? WHERE id = ?",
+                (stepno + 1, task_id),
+            )
+            conn.commit()
+            return f"Complete Step {stepno + 1}: {steps[stepno]}"
+        else:
+            # All steps done — complete the task
+            conn.execute(
+                "UPDATE tasks SET status = 'done', completed_at = ?, task_stepno = NULL WHERE id = ?",
+                (int(time.time()), task_id),
+            )
+            conn.commit()
+
+    # Restore previous task
+    if prev_task:
+        sdb.set_session_task_id(session_id, prev_task)
+        if prev_temp is not None:
+            agent._session_temperature = prev_temp
+
+        # Get parent task info
+        with kdb._conn() as conn:
+            parent = conn.execute(
+                "SELECT title, task_goal FROM tasks WHERE id = ?", (prev_task,)
+            ).fetchone()
+        parent_title = dict(parent).get("title", prev_task) if parent else prev_task
+        parent_goal = dict(parent).get("task_goal", "") if parent else ""
+
+        # Log via session
+        sdb.set_session_subject(session_id, parent_title)
+        try:
+            from tools.registry import registry
+            registry.dispatch("fabric_write", {
+                "type": "note",
+                "content": f"Task {task_id} completed. Continuing parent {prev_task}: {parent_title}",
+                "summary": f"Done: {task_id} → {prev_task}",
+            })
+        except Exception:
+            pass
+
+        return (
+            f"Task {task_id} complete. Continuing parent task {prev_task}, "
+            f"whose goal was: {parent_goal}\n\n"
+            f"Complete Step {stepno}: {steps[stepno - 1] if stepno <= len(steps) else 'review work'}"
+        )
+    else:
+        # No parent — clear task_id, writes will fail
+        sdb.clear_session_task_id(session_id)
+
+        # Auto-commit if in a git repo
+        commit_msg = f"done: {task.get('title', task_id)}"
+        if status:
+            commit_msg += f" — {status}"
+        try:
+            import subprocess
+            subprocess.run(["git", "add", "-A"], capture_output=True, timeout=10)
+            subprocess.run(["git", "commit", "-m", commit_msg], capture_output=True, timeout=10)
+        except Exception:
+            pass
+
+        # Log completion
+        try:
+            from tools.registry import registry
+            registry.dispatch("fabric_write", {
+                "type": "note",
+                "content": f"Task {task_id} completed successfully at {time.strftime('%Y-%m-%d %H:%M:%S')}",
+                "summary": f"Done: {task_id}",
+            })
+        except Exception:
+            pass
+
+        # set_session ego happy
+        try:
+            sdb.set_session_mood(session_id, 0.5)
+        except Exception:
+            pass
+
+        return (
+            f"The task goal was: {goal}\n"
+            f"Verify this goal has been achieved, or present a new plan."
+        )
+
+
+# ---------------------------------------------------------------------------
+# command: dispatch
+# ---------------------------------------------------------------------------
+
+def _cmd_dispatch(agent, title: str, goal: str, project: str, assignee: str,
+                  steps: Optional[List[str]] = None,
+                  resume: Optional[str] = None) -> str:
+    """Create and dispatch a regular kanban task."""
+    if not project:
+        return "ERROR: 'project' (board) is required for dispatch"
+
+    kdb = _get_kanban_db()
+    import uuid
+    task_id = f"t_{uuid.uuid4().hex[:8]}"
+
+    body = f"Goal: {goal}"
+    if steps:
+        body += "\n\nSteps:\n" + "\n".join(f"  {i}. {s}" for i, s in enumerate(steps, 1))
+        steps_json = json.dumps(steps)
+    else:
+        steps_json = None
+
+    try:
+        with kdb._conn() as conn:
+            conn.execute("""
+                INSERT INTO tasks (id, title, body, status, assignee, created_at,
+                                   task_steps, task_goal, previous_task, project_id)
+                VALUES (?, ?, ?, 'ready', ?, ?, ?, ?, ?, ?)
+            """, (
+                task_id, title, body, assignee, int(time.time()),
+                steps_json, goal, resume, project,
+            ))
+            conn.commit()
+    except Exception as e:
+        return f"ERROR: Failed to create task: {e}"
+
+    # Set resume task dependency
+    if resume:
+        try:
+            with kdb._conn() as conn:
+                from hermes_cli.kanban_db import link_tasks
+                link_tasks(conn, task_id, resume)
+        except Exception:
+            pass
+
+    project_display = "**Random**" if project.lower() == "default" else project
+    return f"Task {task_id} dispatched to {assignee} on {project_display}: {title}"
+
+
+# ---------------------------------------------------------------------------
+# command: remind
+# ---------------------------------------------------------------------------
+
+def _cmd_remind(agent) -> str:
+    """Show full plan with current step."""
+    session_id = _get_session_id(agent)
+    if not session_id:
+        return "ERROR: No active session"
+
+    sdb = _get_session_db()
+    row = sdb._execute_read(lambda c: c.execute(
+        "SELECT task_id FROM sessions WHERE id = ?", (session_id,)
+    ).fetchone())
+    if not row:
+        return "ERROR: No task assigned"
+    task_id = row["task_id"] if isinstance(row, dict) else row[0]
+    if not task_id:
+        return "ERROR: No active task"
+
+    kdb = _get_kanban_db()
+    with kdb._conn() as conn:
+        task = conn.execute(
+            "SELECT * FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if not task:
+            return f"Task {task_id} not found"
+
+        task = dict(task)
+        steps = json.loads(task.get("task_steps") or "[]")
+        stepno = task.get("task_stepno") or 1
+        goal = task.get("task_goal") or ""
+
+    lines = [
+        f"Task: {task.get('title', task_id)}",
+        f"Goal: {goal}",
+        f"Step {stepno}/{len(steps)}",
+        "",
+    ]
+    for i, step in enumerate(steps, 1):
+        marker = "→" if i == stepno else " "
+        lines.append(f"  {marker} Step {i}: {step}")
+
+    if stepno <= len(steps):
+        lines.append(f"\nComplete Step {stepno}: {steps[stepno - 1]}")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# command: fail
+# ---------------------------------------------------------------------------
+
+def _cmd_fail(agent, reason: str = "") -> str:
+    """Mark task as failed."""
+    session_id = _get_session_id(agent)
+    if not session_id:
+        return "ERROR: No active session"
+
+    sdb = _get_session_db()
+    row = sdb._execute_read(lambda c: c.execute(
+        "SELECT task_id FROM sessions WHERE id = ?", (session_id,)
+    ).fetchone())
+    if not row:
+        return "ERROR: No task assigned"
+    task_id = row["task_id"] if isinstance(row, dict) else row[0]
+    if not task_id:
+        return "ERROR: No active task"
+
+    kdb = _get_kanban_db()
+    with kdb._conn() as conn:
+        task = conn.execute(
+            "SELECT * FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if not task:
+            return f"Task {task_id} not found"
+
+        task = dict(task)
+        status = task.get("status", "")
+        goal = task.get("task_goal") or ""
+        steps = json.loads(task.get("task_steps") or "[]")
+        stepno = task.get("task_stepno") or 1
+        step_title = steps[stepno - 1] if stepno <= len(steps) else "unknown"
+
+        if status == "manual":
+            # Manual: output full task to user, clear task_id
+            comments = conn.execute(
+                "SELECT * FROM task_comments WHERE task_id = ? ORDER BY created_at",
+                (task_id,)
+            ).fetchall()
+
+            # Clear task
+            conn.execute(
+                "UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?",
+                (int(time.time()), task_id),
+            )
+            conn.commit()
+
+            sdb.clear_session_task_id(session_id)
+            agent._session_temperature = _resolve_temp("worker", agent)
+
+            try:
+                sdb.set_session_mood(session_id, -1.0)
+            except Exception:
+                pass
+
+            comment_text = "\n".join(
+                f"  [{c['author']}] {c['body']}" for c in comments
+            ) if comments else "  (no comments)"
+
+            return (
+                f"Task {task_id} has failed.\n\n"
+                f"Title: {task.get('title', '')}\n"
+                f"Goal: {goal}\n"
+                f"Failed at Step {stepno}: {step_title}\n"
+                f"Reason: {reason or 'unspecified'}\n\n"
+                f"Comments:\n{comment_text}"
+            )
+        else:
+            # Kanban: block with reason
+            conn.execute(
+                "UPDATE tasks SET status = 'blocked', block_kind = 'failure' WHERE id = ?",
+                (task_id,)
+            )
+            conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+                (task_id, _get_agent_name(agent),
+                 f"FAILED at Step {stepno}: {step_title}. {reason}",
+                 int(time.time())),
+            )
+            conn.commit()
+
+    return f"The goal was: {goal}. Step {stepno} ({step_title}) failed. {reason}. Please present a new plan."
+
+
+# ---------------------------------------------------------------------------
+# command: approve
+# ---------------------------------------------------------------------------
+
+def _cmd_approve(agent, task_id: str) -> str:
+    """Approve a blocked plan task."""
+    kdb = _get_kanban_db()
+    with kdb._conn() as conn:
+        task = conn.execute(
+            "SELECT * FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if not task:
+            return f"ERROR: Task {task_id} not found"
+
+        task = dict(task)
+        if task.get("status") != "blocked":
+            return f"ERROR: Task {task_id} is not blocked (status: {task.get('status')})"
+
+        block_kind = task.get("block_kind") or ""
+        if block_kind != "approval":
+            return f"Task {task_id} is blocked but not waiting for approval (kind: {block_kind})"
+
+        steps = json.loads(task.get("task_steps") or "[]")
+        goal = task.get("task_goal") or ""
+
+    # Present for approval
+    lines = [
+        f"Approve plan for task {task_id}: {task.get('title', '')}",
+        f"Goal: {goal}",
+        "",
+        "Steps:",
+    ]
+    for i, step in enumerate(steps, 1):
+        lines.append(f"  {i}. {step}")
+
+    approval_text = "\n".join(lines)
+
+    try:
+        from hermes_cli.auth import request_approval
+        approved, reason = request_approval(approval_text)
+    except Exception:
+        approved, reason = False, "approval gate unavailable"
+
+    if not approved:
+        return f"Plan denied. Stand down and wait for further instructions. Reason: {reason or 'user denied'}"
+
+    # Unblock the task
+    with kdb._conn() as conn:
+        conn.execute(
+            "UPDATE tasks SET status = 'ready', block_kind = NULL WHERE id = ?",
+            (task_id,)
+        )
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+            (task_id, _get_agent_name(agent),
+             f"APPROVED. Complete Step 1: {steps[0] if steps else 'begin'}",
+             int(time.time())),
+        )
+        conn.commit()
+
+    return f"Task {task_id} approved and unblocked. Worker will pick it up on next dispatch."
+
+
+# ---------------------------------------------------------------------------
+# main tool entry point
+# ---------------------------------------------------------------------------
+
+def plan_tool(
+    agent,
+    command: str,
+    title: Optional[str] = None,
+    goal: Optional[str] = None,
+    steps: Optional[List[str]] = None,
+    temp: Optional[str] = None,
+    status: Optional[str] = None,
+    project: Optional[str] = None,
+    assignee: Optional[str] = None,
+    resume: Optional[str] = None,
+    reason: Optional[str] = None,
+    task_id: Optional[str] = None,
+) -> str:
+    """Mandatory Action Protocol — multistep plan management.
+
+    Commands:
+      new      — present a plan for approval
+      done     — mark current step complete
+      dispatch — create + dispatch a kanban task
+      remind   — show current plan with step marker
+      fail     — mark task as failed
+      approve  — approve a blocked plan task
+    """
+    command = (command or "").strip().lower()
+
+    if command == "new":
+        if not title or not goal or not steps:
+            return "ERROR: 'new' requires title, goal, and steps[]"
+        return _cmd_new(agent, title, goal, steps, temp)
+
+    elif command == "done":
+        return _cmd_done(agent, status)
+
+    elif command == "dispatch":
+        if not title or not goal or not project or not assignee:
+            return "ERROR: 'dispatch' requires title, goal, project, and assignee"
+        return _cmd_dispatch(agent, title, goal, project, assignee, steps, resume)
+
+    elif command == "remind":
+        return _cmd_remind(agent)
+
+    elif command == "fail":
+        return _cmd_fail(agent, reason or "")
+
+    elif command == "approve":
+        if not task_id:
+            return "ERROR: 'approve' requires task_id"
+        return _cmd_approve(agent, task_id)
+
+    else:
+        return f"ERROR: Unknown plan command '{command}'. Valid: new, done, dispatch, remind, fail, approve"
