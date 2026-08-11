@@ -6820,6 +6820,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 # ── Ego/mood icon (replaces emotion axes + agenticon) ──
                 _mood = _read_session_mood(getattr(self, "session_id", None))
                 _subject = _read_session_subject(getattr(self, "session_id", None))
+                _task_id = _read_session_task_id(getattr(self, "session_id", None))
 
                 if _mood != 0.0:
                     _ego_icon = _ego_mood_icon(_mood)
@@ -6848,6 +6849,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             if self.show_timestamps:
                 now = datetime.now()
                 label_ts = f" {now.strftime('%a')} {now.strftime('%I:%M')}{now.strftime('%p')[0].lower()} "
+                # Prepend task_id if active
+                if _task_id:
+                    _tid_short = _task_id[-8:] if len(_task_id) >= 8 else _task_id
+                    label_ts = f" 📋{_tid_short}{label_ts}"
                 # Append ambient icons before clock
                 if _ambient_icons:
                     _amb_str = "".join(i[1] for i in sorted(_ambient_icons, key=lambda x: x[0], reverse=True))
@@ -18172,6 +18177,20 @@ def _read_session_subject(session_id: str | None) -> str | None:
         row = db.get_session(session_id)
         if row:
             return SessionDB.get_session_subject(row)
+    except Exception:
+        pass
+    return None
+
+
+def _read_session_task_id(session_id: str | None) -> str | None:
+    if not session_id:
+        return None
+    try:
+        from hermes_state import SessionDB
+        db = SessionDB()
+        row = db.get_session(session_id)
+        if row:
+            return (row.get("task_id") or None) if isinstance(row, dict) else None
     except Exception:
         pass
     return None
