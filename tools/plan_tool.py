@@ -294,6 +294,10 @@ def _cmd_done(agent, status: Optional[str] = None) -> str:
         stepno = task["task_stepno"]
         if stepno is None:
             stepno = 1
+        import logging
+        _logger = logging.getLogger("plan_tool")
+        _logger.info("PLAN_DONE: task=%s raw_stepno=%s resolved_stepno=%s steps_len=%d db_path=%s",
+                     task_id, task["task_stepno"], stepno, len(steps), str(kdb))
         goal = task["task_goal"] or ""
         prev_task = task["previous_task"]
         prev_temp = task["prev_temperature"]
@@ -314,6 +318,10 @@ def _cmd_done(agent, status: Optional[str] = None) -> str:
                 (stepno + 1, task_id),
             )
             conn.commit()
+            _logger.info("PLAN_DONE: updated task_stepno %d -> %d", stepno, stepno + 1)
+            # Verify the write
+            verify = conn.execute("SELECT task_stepno FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            _logger.info("PLAN_DONE: verify task_stepno=%s", verify["task_stepno"] if verify else "NONE")
             return f"Complete Step {stepno + 1}: {steps[stepno]}"
         else:
             # All steps done — complete the task
