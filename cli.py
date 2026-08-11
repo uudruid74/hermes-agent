@@ -6860,7 +6860,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 w = self._scrollback_box_width()
                 name_width = HermesCLI._status_bar_display_width(label)
                 ts_width = len(label_ts)
-                fill = w - 2 - name_width - ts_width - 1  # -1 for task_id padding
+                fill = w - 2 - name_width - ts_width
+                if _task_id:
+                    fill -= 1  # 📋 icon is wider than 1 char
                 _cprint(f"\n{_accent_override}╭─ {label}{'─' * max(fill - 2, 0)}{label_ts}╮{_RST}")
             else:
                 w = self._scrollback_box_width()
