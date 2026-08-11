@@ -6852,7 +6852,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 # Prepend task_id if active
                 if _task_id:
                     _tid_short = _task_id[-8:] if len(_task_id) >= 8 else _task_id
-                    label_ts = f" 📋{_tid_short}{label_ts}"
+                    label_ts = f" {_tid_short}📋{label_ts}"
                 # Append ambient icons before clock
                 if _ambient_icons:
                     _amb_str = "".join(i[1] for i in sorted(_ambient_icons, key=lambda x: x[0], reverse=True))

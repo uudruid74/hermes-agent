@@ -257,14 +257,25 @@ def _cmd_done(agent, status: Optional[str] = None) -> str:
     sdb = _get_session_db()
     with sdb._read_ctx() as c:
         row = c.execute(
-            "SELECT task_id, subject FROM sessions WHERE id = ?", (session_id,)
+            "SELECT task_id FROM sessions WHERE id = ?", (session_id,)
         ).fetchone()
     if not row:
         return "ERROR: Session not found"
     task_id = row["task_id"]
     if not task_id:
         return "ERROR: No active task"
-    old_subject = row["subject"]  # saved for restore on completion
+
+    # Get old subject from PREV_SUBJECT comment saved at plan creation
+    old_subject = ""
+    kdb = _get_kanban_db()
+    with kdb as conn:
+        cr = conn.execute(
+            "SELECT body FROM task_comments WHERE task_id = ? AND body LIKE 'PREV_SUBJECT:%' ORDER BY created_at DESC LIMIT 1",
+            (task_id,)
+        ).fetchone()
+    if cr:
+        body = cr["body"] if isinstance(cr, dict) else cr[0]
+        old_subject = body.split(":", 1)[1] if isinstance(body, str) and ":" in body else ""
 
     kdb = _get_kanban_db()
     with kdb as conn:
