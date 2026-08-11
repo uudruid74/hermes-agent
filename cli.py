@@ -5285,19 +5285,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             pass
 
         # Task ID from session state.db (plan_tool active tasks)
-        try:
-            task_id = os.environ.get("HERMES_KANBAN_TASK") or ""
-            if not task_id:
+        task_id = os.environ.get("HERMES_KANBAN_TASK") or ""
+        if not task_id:
+            try:
                 from hermes_state import SessionDB
                 sdb = SessionDB()
                 row = sdb.get_session(self.session_id)
-                if row:
-                    task_id = (row.get("task_id") or "") if isinstance(row, dict) else ""
-            if task_id:
-                # Truncate to last 8 chars for display
-                snapshot["task_id"] = task_id[-8:] if len(task_id) >= 8 else task_id
-        except Exception:
-            pass
+                if row and isinstance(row, dict):
+                    task_id = row.get("task_id") or ""
+            except Exception:
+                pass
+        if task_id:
+            snapshot["task_id"] = task_id[-8:] if len(task_id) >= 8 else task_id
 
         # Battery read-out (first status-bar element when enabled). Reads are
         # memoised for a few seconds inside agent.battery, so polling it on
