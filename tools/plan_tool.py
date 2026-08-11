@@ -100,10 +100,23 @@ def _cmd_new(agent, title: str, goal: str, steps: List[str],
     import uuid
     task_id = f"t_{uuid.uuid4().hex[:8]}"
 
+    # Debug: check what's actually on agent
+    import logging
+    _log = logging.getLogger(__name__)
+    _log.warning("plan_tool agent type: %s, has clarify_callback: %s, dir keys: %s",
+                 type(agent).__name__,
+                 hasattr(agent, "clarify_callback"),
+                 [k for k in sorted(dir(agent)) if "callback" in k.lower() or "cli" in k.lower() or k.startswith("_cli")][:10])
+
     # Present to user via clarify callback
     clarify_cb = getattr(agent, "clarify_callback", None)
     if clarify_cb is None:
-        return "ERROR: No clarify callback available — cannot present plan for approval"
+        # Fallback: try importing the callbacks module
+        try:
+            from hermes_cli.callbacks import clarify_callback
+            clarify_cb = lambda q, c, ms=False: clarify_callback(agent, q, c, ms)
+        except ImportError:
+            return "ERROR: No clarify callback available — cannot present plan for approval"
 
     try:
         user_response = clarify_cb(
