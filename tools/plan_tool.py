@@ -237,7 +237,13 @@ def _cmd_done(agent, status: Optional[str] = None) -> str:
             return f"ERROR: Task {task_id} not found"
 
         task = dict(task)
-        steps = json.loads(task.get("task_steps") or "[]")
+        raw_steps = task.get("task_steps")
+        if isinstance(raw_steps, str):
+            steps = json.loads(raw_steps)
+        elif isinstance(raw_steps, list):
+            steps = raw_steps
+        else:
+            steps = []
         stepno = task.get("task_stepno") or 1
         goal = task.get("task_goal") or ""
         prev_task = task.get("previous_task")
