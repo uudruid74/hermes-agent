@@ -77,6 +77,17 @@ def set_session_tool(
         if temperature is None and agent is not None:
             agent._session_temperature = None
 
+        # Persist subject to DB (independent of ego)
+        if agent is not None:
+            try:
+                from hermes_state import SessionDB
+                db = SessionDB()
+                session_id = getattr(agent, "session_id", None)
+                if session_id:
+                    db.set_session_subject(session_id, subject)
+            except Exception:
+                pass
+
     # ── fact → fabric ──
     if fact is not None:
         try:

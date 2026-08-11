@@ -4476,6 +4476,28 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
         self._execute_write(_do)
 
+    def set_session_task_id(self, session_id: str, task_id: str) -> None:
+        """Set the current task_id for a session."""
+        if not session_id:
+            return
+        def _do(conn):
+            conn.execute(
+                "UPDATE sessions SET task_id = ? WHERE id = ?",
+                (task_id, session_id),
+            )
+        self._execute_write(_do)
+
+    def clear_session_task_id(self, session_id: str) -> None:
+        """Clear the task_id for a session (task complete/failed)."""
+        if not session_id:
+            return
+        def _do(conn):
+            conn.execute(
+                "UPDATE sessions SET task_id = NULL WHERE id = ?",
+                (session_id,),
+            )
+        self._execute_write(_do)
+
     def _merge_model_config(self, session_id: str, updates: Dict[str, Any]) -> None:
         """Merge keys into the session's model_config JSON."""
         def _do(conn):

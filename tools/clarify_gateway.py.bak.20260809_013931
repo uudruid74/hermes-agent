@@ -207,15 +207,13 @@ def _coerce_text_response(entry: _ClarifyEntry, response: str) -> Optional[str]:
     For native interactive multi-choice clarifies (button UI, awaiting_text=False):
       - Accept numeric selections ("2" → choice[1])
       - Accept exact choice label matches (case-insensitive)
-      - Any other text resolves the clarify as a "something else" answer
-        (does NOT hang — see resolve path below)
+      - Reject arbitrary prose (return None) so the message continues as a normal turn
 
     For multi-select clarifies (entry.multi_select=True):
-      - Accept several numbers separated by commas, ampersands, and/or
-        spaces ("1,3" / "1&3" / "1 3")
-      - Accept exact choice label matches (single or comma/ampersand-separated)
-      - Non-parseable input resolves the clarify with the raw text as a
-        "something else" answer rather than leaving it pending
+      - Accept several numbers separated by commas and/or spaces ("1,3" / "1 3")
+      - Accept exact choice label matches (single or comma-separated)
+      - Out-of-range numbers reject the whole reply (return None) so the user
+        can retry instead of silently getting a partial selection
       - Selections are returned as a JSON array string, which the clarify
         tool's ``_parse_multi_select_response`` decodes back into a list
 
@@ -225,9 +223,7 @@ def _coerce_text_response(entry: _ClarifyEntry, response: str) -> Optional[str]:
     For open-ended clarifies (no choices):
       - Accept any text
 
-    Returns the resolved answer string. Never returns None for user input —
-    unknown text is treated as a "something else" answer so the clarify
-    resolves instead of hanging to timeout.
+    Returns None when the response should be rejected (arbitrary prose for native multi-choice).
     """
     text = str(response).strip()
 
@@ -239,12 +235,9 @@ def _coerce_text_response(entry: _ClarifyEntry, response: str) -> Optional[str]:
         coerced = _coerce_multi_select_text(entry, text)
         if coerced is not None:
             return coerced
-        # Not a parseable selection. Resolve the clarify with the raw text
-        # as a "something else" answer rather than rejecting (rejecting
-        # leaves the clarify pending and hangs the agent to timeout with
-        # "No Answer"). The gateway only calls this while a clarify is
-        # actively awaiting a reply, so the user's text is their answer.
-        return text
+        # Not a parseable selection — accept as custom text only in
+        # awaiting_text mode (the "Other" path); otherwise reject.
+        return text if entry.awaiting_text else None
 
     # Try numeric selection first (always valid for multi-choice)
     try:
@@ -260,24 +253,22 @@ def _coerce_text_response(entry: _ClarifyEntry, response: str) -> Optional[str]:
         if text.casefold() == str(choice).strip().casefold():
             return str(choice).strip()
 
-    # For text fallback or awaiting_text mode, accept custom text.
-    # For native interactive multi-choice mode, do NOT silently reject
-    # arbitrary prose: resolve the clarify with whatever the user typed
-    # as a "something else" answer instead of leaving the clarify pending
-    # (which hangs the agent until timeout and yields "No Answer"). The
-    # gateway only calls this when a clarify is actively awaiting a reply,
-    # so the user's text is their answer — even if it didn't match a choice.
-    return text
+    # For text fallback or awaiting_text mode, accept custom text
+    # For native interactive multi-choice mode, reject arbitrary prose
+    if entry.awaiting_text:
+        return text
+
+    return None
 
 
 def _coerce_multi_select_text(entry: _ClarifyEntry, text: str) -> Optional[str]:
     """Parse a typed multi-select reply into a JSON array of choice labels.
 
-    Accepts numbers and/or exact labels separated by commas, ampersands,
-    or (for all-numeric replies) bare spaces: "1,3", "1&3", "1 3",
-    "staging, prod". Returns ``None`` when no token parses as a valid
-    selection so the caller can resolve the clarify with the raw text as a
-    "something else" answer (rather than leaving it pending to timeout).
+    Accepts numbers and/or exact labels separated by commas (and, for
+    all-numeric replies, bare spaces): "1,3", "1 3", "staging, prod".
+    Returns ``None`` when any token is out of range or unrecognised so the
+    caller can reject the reply cleanly instead of resolving a partial or
+    wrong selection.
     """
     import json as _json
 
@@ -285,14 +276,10 @@ def _coerce_multi_select_text(entry: _ClarifyEntry, text: str) -> Optional[str]:
         return None
     choices = entry.choices or []
 
-    # Split on separators. Accept commas and ampersands as explicit
-    # multi-select separators ("1,3" / "1&3"); also accept bare spaces
-    # between all-numeric tokens ("1 3"). Prefer commas when both are
-    # present; ampersand-only splitting is restricted to all-numeric
-    # replies so labels containing "&" (e.g. "Tom & Jerry") are not torn.
-    if "," in text or "&" in text:
-        sep = "," if "," in text else "&"
-        tokens = [t.strip() for t in text.split(sep) if t.strip()]
+    # Split on commas first; if no commas and every whitespace-separated
+    # token is numeric, treat spaces as separators too ("1 3").
+    if "," in text:
+        tokens = [t.strip() for t in text.split(",") if t.strip()]
     else:
         parts = text.split()
         if len(parts) > 1 and all(p.strip().isdigit() for p in parts):
@@ -329,9 +316,8 @@ def _coerce_multi_select_text(entry: _ClarifyEntry, text: str) -> Optional[str]:
 def resolve_text_response_for_session(session_key: str, response: str) -> bool:
     """Resolve the oldest pending clarify in ``session_key`` from typed text.
 
-    Returns False only if no pending clarify exists. Any typed text —
-    including non-matching prose — resolves the clarify (as a "something
-    else" answer) so the agent never hangs waiting to timeout.
+    Returns False if no pending clarify exists or if the response was rejected
+    (arbitrary prose for native interactive multi-choice clarifies).
     """
     entry = get_pending_for_session(session_key, include_choice_prompts=True)
     if entry is None:
