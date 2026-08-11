@@ -228,6 +228,65 @@ class TestTelegramRichMessagesHint:
         assert "lean into it" not in stable
 
 
+class TestActiveProfileHint:
+    """Verify the active-profile hint uses correct paths in profile mode."""
+
+    def test_profile_mode_no_path_doubling(self):
+        """When HERMES_HOME points at a profile dir, the hint must NOT double
+        the /profiles/<name>/ suffix."""
+        agent = _make_agent()
+        with (
+            patch("run_agent.load_soul_md", return_value=""),
+            patch("run_agent.build_nous_subscription_prompt", return_value=""),
+            patch("run_agent.build_environment_hints", return_value=""),
+            patch("run_agent.build_context_files_prompt", return_value=""),
+            patch(
+                "agent.file_safety._resolve_active_profile_name",
+                return_value="gopher",
+            ),
+            patch(
+                "agent.system_prompt.get_hermes_home",
+                return_value=Path("/home/ekl/.hermes/profiles/gopher"),
+            ),
+            patch(
+                "agent.system_prompt.get_default_hermes_root",
+                return_value=Path("/home/ekl/.hermes"),
+            ),
+        ):
+            parts = build_system_prompt_parts(agent)
+        stable = parts["stable"]
+        # Active profile data dir must appear exactly once, not doubled
+        assert "/home/ekl/.hermes/profiles/gopher/" in stable
+        assert "/home/ekl/.hermes/profiles/gopher/profiles/" not in stable
+        # Default profile data paths must use root, not profile dir
+        assert "/home/ekl/.hermes/skills/" in stable
+        assert "/home/ekl/.hermes/plugins/" in stable
+        assert "/home/ekl/.hermes/cron/" in stable
+        assert "/home/ekl/.hermes/memories/" in stable
+
+    def test_default_profile_hint_unchanged(self):
+        """Default profile branch still renders the standard hint."""
+        agent = _make_agent()
+        with (
+            patch("run_agent.load_soul_md", return_value=""),
+            patch("run_agent.build_nous_subscription_prompt", return_value=""),
+            patch("run_agent.build_environment_hints", return_value=""),
+            patch("run_agent.build_context_files_prompt", return_value=""),
+            patch(
+                "agent.file_safety._resolve_active_profile_name",
+                return_value="default",
+            ),
+            patch(
+                "agent.system_prompt.get_hermes_home",
+                return_value=Path("/home/ekl/.hermes"),
+            ),
+        ):
+            parts = build_system_prompt_parts(agent)
+        stable = parts["stable"]
+        assert "Active Hermes profile: default." in stable
+        assert "/home/ekl/.hermes/profiles/<name>/" in stable
+
+
 _SKILLS = "SKILLS_INDEX_SENTINEL"
 _CONTEXT = "CONTEXT_FILES_SENTINEL"
 
