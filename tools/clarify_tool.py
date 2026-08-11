@@ -114,6 +114,7 @@ def clarify_tool(
     choices: Optional[List[str]] = None,
     multi_select: bool = False,
     callback: Optional[Callable] = None,
+    agent=None,
 ) -> str:
     """
     Ask the user a question, optionally with multiple-choice options.
@@ -159,10 +160,59 @@ def clarify_tool(
     if callback is None:
         return tool_error("Clarify tool is not available in this execution context.")
 
+    # Write to clarify_queue so dashboard can pick it up
+    clarify_id = None
+    if agent is not None:
+        import uuid, time, os
+        try:
+            from hermes_cli.kanban_db import kanban_db_path
+            import sqlite3
+            db = sqlite3.connect(str(kanban_db_path()))
+            db.execute("PRAGMA journal_mode=WAL")
+            clarify_id = uuid.uuid4().hex[:12]
+            session_id = getattr(agent, "session_id", None) or os.environ.get("HERMES_SESSION_ID")
+            task_id = None
+            try:
+                from hermes_state import SessionDB
+                sdb = SessionDB()
+                with sdb._read_ctx() as ctx:
+                    row = ctx.execute("SELECT task_id FROM sessions WHERE id=?", (session_id,)).fetchone()
+                if row:
+                    task_id = row["task_id"] if isinstance(row, dict) else row[0]
+            except Exception:
+                pass
+            agent_name = getattr(agent, "agent_name", "unknown")
+            db.execute(
+                "INSERT INTO clarify_queue(id,session_id,task_id,agent_name,question,choices,multi_select,status,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                (clarify_id, session_id, task_id, agent_name, question,
+                 json.dumps(choices) if choices else None,
+                 1 if multi_select else 0, "pending", int(time.time())))
+            db.commit()
+            db.close()
+        except Exception:
+            clarify_id = None
+
     try:
         raw_response = _invoke_callback(callback, question, choices, multi_select)
     except Exception as exc:
+        # Clean up row on error
+        if clarify_id:
+            try:
+                db2 = sqlite3.connect(str(kanban_db_path()))
+                db2.execute("DELETE FROM clarify_queue WHERE id=?", (clarify_id,))
+                db2.commit(); db2.close()
+            except Exception:
+                pass
         return tool_error(f"Failed to get user input: {exc}")
+
+    # Clean up row after answer
+    if clarify_id:
+        try:
+            db3 = sqlite3.connect(str(kanban_db_path()))
+            db3.execute("DELETE FROM clarify_queue WHERE id=?", (clarify_id,))
+            db3.commit(); db3.close()
+        except Exception:
+            pass
 
     if multi_select and choices is not None:
         user_response = _parse_multi_select_response(raw_response)
@@ -260,7 +310,8 @@ registry.register(
         question=args.get("question", ""),
         choices=args.get("choices"),
         multi_select=args.get("multi_select", False),
-        callback=kw.get("callback")),
+        callback=kw.get("callback"),
+        agent=kw.get("agent")),
     check_fn=check_clarify_requirements,
     emoji="❓",
 )
