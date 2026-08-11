@@ -25,8 +25,10 @@ def _get_session_db():
     return SessionDB()
 
 def _get_kanban_db():
-    from hermes_cli.kanban_db import KanbanDB
-    return KanbanDB()
+    """Return a sqlite3 connection to the kanban database."""
+    import sqlite3
+    from hermes_cli.kanban_db import kanban_db_path
+    return sqlite3.connect(str(kanban_db_path()))
 
 def _get_agent_name(agent) -> str:
     return getattr(agent, "agent_name", None) or os.environ.get("HERMES_AGENT_NAME", "agent")
@@ -110,7 +112,7 @@ def _cmd_new(agent, title: str, goal: str, steps: List[str],
     current_temp = getattr(agent, "_session_temperature", None)
 
     try:
-        with kdb._conn() as conn:
+        with kdb as conn:
             conn.execute("""
                 INSERT INTO tasks (id, title, body, status, assignee, created_at,
                                    task_steps, task_stepno, task_goal,
@@ -159,7 +161,7 @@ def _cmd_done(agent, status: Optional[str] = None) -> str:
         return "ERROR: No active task"
 
     kdb = _get_kanban_db()
-    with kdb._conn() as conn:
+    with kdb as conn:
         task = conn.execute(
             "SELECT * FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
@@ -205,7 +207,7 @@ def _cmd_done(agent, status: Optional[str] = None) -> str:
             agent._session_temperature = prev_temp
 
         # Get parent task info
-        with kdb._conn() as conn:
+        with kdb as conn:
             parent = conn.execute(
                 "SELECT title, task_goal FROM tasks WHERE id = ?", (prev_task,)
             ).fetchone()
@@ -290,7 +292,7 @@ def _cmd_dispatch(agent, title: str, goal: str, project: str, assignee: str,
         steps_json = None
 
     try:
-        with kdb._conn() as conn:
+        with kdb as conn:
             conn.execute("""
                 INSERT INTO tasks (id, title, body, status, assignee, created_at,
                                    task_steps, task_goal, previous_task, project_id)
@@ -306,7 +308,7 @@ def _cmd_dispatch(agent, title: str, goal: str, project: str, assignee: str,
     # Set resume task dependency
     if resume:
         try:
-            with kdb._conn() as conn:
+            with kdb as conn:
                 from hermes_cli.kanban_db import link_tasks
                 link_tasks(conn, task_id, resume)
         except Exception:
@@ -338,7 +340,7 @@ def _cmd_remind(agent) -> str:
         return "ERROR: No active task"
 
     kdb = _get_kanban_db()
-    with kdb._conn() as conn:
+    with kdb as conn:
         task = conn.execute(
             "SELECT * FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
@@ -388,7 +390,7 @@ def _cmd_fail(agent, reason: str = "") -> str:
         return "ERROR: No active task"
 
     kdb = _get_kanban_db()
-    with kdb._conn() as conn:
+    with kdb as conn:
         task = conn.execute(
             "SELECT * FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
@@ -460,7 +462,7 @@ def _cmd_fail(agent, reason: str = "") -> str:
 def _cmd_approve(agent, task_id: str) -> str:
     """Approve a blocked plan task."""
     kdb = _get_kanban_db()
-    with kdb._conn() as conn:
+    with kdb as conn:
         task = conn.execute(
             "SELECT * FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
@@ -501,7 +503,7 @@ def _cmd_approve(agent, task_id: str) -> str:
 
     # Unblock the task — set to 'manual' so dispatcher ignores it
     session_id = _get_session_id(agent)
-    with kdb._conn() as conn:
+    with kdb as conn:
         conn.execute(
             "UPDATE tasks SET status = 'manual', block_kind = NULL WHERE id = ?",
             (task_id,)

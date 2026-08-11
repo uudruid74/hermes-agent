@@ -68,10 +68,10 @@ def _comment_on_task(task_id: str, agent_name: str, body: str) -> None:
     if not task_id:
         return
     try:
-        from hermes_cli.kanban_db import KanbanDB
-        import time
-        kdb = KanbanDB()
-        with kdb._conn() as conn:
+        from hermes_cli.kanban_db import kanban_db_path
+        import sqlite3, time
+        kdb = sqlite3.connect(str(kanban_db_path()))
+        with kdb as conn:
             conn.execute(
                 "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
                 (task_id, agent_name, body, int(time.time())),
@@ -116,9 +116,10 @@ def set_session_tool(
     elif task_id and session_id and subject is None:
         # Auto-set subject from kanban task title
         try:
-            from hermes_cli.kanban_db import KanbanDB
-            kdb = KanbanDB()
-            with kdb._conn() as conn:
+            from hermes_cli.kanban_db import kanban_db_path
+            import sqlite3
+            kdb = sqlite3.connect(str(kanban_db_path()))
+            with kdb as conn:
                 row = conn.execute(
                     "SELECT title FROM tasks WHERE id = ?", (task_id,)
                 ).fetchone()
