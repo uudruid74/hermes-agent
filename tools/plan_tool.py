@@ -100,16 +100,17 @@ def _cmd_new(agent, title: str, goal: str, steps: List[str],
     import uuid
     task_id = f"t_{uuid.uuid4().hex[:8]}"
 
-    # Dispatch clarify through registry so tool_executor injects callback
+    clarify_cb = getattr(agent, "clarify_callback", None) if agent is not None else None
+    if clarify_cb is None:
+        return "ERROR: No clarify callback available (agent={}, running in non-interactive context). Cannot present plan for approval.".format(
+            type(agent).__name__ if agent else "None")
+
+    # Present via agent's clarify callback (set by platform runner)
     try:
-        from tools.registry import registry
-        result_json = registry.dispatch("clarify", {
-            "question": f"Approve plan {task_id}?\n\n{plan_text}",
-            "choices": ["Approve", "Deny"],
-        })
-        user_response = json.loads(result_json) if isinstance(result_json, str) else result_json
-        if isinstance(user_response, dict) and "response" in user_response:
-            user_response = user_response["response"]
+        user_response = clarify_cb(
+            f"Approve plan {task_id}?\n\n{plan_text}",
+            ["Approve", "Deny"],
+        )
     except Exception as e:
         return f"User unavailable: {e}. Stand down."
 
@@ -180,12 +181,9 @@ def _cmd_new(agent, title: str, goal: str, steps: List[str],
         # User denied — ask for reason
         reason = ""
         try:
-            reason_json = registry.dispatch("clarify", {
-                "question": "Reason for denial? (type below or send empty)",
-            })
-            reason = json.loads(reason_json) if isinstance(reason_json, str) else reason_json
-            if isinstance(reason, dict) and "response" in reason:
-                reason = reason["response"]
+            reason = clarify_cb(
+                "Reason for denial? (type below or send empty)",
+            )
         except Exception:
             pass
 
