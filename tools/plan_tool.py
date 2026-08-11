@@ -102,55 +102,21 @@ def _cmd_new(agent, title: str, goal: str, steps: List[str],
 
     approval_text = "\n".join(lines)
 
-    # Present for approval via auth gate
-    try:
-        from hermes_cli.auth import request_approval
-        approved, reason = request_approval(approval_text)
-    except Exception:
-        return "User unavailable. Stand down and wait for the user to return. Do nothing else."
-
-    if not approved:
-        reason_str = f" — {reason}" if reason else ""
-        # Log denial to fabric
-        try:
-            from tools.registry import registry
-            registry.dispatch("fabric_write", {
-                "type": "note",
-                "content": f"Plan denied: {title}{reason_str}",
-                "summary": f"Plan denied: {title}",
-            })
-        except Exception:
-            pass
-        return f"Your plan is denied by the user.{reason_str}"
-
-    # Create manual kanban task
+    # Create blocked task (pending approval)
     kdb = _get_kanban_db()
     import uuid
     task_id = f"t_{uuid.uuid4().hex[:8]}"
+
     current_temp = getattr(agent, "_session_temperature", None)
-    if current_temp is None and session_id:
-        sdb = _get_session_db()
-        with sdb._read_ctx() as c:
-            row = c.execute(
-                "SELECT model_config FROM sessions WHERE id = ?", (session_id,)
-            ).fetchone()
-        if row:
-            mc = row["model_config"] if isinstance(row, dict) else row[0]
-            if isinstance(mc, str):
-                try:
-                    mc = json.loads(mc)
-                except Exception:
-                    mc = {}
-            if isinstance(mc, dict):
-                current_temp = mc.get("temperature")
 
     try:
         with kdb._conn() as conn:
             conn.execute("""
                 INSERT INTO tasks (id, title, body, status, assignee, created_at,
                                    task_steps, task_stepno, task_goal,
-                                   prev_temperature, previous_task, session_id)
-                VALUES (?, ?, ?, 'manual', ?, ?, ?, 1, ?, ?, ?, ?)
+                                   prev_temperature, previous_task, session_id,
+                                   block_kind)
+                VALUES (?, ?, ?, 'blocked', ?, ?, ?, 1, ?, ?, ?, ?, 'approval')
             """, (
                 task_id, title, approval_text, agent_name, int(time.time()),
                 json.dumps(steps), goal,
@@ -160,43 +126,15 @@ def _cmd_new(agent, title: str, goal: str, steps: List[str],
     except Exception as e:
         return f"ERROR: Failed to create task: {e}"
 
-    # Set session task_id and temperature
-    if session_id:
-        sdb = _get_session_db()
-        sdb.set_session_task_id(session_id, task_id)
-        sdb.set_session_subject(session_id, title)
-
-    if resolved_temp is not None:
-        agent._session_temperature = resolved_temp
-
-    # If running as kanban worker, block parent
-    if current_task_id:
-        try:
-            with kdb._conn() as conn:
-                conn.execute(
-                    "UPDATE tasks SET status = 'blocked', block_kind = 'approval' WHERE id = ?",
-                    (current_task_id,)
-                )
-                conn.commit()
-        except Exception:
-            pass
-
-    # Log approval to fabric
-    try:
-        from tools.registry import registry
-        registry.dispatch("fabric_write", {
-            "type": "note",
-            "content": f"Plan approved: {title} → {task_id}",
-            "summary": f"Plan: {title}",
-        })
-    except Exception:
-        pass
-
-    return (
-        f"Your plan is approved as task {task_id}\n\n"
-        f"Complete Step 1: {steps[0]}\n"
-        f"Use plan tool 'done' to mark complete. Do not proceed to Step 2."
+    # Return plan for agent to present via clarify
+    result = (
+        f"PLAN READY FOR APPROVAL ({task_id}):\n\n"
+        f"{approval_text}\n\n"
+        f"Use clarify to present this plan to the user. "
+        f"If approved, call: plan_tool(command=\"approve\", task_id=\"{task_id}\")\n"
+        f"If denied, call: plan_tool(command=\"fail\", reason=\"user denied\")"
     )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -561,21 +499,47 @@ def _cmd_approve(agent, task_id: str) -> str:
     if not approved:
         return f"Plan denied. Stand down and wait for further instructions. Reason: {reason or 'user denied'}"
 
-    # Unblock the task
+    # Unblock the task — set to 'manual' so dispatcher ignores it
+    session_id = _get_session_id(agent)
     with kdb._conn() as conn:
         conn.execute(
-            "UPDATE tasks SET status = 'ready', block_kind = NULL WHERE id = ?",
+            "UPDATE tasks SET status = 'manual', block_kind = NULL WHERE id = ?",
             (task_id,)
         )
+
+        # Get the steps for the prompt
+        task = conn.execute(
+            "SELECT * FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        task = dict(task)
+        steps = json.loads(task.get("task_steps") or "[]")
+        title = task.get("title", task_id)
+
         conn.execute(
             "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
             (task_id, _get_agent_name(agent),
-             f"APPROVED. Complete Step 1: {steps[0] if steps else 'begin'}",
+             f"APPROVED.",
              int(time.time())),
         )
         conn.commit()
 
-    return f"Task {task_id} approved and unblocked. Worker will pick it up on next dispatch."
+    # Set session task_id and subject
+    if session_id:
+        sdb = _get_session_db()
+        sdb.set_session_task_id(session_id, task_id)
+        sdb.set_session_subject(session_id, title)
+
+    # Set temperature if specified
+    prev_temp = task.get("prev_temperature")
+    if prev_temp is not None:
+        agent._session_temperature = prev_temp
+
+    step1 = steps[0] if steps else "begin work"
+    return (
+        f"Task {task_id} approved: {title}\n\n"
+        f"Complete Step 1: {step1}\n"
+        f"Use plan_tool 'done' to mark each step complete."
+    )
 
 
 # ---------------------------------------------------------------------------
