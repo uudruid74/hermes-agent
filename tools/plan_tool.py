@@ -171,17 +171,16 @@ def _cmd_new(agent, title: str, goal: str, steps: List[str],
             sdb.set_session_task_id(session_id, task_id)
             sdb.set_session_subject(session_id, title)
             # Store old subject as task comment for restoration
-            if old_subject:
-                try:
-                    kdb = _get_kanban_db()
-                    with kdb as conn:
-                        conn.execute(
-                            "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
-                            (task_id, agent_name, f"PREV_SUBJECT:{old_subject}", int(time.time())),
-                        )
-                        conn.commit()
-                except Exception:
-                    pass
+            try:
+                kdb = _get_kanban_db()
+                with kdb as conn:
+                    conn.execute(
+                        "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+                        (task_id, agent_name, f"PREV_SUBJECT:{old_subject}", int(time.time())),
+                    )
+                    conn.commit()
+            except Exception:
+                pass
 
         if resolved_temp is not None:
             agent._session_temperature = resolved_temp
