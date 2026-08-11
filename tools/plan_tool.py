@@ -294,9 +294,9 @@ def _cmd_done(agent, status: Optional[str] = None) -> str:
         stepno = task["task_stepno"]
         if stepno is None:
             stepno = 1
-        goal = task.get("task_goal") or ""
-        prev_task = task.get("previous_task")
-        prev_temp = task.get("prev_temperature")
+        goal = task["task_goal"] or ""
+        prev_task = task["previous_task"]
+        prev_temp = task["prev_temperature"]
 
         # Log completion of this step
         note = f"Step {stepno} complete"
@@ -334,8 +334,8 @@ def _cmd_done(agent, status: Optional[str] = None) -> str:
             parent = conn.execute(
                 "SELECT title, task_goal FROM tasks WHERE id = ?", (prev_task,)
             ).fetchone()
-        parent_title = dict(parent).get("title", prev_task) if parent else prev_task
-        parent_goal = dict(parent).get("task_goal", "") if parent else ""
+        parent_title = parent["title"] if parent else prev_task
+        parent_goal = parent["task_goal"] or "" if parent else ""
 
         # Log via session
         sdb.set_session_subject(session_id, parent_title)
@@ -375,7 +375,7 @@ def _cmd_done(agent, status: Optional[str] = None) -> str:
             pass
 
         # Auto-commit if in a git repo
-        commit_msg = f"done: {task.get('title', task_id)}"
+        commit_msg = f"done: {task["title"] or task_id}"
         if status:
             commit_msg += f" — {status}"
         try:
@@ -491,7 +491,7 @@ def _cmd_remind(agent) -> str:
         goal = task["task_goal"] or ""
 
     lines = [
-        f"Task: {task.get('title', task_id)}",
+        f"Task: {task["title"] or task_id}"
         f"Goal: {goal}",
         f"Step {stepno}/{len(steps)}",
         "",
@@ -569,7 +569,7 @@ def _cmd_fail(agent, reason: str = "") -> str:
 
             return (
                 f"Task {task_id} has failed.\n\n"
-                f"Title: {task.get('title', '')}\n"
+                f"Title: {task["title"] or ""}\n"
                 f"Goal: {goal}\n"
                 f"Failed at Step {stepno}: {step_title}\n"
                 f"Reason: {reason or 'unspecified'}\n\n"
@@ -618,7 +618,7 @@ def _cmd_approve(agent, task_id: str) -> str:
 
     # Present for approval
     lines = [
-        f"Approve plan for task {task_id}: {task.get('title', '')}",
+        f"Approve plan for task {task_id}: {task["title"] or ""}"
         f"Goal: {goal}",
         "",
         "Steps:",
@@ -667,7 +667,7 @@ def _cmd_approve(agent, task_id: str) -> str:
         sdb.set_session_subject(session_id, title)
 
     # Set temperature if specified
-    prev_temp = task.get("prev_temperature")
+    prev_temp = task["prev_temperature"]
     if prev_temp is not None:
         agent._session_temperature = prev_temp
 
