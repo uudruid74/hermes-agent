@@ -1602,6 +1602,36 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('clarify', function_args, tool_duration, result=function_result)}")
+        elif function_name == "plan_tool":
+            def _execute(next_args: dict) -> Any:
+                from tools.plan_tool import plan_tool as _plan_tool
+                return _plan_tool(
+                    agent=agent,
+                    command=next_args.get("command", ""),
+                    title=next_args.get("title"),
+                    goal=next_args.get("goal"),
+                    steps=next_args.get("steps"),
+                    temp=next_args.get("temp"),
+                    status=next_args.get("status"),
+                    project=next_args.get("project"),
+                    assignee=next_args.get("assignee"),
+                    resume=next_args.get("resume"),
+                    reason=next_args.get("reason"),
+                    task_id=next_args.get("task_id"),
+                )
+            function_result, function_args, middleware_trace, _execution_blocked = _managed_values(_run_agent_tool_execution_middleware(
+                agent,
+                function_name=function_name,
+                function_args=function_args,
+                effective_task_id=effective_task_id,
+                tool_call_id=getattr(tool_call, "id", "") or "",
+                execute=_execute,
+                scope_block=_ts_scope_block,
+                display_index=i,
+            ))
+            tool_duration = time.time() - tool_start_time
+            if agent._should_emit_quiet_tool_messages():
+                agent._vprint(f"  {_get_cute_tool_message_impl('plan_tool', function_args, tool_duration, result=function_result)}")
         elif function_name == "read_terminal":
             def _execute(next_args: dict) -> Any:
                 from tools.read_terminal_tool import read_terminal_tool as _read_terminal_tool
