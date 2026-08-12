@@ -1245,6 +1245,27 @@ def _adopt_live_compression_child(
     except Exception:
         pass
 
+    # Transfer the task binding from parent → child so plan_tool remind
+    # and the write gate keep working after compression rotation.
+    # (t_2b7a77b2 — compression changed session_id but orphaned the binding)
+    try:
+        from hermes_state import SessionDB
+
+        _sdb = SessionDB()
+        with _sdb._read_ctx() as c:
+            _row = c.execute(
+                "SELECT task_id FROM sessions WHERE id = ?",
+                (parent_session_id,),
+            ).fetchone()
+        if _row:
+            _parent_task_id = (
+                _row["task_id"] if isinstance(_row, dict) else _row[0]
+            )
+            if _parent_task_id:
+                _sdb.set_session_task_id(child_session_id, _parent_task_id)
+    except Exception:
+        pass
+
     agent._session_db_created = True
     if child.get("system_prompt"):
         agent._cached_system_prompt = child["system_prompt"]
