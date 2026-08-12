@@ -6,6 +6,11 @@ Commands: new, done, dispatch, remind, fail, approve
 Default = Deny All. Without an active task_id in the session, file
 writes, cron creation, and kanban task creation are blocked. The Plan
 tool creates 'manual' kanban tasks that carry step-by-step plans.
+
+NOTE (t_2b7a77b2): kanban-changes.md lines 53-54 spec a stuck-agent
+re-prompt timer and line 236 spec an approval timeout. Neither was
+implemented. plan_tool contains zero timer/thread/sleep code. If the
+timeout is needed, it should be a separate implementation.
 """
 
 from __future__ import annotations
@@ -42,7 +47,7 @@ def _get_session_id(agent) -> Optional[str]:
         sid = get_session_env("HERMES_SESSION_ID")
     except Exception:
         sid = os.environ.get("HERMES_SESSION_ID")
-    return sid or getattr(agent, "session_id", None)
+    return sid
 
 
 
@@ -118,6 +123,32 @@ def _cmd_new(agent, title: str, goal: str, steps: List[str],
         return "ERROR: No clarify callback available (agent={}, running in non-interactive context). Cannot present plan for approval.".format(
             type(agent).__name__ if agent else "None")
 
+    # Pre-create task as blocked/approval so denied plans can be re-approved
+    current_task_id = _get_task_id(agent)
+    kdb = _get_kanban_db()
+    try:
+        with kdb as conn:
+            conn.execute("""
+                INSERT INTO tasks
+                    (id, title, body, status, assignee, created_at,
+                     task_steps, task_stepno, task_goal, block_kind,
+                     prev_temperature, previous_task, session_id)
+                VALUES
+                    (:id, :title, :body, 'blocked', :assignee, :created_at,
+                     :task_steps, 1, :task_goal, 'approval',
+                     :prev_temp, :prev_task, :session_id)
+            """, {
+                "id": task_id, "title": title, "body": plan_text,
+                "assignee": agent_name, "created_at": int(time.time()),
+                "task_steps": json.dumps(steps), "task_goal": goal,
+                "prev_temp": getattr(agent, "_session_temperature", None),
+                "prev_task": current_task_id,
+                "session_id": session_id,
+            })
+            conn.commit()
+    except Exception as e:
+        return f"ERROR: Failed to create task: {e}"
+
     # Present via agent's clarify callback (set by platform runner)
     try:
         user_response = clarify_cb(
@@ -133,31 +164,19 @@ def _cmd_new(agent, title: str, goal: str, steps: List[str],
     # Detect approval
     response_lower = str(user_response).strip().lower()
     if "appr" in response_lower:
-        # User approved — create task and activate
+        # User approved — activate task
         current_temp = getattr(agent, "_session_temperature", None)
 
         kdb = _get_kanban_db()
         try:
             with kdb as conn:
-                conn.execute("""
-                    INSERT INTO tasks
-                        (id, title, body, status, assignee, created_at,
-                         task_steps, task_stepno, task_goal,
-                         prev_temperature, previous_task, session_id)
-                    VALUES
-                        (:id, :title, :body, 'manual', :assignee, :created_at,
-                         :task_steps, 1, :task_goal,
-                         :prev_temp, :prev_task, :session_id)
-                """, {
-                    "id": task_id, "title": title, "body": plan_text,
-                    "assignee": agent_name, "created_at": int(time.time()),
-                    "task_steps": json.dumps(steps), "task_goal": goal,
-                    "prev_temp": current_temp, "prev_task": current_task_id,
-                    "session_id": session_id,
-                })
+                conn.execute(
+                    "UPDATE tasks SET status = 'manual', block_kind = NULL WHERE id = ?",
+                    (task_id,),
+                )
                 conn.commit()
         except Exception as e:
-            return f"ERROR: Failed to create task: {e}"
+            return f"ERROR: Failed to activate task: {e}"
 
         # Set session task_id and subject (save old subject first)
         sdb = _get_session_db()
@@ -233,6 +252,18 @@ def _cmd_new(agent, title: str, goal: str, steps: List[str],
             pass
 
         reason_str = str(reason).strip() if reason else "unspecified"
+
+        # Mark as blocked/approval so it can be re-approved later
+        try:
+            kdb = _get_kanban_db()
+            with kdb as conn:
+                conn.execute(
+                    "UPDATE tasks SET status = 'blocked', block_kind = 'approval' WHERE id = ?",
+                    (task_id,),
+                )
+                conn.commit()
+        except Exception:
+            pass
 
         # Log denial to fabric
         try:
@@ -682,13 +713,23 @@ def _cmd_approve(agent, task_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _enumerate_kanban_dbs():
-    """Return list of all kanban.db paths across all boards."""
-    import glob
-    boards_dir = os.path.expanduser("~/.hermes/kanban/boards")
-    dbs = glob.glob(os.path.join(boards_dir, "*", "kanban.db"))
-    root_db = os.path.expanduser("~/.hermes/kanban.db")
-    if root_db not in dbs and os.path.exists(root_db):
-        dbs.append(root_db)
+    """Return list of all kanban.db paths across all boards.
+
+    Uses the same profile-scoped resolution as the CLI
+    (hermes_cli.kanban_db) so plan_tool archive/block find the same DBs
+    that ``hermes kanban show --board all`` does.  (t_2b7a77b2)
+    """
+    from hermes_cli.kanban_db import kanban_db_path, list_boards
+
+    dbs = []
+    seen: set = set()
+    for board in list_boards():
+        slug = board["slug"]
+        path = kanban_db_path(slug)
+        path_str = str(path)
+        if path_str not in seen:
+            dbs.append(path_str)
+            seen.add(path_str)
     return dbs
 
 
