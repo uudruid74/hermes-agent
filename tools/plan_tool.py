@@ -29,11 +29,11 @@ def _get_session_db():
     from hermes_state import SessionDB
     return SessionDB()
 
-def _get_kanban_db():
+def _get_kanban_db(board: Optional[str] = None):
     """Return a sqlite3 connection to the kanban database."""
     import sqlite3
     from hermes_cli.kanban_db import kanban_db_path
-    conn = sqlite3.connect(str(kanban_db_path()))
+    conn = sqlite3.connect(str(kanban_db_path(board)))
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -42,16 +42,33 @@ def _get_agent_name(agent) -> str:
 
 
 def _get_session_id(agent) -> Optional[str]:
-    try:
-        from gateway.session_context import get_session_env
-        sid = get_session_env("HERMES_SESSION_ID")
-    except Exception:
-        sid = os.environ.get("HERMES_SESSION_ID")
-    return sid
+    """Single source of truth: the agent object."""
+    return getattr(agent, "session_id", None)
 
 
 
 def _get_task_id(agent) -> Optional[str]:
+    """Return the active task_id for this session.
+
+    Session DB is authoritative — it's updated by plan_tool when a new
+    sub-plan is created (set_session_task_id) and when a plan completes
+    (clear_session_task_id).  Falls back to the HERMES_KANBAN_TASK env
+    var for the initial kanban worker boot (before any plan_tool call
+    has written to the DB).
+    """
+    session_id = _get_session_id(agent)
+    if session_id:
+        try:
+            sdb = _get_session_db()
+            with sdb._read_ctx() as c:
+                row = c.execute(
+                    "SELECT task_id FROM sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+            if row and row["task_id"]:
+                return row["task_id"]
+        except Exception:
+            pass
     return os.environ.get("HERMES_KANBAN_TASK")
 
 def _resolve_temp(temp: Optional[str], agent) -> Optional[float]:
@@ -83,7 +100,7 @@ def _resolve_temp(temp: Optional[str], agent) -> Optional[float]:
 # ---------------------------------------------------------------------------
 
 def _cmd_new(agent, title: str, goal: str, steps: List[str],
-             temp: Optional[str] = None) -> str:
+             temp: Optional[str] = None, board: Optional[str] = None) -> str:
     """Present a multistep plan for approval via clarify callback."""
     agent_name = _get_agent_name(agent)
     session_id = _get_session_id(agent)
@@ -125,7 +142,7 @@ def _cmd_new(agent, title: str, goal: str, steps: List[str],
 
     # Pre-create task as blocked/approval so denied plans can be re-approved
     current_task_id = _get_task_id(agent)
-    kdb = _get_kanban_db()
+    kdb = _get_kanban_db(board)
     try:
         with kdb as conn:
             conn.execute("""
@@ -373,6 +390,18 @@ def _cmd_done(agent, status: Optional[str] = None) -> str:
         if prev_temp is not None:
             agent._session_temperature = prev_temp
 
+        # Unblock parent task so the dispatcher/agent can resume it
+        try:
+            with kdb as conn:
+                conn.execute(
+                    "UPDATE tasks SET status = 'running', block_kind = NULL "
+                    "WHERE id = ? AND status = 'blocked'",
+                    (prev_task,),
+                )
+                conn.commit()
+        except Exception:
+            pass
+
         # Get parent task info
         with kdb as conn:
             parent = conn.execute(
@@ -448,7 +477,7 @@ def _cmd_dispatch(agent, title: str, goal: str, project: str, assignee: str,
     if not project:
         return "ERROR: 'project' (board) is required for dispatch"
 
-    kdb = _get_kanban_db()
+    kdb = _get_kanban_db(project)
     import uuid
     task_id = f"t_{uuid.uuid4().hex[:8]}"
 
@@ -490,22 +519,23 @@ def _cmd_dispatch(agent, title: str, goal: str, project: str, assignee: str,
 # command: remind
 # ---------------------------------------------------------------------------
 
-def _cmd_remind(agent) -> str:
+def _cmd_remind(agent, task_id: Optional[str] = None) -> str:
     """Show full plan with current step."""
-    session_id = _get_session_id(agent)
-    if not session_id:
-        return "ERROR: No active session"
-
-    sdb = _get_session_db()
-    with sdb._read_ctx() as c:
-        row = c.execute(
-            "SELECT task_id FROM sessions WHERE id = ?", (session_id,)
-        ).fetchone()
-    if not row:
-        return "ERROR: No task assigned"
-    task_id = row["task_id"] if isinstance(row, dict) else row[0]
     if not task_id:
-        return "ERROR: No active task"
+        session_id = _get_session_id(agent)
+        if not session_id:
+            return "ERROR: No active session"
+
+        sdb = _get_session_db()
+        with sdb._read_ctx() as c:
+            row = c.execute(
+                "SELECT task_id FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+        if not row:
+            return "ERROR: No task assigned"
+        task_id = row["task_id"] if isinstance(row, dict) else row[0]
+        if not task_id:
+            return "ERROR: No active task"
 
     kdb = _get_kanban_db()
     with kdb as conn:
@@ -803,6 +833,7 @@ def plan_tool(
     resume: Optional[str] = None,
     reason: Optional[str] = None,
     task_id: Optional[str] = None,
+    board: Optional[str] = None,
 ) -> str:
     """Mandatory Action Protocol — multistep plan management.
 
@@ -819,7 +850,7 @@ def plan_tool(
     if command == "new":
         if not title or not goal or not steps:
             return "ERROR: 'new' requires title, goal, and steps[]"
-        return _cmd_new(agent, title, goal, steps, temp)
+        return _cmd_new(agent, title, goal, steps, temp, board)
 
     elif command == "done":
         return _cmd_done(agent, status)
@@ -830,7 +861,7 @@ def plan_tool(
         return _cmd_dispatch(agent, title, goal, project, assignee, steps, resume)
 
     elif command == "remind":
-        return _cmd_remind(agent)
+        return _cmd_remind(agent, task_id)
 
     elif command == "fail":
         return _cmd_fail(agent, reason or "")
@@ -863,7 +894,7 @@ PLAN_TOOL_SCHEMA = {
         "Commands: new (present plan for approval), done (mark step complete), "
         "dispatch (create kanban task), remind (show current plan), "
         "fail (mark task failed), approve (unblock plan task), block (emergency block), archive (block + archive). "
-        "Writes are blocked when no task is active."
+        "Writes are blocked when no task is active. Use 'board' to route 'new' tasks to a specific kanban board."
     ),
     "parameters": {
         "type": "object",
@@ -913,6 +944,10 @@ PLAN_TOOL_SCHEMA = {
             "task_id": {
                 "type": "string",
                 "description": "Task ID for 'approve' command",
+            },
+            "board": {
+                "type": "string",
+                "description": "Kanban board name (optional, defaults to current board). Use for 'new' to route task to a specific board.",
             },
         },
         "required": ["command"],
