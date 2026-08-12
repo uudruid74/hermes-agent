@@ -42,8 +42,17 @@ def _get_agent_name(agent) -> str:
 
 
 def _get_session_id(agent) -> Optional[str]:
-    """Single source of truth: the agent object."""
-    return getattr(agent, "session_id", None)
+    """Canonical session ID: ContextVar first, then env, then agent attr.
+
+    Must match file_safety._session_task_id() resolution so the write gate
+    finds the task_id that plan_tool just wrote.  (f3ee48575 / t_6c68e6de)
+    """
+    try:
+        from gateway.session_context import get_session_env
+        sid = get_session_env("HERMES_SESSION_ID")
+    except Exception:
+        sid = os.environ.get("HERMES_SESSION_ID")
+    return sid or getattr(agent, "session_id", None)
 
 
 
@@ -675,9 +684,13 @@ def _cmd_approve(agent, task_id: str) -> str:
         steps = json.loads(task["task_steps"]) if task["task_steps"] else []
         goal = task["task_goal"] or ""
 
-    # Present for approval
+    # Present for approval via clarify callback (same mechanism as _cmd_new)
+    clarify_cb = getattr(agent, "clarify_callback", None) if agent is not None else None
+    if clarify_cb is None:
+        return f"ERROR: No clarify callback available. Cannot present plan {task_id} for approval."
+
     lines = [
-        f"Approve plan for task {task_id}: {task['title'] or ''}"
+        f"Approve plan for task {task_id}: {task['title'] or ''}",
         f"Goal: {goal}",
         "",
         "Steps:",
@@ -688,13 +701,16 @@ def _cmd_approve(agent, task_id: str) -> str:
     approval_text = "\n".join(lines)
 
     try:
-        from hermes_cli.auth import request_approval
-        approved, reason = request_approval(approval_text)
-    except Exception:
-        approved, reason = False, "approval gate unavailable"
+        user_response = clarify_cb(approval_text, ["Approve", "Deny"])
+    except Exception as e:
+        return f"User unavailable: {e}. Stand down."
 
-    if not approved:
-        return f"Plan denied ({task_id}). Stand down and wait for further instructions. Reason: {reason or 'user denied'}"
+    if not user_response:
+        return "No response received. Stand down."
+
+    response_lower = str(user_response).strip().lower()
+    if "appr" not in response_lower:
+        return f"Plan denied ({task_id}). Stand down and wait for further instructions. Reason: {user_response or 'user denied'}"
 
     # Unblock the task — set to 'manual' so dispatcher ignores it
     session_id = _get_session_id(agent)
