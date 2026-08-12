@@ -37,7 +37,12 @@ def _get_agent_name(agent) -> str:
 
 
 def _get_session_id(agent) -> Optional[str]:
-    return getattr(agent, "session_id", None) or os.environ.get("HERMES_SESSION_ID")
+    try:
+        from gateway.session_context import get_session_env
+        sid = get_session_env("HERMES_SESSION_ID")
+    except Exception:
+        sid = os.environ.get("HERMES_SESSION_ID")
+    return sid or getattr(agent, "session_id", None)
 
 
 
@@ -676,6 +681,74 @@ def _cmd_approve(agent, task_id: str) -> str:
 # main tool entry point
 # ---------------------------------------------------------------------------
 
+def _enumerate_kanban_dbs():
+    """Return list of all kanban.db paths across all boards."""
+    import glob
+    boards_dir = os.path.expanduser("~/.hermes/kanban/boards")
+    dbs = glob.glob(os.path.join(boards_dir, "*", "kanban.db"))
+    root_db = os.path.expanduser("~/.hermes/kanban.db")
+    if root_db not in dbs and os.path.exists(root_db):
+        dbs.append(root_db)
+    return dbs
+
+
+def _cmd_block(task_id: str) -> str:
+    """Block a task by ID. Searches all boards. Clears session task_id."""
+    if not task_id:
+        return "ERROR: 'block' requires task_id"
+    found_board = None
+    for db_path in _enumerate_kanban_dbs():
+        try:
+            conn = sqlite3.connect(db_path)
+            with conn:
+                cur = conn.execute(
+                    "UPDATE tasks SET status='blocked' WHERE id=? AND status NOT IN ('done','archived','blocked')",
+                    (task_id,)
+                )
+                if cur.rowcount > 0:
+                    found_board = db_path
+            conn.close()
+        except Exception:
+            pass
+    if not found_board:
+        return f"ERROR: Task {task_id} not found on any board (or already blocked/done/archived)"
+    try:
+        from hermes_state import SessionDB
+        db = SessionDB()
+        with db._read_ctx() as c:
+            rows = c.execute("SELECT id FROM sessions WHERE task_id = ?", (task_id,)).fetchall()
+        for row in rows:
+            sid = row["id"] if isinstance(row, dict) else row[0]
+            db.set_session_task_id(sid, None)
+    except Exception:
+        pass
+    return f"BLOCKED: {task_id} on {os.path.basename(os.path.dirname(found_board))}"
+
+
+def _cmd_archive(task_id: str) -> str:
+    """Block then archive a task. Safety for runaway tasks."""
+    if not task_id:
+        return "ERROR: 'archive' requires task_id"
+    _cmd_block(task_id)  # block first (ignore if already blocked)
+    found_board = None
+    for db_path in _enumerate_kanban_dbs():
+        try:
+            conn = sqlite3.connect(db_path)
+            with conn:
+                cur = conn.execute(
+                    "UPDATE tasks SET status='archived' WHERE id=? AND status NOT IN ('done','archived')",
+                    (task_id,)
+                )
+                if cur.rowcount > 0:
+                    found_board = db_path
+            conn.close()
+        except Exception:
+            pass
+    if not found_board:
+        return f"ERROR: Task {task_id} could not be archived"
+    return f"ARCHIVED: {task_id} on {os.path.basename(os.path.dirname(found_board))}"
+
+
 def plan_tool(
     agent,
     command: str,
@@ -726,6 +799,16 @@ def plan_tool(
             return "ERROR: 'approve' requires task_id"
         return _cmd_approve(agent, task_id)
 
+    elif command == "block":
+        if not task_id:
+            return "ERROR: 'block' requires task_id"
+        return _cmd_block(task_id)
+
+    elif command == "archive":
+        if not task_id:
+            return "ERROR: 'archive' requires task_id"
+        return _cmd_archive(task_id)
+
     else:
         return f"ERROR: Unknown plan command '{command}'. Valid: new, done, dispatch, remind, fail, approve"
 
@@ -738,7 +821,7 @@ PLAN_TOOL_SCHEMA = {
         "Mandatory Action Protocol — create and manage multistep plans. "
         "Commands: new (present plan for approval), done (mark step complete), "
         "dispatch (create kanban task), remind (show current plan), "
-        "fail (mark task failed), approve (unblock plan task). "
+        "fail (mark task failed), approve (unblock plan task), block (emergency block), archive (block + archive). "
         "Writes are blocked when no task is active."
     ),
     "parameters": {
@@ -746,8 +829,8 @@ PLAN_TOOL_SCHEMA = {
         "properties": {
             "command": {
                 "type": "string",
-                "description": "Command: new, done, dispatch, remind, fail, or approve",
-                "enum": ["new", "done", "dispatch", "remind", "fail", "approve"],
+                "description": "Command: new, done, dispatch, remind, fail, approve, block, or archive",
+                "enum": ["new", "done", "dispatch", "remind", "fail", "approve", "block", "archive"],
             },
             "title": {
                 "type": "string",

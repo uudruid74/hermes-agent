@@ -695,7 +695,11 @@ def get_container_mirror_warning(
 
 def _session_task_id() -> Optional[str]:
     """Read task_id from session state.db for the current session."""
-    session_id = os.environ.get("HERMES_SESSION_ID")
+    try:
+        from gateway.session_context import get_session_env
+        session_id = get_session_env("HERMES_SESSION_ID")
+    except Exception:
+        session_id = os.environ.get("HERMES_SESSION_ID")
     if not session_id:
         return None
     try:
