@@ -37,12 +37,18 @@ def _get_kanban_db(board: Optional[str] = None):
     conn.row_factory = sqlite3.Row
     return conn
 
+def _resolve_board(board: Optional[str]) -> str:
+    """Resolve a board slug for the `board` column, defaulting to 'default'."""
+    slug = (board or "").strip()
+    return slug if slug else "default"
+
+
 def _get_agent_name(agent) -> str:
     return getattr(agent, "agent_name", None) or os.environ.get("HERMES_AGENT_NAME", "agent")
 
 
 def _get_session_id(agent) -> Optional[str]:
-    """Canonical session ID: ContextVar first, then env, then agent attr.
+    """Canonical session ID: ContextVar first, then env. No agent fallback.
 
     Must match file_safety._session_task_id() resolution so the write gate
     finds the task_id that plan_tool just wrote.  (f3ee48575 / t_6c68e6de)
@@ -52,7 +58,7 @@ def _get_session_id(agent) -> Optional[str]:
         sid = get_session_env("HERMES_SESSION_ID")
     except Exception:
         sid = os.environ.get("HERMES_SESSION_ID")
-    return sid or getattr(agent, "session_id", None)
+    return sid or None
 
 
 
@@ -158,11 +164,11 @@ def _cmd_new(agent, title: str, goal: str, steps: List[str],
                 INSERT INTO tasks
                     (id, title, body, status, assignee, created_at,
                      task_steps, task_stepno, task_goal, block_kind,
-                     prev_temperature, previous_task, session_id)
+                     prev_temperature, previous_task, session_id, board)
                 VALUES
                     (:id, :title, :body, 'blocked', :assignee, :created_at,
                      :task_steps, 1, :task_goal, 'approval',
-                     :prev_temp, :prev_task, :session_id)
+                     :prev_temp, :prev_task, :session_id, :board)
             """, {
                 "id": task_id, "title": title, "body": plan_text,
                 "assignee": agent_name, "created_at": int(time.time()),
@@ -170,6 +176,7 @@ def _cmd_new(agent, title: str, goal: str, steps: List[str],
                 "prev_temp": getattr(agent, "_session_temperature", None),
                 "prev_task": current_task_id,
                 "session_id": session_id,
+                "board": _resolve_board(board),
             })
             conn.commit()
     except Exception as e:
@@ -497,15 +504,19 @@ def _cmd_dispatch(agent, title: str, goal: str, project: str, assignee: str,
     else:
         steps_json = None
 
+    session_id = _get_session_id(agent)
+
     try:
         with kdb as conn:
             conn.execute("""
                 INSERT INTO tasks (id, title, body, status, assignee, created_at,
-                                   task_steps, task_goal, previous_task, project_id)
-                VALUES (?, ?, ?, 'ready', ?, ?, ?, ?, ?, ?)
+                                   task_steps, task_goal, previous_task, project_id,
+                                   session_id, board)
+                VALUES (?, ?, ?, 'ready', ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 task_id, title, body, assignee, int(time.time()),
                 steps_json, goal, resume, project,
+                session_id, _resolve_board(project),
             ))
             conn.commit()
     except Exception as e:
@@ -522,6 +533,102 @@ def _cmd_dispatch(agent, title: str, goal: str, project: str, assignee: str,
 
     project_display = "**Random**" if project.lower() == "default" else project
     return f"Task {task_id} dispatched to {assignee} on {project_display}: {title}"
+
+
+# ---------------------------------------------------------------------------
+# command: cron
+# ---------------------------------------------------------------------------
+
+def _cmd_cron(agent, cron: str, root: str, title: str, goal: str,
+              steps: List[str], temp: Optional[str] = None,
+              board: Optional[str] = None) -> str:
+    """Schedule a recurring plan. Creates a cron template task (cron + root)
+    and registers a cron job that copies + dispatches it on each fire."""
+    import uuid
+    agent_name = _get_agent_name(agent)
+    session_id = _get_session_id(agent)
+    board_slug = _resolve_board(board)
+
+    # Validate cron expression (5 fields).
+    cron_parts = cron.split()
+    if len(cron_parts) != 5:
+        return "ERROR: 'cron' must be a 5-field cron expression (e.g. '0 9 * * *')"
+
+    # Validate root is an absolute path.
+    root_abs = os.path.abspath(os.path.expanduser(root))
+    if not os.path.isdir(root_abs):
+        return f"ERROR: root directory does not exist: {root_abs}"
+
+    task_id = f"t_{uuid.uuid4().hex[:8]}"
+    body = f"Goal: {goal}\n\nSteps:\n" + "\n".join(
+        f"  {i}. {s}" for i, s in enumerate(steps, 1)
+    )
+
+    # Create the cron template task. status='manual' so it does not trip the
+    # write gate for the current session; the scheduler copies it on fire.
+    kdb = _get_kanban_db(board_slug)
+    try:
+        with kdb as conn:
+            conn.execute("""
+                INSERT INTO tasks
+                    (id, title, body, status, assignee, created_at,
+                     task_steps, task_stepno, task_goal, session_id, board,
+                     cron, root)
+                VALUES (?, ?, ?, 'manual', ?, ?, ?, 1, ?, ?, ?, ?, ?)
+            """, (
+                task_id, title, body, agent_name, int(time.time()),
+                json.dumps(steps), goal, session_id, board_slug,
+                cron, root_abs,
+            ))
+            conn.commit()
+    except Exception as e:
+        return f"ERROR: Failed to create cron template task: {e}"
+
+    # Register the cron job. Each template gets its own tiny fire script (the
+    # scheduler passes no argv to no_agent scripts), which imports a shared
+    # helper that copies the template and dispatches the copy.
+    try:
+        from cron.jobs import create_job
+        scripts_dir = os.path.expanduser("~/.hermes/scripts")
+        os.makedirs(scripts_dir, exist_ok=True)
+        fire_script_name = f"plan_cron_{task_id}.py"
+        fire_script_path = os.path.join(scripts_dir, fire_script_name)
+        _fire_script_content = (
+            "from cron.fire_plan_cron import fire_plan_cron\n"
+            f"if __name__ == '__main__':\n"
+            f"    fire_plan_cron({task_id!r})\n"
+        )
+        with open(fire_script_path, "w") as f:
+            f.write(_fire_script_content)
+        job = create_job(
+            prompt=None,
+            schedule=cron,
+            name=f"plan-cron:{task_id}",
+            script=fire_script_name,
+            no_agent=True,
+            workdir=root_abs,
+        )
+        job_id = job.get("job_id") or job.get("id")
+    except Exception as e:
+        # Roll back the template task — a cron without a job is useless.
+        try:
+            with kdb as conn:
+                conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+                conn.commit()
+        except Exception:
+            pass
+        return f"ERROR: Failed to register cron job: {e}"
+
+    return (
+        f"Cron plan scheduled: {task_id} (job {job_id})\n"
+        f"  Schedule: {cron}\n"
+        f"  Root: {root_abs}\n"
+        f"  Board: {board_slug}\n"
+        f"  Title: {title}\n"
+        f"On each fire, the template is copied and dispatched. The copy inherits "
+        f"the root, so write_file is allowed under {root_abs} (and subdirs), and "
+        f"terminal/python run sandboxed with bubblewrap."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -850,6 +957,8 @@ def plan_tool(
     reason: Optional[str] = None,
     task_id: Optional[str] = None,
     board: Optional[str] = None,
+    cron: Optional[str] = None,
+    root: Optional[str] = None,
 ) -> str:
     """Mandatory Action Protocol — multistep plan management.
 
@@ -860,6 +969,7 @@ def plan_tool(
       remind   — show current plan with step marker
       fail     — mark task as failed
       approve  — approve a blocked plan task
+      cron     — schedule a recurring plan (cron + root scoped file access)
     """
     command = (command or "").strip().lower()
 
@@ -867,6 +977,11 @@ def plan_tool(
         if not title or not goal or not steps:
             return "ERROR: 'new' requires title, goal, and steps[]"
         return _cmd_new(agent, title, goal, steps, temp, board)
+
+    elif command == "cron":
+        if not cron or not root or not title or not goal or not steps:
+            return "ERROR: 'cron' requires cron, root, title, goal, and steps[]"
+        return _cmd_cron(agent, cron, root, title, goal, steps, temp, board)
 
     elif command == "done":
         return _cmd_done(agent, status)
@@ -909,16 +1024,19 @@ PLAN_TOOL_SCHEMA = {
         "Mandatory Action Protocol — create and manage multistep plans. "
         "Commands: new (present plan for approval), done (mark step complete), "
         "dispatch (create kanban task), remind (show current plan), "
-        "fail (mark task failed), approve (unblock plan task), block (emergency block), archive (block + archive). "
-        "Writes are blocked when no task is active. Use 'board' to route 'new' tasks to a specific kanban board."
+        "fail (mark task failed), approve (unblock plan task), block (emergency block), "
+        "archive (block + archive), cron (schedule a recurring plan). "
+        "Writes are blocked when no task is active. Use 'board' to route 'new' "
+        "tasks to a specific kanban board. 'cron' requires 'cron' (schedule) and "
+        "'root' (scoped write directory)."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "command": {
                 "type": "string",
-                "description": "Command: new, done, dispatch, remind, fail, approve, block, or archive",
-                "enum": ["new", "done", "dispatch", "remind", "fail", "approve", "block", "archive"],
+                "description": "Command: new, done, dispatch, remind, fail, approve, block, archive, or cron",
+                "enum": ["new", "done", "dispatch", "remind", "fail", "approve", "block", "archive", "cron"],
             },
             "title": {
                 "type": "string",
@@ -964,6 +1082,14 @@ PLAN_TOOL_SCHEMA = {
             "board": {
                 "type": "string",
                 "description": "Kanban board name (optional, defaults to current board). Use for 'new' to route task to a specific board.",
+            },
+            "cron": {
+                "type": "string",
+                "description": "5-field cron schedule (e.g. '0 9 * * *'). Required for the 'cron' command.",
+            },
+            "root": {
+                "type": "string",
+                "description": "Absolute directory path for scoped file access. Required for the 'cron' command; write_file is allowed under this directory and terminal/python run sandboxed.",
             },
         },
         "required": ["command"],

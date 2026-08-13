@@ -83,7 +83,7 @@ def build_write_denied_prefixes(home: str) -> list[str]:
 def get_safe_write_roots() -> set[str]:
     """Return resolved HERMES_WRITE_SAFE_ROOT paths. Supports multiple directories
     separated by ``os.pathsep`` (``:`` on Unix, ``;`` on Windows).
-    E.g., ``/opt/data:/var/www/html`` on Unix, ``C:\\data;D:\\www`` on Windows."""
+    E.g., ``/opt/data:/var/www/html`` on Unix, ``C:\\\\data;D:\\\\www`` on Windows."""
     env = os.getenv("HERMES_WRITE_SAFE_ROOT", "")
     if not env:
         return set()
@@ -98,10 +98,54 @@ def get_safe_write_roots() -> set[str]:
     return roots
 
 
+def _task_root() -> Optional[str]:
+    """Return the current kanban task's scoped write ``root``, if any.
+
+    Used by plan-cron tasks to allow write_file under a fixed directory
+    without tripping the task write gate. Returns None when there is no
+    active task or the task carries no root column.
+    """
+    task_id = os.environ.get("HERMES_KANBAN_TASK") or _session_task_id()
+    if not task_id:
+        return None
+    try:
+        import sqlite3
+        from hermes_cli.kanban_db import kanban_db_path
+        db = sqlite3.connect(str(kanban_db_path()))
+        try:
+            row = db.execute(
+                "SELECT root FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+        finally:
+            db.close()
+        if row and row[0]:
+            return os.path.realpath(os.path.expanduser(row[0]))
+    except Exception:
+        return None
+    return None
+
+
+def _is_temp_path(resolved: str) -> bool:
+    """True when ``resolved`` is under the system temp dir (e.g. /tmp).
+
+    Writes to the temp dir are always allowed regardless of the task write
+    gate or safe-root restriction, so agents can always stage scratch files.
+    """
+    import tempfile
+    try:
+        tmp = os.path.realpath(tempfile.gettempdir())
+    except Exception:
+        tmp = "/tmp"
+    return resolved == tmp or resolved.startswith(tmp + os.sep)
+
+
 def _classify_write_denial(path: str) -> Optional[str]:
     """Return ``'credential'``, ``'safe_root'``, or ``None`` if writes are allowed."""
     home = os.path.realpath(os.path.expanduser("~"))
     resolved = os.path.realpath(os.path.expanduser(str(path)))
+
+    if _is_temp_path(resolved):
+        return None
 
     if resolved in build_write_denied_paths(home):
         return "credential"
@@ -146,6 +190,10 @@ def _classify_write_denial(path: str) -> Optional[str]:
             pass
 
     safe_roots = get_safe_write_roots()
+    task_root = _task_root()
+    if task_root:
+        safe_roots = set(safe_roots)
+        safe_roots.add(task_root)
     if safe_roots:
         allowed = False
         for safe_root in safe_roots:

@@ -5648,20 +5648,24 @@ def _agent_cbs(sid: str) -> dict:
         "notice_clear_callback": lambda key: _emit(
             "notification.clear", sid, {"key": key}
         ),
-        "clarify_callback": lambda q, c, multi_select=False: _block(
-            "clarify.request",
-            sid,
-            # multi_select is a pass-through hint: renderers with checkbox
-            # support can honor it; older renderers ignore the extra field
-            # and stay single-select (a single answer still parses as a
-            # one-element list on the tool side). Only emitted when True so
-            # single-select payloads keep the exact pre-multi-select shape.
-            (
-                {"question": q, "choices": c, "multi_select": True}
-                if multi_select
-                else {"question": q, "choices": c}
-            ),
-            timeout=_clarify_timeout_seconds(),
+        "clarify_callback": lambda q, c, multi_select=False: (
+            r
+            if (r := _block(
+                "clarify.request",
+                sid,
+                # multi_select is a pass-through hint: renderers with checkbox
+                # support can honor it; older renderers ignore the extra field
+                # and stay single-select (a single answer still parses as a
+                # one-element list on the tool side). Only emitted when True so
+                # single-select payloads keep the exact pre-multi-select shape.
+                (
+                    {"question": q, "choices": c, "multi_select": True}
+                    if multi_select
+                    else {"question": q, "choices": c}
+                ),
+                timeout=_clarify_timeout_seconds(),
+            ))
+            else "User unavailable. Stand down and wait for the user to return. Do nothing else."
         ),
         # read_terminal tool (desktop GUI): same blocking bridge as clarify — the
         # renderer answers terminal.read.respond with the serialized buffer.

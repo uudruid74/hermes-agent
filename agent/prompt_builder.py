@@ -163,7 +163,7 @@ HERMES_AGENT_HELP_GUIDANCE = (
 )
 
 MEMORY_GUIDANCE = (
-    "You have persistent memory across sessions. Save durable facts using the memory "
+    "You have persistent memory across sessions. Save durable facts using the session "
     "tool: user preferences, environment details, tool quirks, and stable conventions. "
     "Memory is injected into every turn, so keep it compact and focused on facts that "
     "will still matter later.\n"

@@ -137,6 +137,7 @@ def clarify_tool(
     Returns:
         JSON string with the user's response.
     """
+    import time
     if not question or not question.strip():
         return tool_error("Question text is required.")
 
@@ -164,55 +165,83 @@ def clarify_tool(
     clarify_id = None
     if agent is not None:
         import uuid, time, os
-        try:
-            from hermes_cli.kanban_db import kanban_db_path
-            import sqlite3
-            db = sqlite3.connect(str(kanban_db_path()))
-            db.execute("PRAGMA journal_mode=WAL")
-            clarify_id = uuid.uuid4().hex[:12]
-            session_id = getattr(agent, "session_id", None) or os.environ.get("HERMES_SESSION_ID")
-            task_id = None
-            try:
-                from hermes_state import SessionDB
-                sdb = SessionDB()
-                with sdb._read_ctx() as ctx:
-                    row = ctx.execute("SELECT task_id FROM sessions WHERE id=?", (session_id,)).fetchone()
-                if row:
-                    task_id = row["task_id"] if isinstance(row, dict) else row[0]
-            except Exception:
-                pass
-            agent_name = getattr(agent, "agent_name", "unknown")
-            db.execute(
-                "INSERT INTO clarify_queue(id,session_id,task_id,agent_name,question,choices,multi_select,status,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                (clarify_id, session_id, task_id, agent_name, question,
-                 json.dumps(choices) if choices else None,
-                 1 if multi_select else 0, "pending", int(time.time())))
-            db.commit()
-            db.close()
-        except Exception:
-            clarify_id = None
+        from hermes_cli.kanban_db import kanban_db_path
+        import sqlite3
+        db = sqlite3.connect(str(kanban_db_path()))
+        db.execute("PRAGMA journal_mode=WAL")
+        clarify_id = uuid.uuid4().hex[:12]
+        session_id = getattr(agent, "session_id", None) or os.environ.get("HERMES_SESSION_ID")
+        task_id = None
+        from hermes_state import SessionDB
+        sdb = SessionDB()
+        with sdb._read_ctx() as ctx:
+            row = ctx.execute("SELECT task_id FROM sessions WHERE id=?", (session_id,)).fetchone()
+        if row:
+            task_id = row["task_id"] if isinstance(row, dict) else row[0]
+        agent_name = getattr(agent, "agent_name", "unknown")
+        db.execute(
+            "INSERT INTO clarify_queue(id,session_id,task_id,agent_name,question,choices,multi_select,status,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            (clarify_id, session_id, task_id, agent_name, question,
+             json.dumps(choices) if choices else None,
+             1 if multi_select else 0, "pending", int(time.time())))
+        db.commit()
+        db.close()
+        import sys
+        print(f"CLARIFY_DBG: inserted {clarify_id} for agent={agent_name}, session={session_id}", file=sys.stderr)
 
-    try:
-        raw_response = _invoke_callback(callback, question, choices, multi_select)
-    except Exception as exc:
-        # Clean up row on error
-        if clarify_id:
-            try:
-                db2 = sqlite3.connect(str(kanban_db_path()))
-                db2.execute("DELETE FROM clarify_queue WHERE id=?", (clarify_id,))
-                db2.commit(); db2.close()
-            except Exception:
-                pass
-        return tool_error(f"Failed to get user input: {exc}")
-
-    # Clean up row after answer
+    # Race: callback (WebSocket/CLI) vs DB poll (dashboard).
+    # The dashboard writes answers to clarify_queue; the callback blocks on
+    # a WebSocket event.  Whichever provides an answer first wins.
+    raw_response = None
     if clarify_id:
-        try:
-            db3 = sqlite3.connect(str(kanban_db_path()))
-            db3.execute("DELETE FROM clarify_queue WHERE id=?", (clarify_id,))
-            db3.commit(); db3.close()
-        except Exception:
-            pass
+        import threading
+        _cb_result = [None]
+        _cb_done = threading.Event()
+        def _run_callback():
+            try:
+                _cb_result[0] = _invoke_callback(callback, question, choices, multi_select)
+            except Exception:
+                pass
+            _cb_done.set()
+        t = threading.Thread(target=_run_callback, daemon=True)
+        t.start()
+        # Poll DB for dashboard answer while callback runs
+        db_path = str(kanban_db_path())
+        while not _cb_done.is_set():
+            _cb_done.wait(timeout=1.0)
+            if _cb_done.is_set():
+                break
+            # Check if dashboard wrote an answer
+            try:
+                chk = sqlite3.connect(db_path, timeout=2)
+                chk.execute("PRAGMA journal_mode=WAL")
+                row = chk.execute(
+                    "SELECT answer FROM clarify_queue WHERE id=? AND status='answered'",
+                    (clarify_id,)).fetchone()
+                chk.close()
+                if row and row[0] is not None:
+                    raw_response = row[0]
+                    import sys
+                    print(f"CLARIFY_DBG: dashboard answered {clarify_id}: {raw_response}", file=sys.stderr)
+                    break
+            except Exception:
+                pass
+        if raw_response is None:
+            raw_response = _cb_result[0]
+        # If callback is still blocking (dashboard answered via DB), the
+        # thread will eventually time out or get cleaned up — that's fine.
+    else:
+        raw_response = _invoke_callback(callback, question, choices, multi_select)
+    if raw_response is None:
+        raw_response = ""
+
+    if clarify_id and raw_response:
+        db3 = sqlite3.connect(str(kanban_db_path()))
+        db3.execute("UPDATE clarify_queue SET status='answered', answered_at=? WHERE id=?",
+                    (int(time.time()), clarify_id))
+        db3.commit(); db3.close()
+        import sys
+        print(f"CLARIFY_DBG: marked {clarify_id} as answered", file=sys.stderr)
 
     if multi_select and choices is not None:
         user_response = _parse_multi_select_response(raw_response)

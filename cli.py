@@ -13306,10 +13306,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._clarify_deadline = None
         self._clarify_multi_base = None
         self._paint_now()
-        _cprint(f"\n{_DIM}(clarify timed out after {timeout}s — agent will decide){_RST}")
+        _cprint(f"\n{_DIM}(clarify timed out after {timeout}s — agent will stand down){_RST}")
         return (
-            "The user did not provide a response within the time limit. "
-            "Use your best judgement to make the choice and proceed."
+            "User unavailable. Stand down and wait for the user to return. "
+            "Do nothing else."
         )
 
     def _sudo_password_callback(self) -> str:

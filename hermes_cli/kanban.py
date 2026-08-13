@@ -49,11 +49,12 @@ def _fmt_ts(ts: Optional[int]) -> str:
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
 
 
-def _fmt_task_line(t: kb.Task) -> str:
+def _fmt_task_line(t: kb.Task, *, board: Optional[str] = None) -> str:
     icon = _STATUS_ICONS.get(t.status, "?")
     assignee = t.assignee or "(unassigned)"
     tenant = f" [{t.tenant}]" if t.tenant else ""
-    return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}"
+    board_tag = f"  [{board}]" if board else ""
+    return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}{board_tag}"
 
 
 def _task_to_dict(t: kb.Task) -> dict[str, Any]:
@@ -424,11 +425,15 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
 
     # --- list ---
     p_list = sub.add_parser("list", aliases=["ls"], help="List tasks")
+    p_list.add_argument("--board", default=None, metavar="<slug|all>",
+                        help="Board slug, or 'all' to search across all boards")
     p_list.add_argument("--mine", action="store_true",
                         help="Filter by $HERMES_PROFILE as assignee")
     p_list.add_argument("--assignee", default=None)
-    p_list.add_argument("--status", default=None,
-                        choices=sorted(kb.VALID_STATUSES))
+    p_list.add_argument("--status", default=None, metavar="<status>",
+                        help="Filter by task status. Accepts comma-separated "
+                             "values, e.g. --status=running,blocked. "
+                             f"Valid: {', '.join(sorted(kb.VALID_STATUSES))}")
     p_list.add_argument("--tenant", default=None)
     p_list.add_argument("--session", default=None,
                         help="Filter by originating chat/agent session id "
@@ -459,6 +464,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     # --- show ---
     p_show = sub.add_parser("show", help="Show a task with comments + events")
     p_show.add_argument("task_id")
+    p_show.add_argument("--board", default=None, metavar="<slug|all>",
+                        help="Board slug, or 'all' to search across all boards")
     p_show.add_argument("--json", action="store_true")
     p_show.add_argument(
         "--state-type",
@@ -1002,6 +1009,22 @@ def kanban_command(args: argparse.Namespace) -> int:
     board_override = getattr(args, "board", None)
     board_scope = contextlib.nullcontext()
     if board_override:
+        # --board=all is a cross-board search, handled separately for
+        # list and show commands.
+        if board_override.strip().lower() == "all":
+            _all_handlers = {
+                "list": _cmd_list_all,
+                "ls": _cmd_list_all,
+                "show": _cmd_show_all,
+            }
+            _all_h = _all_handlers.get(action)
+            if _all_h:
+                return int(_all_h(args) or 0)
+            print(
+                f"kanban: --board=all is only supported for 'list' and 'show'",
+                file=sys.stderr,
+            )
+            return 2
         try:
             normed = kb._normalize_board_slug(board_override)
         except ValueError as exc:
@@ -1817,6 +1840,236 @@ def _cmd_swarm(args: argparse.Namespace) -> int:
     return 0
 
 
+def _list_all_boards(include_archived: bool = False) -> list[dict]:
+    """Return all boards, optionally including archived ones."""
+    return kb.list_boards(include_archived=include_archived)
+
+
+def _cmd_list_all(args: argparse.Namespace) -> int:
+    """List tasks across all boards (--board=all)."""
+    assignee = args.assignee
+    if args.mine and not assignee:
+        assignee = _profile_author()
+    include_archived = getattr(args, "archived", False)
+    boards = _list_all_boards(include_archived=include_archived)
+    all_tasks: list[tuple[str, kb.Task]] = []
+    for board_meta in boards:
+        slug = board_meta.get("slug", kb.DEFAULT_BOARD)
+        try:
+            with kb.connect_closing(board=slug) as conn:
+                kb.recompute_ready(conn)
+                tasks = kb.list_tasks(
+                    conn,
+                    assignee=assignee,
+                    status=args.status,
+                    tenant=args.tenant,
+                    session_id=args.session,
+                    include_archived=include_archived,
+                    order_by=getattr(args, "sort", None),
+                    workflow_template_id=args.workflow_template_id,
+                    current_step_key=args.current_step_key,
+                )
+                for t in tasks:
+                    all_tasks.append((slug, t))
+        except Exception:
+            continue
+    if getattr(args, "json", False):
+        rows = []
+        for slug, t in all_tasks:
+            d = _task_to_dict(t)
+            d["board"] = slug
+            rows.append(d)
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
+        return 0
+    print(f"Board: all ({len(boards)} board{'s' if len(boards) != 1 else ''})\n")
+    if not all_tasks:
+        print("(no matching tasks)")
+        return 0
+    for slug, t in all_tasks:
+        print(_fmt_task_line(t, board=slug))
+    return 0
+
+
+def _cmd_show_all(args: argparse.Namespace) -> int:
+    """Show a task searching across all boards (--board=all)."""
+    rsk = _run_state_kwargs(args)
+    if rsk is None:
+        print(
+            "kanban show: pass both --state-type and --state-name, or omit both",
+            file=sys.stderr,
+        )
+        return 2
+    boards = _list_all_boards(include_archived=True)
+    for board_meta in boards:
+        slug = board_meta.get("slug", kb.DEFAULT_BOARD)
+        try:
+            with kb.connect_closing(board=slug) as conn:
+                task = kb.get_task(conn, args.task_id)
+                if not task:
+                    continue
+                # Found it — gather full context and print.
+                comments = kb.list_comments(conn, args.task_id)
+                events = kb.list_events(conn, args.task_id)
+                parents = kb.parent_ids(conn, args.task_id)
+                children = kb.child_ids(conn, args.task_id)
+                runs = kb.list_runs(conn, args.task_id, **rsk)
+                latest_summary = kb.latest_summary(conn, args.task_id)
+        except Exception:
+            continue
+        if getattr(args, "json", False):
+            payload = {
+                "board": slug,
+                "task": _task_to_dict(task),
+                "latest_summary": latest_summary,
+                "parents": parents,
+                "children": children,
+                "comments": [
+                    {"author": c.author, "body": c.body, "created_at": c.created_at}
+                    for c in comments
+                ],
+                "events": [
+                    {
+                        "kind": e.kind,
+                        "payload": e.payload,
+                        "created_at": e.created_at,
+                        "run_id": e.run_id,
+                    }
+                    for e in events
+                ],
+                "runs": [
+                    {
+                        "id": r.id,
+                        "profile": r.profile,
+                        "step_key": r.step_key,
+                        "status": r.status,
+                        "outcome": r.outcome,
+                        "summary": r.summary,
+                        "error": r.error,
+                        "metadata": r.metadata,
+                        "worker_pid": r.worker_pid,
+                        "started_at": r.started_at,
+                        "ended_at": r.ended_at,
+                    }
+                    for r in runs
+                ],
+            }
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
+            return 0
+        # Print board tag then delegate to the standard show output.
+        print(f"Board: {slug}\n")
+        # Reuse the standard show display logic inline (avoids duplicating
+        # 80+ lines of formatting). We already have all the data.
+        _print_show_details(task, comments, events, parents, children, runs, latest_summary)
+        return 0
+    print(f"no such task: {args.task_id}", file=sys.stderr)
+    return 1
+
+
+def _print_show_details(
+    task: kb.Task,
+    comments: list,
+    events: list,
+    parents: list,
+    children: list,
+    runs: list,
+    latest_summary: Optional[str],
+) -> None:
+    """Print the standard show output (shared by _cmd_show and _cmd_show_all)."""
+    print(f"Task {task.id}: {task.title}")
+    print(f"  status:    {task.status}")
+    print(f"  assignee:  {task.assignee or '-'}")
+    if task.tenant:
+        print(f"  tenant:    {task.tenant}")
+    print(f"  workspace: {task.workspace_kind}" +
+          (f" @ {task.workspace_path}" if task.workspace_path else ""))
+    if task.branch_name:
+        print(f"  branch:    {task.branch_name}")
+    if task.skills:
+        print(f"  skills:    {', '.join(task.skills)}")
+    if task.model_override:
+        _prov = f" (provider: {task.provider_override})" if task.provider_override else ""
+        print(f"  model:     {task.model_override}{_prov}")
+    if task.max_retries is not None:
+        print(f"  max-retries: {task.max_retries} (task)")
+    else:
+        try:
+            from hermes_cli.config import load_config
+            cfg = load_config()
+            cfg_val = (cfg.get("kanban", {}) or {}).get("failure_limit")
+        except Exception:
+            cfg_val = None
+        if cfg_val is not None and int(cfg_val) != kb.DEFAULT_FAILURE_LIMIT:
+            print(f"  max-retries: {int(cfg_val)} (config kanban.failure_limit)")
+        else:
+            print(f"  max-retries: {kb.DEFAULT_FAILURE_LIMIT} (default)")
+    print(f"  created:   {_fmt_ts(task.created_at)} by {task.created_by or '-'}")
+    from hermes_cli import kanban_diagnostics as kd
+    diags = kd.compute_task_diagnostics(task, events, runs)
+    if diags:
+        sev_marker = {"warning": "⚠", "error": "!!", "critical": "!!!"}
+        print(f"\n  Diagnostics ({len(diags)}):")
+        for d in diags:
+            print(f"    {sev_marker.get(d.severity, '?')} [{d.severity}] {d.title}")
+            if d.data:
+                bits = []
+                for k, v in d.data.items():
+                    if isinstance(v, list):
+                        bits.append(f"{k}={','.join(str(x) for x in v)}")
+                    else:
+                        bits.append(f"{k}={v}")
+                if bits:
+                    print(f"       data: {' | '.join(bits)}")
+            for a in d.actions:
+                if a.suggested:
+                    print(f"       → {a.label}")
+    if task.started_at:
+        print(f"  started:   {_fmt_ts(task.started_at)}")
+    if task.completed_at:
+        print(f"  completed: {_fmt_ts(task.completed_at)}")
+    if parents:
+        print(f"  parents:   {', '.join(parents)}")
+    if children:
+        print(f"  children:  {', '.join(children)}")
+    if task.body:
+        print()
+        print("Body:")
+        print(task.body)
+    if task.result:
+        print()
+        print("Result:")
+        print(task.result)
+    elif latest_summary:
+        print()
+        print("Latest summary:")
+        print(latest_summary)
+    if comments:
+        print()
+        print(f"Comments ({len(comments)}):")
+        for c in comments:
+            print(f"  [{_fmt_ts(c.created_at)}] {c.author}: {c.body}")
+    if events:
+        print()
+        print(f"Events ({len(events)}):")
+        for e in events[-20:]:
+            pl = f" {e.payload}" if e.payload else ""
+            run_tag = f" [run {e.run_id}]" if e.run_id else ""
+            print(f"  [{_fmt_ts(e.created_at)}]{run_tag} {e.kind}{pl}")
+    if runs:
+        print()
+        print(f"Runs ({len(runs)}):")
+        for r in runs:
+            elapsed = (max(0, r.ended_at - r.started_at)
+                       if r.ended_at else None)
+            el = f"{elapsed}s" if elapsed is not None else "active"
+            outcome = r.outcome or r.status or "active"
+            print(f"  #{r.id:<3} {outcome:<12} @{r.profile or '-'}  {el}  "
+                  f"{_fmt_ts(r.started_at)}")
+            if r.summary:
+                print(f"        → {r.summary.splitlines()[0][:160]}")
+            if r.error:
+                print(f"        ! {r.error.splitlines()[0][:160]}")
+
+
 def _cmd_list(args: argparse.Namespace) -> int:
     assignee = args.assignee
     if args.mine and not assignee:
@@ -1924,113 +2177,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         return 0
 
-    print(f"Task {task.id}: {task.title}")
-    print(f"  status:    {task.status}")
-    print(f"  assignee:  {task.assignee or '-'}")
-    if task.tenant:
-        print(f"  tenant:    {task.tenant}")
-    print(f"  workspace: {task.workspace_kind}" +
-          (f" @ {task.workspace_path}" if task.workspace_path else ""))
-    if task.branch_name:
-        print(f"  branch:    {task.branch_name}")
-    if task.skills:
-        print(f"  skills:    {', '.join(task.skills)}")
-    if task.model_override:
-        _prov = f" (provider: {task.provider_override})" if task.provider_override else ""
-        print(f"  model:     {task.model_override}{_prov}")
-    # Effective retry threshold. Show the per-task override if set,
-    # otherwise the dispatcher's resolved value from config (or the
-    # default if config doesn't set it either). Helps operators see
-    # why a task auto-blocked earlier/later than they expected.
-    if task.max_retries is not None:
-        print(f"  max-retries: {task.max_retries} (task)")
-    else:
-        try:
-            from hermes_cli.config import load_config
-            cfg = load_config()
-            cfg_val = (cfg.get("kanban", {}) or {}).get("failure_limit")
-        except Exception:
-            cfg_val = None
-        if cfg_val is not None and int(cfg_val) != kb.DEFAULT_FAILURE_LIMIT:
-            print(f"  max-retries: {int(cfg_val)} (config kanban.failure_limit)")
-        else:
-            print(f"  max-retries: {kb.DEFAULT_FAILURE_LIMIT} (default)")
-    print(f"  created:   {_fmt_ts(task.created_at)} by {task.created_by or '-'}")
-
-    # Diagnostics section — surface active distress signals at the top
-    # of show output so CLI users see them before scrolling through
-    # comments / runs.
-    from hermes_cli import kanban_diagnostics as kd
-    diags = kd.compute_task_diagnostics(task, events, runs)
-    if diags:
-        sev_marker = {"warning": "⚠", "error": "!!", "critical": "!!!"}
-        print(f"\n  Diagnostics ({len(diags)}):")
-        for d in diags:
-            print(f"    {sev_marker.get(d.severity, '?')} [{d.severity}] {d.title}")
-            if d.data:
-                bits = []
-                for k, v in d.data.items():
-                    if isinstance(v, list):
-                        bits.append(f"{k}={','.join(str(x) for x in v)}")
-                    else:
-                        bits.append(f"{k}={v}")
-                if bits:
-                    print(f"       data: {' | '.join(bits)}")
-            # Only show suggested actions in show output to keep it tight;
-            # full list is available via `kanban diagnostics --task <id>`.
-            for a in d.actions:
-                if a.suggested:
-                    print(f"       → {a.label}")
-    if task.started_at:
-        print(f"  started:   {_fmt_ts(task.started_at)}")
-    if task.completed_at:
-        print(f"  completed: {_fmt_ts(task.completed_at)}")
-    if parents:
-        print(f"  parents:   {', '.join(parents)}")
-    if children:
-        print(f"  children:  {', '.join(children)}")
-    if task.body:
-        print()
-        print("Body:")
-        print(task.body)
-    if task.result:
-        print()
-        print("Result:")
-        print(task.result)
-    elif latest_summary:
-        # Worker handoff lives on the latest run, not on tasks.result.
-        # Surface it at top-level so a glance at ``hermes kanban show <id>``
-        # tells you what the worker did even if tasks.result is empty.
-        print()
-        print("Latest summary:")
-        print(latest_summary)
-    if comments:
-        print()
-        print(f"Comments ({len(comments)}):")
-        for c in comments:
-            print(f"  [{_fmt_ts(c.created_at)}] {c.author}: {c.body}")
-    if events:
-        print()
-        print(f"Events ({len(events)}):")
-        for e in events[-20:]:
-            pl = f" {e.payload}" if e.payload else ""
-            run_tag = f" [run {e.run_id}]" if e.run_id else ""
-            print(f"  [{_fmt_ts(e.created_at)}]{run_tag} {e.kind}{pl}")
-    if runs:
-        print()
-        print(f"Runs ({len(runs)}):")
-        for r in runs:
-            # Clamp to 0 so NTP backward-jumps don't print negative seconds.
-            elapsed = (max(0, r.ended_at - r.started_at)
-                       if r.ended_at else None)
-            el = f"{elapsed}s" if elapsed is not None else "active"
-            outcome = r.outcome or r.status or "active"
-            print(f"  #{r.id:<3} {outcome:<12} @{r.profile or '-'}  {el}  "
-                  f"{_fmt_ts(r.started_at)}")
-            if r.summary:
-                print(f"        → {r.summary.splitlines()[0][:160]}")
-            if r.error:
-                print(f"        ! {r.error.splitlines()[0][:160]}")
+    _print_show_details(task, comments, events, parents, children, runs, latest_summary)
     return 0
 
 

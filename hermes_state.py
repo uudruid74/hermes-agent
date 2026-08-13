@@ -4494,13 +4494,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._execute_write(_do)
 
     def set_session_task_id(self, session_id: str, task_id: str) -> None:
-        """Set the current task_id for a session."""
+        """Set the current task_id for a session.
+
+        Uses an upsert so the binding succeeds even if the session row hasn't
+        been created yet (lazy row creation in the TUI gateway means the row
+        may not exist when plan_tool approves a task).
+        """
         if not session_id:
             return
         def _do(conn):
             conn.execute(
-                "UPDATE sessions SET task_id = ? WHERE id = ?",
-                (task_id, session_id),
+                """INSERT INTO sessions (id, source, started_at, task_id)
+                   VALUES (?, 'plan_tool', ?, ?)
+                   ON CONFLICT(id) DO UPDATE SET task_id = excluded.task_id""",
+                (session_id, time.time(), task_id),
             )
         self._execute_write(_do)
 
@@ -4509,6 +4516,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if not session_id:
             return
         def _do(conn):
+            # Row may not exist (lazy creation); no-op in that case.
             conn.execute(
                 "UPDATE sessions SET task_id = NULL WHERE id = ?",
                 (session_id,),

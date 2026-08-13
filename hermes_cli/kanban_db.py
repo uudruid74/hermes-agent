@@ -556,7 +556,7 @@ def board_dir(board: Optional[str] = None) -> Path:
 
 
 def board_exists(board: Optional[str] = None) -> bool:
-    """Return True if the board has persisted metadata or a DB on disk.
+    """Return True if the board has persisted ``board.json`` metadata.
 
     ``default`` is considered to always exist — its DB is created
     on first :func:`connect` and there's no way for it to be missing
@@ -565,33 +565,26 @@ def board_exists(board: Optional[str] = None) -> bool:
     slug = _normalize_board_slug(board) or DEFAULT_BOARD
     if slug == DEFAULT_BOARD:
         return True
-    d = board_dir(slug)
-    return (d / "board.json").exists() or (d / "kanban.db").exists()
+    return (board_dir(slug) / "board.json").exists()
 
 
 def kanban_db_path(board: Optional[str] = None) -> Path:
-    """Return the path to the ``kanban.db`` for ``board``.
+    """Return the path to the consolidated ``kanban.db``.
 
-    Resolution (highest precedence first):
+    All boards share a single SQLite database. The ``board`` argument is
+    retained for API compatibility and to carry the board slug into queries,
+    but it no longer selects a per-board file. Resolution:
 
     1. ``HERMES_KANBAN_DB`` env var — pins the path directly. Honoured for
        back-compat and for the dispatcher→worker handoff (defense in
        depth: dispatcher injects this into worker env so workers are
        immune to any path-resolution disagreement).
-    2. When ``board`` arg is None, the active board from
-       :func:`get_current_board` is used.
-    3. Board ``default`` → ``<root>/kanban.db`` (back-compat path).
-       Other boards → ``<root>/kanban/boards/<slug>/kanban.db``.
+    2. Otherwise ``<root>/kanban/kanban.db`` — the single consolidated DB.
     """
     override = os.environ.get("HERMES_KANBAN_DB", "").strip()
     if override:
         return Path(override).expanduser()
-    slug = _normalize_board_slug(board)
-    if slug is None:
-        slug = get_current_board()
-    if slug == DEFAULT_BOARD:
-        return kanban_home() / "kanban.db"
-    return board_dir(slug) / "kanban.db"
+    return kanban_home() / "kanban" / "kanban.db"
 
 
 def workspaces_root(board: Optional[str] = None) -> Path:
@@ -813,15 +806,14 @@ def create_board(
 
 
 def list_boards(*, include_archived: bool = True) -> list[dict]:
-    """Enumerate all boards that exist on disk.
+    """Enumerate all boards that have persisted ``board.json`` metadata.
 
-    Always includes ``default`` (even when the ``boards/default/``
-    metadata dir doesn't exist, because its DB is at the legacy path).
-    Other boards are discovered by scanning ``boards/`` for subdirectories
-    that either contain a ``kanban.db`` or a ``board.json``.
+    Always includes ``default`` first, then the rest alphabetically.
+    Board slugs are discovered by scanning ``boards/`` for ``board.json``
+    files (the per-board ``kanban.db`` files are gone post-consolidation;
+    task data lives in the single consolidated DB).
 
-    Returns a list of metadata dicts, sorted with ``default`` first and
-    the rest alphabetically.
+    Returns a list of metadata dicts.
     """
     entries: list[dict] = []
     seen: set[str] = set()
@@ -836,17 +828,13 @@ def list_boards(*, include_archived: bool = True) -> list[dict]:
             if not child.is_dir():
                 continue
             slug = child.name
-            # Keep slug normalisation soft for discovery — but skip dirs
-            # that don't parse as valid slugs so we don't surface junk.
             try:
                 normed = _normalize_board_slug(slug)
             except ValueError:
                 continue
             if not normed or normed in seen:
                 continue
-            has_db = (child / "kanban.db").exists()
-            has_meta = (child / "board.json").exists()
-            if not (has_db or has_meta):
+            if not (child / "board.json").exists():
                 continue
             meta = read_board_metadata(normed)
             if meta.get("archived") and not include_archived:
@@ -1281,7 +1269,16 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Plan tool columns for manual-task step tracking
+    task_steps           TEXT,
+    task_stepno          INTEGER,
+    task_goal            TEXT,
+    prev_temperature     TEXT,
+    previous_task        TEXT,
+    board                TEXT NOT NULL DEFAULT 'default',
+    root                 TEXT,
+    cron                 TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1369,6 +1366,26 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     created_at    INTEGER NOT NULL,
     last_event_id INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
+);
+
+-- Pending clarify() calls from agents. The clarify_tool INSERTs a row
+-- before blocking on user input; the dashboard SELECTs pending rows to
+-- render the gold CLARIFY card; and the dashboard's clarify_respond()
+-- writes the answer back. Rows are DELETEd by clarify_tool after the
+-- callback returns.
+CREATE TABLE IF NOT EXISTS clarify_queue (
+    id           TEXT PRIMARY KEY,
+    session_id   TEXT,
+    task_id      TEXT,
+    agent_name   TEXT,
+    question     TEXT,
+    choices      TEXT,
+    multi_select INTEGER DEFAULT 0,
+    answer       TEXT,
+    status       TEXT DEFAULT 'pending',
+    created_at   INTEGER,
+    answered_at  INTEGER,
+    board        TEXT NOT NULL DEFAULT 'default'
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
@@ -2496,6 +2513,27 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
     )
 
+    # Plan tool columns for manual-task step tracking (added after initial schema)
+    if "task_steps" not in cols:
+        _add_column_if_missing(conn, "tasks", "task_steps", "task_steps TEXT")
+    if "task_stepno" not in cols:
+        _add_column_if_missing(conn, "tasks", "task_stepno", "task_stepno INTEGER")
+    if "task_goal" not in cols:
+        _add_column_if_missing(conn, "tasks", "task_goal", "task_goal TEXT")
+    if "prev_temperature" not in cols:
+        _add_column_if_missing(conn, "tasks", "prev_temperature", "prev_temperature TEXT")
+    if "previous_task" not in cols:
+        _add_column_if_missing(conn, "tasks", "previous_task", "previous_task TEXT")
+    if "board" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "board", "board TEXT NOT NULL DEFAULT 'default'"
+        )
+    if "root" not in cols:
+        _add_column_if_missing(conn, "tasks", "root", "root TEXT")
+    if "cron" not in cols:
+        _add_column_if_missing(conn, "tasks", "cron", "cron TEXT")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_board ON tasks(board)")
+
     # task_events gained a run_id column; back-fill it as NULL for
     # historical events (they predate runs and can't be attributed).
     ev_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_events)")}
@@ -2528,6 +2566,19 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         if "delivery_metadata" not in notify_cols:
             _add_column_if_missing(
                 conn, "kanban_notify_subs", "delivery_metadata", "delivery_metadata TEXT"
+            )
+
+    # clarify_queue gained a board column for the consolidated DB.
+    cq_exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='clarify_queue'"
+    ).fetchone() is not None
+    if cq_exists:
+        cq_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(clarify_queue)")
+        }
+        if "board" not in cq_cols:
+            _add_column_if_missing(
+                conn, "clarify_queue", "board", "board TEXT NOT NULL DEFAULT 'default'"
             )
 
     # One-shot backfill: any task that is 'running' before runs existed
@@ -3367,6 +3418,7 @@ def list_tasks(
     status: Optional[str] = None,
     tenant: Optional[str] = None,
     session_id: Optional[str] = None,
+    board: Optional[str] = None,
     include_archived: bool = False,
     limit: Optional[int] = None,
     order_by: Optional[str] = None,
@@ -3375,14 +3427,27 @@ def list_tasks(
 ) -> list[Task]:
     query = "SELECT * FROM tasks WHERE 1=1"
     params: list[Any] = []
+    if board is not None:
+        query += " AND board = ?"
+        params.append(board)
     if assignee is not None:
         query += " AND assignee = ?"
         params.append(_canonical_assignee(assignee))
     if status is not None:
-        if status not in VALID_STATUSES:
-            raise ValueError(f"status must be one of {sorted(VALID_STATUSES)}")
-        query += " AND status = ?"
-        params.append(status)
+        if isinstance(status, list):
+            statuses = status
+        else:
+            statuses = [s.strip() for s in status.split(",") if s.strip()]
+        for s in statuses:
+            if s not in VALID_STATUSES:
+                raise ValueError(f"status must be one of {sorted(VALID_STATUSES)}")
+        if len(statuses) == 1:
+            query += " AND status = ?"
+            params.append(statuses[0])
+        else:
+            placeholders = ",".join("?" for _ in statuses)
+            query += f" AND status IN ({placeholders})"
+            params.extend(statuses)
     if tenant is not None:
         query += " AND tenant = ?"
         params.append(tenant)
@@ -3395,7 +3460,12 @@ def list_tasks(
     if current_step_key is not None:
         query += " AND current_step_key = ?"
         params.append(current_step_key)
-    if not include_archived and status != "archived":
+    # Exclude archived unless user explicitly requested them.
+    _wants_archived = False
+    if status is not None:
+        _statuses = status if isinstance(status, list) else [s.strip() for s in status.split(",") if s.strip()]
+        _wants_archived = "archived" in _statuses
+    if not include_archived and not _wants_archived:
         query += " AND status != 'archived'"
     if order_by is not None:
         order_by = order_by.strip().lower()
@@ -4265,12 +4335,17 @@ def recompute_ready(
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status, consecutive_failures, max_retries "
+            "SELECT id, status, consecutive_failures, max_retries, assignee "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
+            # Invariant: unassigned tasks are never promoted to 'ready' — they
+            # stay held in 'todo' until an operator assigns them. This keeps
+            # "unassigned = held, never dispatched" structural.
+            if not (row["assignee"] or "").strip():
+                continue
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                 # Worker / operator asked for human review — do not
                 # silently auto-recover.  ``unblock_task`` is the only
@@ -5985,7 +6060,7 @@ def promote_task(
     promotion would succeed without mutating state.
     """
     row = conn.execute(
-        "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        "SELECT status, assignee FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
     if row is None:
         return False, f"task {task_id} not found"
@@ -5995,6 +6070,13 @@ def promote_task(
         return False, (
             f"task {task_id} is {cur_status!r}; promote only applies to "
             f"'todo' or 'blocked'"
+        )
+
+    # Invariant: unassigned tasks are never promoted to 'ready' — they stay
+    # held in 'todo' until an operator assigns them.
+    if not (row["assignee"] or "").strip():
+        return False, (
+            f"task {task_id} has no assignee; assign it before promoting to 'ready'"
         )
 
     if not force:
@@ -6075,7 +6157,13 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             "WHERE l.child_id = ? AND p.status != 'done' LIMIT 1",
             (task_id,),
         ).fetchone()
-        new_status = "todo" if undone_parents else "ready"
+        # Invariant: unassigned tasks are never 'ready' — they stay held in
+        # 'todo' until an operator assigns them.
+        _a = conn.execute(
+            "SELECT assignee FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        _has_assignee = bool((_a["assignee"] or "").strip()) if _a else False
+        new_status = "ready" if (not undone_parents and _has_assignee) else "todo"
         # NOTE: deliberately does NOT touch ``block_recurrences`` or
         # ``block_kind``. Resetting the recurrence counter on unblock is exactly
         # the amnesia that let a cron unblock → worker re-block loop run

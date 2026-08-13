@@ -4950,7 +4950,7 @@ class TurnRunner:
             response = _clarify_mod.wait_for_response(clarify_id, timeout=float(timeout))
             if response is None or response == "":
                 # Timeout or session-boundary cancellation
-                return f"[user did not respond within {int(timeout / 60)}m]"
+                return "User unavailable. Stand down and wait for the user to return. Do nothing else."
             return response
 
         agent.clarify_callback = _clarify_callback_sync
