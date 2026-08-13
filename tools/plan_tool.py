@@ -401,12 +401,14 @@ def _cmd_done(agent, status: Optional[str] = None) -> str:
             conn.commit()
 
     # Restore previous task
+    # BUG: No conditional is needed here!
     if prev_task:
         sdb.set_session_task_id(session_id, prev_task)
         if prev_temp is not None:
             agent._session_temperature = prev_temp
 
         # Unblock parent task so the dispatcher/agent can resume it
+        # BUG: This should only be done for kanban tasks, not Manual
         try:
             with kdb as conn:
                 conn.execute(
@@ -424,7 +426,7 @@ def _cmd_done(agent, status: Optional[str] = None) -> str:
                 "SELECT title, task_goal FROM tasks WHERE id = ?", (prev_task,)
             ).fetchone()
         parent_title = parent["title"] if parent else prev_task
-        parent_goal = parent["task_goal"] or "" if parent else ""
+        parent_goal = (parent["task_goal"] or "") if parent else ""
 
         # Log via session
         sdb.set_session_subject(session_id, parent_title)
@@ -439,12 +441,12 @@ def _cmd_done(agent, status: Optional[str] = None) -> str:
             pass
 
         return (
-            f"Task {task_id} complete. Continuing parent task {prev_task}, "
-            f"whose goal was: {parent_goal}\n\n"
-            f"Complete Step {stepno}: {steps[stepno - 1] if stepno <= len(steps) else 'review work'}"
+            f"Task {task_id} complete. Continuing parent task {prev_task} "
+            f"({parent_title}, goal: {parent_goal}). Resume work on the parent task."
         )
     else:
         # No parent — clear task_id, restore old subject
+        # BUG: Don't clear it, restore it.  If the old task_id is blank, restore that!
         sdb.clear_session_task_id(session_id)
         sdb.set_session_subject(session_id, old_subject or "")
 
@@ -476,6 +478,7 @@ def _cmd_done(agent, status: Optional[str] = None) -> str:
         except Exception:
             pass
 
+        # BUG: This is where the conditional goes.  If the new task_id is blank, return below, else the one above.
         return (
             f"The task goal was: {goal}\n"
             f"Verify this goal has been achieved, or present a new plan."
