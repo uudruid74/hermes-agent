@@ -185,8 +185,14 @@ def _cmd_new(agent, title: str, goal: str, steps: List[str],
     if not user_response:
         return "No response received. Stand down."
 
-    # Detect approval
+    # A CLI/gateway timeout is not a user denial. Keep the pre-created task
+    # blocked for approval without inventing an unspecified denial reason.
     response_lower = str(user_response).strip().lower()
+    if response_lower == "user unavailable. stand down and wait for the user to return. do nothing else.":
+        return (
+            f"Plan awaiting approval ({task_id}): no user response was received. "
+            "The plan remains blocked for approval. Stand down."
+        )
     if "appr" in response_lower:
         # User approved — activate task
         current_temp = getattr(agent, "_session_temperature", None)
