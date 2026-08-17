@@ -48,17 +48,8 @@ def _get_agent_name(agent) -> str:
 
 
 def _get_session_id(agent) -> Optional[str]:
-    """Canonical session ID: ContextVar first, then env. No agent fallback.
-
-    Must match file_safety._session_task_id() resolution so the write gate
-    finds the task_id that plan_tool just wrote.  (f3ee48575 / t_6c68e6de)
-    """
-    try:
-        from gateway.session_context import get_session_env
-        sid = get_session_env("HERMES_SESSION_ID")
-    except Exception:
-        sid = os.environ.get("HERMES_SESSION_ID")
-    return sid or None
+    """Return the agent's session ID pinned at initialization."""
+    return getattr(agent, "canonical_session_id", None) or getattr(agent, "session_id", None)
 
 
 
@@ -242,13 +233,15 @@ def _cmd_new(agent, title: str, goal: str, steps: List[str],
         if resolved_temp is not None:
             agent._session_temperature = resolved_temp
 
-        # If running as kanban worker, block parent task
+        # Block a kanban parent while its child plan is active. Manual plans
+        # remain manual and are restored from the session binding alone.
         if current_task_id:
             try:
                 with kdb as conn:
                     conn.execute(
-                        "UPDATE tasks SET status = 'blocked', block_kind = 'approval' WHERE id = ?",
-                        (current_task_id,)
+                        "UPDATE tasks SET status = 'blocked', block_kind = 'approval' "
+                        "WHERE id = ? AND status != 'manual'",
+                        (current_task_id,),
                     )
                     conn.commit()
             except Exception:
@@ -400,15 +393,14 @@ def _cmd_done(agent, status: Optional[str] = None) -> str:
             )
             conn.commit()
 
-    # Restore previous task
-    # BUG: No conditional is needed here!
+    # Restore previous task.
     if prev_task:
         sdb.set_session_task_id(session_id, prev_task)
         if prev_temp is not None:
             agent._session_temperature = prev_temp
 
-        # Unblock parent task so the dispatcher/agent can resume it
-        # BUG: This should only be done for kanban tasks, not Manual
+        # A manual parent remains manual while its child runs. Only a blocked
+        # kanban parent must be returned to the worker queue.
         try:
             with kdb as conn:
                 conn.execute(
@@ -446,7 +438,6 @@ def _cmd_done(agent, status: Optional[str] = None) -> str:
         )
     else:
         # No parent — clear task_id, restore old subject
-        # BUG: Don't clear it, restore it.  If the old task_id is blank, restore that!
         sdb.clear_session_task_id(session_id)
         sdb.set_session_subject(session_id, old_subject or "")
 
@@ -1119,6 +1110,9 @@ registry.register(
         resume=args.get("resume"),
         reason=args.get("reason"),
         task_id=args.get("task_id"),
+        board=args.get("board"),
+        cron=args.get("cron"),
+        root=args.get("root"),
     ),
     emoji="📋",
 )
