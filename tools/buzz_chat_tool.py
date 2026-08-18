@@ -27,7 +27,7 @@ from typing import Any, Dict, Optional
 # ---------------------------------------------------------------------------
 
 DEFAULT_CLI = "/home/ekl/Documents/Programming/buzz/target/debug/buzz"
-DEFAULT_RELAY = "ws://127.0.0.1:3000"
+DEFAULT_RELAY = "wss://buzz.virtuallyreal.games"
 CREW_CHANNEL = "7c1dbf0d-33b3-4952-8364-6d7e2fc2f8b3"
 
 

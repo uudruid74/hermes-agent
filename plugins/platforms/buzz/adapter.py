@@ -973,13 +973,23 @@ class BuzzAdapter(BasePlatformAdapter):
         code, out, _err = await self._run_cli(["channels", "list"])
         if code != 0:
             return
+        # In all-joined mode (no explicit ``channels`` whitelist), watch every
+        # channel the agent is a member of — including real named channels
+        # added later via the UI/CLI — so a UI "add member" is sufficient to
+        # start receiving that channel.  This matches the documented
+        # "empty = all joined" semantics.  When an explicit whitelist IS set,
+        # only DM-shaped conversations are discovered (real channels already
+        # in the whitelist are watched at seeding).
+        all_joined = not self.channels
         for ch in _parse_json_list(out):
             ch_id = str(ch.get("channel_id") or "")
             if not ch_id:
                 continue
             self._channel_meta[ch_id] = ch
             self._channel_names.setdefault(ch_id, str(ch.get("name") or ch_id))
-            if ch_id in self._channel_state or not self._may_reclassify_as_dm(ch_id):
+            if ch_id in self._channel_state:
+                continue
+            if not all_joined and not self._may_reclassify_as_dm(ch_id):
                 continue
             if seed:
                 await self._seed_channel(ch_id, chat_type="group")

@@ -930,7 +930,7 @@ def _cmd_archive(task_id: str) -> str:
             conn = sqlite3.connect(db_path)
             with conn:
                 cur = conn.execute(
-                    "UPDATE tasks SET status='archived' WHERE id=? AND status NOT IN ('done','archived')",
+                    "UPDATE tasks SET status='archived' WHERE id=? AND status != 'archived'",
                     (task_id,)
                 )
                 if cur.rowcount > 0:

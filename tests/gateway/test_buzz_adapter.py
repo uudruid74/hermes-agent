@@ -362,9 +362,9 @@ class TestDmClassification:
     @pytest.mark.asyncio
     async def test_dm_shaped_channel_discovered_when_dms_list_empty(self):
         """Fallback discovery: with `dms list` broken (returns []), a
-        DM-shaped `channels list` entry gets watched; real channels not
-        already watched are left alone."""
-        a = _make_adapter()
+        DM-shaped `channels list` entry gets watched even when an explicit
+        whitelist is set; real channels outside the whitelist are left alone."""
+        a = _make_adapter(extra={"channels": [CHANNEL]})
         cli = _ScriptedCli()
         cli.script("dms", "list", [])
         cli.script("channels", "list", [
@@ -377,8 +377,25 @@ class TestDmClassification:
         # Watched as group; the p-tag latch flips it on the first real DM.
         assert a._channel_state[DM_CHANNEL]["chat_type"] == "group"
         assert a._may_reclassify_as_dm(DM_CHANNEL) is True
-        assert CHANNEL not in a._channel_state
         assert a._may_reclassify_as_dm(CHANNEL) is False
+
+    @pytest.mark.asyncio
+    async def test_all_joined_mode_watches_real_channels_added_later(self):
+        """In all-joined mode (no `channels` whitelist), a UI-added real
+        channel is discovered automatically — no manual config edit needed."""
+        a = _make_adapter()  # empty channels => all-joined mode
+        cli = _ScriptedCli()
+        cli.script("dms", "list", [])
+        cli.script("channels", "list", [
+            {"channel_id": DM_CHANNEL, "name": "DM", "description": "", "created_at": 1},
+            {"channel_id": CHANNEL, "name": "general",
+             "description": "General conversation and community updates.", "created_at": 2},
+        ])
+        a._run_cli = cli
+        await a._discover_dms(seed=False)
+        # Both the DM-shaped conversation and the real named channel are watched.
+        assert a._channel_state[DM_CHANNEL]["chat_type"] == "group"
+        assert a._channel_state[CHANNEL]["chat_type"] == "group"
 
 
 # ── Sending ───────────────────────────────────────────────────────────────
