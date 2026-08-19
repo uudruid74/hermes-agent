@@ -772,11 +772,13 @@ def _cmd_remind(agent, task_id: Optional[str] = None) -> str:
             return f"Task {task_id} not found"
 
         steps = json.loads(task["task_steps"]) if task["task_steps"] else []
+        status = task["status"]
         stepno = task["task_stepno"] or 1
         goal = task["task_goal"] or ""
 
     lines = [
-        f"Task: {task['title'] or task_id}"
+        f"Task: {task['title'] or task_id}",
+        f"Status: {status}",
         f"Goal: {goal}",
         f"Step {stepno}/{len(steps)}",
         "",

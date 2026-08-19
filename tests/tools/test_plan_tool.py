@@ -89,3 +89,21 @@ def test_new_activates_plan_after_an_approve_response(monkeypatch):
     task = conn.execute("SELECT status, block_kind FROM tasks").fetchone()
     assert task["status"] == "manual"
     assert task["block_kind"] is None
+
+
+def test_remind_returns_requested_task_status(monkeypatch):
+    conn = _plan_db()
+    conn.execute(
+        """INSERT INTO tasks
+           (id, title, status, assignee, created_at, task_steps, task_stepno,
+            task_goal, board)
+           VALUES ('t_remind', 'Status check', 'blocked', 'neo', 1,
+                   '[\"Inspect status\"]', 1, 'Report the status', 'default')"""
+    )
+    conn.commit()
+    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+
+    result = plan_tool._cmd_remind(_UnavailableAgent(), "t_remind")
+
+    assert "Task: Status check" in result
+    assert "Status: blocked" in result
