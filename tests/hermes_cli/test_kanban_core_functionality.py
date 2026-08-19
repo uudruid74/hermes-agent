@@ -1378,6 +1378,25 @@ def test_protocol_violation_budget_not_consumed_by_other_failures(kanban_home):
 
 
 
+def test_protocol_violation_breaker_block_is_not_auto_promoted(kanban_home):
+    """A protocol-violation breaker trip must stop respawning workers."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="protocol flood", assignee="worker")
+        for pid in (991001, 991002, 991003):
+            _drive_protocol_violation(conn, tid, pid)
+
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "blocked"
+        assert kb.recompute_ready(conn) == 0
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "blocked"
+    finally:
+        conn.close()
+
+
 def test_notify_sub_starts_caught_up_on_active_task(kanban_home):
     """A new subscription must NOT replay historical terminal events.
 
