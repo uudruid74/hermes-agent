@@ -890,6 +890,62 @@ def _cmd_fail(agent, reason: str = "") -> str:
 
 
 # ---------------------------------------------------------------------------
+# command: test-complete
+# ---------------------------------------------------------------------------
+
+def _cmd_test_complete(agent) -> str:
+    """Archive an investigation/test plan without a mood or rating change."""
+    session_id = _get_session_id(agent)
+    if not session_id:
+        return "ERROR: No active session"
+
+    sdb = _get_session_db()
+    with sdb._read_ctx() as c:
+        row = c.execute(
+            "SELECT task_id FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+    if not row:
+        return "ERROR: No task assigned"
+    task_id = row["task_id"] if isinstance(row, dict) else row[0]
+    if not task_id:
+        return "ERROR: No active task"
+
+    kdb = _get_kanban_db()
+    now = int(time.time())
+    with kdb as conn:
+        task = conn.execute(
+            "SELECT * FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if not task:
+            return f"Task {task_id} not found"
+        if task["status"] in {"done", "archived"}:
+            return f"ERROR: Task {task_id} is already closed"
+
+        goal = task["task_goal"] or ""
+        steps = json.loads(task["task_steps"]) if task["task_steps"] else []
+        stepno = task["task_stepno"] or 1
+        step_title = steps[stepno - 1] if stepno <= len(steps) else "unknown"
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+            (task_id, _get_agent_name(agent),
+             f"TEST COMPLETE at Step {stepno}: {step_title}.", now),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, ?, ?, ?)",
+            (task_id, "test-complete", json.dumps({"outcome": "test", "step": stepno}), now),
+        )
+        conn.execute(
+            "UPDATE tasks SET status = 'archived', completed_at = ? WHERE id = ?",
+            (now, task_id),
+        )
+        conn.commit()
+
+    sdb.clear_session_task_id(session_id)
+    agent._session_temperature = _resolve_temp("worker", agent)
+    return f"The goal was: {goal}. Step {stepno} ({step_title}) was recorded as a test outcome and plan {task_id} was archived."
+
+
+# ---------------------------------------------------------------------------
 # command: approve
 # ---------------------------------------------------------------------------
 
@@ -1088,13 +1144,14 @@ def plan_tool(
     """Mandatory Action Protocol — multistep plan management.
 
     Commands:
-      new      — present a plan for approval
-      done     — mark current step complete
-      dispatch — create + dispatch a kanban task
-      remind   — show current plan with step marker
-      fail     — mark task as failed
-      approve  — approve a blocked plan task
-      cron     — schedule a recurring plan (cron + root scoped file access)
+      new           — present a plan for approval
+      done          — mark current step complete
+      dispatch      — create + dispatch a kanban task
+      remind        — show current plan with step marker
+      fail          — mark task as failed
+      test-complete — archive a test/investigation outcome without penalty
+      approve       — approve a blocked plan task
+      cron          — schedule a recurring plan (cron + root scoped file access)
     """
     command = (command or "").strip().lower()
 
@@ -1122,6 +1179,9 @@ def plan_tool(
     elif command == "fail":
         return _cmd_fail(agent, reason or "")
 
+    elif command == "test-complete":
+        return _cmd_test_complete(agent)
+
     elif command == "approve":
         if not task_id:
             return "ERROR: 'approve' requires task_id"
@@ -1138,7 +1198,7 @@ def plan_tool(
         return _cmd_archive(task_id)
 
     else:
-        return f"ERROR: Unknown plan command '{command}'. Valid: new, done, dispatch, remind, fail, approve"
+        return f"ERROR: Unknown plan command '{command}'. Valid: new, done, dispatch, remind, fail, test-complete, approve"
 
 
 # --- Schema ---
@@ -1149,7 +1209,7 @@ PLAN_TOOL_SCHEMA = {
         "Mandatory Action Protocol — create and manage multistep plans. "
         "Commands: new (present plan for approval), done (mark step complete), "
         "dispatch (create kanban task), remind (show current plan), "
-        "fail (mark task failed), approve (unblock plan task), block (emergency block), "
+        "fail (mark task failed), test-complete (neutral test outcome), approve (unblock plan task), block (emergency block), "
         "archive (block + archive), cron (schedule a recurring plan). "
         "Writes are blocked when no task is active. Use 'board' to route 'new' "
         "tasks to a specific kanban board. 'cron' requires 'cron' (schedule) and "
@@ -1160,8 +1220,8 @@ PLAN_TOOL_SCHEMA = {
         "properties": {
             "command": {
                 "type": "string",
-                "description": "Command: new, done, dispatch, remind, fail, approve, block, archive, or cron",
-                "enum": ["new", "done", "dispatch", "remind", "fail", "approve", "block", "archive", "cron"],
+                "description": "Command: new, done, dispatch, remind, fail, test-complete, approve, block, archive, or cron",
+                "enum": ["new", "done", "dispatch", "remind", "fail", "test-complete", "approve", "block", "archive", "cron"],
             },
             "title": {
                 "type": "string",

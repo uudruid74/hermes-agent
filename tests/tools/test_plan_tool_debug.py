@@ -161,3 +161,25 @@ def test_normal_failure_archives_without_rating_change(monkeypatch):
     assert state.ratings == {}
     assert conn.execute("SELECT status FROM tasks WHERE id = 'normal'").fetchone()[0] == "archived"
     assert state.moods == [("session", -1.0)]
+
+
+def test_test_complete_archives_without_mood_or_rating_penalty(monkeypatch):
+    conn = _db()
+    _insert_task(conn, "test", assignee="tester")
+    state = _State("test")
+    agent = _Agent()
+    _bind(monkeypatch, conn, state)
+
+    result = plan_tool.plan_tool(agent, "test-complete")
+
+    assert "test-complete" in plan_tool.PLAN_TOOL_SCHEMA["parameters"]["properties"]["command"]["enum"]
+    assert "recorded as a test outcome" in result
+    assert state.ratings == {}
+    assert state.moods == []
+    assert state.conn.execute("SELECT task_id FROM sessions WHERE id = 'session'").fetchone()[0] is None
+    assert conn.execute("SELECT status FROM tasks WHERE id = 'test'").fetchone()[0] == "archived"
+    comment = conn.execute("SELECT body FROM task_comments WHERE task_id = 'test'").fetchone()[0]
+    event = conn.execute("SELECT kind, payload FROM task_events WHERE task_id = 'test'").fetchone()
+    assert comment.startswith("TEST COMPLETE at Step 1")
+    assert event["kind"] == "test-complete"
+    assert json.loads(event["payload"]) == {"outcome": "test", "step": 1}
