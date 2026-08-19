@@ -342,5 +342,41 @@ class TestCLI:
         assert titlesB == ["Task B"]
         assert titlesD == []
 
+    def test_boards_list_counts_are_scoped_by_slug(self, fresh_home):
+        env = {"HERMES_HOME": str(fresh_home)}
+        for slug in ("alpha", "beta"):
+            result = _cli(["boards", "create", slug], env_extra=env)
+            assert result.returncode == 0, result.stderr
+
+        with kb.connect() as conn:
+            alpha_todo = kb.create_task(
+                conn, title="Alpha todo", assignee="dev"
+            )
+            alpha_blocked = kb.create_task(
+                conn, title="Alpha blocked", assignee="dev"
+            )
+            beta_blocked = kb.create_task(
+                conn, title="Beta blocked", assignee="dev"
+            )
+            conn.execute(
+                "UPDATE tasks SET board='alpha', status='todo' WHERE id=?",
+                (alpha_todo,),
+            )
+            conn.execute(
+                "UPDATE tasks SET board='alpha', status='blocked' WHERE id=?",
+                (alpha_blocked,),
+            )
+            conn.execute(
+                "UPDATE tasks SET board='beta', status='blocked' WHERE id=?",
+                (beta_blocked,),
+            )
+
+        result = _cli(["boards", "list", "--json"], env_extra=env)
+        assert result.returncode == 0, result.stderr
+        counts = {board["slug"]: board["counts"] for board in json.loads(result.stdout)}
+
+        assert counts["alpha"] == {"blocked": 1, "todo": 1}
+        assert counts["beta"] == {"blocked": 1}
+
 
 
