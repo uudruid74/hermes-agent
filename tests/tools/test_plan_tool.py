@@ -26,28 +26,11 @@ class _ApprovedAgent(_UnavailableAgent):
 
 
 def _plan_db():
+    from hermes_cli.kanban_db import SCHEMA_SQL
+
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
-    conn.execute(
-        """
-        CREATE TABLE tasks (
-            id TEXT PRIMARY KEY,
-            title TEXT,
-            body TEXT,
-            status TEXT,
-            assignee TEXT,
-            created_at INTEGER,
-            task_steps TEXT,
-            task_stepno INTEGER,
-            task_goal TEXT,
-            block_kind TEXT,
-            prev_temperature REAL,
-            previous_task TEXT,
-            session_id TEXT,
-            board TEXT
-        )
-        """
-    )
+    conn.executescript(SCHEMA_SQL)
     return conn
 
 
@@ -70,8 +53,15 @@ def test_new_keeps_unavailable_clarify_as_pending_approval(monkeypatch):
     assert "unspecified" not in result.lower()
     assert agent.callback_calls == 1
     task = conn.execute("SELECT status, block_kind FROM tasks").fetchone()
+    authorization = conn.execute(
+        "SELECT state, execution_session_id, origin_session_id "
+        "FROM plan_authorizations"
+    ).fetchone()
     assert task["status"] == "blocked"
     assert task["block_kind"] == "approval"
+    assert authorization["state"] == "pending"
+    assert authorization["execution_session_id"] is None
+    assert authorization["origin_session_id"] is None
 
 
 def test_new_activates_plan_after_an_approve_response(monkeypatch):

@@ -122,7 +122,7 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # ``BLOCK_RECURRENCE_LIMIT``) escalates them to ``triage`` if a cron keeps
 # unblocking them only to have the worker re-block for the same reason.
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
-VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
+VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient", "approval"}
 
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
@@ -1276,6 +1276,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     task_goal            TEXT,
     prev_temperature     TEXT,
     previous_task        TEXT,
+    -- Debug plans attach their plan id to the coding task they exercise.
+    plan_kind            TEXT NOT NULL DEFAULT 'normal',
+    pre_approved         INTEGER NOT NULL DEFAULT 0,
+    debug_plan_id        TEXT,
     board                TEXT NOT NULL DEFAULT 'default',
     root                 TEXT,
     cron                 TEXT
@@ -1398,6 +1402,49 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+
+CREATE TABLE IF NOT EXISTS plan_authorizations (
+    plan_id TEXT PRIMARY KEY,
+    board TEXT NOT NULL DEFAULT 'default',
+    kind TEXT NOT NULL,
+    state TEXT NOT NULL,
+    plan_digest TEXT NOT NULL,
+    execution_task_id TEXT,
+    execution_session_id TEXT,
+    parent_task_id TEXT,
+    origin_session_id TEXT,
+    origin_platform TEXT,
+    origin_chat_id TEXT,
+    origin_thread_id TEXT NOT NULL DEFAULT '',
+    requested_at INTEGER NOT NULL,
+    presented_at INTEGER,
+    approved_at INTEGER,
+    approved_by_session_id TEXT,
+    approved_by_actor TEXT,
+    approved_via TEXT,
+    denied_at INTEGER,
+    denied_by_session_id TEXT,
+    denial_reason TEXT,
+    revoked_at INTEGER,
+    revision INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS plan_authorization_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    actor TEXT,
+    actor_session_id TEXT,
+    via TEXT,
+    payload TEXT,
+    created_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_plan_auth_state ON plan_authorizations(state, board);
+CREATE INDEX IF NOT EXISTS idx_plan_auth_origin ON plan_authorizations(origin_session_id);
+CREATE INDEX IF NOT EXISTS idx_plan_auth_execution ON plan_authorizations(execution_task_id);
+CREATE INDEX IF NOT EXISTS idx_plan_auth_events ON plan_authorization_events(plan_id, id);
 """
 
 
@@ -2524,6 +2571,16 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(conn, "tasks", "prev_temperature", "prev_temperature TEXT")
     if "previous_task" not in cols:
         _add_column_if_missing(conn, "tasks", "previous_task", "previous_task TEXT")
+    if "plan_kind" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "plan_kind", "plan_kind TEXT NOT NULL DEFAULT 'normal'"
+        )
+    if "pre_approved" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "pre_approved", "pre_approved INTEGER NOT NULL DEFAULT 0"
+        )
+    if "debug_plan_id" not in cols:
+        _add_column_if_missing(conn, "tasks", "debug_plan_id", "debug_plan_id TEXT")
     if "board" not in cols:
         _add_column_if_missing(
             conn, "tasks", "board", "board TEXT NOT NULL DEFAULT 'default'"

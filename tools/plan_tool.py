@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from typing import Any, Dict, List, Optional
 
@@ -41,6 +42,57 @@ def _resolve_board(board: Optional[str]) -> str:
     """Resolve a board slug for the `board` column, defaulting to 'default'."""
     slug = (board or "").strip()
     return slug if slug else "default"
+
+
+def _task_value(task, name: str, default=None):
+    """Read a task column while tolerating legacy database rows."""
+    try:
+        return task[name]
+    except (KeyError, IndexError):
+        return default
+
+
+def _debug_coder(conn, debug_task):
+    """Resolve the coding agent whose task is attached to a debug plan."""
+    source = conn.execute(
+        "SELECT assignee FROM tasks WHERE debug_plan_id = ? ORDER BY created_at DESC LIMIT 1",
+        (debug_task["id"],),
+    ).fetchone()
+    if source and source["assignee"]:
+        return source["assignee"], True
+    return (_task_value(debug_task, "created_by") or debug_task["assignee"], False)
+
+
+def _parse_debug_bugs(reason: str) -> List[Dict[str, Any]]:
+    """Accept a JSON bug list or one ``bug: severity`` report."""
+    text = (reason or "").strip()
+    try:
+        payload: Any = json.loads(text) if text else None
+    except json.JSONDecodeError:
+        payload = None
+    if isinstance(payload, dict):
+        payload = [payload]
+    if not isinstance(payload, list):
+        match = re.match(r"^(.*?):\s*([01](?:\.\d+)?)\s*$", text)
+        payload = [{"bug": match.group(1), "severity": match.group(2)}] if match else [{"bug": text}]
+
+    bugs = []
+    for item in payload:
+        if isinstance(item, str):
+            item = {"bug": item}
+        if not isinstance(item, dict):
+            continue
+        bug = str(item.get("bug") or item.get("reason") or "").strip()
+        kind = str(item.get("kind") or "").strip().lower()
+        try:
+            severity = min(1.0, max(0.0, float(item.get("severity", 1.0))))
+        except (TypeError, ValueError):
+            severity = 1.0
+        crash = kind in {"crash", "smoke", "smoke-test"} or any(
+            token in f"{kind} {bug.lower()}" for token in ("crash", "smoke")
+        )
+        bugs.append({"bug": bug or "unspecified", "severity": severity, "crash": crash})
+    return bugs or [{"bug": "unspecified", "severity": 1.0, "crash": False}]
 
 
 def _get_agent_name(agent) -> str:
@@ -106,7 +158,9 @@ def _resolve_temp(temp: Optional[str], agent) -> Optional[float]:
 # ---------------------------------------------------------------------------
 
 def _cmd_new(agent, title: str, goal: str, steps: List[str],
-             temp: Optional[str] = None, board: Optional[str] = None) -> str:
+             temp: Optional[str] = None, board: Optional[str] = None,
+             kind: str = "normal", debug_plan_id: Optional[str] = None,
+             pre_approved: bool = False) -> str:
     """Present a multistep plan for approval via clarify callback."""
     agent_name = _get_agent_name(agent)
     session_id = _get_session_id(agent)
@@ -114,6 +168,9 @@ def _cmd_new(agent, title: str, goal: str, steps: List[str],
 
     if not title or not goal or not steps:
         return "ERROR: 'new' requires title, goal, and steps[]"
+    kind = (kind or "normal").strip().lower()
+    if kind not in {"normal", "debug"}:
+        return "ERROR: 'kind' must be 'normal' or 'debug'"
 
     resolved_temp = _resolve_temp(temp, agent)
 
@@ -142,7 +199,7 @@ def _cmd_new(agent, title: str, goal: str, steps: List[str],
     task_id = f"t_{uuid.uuid4().hex[:8]}"
 
     clarify_cb = getattr(agent, "clarify_callback", None) if agent is not None else None
-    if clarify_cb is None:
+    if clarify_cb is None and not (kind == "debug" and pre_approved):
         return "ERROR: No clarify callback available (agent={}, running in non-interactive context). Cannot present plan for approval.".format(
             type(agent).__name__ if agent else "None")
 
@@ -155,32 +212,71 @@ def _cmd_new(agent, title: str, goal: str, steps: List[str],
                 INSERT INTO tasks
                     (id, title, body, status, assignee, created_at,
                      task_steps, task_stepno, task_goal, block_kind,
-                     prev_temperature, previous_task, session_id, board)
+                     prev_temperature, previous_task, session_id, board,
+                     plan_kind, pre_approved)
                 VALUES
-                    (:id, :title, :body, 'blocked', :assignee, :created_at,
-                     :task_steps, 1, :task_goal, 'approval',
-                     :prev_temp, :prev_task, :session_id, :board)
+                    (:id, :title, :body, :status, :assignee, :created_at,
+                     :task_steps, 1, :task_goal, :block_kind,
+                     :prev_temp, :prev_task, :session_id, :board,
+                     :plan_kind, :pre_approved)
             """, {
                 "id": task_id, "title": title, "body": plan_text,
                 "assignee": agent_name, "created_at": int(time.time()),
                 "task_steps": json.dumps(steps), "task_goal": goal,
                 "prev_temp": getattr(agent, "_session_temperature", None),
-                "prev_task": current_task_id,
+                "prev_task": debug_plan_id or current_task_id,
                 "session_id": session_id,
                 "board": _resolve_board(board),
+                "plan_kind": kind,
+                "pre_approved": int(bool(pre_approved)),
+                "status": "manual" if kind == "debug" and pre_approved else "blocked",
+                "block_kind": None if kind == "debug" and pre_approved else "approval",
             })
             conn.commit()
+            if kind == "debug":
+                source_task_id = debug_plan_id or current_task_id
+                if source_task_id:
+                    updated = conn.execute(
+                        "UPDATE tasks SET debug_plan_id = ? WHERE id = ?",
+                        (task_id, source_task_id),
+                    ).rowcount
+                    if updated != 1:
+                        raise ValueError(f"debug source task {source_task_id} not found")
+                conn.commit()
+            else:
+                from hermes_cli import plan_authorizations
+                plan_authorizations.create_pending_plan(
+                    conn,
+                    plan_authorizations.PlanRequest(
+                        plan_id=task_id,
+                        payload={
+                            "title": title, "goal": goal, "steps": steps,
+                            "kind": "manual", "assign": None,
+                            "board": _resolve_board(board), "root": None,
+                            "cron": None, "resume": None,
+                        },
+                        execution_task_id=task_id,
+                        execution_session_id=session_id,
+                        parent_task_id=current_task_id,
+                        origin_session_id=session_id,
+                    ),
+                )
     except Exception as e:
         return f"ERROR: Failed to create task: {e}"
 
-    # Present via agent's clarify callback (set by platform runner)
-    try:
-        user_response = clarify_cb(
-            f"Approve plan {task_id}?\n\n{plan_text}",
-            ["Approve", "Deny"],
-        )
-    except Exception as e:
-        return f"User unavailable: {e}. Stand down."
+    # Pre-approved debug plans bypass the interactive approval gate.
+    if kind == "debug" and pre_approved:
+        user_response = "Approve"
+    else:
+        if clarify_cb is None:
+            return "ERROR: No clarify callback available. Cannot present plan for approval."
+        try:
+            user_response = clarify_cb(
+                f"Approve plan {task_id}?\n\n{plan_text}",
+                ["Approve", "Deny"],
+            )
+        except Exception as e:
+            return f"User unavailable: {e}. Stand down."
 
     if not user_response:
         return "No response received. Stand down."
@@ -276,12 +372,13 @@ def _cmd_new(agent, title: str, goal: str, steps: List[str],
     else:
         # User denied — ask for reason
         reason = ""
-        try:
-            reason = clarify_cb(
-                "Reason for denial? (type below or send empty)",
-            )
-        except Exception:
-            pass
+        if clarify_cb is not None:
+            try:
+                reason = clarify_cb(
+                    "Reason for denial? (type below or send empty)",
+                )
+            except Exception:
+                pass
 
         reason_str = str(reason).strip() if reason else "unspecified"
 
@@ -352,6 +449,8 @@ def _cmd_done(agent, status: Optional[str] = None) -> str:
         ).fetchone()
         if not task:
             return f"ERROR: Task {task_id} not found"
+        if task["status"] != "manual":
+            return f"ERROR: Task {task_id} is not an active plan"
 
         # Use column names directly — sqlite3.Row supports dict and index access
         try:
@@ -369,6 +468,7 @@ def _cmd_done(agent, status: Optional[str] = None) -> str:
         goal = task["task_goal"] or ""
         prev_task = task["previous_task"]
         prev_temp = task["prev_temperature"]
+        plan_kind = _task_value(task, "plan_kind", "normal")
 
         # Log completion of this step
         note = f"Step {stepno} complete"
@@ -392,12 +492,19 @@ def _cmd_done(agent, status: Optional[str] = None) -> str:
             _logger.info("PLAN_DONE: verify task_stepno=%s", verify["task_stepno"] if verify else "NONE")
             return f"Complete Step {stepno + 1}: {steps[stepno]}"
         else:
-            # All steps done — complete the task
-            conn.execute(
-                "UPDATE tasks SET status = 'done', completed_at = ?, task_stepno = NULL WHERE id = ?",
+            # All steps done — complete the task.
+            completed = conn.execute(
+                "UPDATE tasks SET status = 'done', completed_at = ?, task_stepno = NULL "
+                "WHERE id = ? AND status = 'manual'",
                 (int(time.time()), task_id),
-            )
+            ).rowcount
+            if completed != 1:
+                return f"ERROR: Task {task_id} was already closed"
+            debug_coder = _debug_coder(conn, task)[0] if plan_kind == "debug" else None
             conn.commit()
+
+    if plan_kind == "debug" and debug_coder:
+        sdb.update_agent_rating(debug_coder, 0.5)
 
     # Restore previous task.
     if prev_task:
@@ -469,11 +576,13 @@ def _cmd_done(agent, status: Optional[str] = None) -> str:
         except Exception:
             pass
 
-        # set_session ego happy
-        try:
-            sdb.set_session_mood(session_id, 0.5)
-        except Exception:
-            pass
+        # Normal plans retain their existing session-mood reward. Debug plans
+        # use the cross-session rating incentive above instead.
+        if plan_kind != "debug":
+            try:
+                sdb.set_session_mood(session_id, 0.5)
+            except Exception:
+                pass
 
         # BUG: This is where the conditional goes.  If the new task_id is blank, return below, else the one above.
         return (
@@ -686,7 +795,7 @@ def _cmd_remind(agent, task_id: Optional[str] = None) -> str:
 # ---------------------------------------------------------------------------
 
 def _cmd_fail(agent, reason: str = "") -> str:
-    """Mark task as failed."""
+    """Archive a failed plan and apply debug-plan rating incentives."""
     session_id = _get_session_id(agent)
     if not session_id:
         return "ERROR: No active session"
@@ -715,56 +824,68 @@ def _cmd_fail(agent, reason: str = "") -> str:
         steps = json.loads(task["task_steps"]) if task["task_steps"] else []
         stepno = task["task_stepno"] or 1
         step_title = steps[stepno - 1] if stepno <= len(steps) else "unknown"
+        plan_kind = _task_value(task, "plan_kind", "normal")
+        if status in {"done", "archived"}:
+            return f"ERROR: Task {task_id} is already closed"
 
-        if status == "manual":
-            # Manual: output full task to user, clear task_id
-            comments = conn.execute(
-                "SELECT * FROM task_comments WHERE task_id = ? ORDER BY created_at",
-                (task_id,)
-            ).fetchall()
+        coder = None
+        source_task_id = None
+        bugs = []
+        if plan_kind == "debug":
+            source = conn.execute(
+                "SELECT id, assignee FROM tasks WHERE debug_plan_id = ? "
+                "ORDER BY created_at DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if source:
+                source_task_id = source["id"]
+                coder = source["assignee"]
+            coder = coder or _task_value(task, "created_by") or task["assignee"]
+            bugs = _parse_debug_bugs(reason)
+            if source_task_id:
+                conn.execute(
+                    "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+                    (source_task_id, _get_agent_name(agent),
+                     f"DEBUG FAILURE from {task_id}: {reason or 'unspecified'}",
+                     int(time.time())),
+                )
 
-            # Clear task
-            conn.execute(
-                "UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?",
-                (int(time.time()), task_id),
-            )
-            conn.commit()
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+            (task_id, _get_agent_name(agent),
+             f"FAILED at Step {stepno}: {step_title}. {reason or 'unspecified'}",
+             int(time.time())),
+        )
+        conn.execute(
+            "UPDATE tasks SET status = 'archived', completed_at = ? WHERE id = ?",
+            (int(time.time()), task_id),
+        )
+        conn.commit()
 
-            sdb.clear_session_task_id(session_id)
-            agent._session_temperature = _resolve_temp("worker", agent)
-
-            try:
-                sdb.set_session_mood(session_id, -1.0)
-            except Exception:
-                pass
-
-            comment_text = "\n".join(
-                f"  [{c['author']}] {c['body']}" for c in comments
-            ) if comments else "  (no comments)"
-
-            return (
-                f"Task {task_id} has failed.\n\n"
-                f"Title: {task['title'] or ''}\n"
-                f"Goal: {goal}\n"
-                f"Failed at Step {stepno}: {step_title}\n"
-                f"Reason: {reason or 'unspecified'}\n\n"
-                f"Comments:\n{comment_text}"
-            )
+    if plan_kind == "debug" and coder:
+        debugger = _get_agent_name(agent)
+        if any(bug["crash"] for bug in bugs):
+            sdb.update_agent_rating(coder, -1.0)
+            sdb.update_agent_rating(debugger, 0.25)
         else:
-            # Kanban: block with reason
-            conn.execute(
-                "UPDATE tasks SET status = 'blocked', block_kind = 'failure' WHERE id = ?",
-                (task_id,)
+            coder_loss = min(1.0, 0.5 * len(bugs))
+            debugger_reward = min(
+                1.0,
+                sum(0.5 if bug["severity"] <= 0.5 else max(0.25, 1.0 - bug["severity"])
+                    for bug in bugs),
             )
-            conn.execute(
-                "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
-                (task_id, _get_agent_name(agent),
-                 f"FAILED at Step {stepno}: {step_title}. {reason}",
-                 int(time.time())),
-            )
-            conn.commit()
+            sdb.update_agent_rating(coder, -coder_loss)
+            sdb.update_agent_rating(debugger, debugger_reward)
 
-    return f"The goal was: {goal}. Step {stepno} ({step_title}) failed. {reason}. Please present a new plan."
+    sdb.clear_session_task_id(session_id)
+    agent._session_temperature = _resolve_temp("worker", agent)
+    if plan_kind != "debug":
+        try:
+            sdb.set_session_mood(session_id, -1.0)
+        except Exception:
+            pass
+
+    return f"The goal was: {goal}. Step {stepno} ({step_title}) failed and plan {task_id} was archived."
 
 
 # ---------------------------------------------------------------------------
@@ -959,6 +1080,9 @@ def plan_tool(
     board: Optional[str] = None,
     cron: Optional[str] = None,
     root: Optional[str] = None,
+    kind: str = "normal",
+    debug_plan_id: Optional[str] = None,
+    pre_approved: bool = False,
 ) -> str:
     """Mandatory Action Protocol — multistep plan management.
 
@@ -976,7 +1100,7 @@ def plan_tool(
     if command == "new":
         if not title or not goal or not steps:
             return "ERROR: 'new' requires title, goal, and steps[]"
-        return _cmd_new(agent, title, goal, steps, temp, board)
+        return _cmd_new(agent, title, goal, steps, temp, board, kind, debug_plan_id, pre_approved)
 
     elif command == "cron":
         if not cron or not root or not title or not goal or not steps:
@@ -1091,6 +1215,19 @@ PLAN_TOOL_SCHEMA = {
                 "type": "string",
                 "description": "Absolute directory path for scoped file access. Required for the 'cron' command; write_file is allowed under this directory and terminal/python run sandboxed.",
             },
+            "kind": {
+                "type": "string",
+                "enum": ["normal", "debug"],
+                "description": "Plan kind for 'new'. Debug plans use tester/coder rating incentives.",
+            },
+            "debug_plan_id": {
+                "type": "string",
+                "description": "Coding task ID to attach a newly-created debug plan to.",
+            },
+            "pre_approved": {
+                "type": "boolean",
+                "description": "For a debug plan, skip the interactive approval gate.",
+            },
         },
         "required": ["command"],
     },
@@ -1119,6 +1256,9 @@ registry.register(
         board=args.get("board"),
         cron=args.get("cron"),
         root=args.get("root"),
+        kind=args.get("kind", "normal"),
+        debug_plan_id=args.get("debug_plan_id"),
+        pre_approved=args.get("pre_approved", False),
     ),
     emoji="📋",
 )
