@@ -1304,26 +1304,17 @@ def _notify_kanban_status_change(
     Fails silently on all errors so a broken notification can never block
     a task transition.
     """
-    # Resolve origin routing
+    # Resolve origin routing and the CLI session fallback target.
     try:
         conn = kb.connect()
         try:
             origin = kb.get_origin_routing(conn, task_id)
+            task = kb.get_task(conn, task_id)
         finally:
             conn.close()
     except Exception:
         origin = None
-
-    if not (origin and origin.get("platform") and origin.get("chat_id")):
-        return
-
-    platform = origin["platform"].lower()
-    chat_id = origin["chat_id"]
-    thread_id = origin.get("thread_id", "")
-    chat_type = origin.get("chat_type", "group")
-    target = f"{platform}:{chat_id}"
-    if thread_id:
-        target = f"{target}:{thread_id}"
+        task = None
 
     icon = _NOTIFY_EMOJI.get(new_status, "❓")
     task_label = title or task_id
@@ -1348,6 +1339,30 @@ def _notify_kanban_status_change(
         "summary": summary_line or None,
         "assignee": assignee or "unassigned",
     })
+
+    if not (origin and origin.get("platform") and origin.get("chat_id")):
+        if task and task.session_id:
+            try:
+                from hermes_cli.profiles import get_profile_dir
+                from hermes_state import SessionDB
+
+                profile_home = get_profile_dir(task.created_by or "default")
+                session_db = SessionDB(db_path=profile_home / "state.db")
+                try:
+                    session_db.enqueue_session_notice(task.session_id, human_msg)
+                finally:
+                    session_db.close()
+            except Exception:
+                pass
+        return
+
+    platform = origin["platform"].lower()
+    chat_id = origin["chat_id"]
+    thread_id = origin.get("thread_id", "")
+    chat_type = origin.get("chat_type", "group")
+    target = f"{platform}:{chat_id}"
+    if thread_id:
+        target = f"{target}:{thread_id}"
 
     import subprocess
 

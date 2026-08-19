@@ -349,6 +349,14 @@ CREATE TABLE IF NOT EXISTS async_delegations (
     delivery_claimed_at REAL
 );
 
+CREATE TABLE IF NOT EXISTS session_notices (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES sessions(id),
+    text TEXT NOT NULL,
+    level TEXT NOT NULL DEFAULT 'info',
+    created_at REAL NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
@@ -368,6 +376,8 @@ CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usag
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
 CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
     ON async_delegations(delivery_state, completed_at);
+CREATE INDEX IF NOT EXISTS idx_session_notices_session
+    ON session_notices(session_id, id);
 """
 
 

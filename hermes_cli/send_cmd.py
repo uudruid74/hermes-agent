@@ -332,6 +332,7 @@ def cmd_send(args: argparse.Namespace) -> None:
             "  hermes send -t discord:#ops --file report.md\n"
             "  hermes send -u telegram \"agent wake event\"\n"
             "  hermes send -u telegram:-1001234567890:17585 \"cmd\"\n"
+            "  hermes send -u cli:session_id \"out-of-band notice\"\n"
             "  hermes send --list      # list available targets",
             file=sys.stderr,
         )
@@ -357,6 +358,29 @@ def cmd_send(args: argparse.Namespace) -> None:
 
     # Import lazily so `hermes send --help` stays fast and does not pull in
     # the full tool registry / gateway config stack.
+    if user_flag and user_flag.lower().startswith("cli:"):
+        session_id = user_flag[4:].strip()
+        if not session_id:
+            print("hermes send: cli target requires cli:<session_id>", file=sys.stderr)
+            sys.exit(_USAGE_EXIT)
+        from hermes_state import SessionDB
+        from hermes_constants import get_hermes_home
+
+        session_db = SessionDB(db_path=get_hermes_home() / "state.db")
+        try:
+            queued = session_db.enqueue_session_notice(session_id, message)
+        finally:
+            session_db.close()
+        result = json.dumps(
+            {"success": True, "note": "queued for CLI session"}
+            if queued else {"error": f"CLI session not found: {session_id}"}
+        )
+        sys.exit(_emit_result(
+            result,
+            json_mode=getattr(args, "json", False),
+            quiet=getattr(args, "quiet", False),
+        ))
+
     from tools.send_message_tool import send_message_tool
 
     # send_message_tool auto-loads gateway config + env and routes to the
@@ -444,8 +468,9 @@ def register_send_subparser(subparsers) -> argparse.ArgumentParser:
             "Simulate user→agent message (routes through handle_message with "
             "full user identity). Format: "
             "'platform' (home channel), 'platform:chat_id', or "
-            "'platform:chat_id:thread_id'. Examples: -u telegram, "
-            "-u telegram:-1001234567890:17585."
+            "'platform:chat_id:thread_id'. Use 'cli:session_id' to queue an "
+            "out-of-band notice for a live CLI session. Examples: -u telegram, "
+            "-u telegram:-1001234567890:17585, -u cli:session_id."
         ),
     )
 

@@ -6606,6 +6606,34 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
         )
 
+    def enqueue_session_notice(self, session_id: str, text: str, *, level: str = "info") -> bool:
+        """Queue a driver-visible notice for a live session without adding a turn."""
+        def _do(conn):
+            cursor = conn.execute(
+                """INSERT INTO session_notices (session_id, text, level, created_at)
+                   SELECT ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM sessions WHERE id = ?)""",
+                (session_id, text, level, time.time(), session_id),
+            )
+            return cursor.rowcount == 1
+
+        return self._execute_write(_do)
+
+    def drain_session_notices(self, session_id: str) -> List[Dict[str, str]]:
+        """Atomically take queued driver notices for one live session."""
+        def _do(conn):
+            rows = conn.execute(
+                "SELECT id, text, level FROM session_notices WHERE session_id = ? ORDER BY id",
+                (session_id,),
+            ).fetchall()
+            if rows:
+                conn.executemany(
+                    "DELETE FROM session_notices WHERE id = ?",
+                    [(row["id"],) for row in rows],
+                )
+            return [{"text": row["text"], "level": row["level"]} for row in rows]
+
+        return self._execute_write(_do)
+
     def set_latest_matching_message_display_kind(
         self, session_id: str, *, role: str, content: str, display_kind: str,
         display_metadata: Optional[Dict[str, Any]] = None,

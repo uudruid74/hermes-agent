@@ -6392,6 +6392,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         except Exception:
             pass
 
+    def _drain_session_notices(self) -> None:
+        """Move cross-process notices into the existing clean-boundary renderer."""
+        if not self._session_db or not self.session_id:
+            return
+        from agent.credits_tracker import AgentNotice
+
+        for payload in self._session_db.drain_session_notices(self.session_id):
+            self._on_notice(AgentNotice(text=payload["text"], level=payload["level"]))
+        self._flush_credit_notices()
+
     def _flush_credit_notices(self) -> None:
         """Print any queued credit notices as level-colored lines. Called at turn end
         (after run_conversation) where _cprint paints cleanly above the prompt."""
@@ -17469,6 +17479,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         # Periodic config watcher — auto-reload MCP on mcp_servers change
                         if not self._agent_running:
                             self._check_config_mcp_changes()
+                            try:
+                                self._drain_session_notices()
+                            except Exception:
+                                logging.debug("session notice drain failed", exc_info=True)
                             # Check for background process notifications (completions
                             # and watch pattern matches) while agent is idle.
                             try:
@@ -17668,6 +17682,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         # Drain process notifications (completions + watch matches)
                         # that arrived while the agent was running.
                         try:
+                            self._drain_session_notices()
                             self._drain_process_notifications("cli-post-turn")
                         except Exception:
                             pass  # Non-fatal — don't break the main loop
