@@ -1,6 +1,7 @@
 """Regression coverage for plan approval outcomes."""
 
 import sqlite3
+from types import SimpleNamespace
 
 from tools import plan_tool
 
@@ -32,6 +33,12 @@ def _plan_db():
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA_SQL)
     return conn
+
+
+def test_get_session_id_uses_only_canonical_session_id():
+    agent = SimpleNamespace(canonical_session_id=None, session_id="mutable-session")
+
+    assert plan_tool._get_session_id(agent) is None
 
 
 def test_new_keeps_unavailable_clarify_as_pending_approval(monkeypatch):

@@ -101,8 +101,8 @@ def _get_agent_name(agent) -> str:
 
 
 def _get_session_id(agent) -> Optional[str]:
-    """Return the agent's session ID pinned at initialization."""
-    return getattr(agent, "canonical_session_id", None) or getattr(agent, "session_id", None)
+    """Return the immutable session ID pinned when the agent is initialized."""
+    return getattr(agent, "canonical_session_id", None)
 
 
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -47,6 +48,25 @@ def test_session_state_paths_are_write_denied(fake_homes, relative):
 
 
 
+
+
+def test_session_task_id_uses_only_canonical_session_id(monkeypatch):
+    from agent import agent_runtime_helpers
+    from agent.file_safety import _session_task_id
+    import hermes_state
+
+    monkeypatch.setattr(
+        agent_runtime_helpers,
+        "_current_agent",
+        SimpleNamespace(canonical_session_id=None, session_id="mutable-session"),
+    )
+    monkeypatch.setattr(
+        hermes_state,
+        "SessionDB",
+        lambda: pytest.fail("mutable agent.session_id must not select a session row"),
+    )
+
+    assert _session_task_id() is None
 
 
 def test_write_file_tool_preserves_existing_session_snapshot(fake_homes):

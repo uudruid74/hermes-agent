@@ -745,10 +745,7 @@ def _session_task_id() -> Optional[str]:
     """Read task_id from the live agent's pinned session state."""
     from agent.agent_runtime_helpers import _current_agent
 
-    session_id = (
-        getattr(_current_agent, "canonical_session_id", None)
-        or getattr(_current_agent, "session_id", None)
-    )
+    session_id = getattr(_current_agent, "canonical_session_id", None)
     if not session_id:
         return None
     try:
