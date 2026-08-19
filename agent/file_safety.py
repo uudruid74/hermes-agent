@@ -144,9 +144,6 @@ def _classify_write_denial(path: str) -> Optional[str]:
     home = os.path.realpath(os.path.expanduser("~"))
     resolved = os.path.realpath(os.path.expanduser(str(path)))
 
-    if _is_temp_path(resolved):
-        return None
-
     if resolved in build_write_denied_paths(home):
         return "credential"
     for prefix in build_write_denied_prefixes(home):
@@ -188,6 +185,9 @@ def _classify_write_denial(path: str) -> Optional[str]:
                 return "credential"
         except Exception:
             pass
+
+    if _is_temp_path(resolved):
+        return None
 
     safe_roots = get_safe_write_roots()
     task_root = _task_root()
