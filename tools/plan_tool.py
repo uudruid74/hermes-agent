@@ -286,6 +286,8 @@ def _cmd_new(agent, title: str, goal: str, steps: List[str],
     # blocked for approval without inventing an unspecified denial reason.
     response_lower = str(user_response).strip().lower()
     if response_lower == "user unavailable. stand down and wait for the user to return. do nothing else.":
+        if agent is not None:
+            agent._plan_approval_timed_out = task_id
         return (
             f"Plan awaiting approval ({task_id}): no user response was received. "
             "The plan remains blocked for approval. Stand down."

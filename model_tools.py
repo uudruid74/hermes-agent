@@ -1149,8 +1149,17 @@ def handle_function_call(
         if function_name == "plan_tool" and function_args.get("command") in ("block", "archive"):
             pass  # allow without active task
         else:
-            from agent.file_safety import is_write_denied_by_task_gate
-            if is_write_denied_by_task_gate():
+            from agent.file_safety import (
+                is_write_denied_by_task_gate,
+                terminal_bubblewrap_root,
+            )
+            bubblewrap_root = (
+                terminal_bubblewrap_root(function_args.get("cwd"))
+                if function_name == "terminal" else None
+            )
+            if bubblewrap_root:
+                function_args["_bubblewrap_root"] = bubblewrap_root
+            elif is_write_denied_by_task_gate():
                 return json.dumps({
                     "error": "Write denied: No active task. "
                              "Use plan_tool 'new' to create a task first."

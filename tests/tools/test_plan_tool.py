@@ -11,6 +11,7 @@ class _UnavailableAgent:
     session_id = None
     agent_name = "test-agent"
     _session_temperature = None
+    _plan_approval_timed_out = None
 
     def __init__(self):
         self.callback_calls = 0
@@ -59,6 +60,8 @@ def test_new_keeps_unavailable_clarify_as_pending_approval(monkeypatch):
     assert "denied" not in result.lower()
     assert "unspecified" not in result.lower()
     assert agent.callback_calls == 1
+    assert isinstance(agent._plan_approval_timed_out, str)
+    assert agent._plan_approval_timed_out.startswith("t_")
     task = conn.execute("SELECT status, block_kind FROM tasks").fetchone()
     authorization = conn.execute(
         "SELECT state, execution_session_id, origin_session_id "

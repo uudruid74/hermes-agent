@@ -2233,6 +2233,26 @@ def _resolve_command_cwd(
     return get_session_cwd(session_key) or default_cwd
 
 
+def _bubblewrap_command(command: str, root: str) -> str:
+    """Wrap *command* in Bubblewrap with only *root* writable."""
+    bwrap = shutil.which("bwrap")
+    if bwrap is None:
+        raise RuntimeError("Bubblewrap is required for this terminal sandbox")
+    argv = [bwrap, "--die-with-parent"]
+    for path in ("/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc"):
+        if os.path.exists(path):
+            argv.extend(("--ro-bind", path, path))
+    argv.extend((
+        "--dev", "/dev",
+        "--proc", "/proc",
+        "--tmpfs", "/tmp",
+        "--bind", root, "/workspace",
+        "--chdir", "/workspace",
+        "/bin/sh", "-lc", command,
+    ))
+    return shlex.join(argv)
+
+
 def terminal_tool(
     command: str,
     background: bool = False,
@@ -2241,6 +2261,8 @@ def terminal_tool(
     session_id: Optional[str] = None,
     force: bool = False,
     workdir: Optional[str] = None,
+    requested_cwd: Optional[str] = None,
+    _bubblewrap_root: Optional[str] = None,
     pty: bool = False,
     notify_on_complete: bool = False,
     watch_patterns: Optional[List[str]] = None,
@@ -2256,6 +2278,7 @@ def terminal_tool(
         session_id: Conversation/session identifier for durable observability
         force: If True, skip dangerous command check (use after user confirms)
         workdir: Working directory for this command (optional, uses session cwd if not set)
+        requested_cwd: Working directory and optional Bubblewrap root for this command
         pty: If True, use pseudo-terminal for interactive CLI tools (local backend only)
         notify_on_complete: If True and background=True, you'll be notified exactly once when the process exits. The right choice for almost every long task. MUTUALLY EXCLUSIVE with watch_patterns.
         watch_patterns: List of strings to watch for in background output. HARD rate limit: 1 notification per 15s per process. After 3 strike windows in a row, watch_patterns is disabled and the session is auto-promoted to notify_on_complete. Use ONLY for rare, one-shot mid-process signals on long-lived processes (server readiness, migration-done markers). NEVER use in loops/batch jobs — error patterns there will hit the strike limit and get disabled. MUTUALLY EXCLUSIVE with notify_on_complete — set one, not both.
@@ -2292,6 +2315,14 @@ def terminal_tool(
         # Get configuration
         config = _get_env_config()
         env_type = config["env_type"]
+        if requested_cwd is not None and workdir is not None:
+            return tool_error("Specify only one of cwd or workdir.")
+        command_workdir = requested_cwd if requested_cwd is not None else workdir
+        sandbox_root = _bubblewrap_root
+        if sandbox_root:
+            if env_type != "local":
+                return tool_error("Bubblewrap terminal isolation requires the local backend.")
+            command_workdir = sandbox_root
 
         # Use task_id for environment isolation. By default all subagent
         # task_ids collapse back to "default" so the top-level agent and
@@ -2522,7 +2553,7 @@ def terminal_tool(
             if guard_cwd_base is None:
                 guard_cwd_base = getattr(env, "cwd", None) or cwd
             guard_cwd = _resolve_command_cwd(
-                workdir=workdir,
+                workdir=command_workdir,
                 default_cwd=guard_cwd_base,
                 session_key=session_key,
             )
@@ -2625,17 +2656,20 @@ def terminal_tool(
                 approval_note = f"Command was flagged ({desc}) and auto-approved by smart approval."
 
         # Validate workdir against shell injection
-        if workdir:
-            workdir_error = _validate_workdir(workdir)
+        if command_workdir:
+            workdir_error = _validate_workdir(command_workdir)
             if workdir_error:
                 logger.warning("Blocked dangerous workdir: %s (command: %s)",
-                               workdir[:200], _safe_command_preview(command))
+                               command_workdir[:200], _safe_command_preview(command))
                 return json.dumps({
                     "output": "",
                     "exit_code": -1,
                     "error": workdir_error,
                     "status": "blocked"
                 }, ensure_ascii=False)
+
+        if sandbox_root:
+            command = _bubblewrap_command(command, sandbox_root)
 
         # Prepare command for execution
         pty_disabled_reason = None
@@ -2657,7 +2691,7 @@ def terminal_tool(
             from tools.process_registry import process_registry
 
             effective_cwd = _resolve_command_cwd(
-                workdir=workdir,
+                workdir=command_workdir,
                 default_cwd=cwd,
                 session_key=session_key,
             )
@@ -2917,7 +2951,7 @@ def terminal_tool(
             while retry_count <= max_retries:
                 try:
                     command_cwd = _resolve_command_cwd(
-                        workdir=workdir,
+                        workdir=command_workdir,
                         default_cwd=cwd,
                         session_key=session_key,
                     )
@@ -2968,11 +3002,10 @@ def terminal_tool(
             # never depends on the shared env surviving or on who drives the
             # env next.
             #
-            # BUT: a per-command ``workdir`` override is transient by contract
-            # (docstring: "Working directory for this command"). Recording it
-            # would hijack the session's durable cwd for every later command
-            # that doesn't pass ``workdir``. Skip the dual-write in that case.
-            if not workdir:
+            # BUT: a per-command ``workdir`` or ``cwd`` override is transient by
+            # contract. Recording it would hijack the session's durable cwd for
+            # every later command that omits both values. Skip the dual-write.
+            if not command_workdir:
                 record_session_cwd(session_key, getattr(env, "cwd", None))
 
             # Extract output
@@ -3360,6 +3393,10 @@ TERMINAL_SCHEMA = {
                 "type": "string",
                 "description": "Working directory for this command (absolute path). Defaults to the session working directory."
             },
+            "cwd": {
+                "type": "string",
+                "description": "Optional working directory to run in through Bubblewrap when no active plan authorizes the call."
+            },
             "pty": {
                 "type": "boolean",
                 "description": "Run in pseudo-terminal (PTY) mode for interactive CLI tools like Codex, Claude Code, or Python REPL. Only works with local and SSH backends. Default: false.",
@@ -3389,6 +3426,8 @@ def _handle_terminal(args, **kw):
         task_id=kw.get("task_id"),
         session_id=kw.get("session_id"),
         workdir=args.get("workdir"),
+        requested_cwd=args.get("cwd"),
+        _bubblewrap_root=args.get("_bubblewrap_root"),
         pty=args.get("pty", False),
         notify_on_complete=args.get("notify_on_complete", False),
         watch_patterns=args.get("watch_patterns"),

@@ -139,6 +139,79 @@ def _is_temp_path(resolved: str) -> bool:
     return resolved == tmp or resolved.startswith(tmp + os.sep)
 
 
+def _path_contains(root: str, path: str) -> bool:
+    """Return whether *path* is *root* or is contained below it."""
+    return path == root or path.startswith(root + os.sep)
+
+
+def _terminal_root_contains_hermes_state(root: str) -> bool:
+    """Reject terminal sandbox roots that expose Hermes session state."""
+    homes: list[str] = []
+    for home in (_hermes_home_path(), _hermes_root_path()):
+        real = os.path.realpath(home)
+        if real not in homes:
+            homes.append(real)
+    for home in homes:
+        state_db = os.path.realpath(os.path.join(home, "state.db"))
+        sessions = os.path.realpath(os.path.join(home, "sessions"))
+        if _path_contains(root, state_db) or _path_contains(root, sessions):
+            return True
+    return False
+
+
+def _resolve_terminal_root(cwd: str) -> Optional[str]:
+    """Resolve an existing terminal sandbox root, excluding Hermes state."""
+    root = os.path.realpath(os.path.expanduser(cwd))
+    if not os.path.isdir(root) or _terminal_root_contains_hermes_state(root):
+        return None
+    return root
+
+
+def _agent_journal_root() -> Optional[str]:
+    """Return this agent's vault journal directory when configured."""
+    vault_root = os.environ.get("VAULT_ROOT", "").strip()
+    agent_name = os.environ.get("HERMES_AGENT_NAME", "").strip()
+    if not vault_root or not agent_name:
+        return None
+    return os.path.realpath(os.path.join(vault_root, agent_name))
+
+
+def _plan_approval_timed_out() -> bool:
+    """Return whether this live agent is continuing after plan-approval timeout."""
+    from agent.agent_runtime_helpers import _current_agent
+
+    return bool(getattr(_current_agent, "_plan_approval_timed_out", None))
+
+
+def terminal_bubblewrap_root(cwd: Optional[str]) -> Optional[str]:
+    """Return the Bubblewrap root that makes a no-plan terminal call safe.
+
+    A session-bound active plan remains the normal write authorization and is
+    deliberately not chrooted. Without one, only an explicit path below /tmp
+    or the current agent's vault journal is eligible. A plan-approval timeout
+    instead receives the project working directory as its forced sandbox root.
+    """
+    if _session_task_id():
+        return None
+
+    if cwd:
+        root = _resolve_terminal_root(cwd)
+        if root is None:
+            return None
+        journal_root = _agent_journal_root()
+        if _is_temp_path(root) or (
+            journal_root is not None and _path_contains(journal_root, root)
+        ):
+            return root
+        return None
+
+    if not _plan_approval_timed_out():
+        return None
+    from agent.runtime_cwd import resolve_agent_cwd
+
+    return _resolve_terminal_root(str(resolve_agent_cwd()))
+
+
 def _classify_write_denial(path: str) -> Optional[str]:
     """Return ``'credential'``, ``'safe_root'``, or ``None`` if writes are allowed."""
     home = os.path.realpath(os.path.expanduser("~"))
