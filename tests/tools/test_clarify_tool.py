@@ -1,6 +1,8 @@
 """Tests for tools/clarify_tool.py - Interactive clarifying questions."""
 
 import json
+import sqlite3
+from types import SimpleNamespace
 from typing import List, Optional
 
 
@@ -34,6 +36,32 @@ class TestClarifyToolBasics:
         result = json.loads(clarify_tool("What do you want?"))
         assert "error" in result
         assert "not available" in result["error"].lower()
+
+    def test_explicit_task_id_is_persisted_for_dashboard_plan_approval(self, tmp_path, monkeypatch):
+        """A plan prompt must be queryable by the task ID shown on its card."""
+        from hermes_cli import kanban_db
+        from hermes_cli.kanban_db import SCHEMA_SQL
+
+        db_path = tmp_path / "kanban.db"
+        with sqlite3.connect(db_path) as conn:
+            conn.executescript(SCHEMA_SQL)
+        monkeypatch.setattr(kanban_db, "kanban_db_path", lambda board=None: db_path)
+
+        agent = SimpleNamespace(agent_name="neo", session_id="session-1")
+        result = json.loads(clarify_tool(
+            "Approve plan?",
+            choices=["Approve", "Deny"],
+            callback=lambda *_args, **_kwargs: "Approve",
+            agent=agent,
+            task_id="t_plan123",
+        ))
+
+        with sqlite3.connect(db_path) as conn:
+            row = conn.execute(
+                "SELECT task_id, status FROM clarify_queue"
+            ).fetchone()
+        assert result["user_response"] == "Approve"
+        assert row == ("t_plan123", "answered")
 
 
 class TestClarifyToolChoicesValidation:

@@ -115,6 +115,7 @@ def clarify_tool(
     multi_select: bool = False,
     callback: Optional[Callable] = None,
     agent=None,
+    task_id: Optional[str] = None,
 ) -> str:
     """
     Ask the user a question, optionally with multiple-choice options.
@@ -133,6 +134,9 @@ def clarify_tool(
                       The optional ``multi_select`` keyword is passed so the
                       platform can render checkboxes instead of radio buttons.
                       Injected by the agent runner (cli.py / gateway).
+        task_id:      Internal override for the task linked to the queue row.
+                      Plan approval uses this before the new task is bound to
+                      the session.
 
     Returns:
         JSON string with the user's response.
@@ -171,17 +175,18 @@ def clarify_tool(
         db.execute("PRAGMA journal_mode=WAL")
         clarify_id = uuid.uuid4().hex[:12]
         session_id = getattr(agent, "session_id", None) or os.environ.get("HERMES_SESSION_ID")
-        task_id = None
-        from hermes_state import SessionDB
-        sdb = SessionDB()
-        with sdb._read_ctx() as ctx:
-            row = ctx.execute("SELECT task_id FROM sessions WHERE id=?", (session_id,)).fetchone()
-        if row:
-            task_id = row["task_id"] if isinstance(row, dict) else row[0]
+        queue_task_id = task_id
+        if queue_task_id is None:
+            from hermes_state import SessionDB
+            sdb = SessionDB()
+            with sdb._read_ctx() as ctx:
+                row = ctx.execute("SELECT task_id FROM sessions WHERE id=?", (session_id,)).fetchone()
+            if row:
+                queue_task_id = row["task_id"] if isinstance(row, dict) else row[0]
         agent_name = getattr(agent, "agent_name", "unknown")
         db.execute(
             "INSERT INTO clarify_queue(id,session_id,task_id,agent_name,question,choices,multi_select,status,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-            (clarify_id, session_id, task_id, agent_name, question,
+            (clarify_id, session_id, queue_task_id, agent_name, question,
              json.dumps(choices) if choices else None,
              1 if multi_select else 0, "pending", int(time.time())))
         db.commit()

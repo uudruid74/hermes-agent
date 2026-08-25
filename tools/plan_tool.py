@@ -22,6 +22,8 @@ import sqlite3
 import time
 from typing import Any, Dict, List, Optional
 
+from tools.clarify_tool import clarify_tool
+
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
@@ -272,10 +274,14 @@ def _cmd_new(agent, title: str, goal: str, steps: List[str],
         if clarify_cb is None:
             return "ERROR: No clarify callback available. Cannot present plan for approval."
         try:
-            user_response = clarify_cb(
+            clarification = json.loads(clarify_tool(
                 f"Approve plan {task_id}?\n\n{plan_text}",
-                ["Approve", "Deny"],
-            )
+                choices=["Approve", "Deny"],
+                callback=clarify_cb,
+                agent=agent,
+                task_id=task_id,
+            ))
+            user_response = clarification.get("user_response", "")
         except Exception as e:
             return f"User unavailable: {e}. Stand down."
 

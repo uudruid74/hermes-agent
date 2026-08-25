@@ -1,6 +1,7 @@
 """Regression coverage for plan approval outcomes."""
 
 import sqlite3
+import threading
 from types import SimpleNamespace
 
 from tools import plan_tool
@@ -46,6 +47,17 @@ def test_new_keeps_unavailable_clarify_as_pending_approval(monkeypatch):
     """A CLI timeout must not become a fabricated unspecified denial."""
     conn = _plan_db()
     monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    def unavailable_bridge(question, choices, multi_select=False, callback=None, **_kwargs):
+        assert callback is not None
+        answer = callback(question, choices, multi_select=multi_select)
+        return '{"user_response": "%s"}' % answer
+
+    monkeypatch.setattr(
+        plan_tool,
+        "clarify_tool",
+        unavailable_bridge,
+        raising=False,
+    )
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     agent = _UnavailableAgent()
 
@@ -78,6 +90,12 @@ def test_new_activates_plan_after_an_approve_response(monkeypatch):
     """A real approval still activates the freshly created plan."""
     conn = _plan_db()
     monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    monkeypatch.setattr(
+        plan_tool,
+        "clarify_tool",
+        lambda *_args, **_kwargs: '{"user_response": "Approve"}',
+        raising=False,
+    )
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     agent = _ApprovedAgent()
 
@@ -92,6 +110,85 @@ def test_new_activates_plan_after_an_approve_response(monkeypatch):
     task = conn.execute("SELECT status, block_kind FROM tasks").fetchone()
     assert task["status"] == "manual"
     assert task["block_kind"] is None
+
+
+def test_new_links_approval_prompt_to_its_new_plan(monkeypatch):
+    """Dashboard approval must target the plan task, not the prior session task."""
+    conn = _plan_db()
+    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    seen = {}
+
+    def bridge(question, choices, multi_select=False, callback=None, agent=None, task_id=None):
+        seen.update({
+            "question": question,
+            "choices": choices,
+            "callback": callback,
+            "agent": agent,
+            "task_id": task_id,
+        })
+        return '{"user_response": "Approve"}'
+
+    monkeypatch.setattr(plan_tool, "clarify_tool", bridge, raising=False)
+    agent = _ApprovedAgent()
+
+    result = plan_tool._cmd_new(
+        agent,
+        title="Dashboard-linked plan",
+        goal="Route approval through clarify_queue",
+        steps=["Wait for dashboard approval"],
+    )
+
+    task_id = conn.execute("SELECT id FROM tasks").fetchone()[0]
+    assert result.startswith("TASK APPROVED (")
+    assert seen["task_id"] == task_id
+    assert seen["choices"] == ["Approve", "Deny"]
+    assert seen["callback"] == agent.clarify_callback
+    assert seen["agent"] is agent
+
+
+def test_new_activates_from_dashboard_queue_answer(tmp_path, monkeypatch):
+    """A dashboard answer wins the clarify race and activates its plan."""
+    from hermes_cli import kanban_db
+    from hermes_cli.kanban_db import SCHEMA_SQL
+
+    db_path = tmp_path / "kanban.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(SCHEMA_SQL)
+    monkeypatch.setattr(kanban_db, "kanban_db_path", lambda board=None: db_path)
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+
+    def dashboard_callback(*_args, **_kwargs):
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                "UPDATE clarify_queue SET status='answered', answer='Approve' "
+                "WHERE status='pending'"
+            )
+        threading.Event().wait(2)
+        return "User unavailable. Stand down and wait for the user to return. Do nothing else."
+
+    agent = SimpleNamespace(
+        canonical_session_id=None,
+        session_id=None,
+        agent_name="neo",
+        _session_temperature=None,
+        clarify_callback=dashboard_callback,
+    )
+    result = plan_tool._cmd_new(
+        agent,
+        title="Dashboard race plan",
+        goal="Approve through clarify_queue",
+        steps=["Begin after dashboard approval"],
+    )
+
+    with sqlite3.connect(db_path) as conn:
+        task = conn.execute("SELECT id, status FROM tasks").fetchone()
+        queue = conn.execute(
+            "SELECT task_id, status, answer FROM clarify_queue"
+        ).fetchone()
+    assert result.startswith("TASK APPROVED (")
+    assert task[1] == "manual"
+    assert queue == (task[0], "answered", "Approve")
 
 
 def test_remind_returns_requested_task_status(monkeypatch):
