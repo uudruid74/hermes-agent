@@ -1618,6 +1618,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     resume=next_args.get("resume"),
                     reason=next_args.get("reason"),
                     task_id=next_args.get("task_id"),
+                    board=next_args.get("board"),
+                    cron=next_args.get("cron"),
+                    root=next_args.get("root"),
+                    kind=next_args.get("kind") or "normal",
+                    debug_plan_id=next_args.get("debug_plan_id"),
+                    pre_approved=next_args.get("pre_approved", False),
                 )
             function_result, function_args, middleware_trace, _execution_blocked = _managed_values(_run_agent_tool_execution_middleware(
                 agent,
