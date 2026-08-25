@@ -212,6 +212,22 @@ def terminal_bubblewrap_root(cwd: Optional[str]) -> Optional[str]:
     return _resolve_terminal_root(str(resolve_agent_cwd()))
 
 
+def is_write_file_path_allowed_without_task(path: object) -> bool:
+    """Return whether a no-task ``write_file`` target is explicitly scoped safe."""
+    if not isinstance(path, str):
+        return False
+    try:
+        resolved = os.path.realpath(os.path.expanduser(path))
+    except (OSError, TypeError, ValueError):
+        return False
+    if _classify_write_denial(resolved) is not None:
+        return False
+    journal_root = _agent_journal_root()
+    return _is_temp_path(resolved) or (
+        journal_root is not None and _path_contains(journal_root, resolved)
+    )
+
+
 def _classify_write_denial(path: str) -> Optional[str]:
     """Return ``'credential'``, ``'safe_root'``, or ``None`` if writes are allowed."""
     home = os.path.realpath(os.path.expanduser("~"))

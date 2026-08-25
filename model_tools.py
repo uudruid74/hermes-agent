@@ -1151,6 +1151,7 @@ def handle_function_call(
         else:
             from agent.file_safety import (
                 is_write_denied_by_task_gate,
+                is_write_file_path_allowed_without_task,
                 terminal_bubblewrap_root,
             )
             bubblewrap_root = (
@@ -1159,7 +1160,10 @@ def handle_function_call(
             )
             if bubblewrap_root:
                 function_args["_bubblewrap_root"] = bubblewrap_root
-            elif is_write_denied_by_task_gate():
+            elif is_write_denied_by_task_gate() and not (
+                function_name == "write_file"
+                and is_write_file_path_allowed_without_task(function_args.get("path"))
+            ):
                 return json.dumps({
                     "error": "Write denied: No active task. "
                              "Use plan_tool 'new' to create a task first."
