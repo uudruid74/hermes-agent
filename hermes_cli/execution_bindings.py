@@ -17,7 +17,7 @@ import sqlite3
 import time
 from typing import Literal, Optional
 
-from hermes_cli.kanban_db import write_txn
+from hermes_cli.kanban_db import kanban_db_path, write_txn
 
 
 class ExecutionBindingError(RuntimeError):
@@ -44,10 +44,32 @@ class PlanAuthorizationRequired(ExecutionBindingError):
     """A manual Plan has no durable approved authorization."""
 
 
+class PlanStateUnavailable(ExecutionBindingError):
+    """The authoritative binding or strict session lineage could not be read."""
+
+
 @dataclass(frozen=True)
 class ExecutionKey:
     profile: str
     root_session_id: str
+
+
+def identity_for_agent(agent) -> ExecutionKey:
+    """Resolve an agent to its normalized, compression-stable execution key."""
+    profile = getattr(agent, "profile_name", None)
+    session_id = getattr(agent, "session_id", None)
+    session_db = getattr(agent, "_session_db", None)
+    if not isinstance(profile, str) or not profile.strip():
+        raise PlanStateUnavailable("agent profile is unavailable")
+    if not isinstance(session_id, str) or not session_id.strip():
+        raise PlanStateUnavailable("agent session is unavailable")
+    if session_db is None:
+        raise PlanStateUnavailable("agent session database is unavailable")
+    try:
+        root_session_id = session_db.get_compression_root(session_id)
+    except (OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
+        raise PlanStateUnavailable("strict compression lineage is unavailable") from exc
+    return ExecutionKey(profile=profile.strip().casefold(), root_session_id=root_session_id)
 
 
 @dataclass(frozen=True)
@@ -111,6 +133,22 @@ def get_binding(
     _validate_key(key)
     row = _get_binding_row(conn, key)
     return _binding_from_row(row) if row is not None else None
+
+
+def resolve_active_for_agent(
+    agent, board: Optional[str] = None
+) -> Optional[ExecutionBinding]:
+    """Read the sole runtime binding without environment/session fallback."""
+    key = identity_for_agent(agent)
+    try:
+        conn = sqlite3.connect(str(kanban_db_path(board)))
+        conn.row_factory = sqlite3.Row
+        try:
+            return get_binding(conn, key)
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        raise PlanStateUnavailable("execution binding database is unavailable") from exc
 
 
 def require_binding(conn: sqlite3.Connection, key: ExecutionKey) -> ExecutionBinding:

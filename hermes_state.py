@@ -8076,6 +8076,35 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 continue
         return lineage if session_id in lineage else [session_id]
 
+    def get_compression_root(self, session_id: str) -> str:
+        """Return the strict compression-only root for ``session_id``.
+
+        Delegate and branch children retain their own identity. A missing or
+        cyclic compression parent is corruption, never a reason to fall back
+        to a mutable child session ID.
+        """
+        if not session_id:
+            raise ValueError("session_id must not be empty")
+        current = self.get_session(session_id)
+        if current is None:
+            raise RuntimeError(f"session not found: {session_id}")
+        if self._is_branch_child_row(current):
+            return current["id"]
+
+        seen = {current["id"]}
+        while current.get("parent_session_id"):
+            parent_id = current["parent_session_id"]
+            if parent_id in seen:
+                raise RuntimeError(f"compression lineage cycle at {parent_id}")
+            parent = self.get_session(parent_id)
+            if parent is None:
+                raise RuntimeError(f"parent session not found: {parent_id}")
+            if parent.get("end_reason") != "compression":
+                return current["id"]
+            seen.add(parent_id)
+            current = parent
+        return current["id"]
+
     def get_root_session_id(self, session_id: str) -> str:
         """Return the unique oldest ancestor of a session.
 
