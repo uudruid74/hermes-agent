@@ -623,18 +623,19 @@ def _cmd_dispatch(agent, title: str, goal: str, project: str, assignee: str,
         steps_json = None
 
     session_id = _get_session_id(agent)
+    agent_name = _get_agent_name(agent)
 
     try:
         with kdb as conn:
             conn.execute("""
                 INSERT INTO tasks (id, title, body, status, assignee, created_at,
                                    task_steps, task_goal, previous_task, project_id,
-                                   session_id, board)
-                VALUES (?, ?, ?, 'ready', ?, ?, ?, ?, ?, ?, ?, ?)
+                                   session_id, board, created_by)
+                VALUES (?, ?, ?, 'ready', ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 task_id, title, body, assignee, int(time.time()),
                 steps_json, goal, resume, project,
-                session_id, _resolve_board(project),
+                session_id, _resolve_board(project), agent_name,
             ))
             conn.commit()
     except Exception as e:
@@ -1131,6 +1132,18 @@ def _cmd_archive(task_id: str) -> str:
     return f"ARCHIVED: {task_id} on {os.path.basename(os.path.dirname(found_board))}"
 
 
+# Live Plan commands resolve identity only through execution bindings. The
+# historical private helpers above remain provenance and are not dispatched.
+from tools.plan_binding_adapter import (
+    cmd_approve as _cmd_approve,
+    cmd_done as _cmd_done,
+    cmd_fail as _cmd_fail,
+    cmd_new as _cmd_new,
+    cmd_remind as _cmd_remind,
+    cmd_test_complete as _cmd_test_complete,
+)
+
+
 def plan_tool(
     agent,
     command: str,
@@ -1150,6 +1163,7 @@ def plan_tool(
     kind: str = "normal",
     debug_plan_id: Optional[str] = None,
     pre_approved: bool = False,
+    parent_task_id: Optional[str] = None,
 ) -> str:
     """Mandatory Action Protocol — multistep plan management.
 
@@ -1168,7 +1182,10 @@ def plan_tool(
     if command == "new":
         if not title or not goal or not steps:
             return "ERROR: 'new' requires title, goal, and steps[]"
-        return _cmd_new(agent, title, goal, steps, temp, board, kind, debug_plan_id, pre_approved)
+        return _cmd_new(
+            agent, title, goal, steps, temp, board, kind, debug_plan_id,
+            pre_approved, parent_task_id,
+        )
 
     elif command == "cron":
         if not cron or not root or not title or not goal or not steps:
@@ -1299,6 +1316,10 @@ PLAN_TOOL_SCHEMA = {
                 "type": "boolean",
                 "description": "For a debug plan, skip the interactive approval gate.",
             },
+            "parent_task_id": {
+                "type": "string",
+                "description": "Explicit active parent required to nest a new Plan.",
+            },
         },
         "required": ["command"],
     },
@@ -1330,6 +1351,7 @@ registry.register(
         kind=args.get("kind", "normal"),
         debug_plan_id=args.get("debug_plan_id"),
         pre_approved=args.get("pre_approved", False),
+        parent_task_id=args.get("parent_task_id"),
     ),
     emoji="📋",
 )
