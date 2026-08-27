@@ -1403,6 +1403,22 @@ CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 
+-- Sole durable authority for the task executed by one conversation lineage.
+-- Session rows own transcript identity only; task binding does not rotate when
+-- compression creates a child session.
+CREATE TABLE IF NOT EXISTS execution_bindings (
+    profile          TEXT NOT NULL,
+    root_session_id  TEXT NOT NULL,
+    task_id          TEXT NOT NULL REFERENCES tasks(id),
+    revision         INTEGER NOT NULL DEFAULT 1,
+    bound_at         INTEGER NOT NULL,
+    updated_at       INTEGER NOT NULL,
+    PRIMARY KEY (profile, root_session_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_execution_bindings_task
+    ON execution_bindings(task_id);
+
 CREATE TABLE IF NOT EXISTS plan_authorizations (
     plan_id TEXT PRIMARY KEY,
     board TEXT NOT NULL DEFAULT 'default',

@@ -8076,6 +8076,40 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 continue
         return lineage if session_id in lineage else [session_id]
 
+    def get_root_session_id(self, session_id: str) -> str:
+        """Return the unique oldest ancestor of a session.
+
+        Follows parent_session_id to the root, rejecting cycles and missing
+        parents. Returns the original session_id if it has no parent or is a
+        branch child (branches own their identity; compression children do not).
+
+        This is identity only; it does not read Plan state.
+        """
+        if not session_id:
+            raise ValueError("session_id must not be empty")
+
+        current = self.get_session(session_id)
+        if current is None:
+            raise RuntimeError(f"session not found: {session_id}")
+        if self._is_branch_child_row(current):
+            return current["id"]
+
+        seen = {current["id"]}
+        while True:
+            parent_id = current.get("parent_session_id")
+            if not parent_id:
+                return current["id"]
+            if parent_id in seen:
+                raise RuntimeError(f"compression lineage cycle at {parent_id}")
+            parent = self.get_session(parent_id)
+            if parent is None:
+                raise RuntimeError(f"parent session not found: {parent_id}")
+            if self._is_branch_child_row(parent):
+                return parent["id"]
+            seen.add(parent["id"])
+            current = parent
+
+
     def clear_messages(self, session_id: str) -> None:
         """Delete all messages for a session and reset its counters."""
         def _do(conn):
