@@ -48,6 +48,11 @@ class TestComposeUserApiContent:
         fenced = build_memory_context_block("likes tea")
         assert out == "hello" + "\n\n" + fenced + "\n\n" + "PLUGIN-CTX"
 
+    def test_composes_active_plan_context_in_api_sidecar(self):
+        assert compose_user_api_content(
+            "hello", "", "", "[ACTIVE PLAN: task_id=t_plan; revision=4]"
+        ) == "hello\n\n[ACTIVE PLAN: task_id=t_plan; revision=4]"
+
 
 
 

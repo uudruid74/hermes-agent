@@ -5284,19 +5284,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         except Exception:
             pass
 
-        # Task ID from session state.db (plan_tool active tasks)
-        task_id = os.environ.get("HERMES_KANBAN_TASK") or ""
-        if not task_id:
+        # Active Plan identity is execution-binding-only. The worker environment
+        # and sessions.task_id are bootstrap/migration data, not live authority.
+        from hermes_cli.execution_bindings import (
+            PlanStateUnavailable,
+            resolve_active_for_agent,
+        )
+        if agent is not None:
             try:
-                from hermes_state import SessionDB
-                sdb = SessionDB()
-                row = sdb.get_session(self.session_id)
-                if row and isinstance(row, dict):
-                    task_id = row.get("task_id") or ""
-            except Exception:
-                pass
-        if task_id:
-            snapshot["task_id"] = task_id[-8:] if len(task_id) >= 8 else task_id
+                binding = resolve_active_for_agent(agent)
+            except PlanStateUnavailable:
+                snapshot["task_state"] = "unavailable"
+            else:
+                if binding is not None:
+                    task_id = binding.task_id
+                    snapshot["task_id"] = task_id[-8:] if len(task_id) >= 8 else task_id
 
         # Battery read-out (first status-bar element when enabled). Reads are
         # memoised for a few seconds inside agent.battery, so polling it on

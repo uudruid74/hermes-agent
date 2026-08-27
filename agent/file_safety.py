@@ -110,14 +110,15 @@ def _session_task_id() -> Optional[str]:
 
 
 def _task_root() -> Optional[str]:
-    """Return the current kanban task's scoped write ``root``, if any.
+    """Return the active binding task's scoped write root, if any."""
+    from hermes_cli.execution_bindings import PlanStateUnavailable
+    import sqlite3
 
-    Used by plan-cron tasks to allow write_file under a fixed directory
-    without tripping the task write gate. Returns None when there is no
-    active task or the task carries no root column.
-    """
-    task_id = os.environ.get("HERMES_KANBAN_TASK") or _session_task_id()
-    if not task_id:
+    try:
+        binding = _active_execution_binding()
+    except PlanStateUnavailable:
+        return None
+    if binding is None:
         return None
     try:
         import sqlite3
@@ -125,13 +126,13 @@ def _task_root() -> Optional[str]:
         db = sqlite3.connect(str(kanban_db_path()))
         try:
             row = db.execute(
-                "SELECT root FROM tasks WHERE id = ?", (task_id,)
+                "SELECT root FROM tasks WHERE id = ?", (binding.task_id,)
             ).fetchone()
         finally:
             db.close()
         if row and row[0]:
             return os.path.realpath(os.path.expanduser(row[0]))
-    except Exception:
+    except sqlite3.Error:
         return None
     return None
 
