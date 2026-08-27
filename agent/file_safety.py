@@ -98,15 +98,27 @@ def get_safe_write_roots() -> set[str]:
     return roots
 
 
-def _task_root() -> Optional[str]:
-    """Return the current kanban task's scoped write ``root``, if any.
+def _session_task_id() -> Optional[str]:
+    """Compatibility accessor backed exclusively by the execution binding."""
+    from hermes_cli.execution_bindings import PlanStateUnavailable
 
-    Used by plan-cron tasks to allow write_file under a fixed directory
-    without tripping the task write gate. Returns None when there is no
-    active task or the task carries no root column.
-    """
-    task_id = os.environ.get("HERMES_KANBAN_TASK") or _session_task_id()
-    if not task_id:
+    try:
+        binding = _active_execution_binding()
+    except PlanStateUnavailable:
+        return None
+    return binding.task_id if binding is not None else None
+
+
+def _task_root() -> Optional[str]:
+    """Return the active binding task's scoped write root, if any."""
+    from hermes_cli.execution_bindings import PlanStateUnavailable
+    import sqlite3
+
+    try:
+        binding = _active_execution_binding()
+    except PlanStateUnavailable:
+        return None
+    if binding is None:
         return None
     try:
         import sqlite3
@@ -114,13 +126,13 @@ def _task_root() -> Optional[str]:
         db = sqlite3.connect(str(kanban_db_path()))
         try:
             row = db.execute(
-                "SELECT root FROM tasks WHERE id = ?", (task_id,)
+                "SELECT root FROM tasks WHERE id = ?", (binding.task_id,)
             ).fetchone()
         finally:
             db.close()
         if row and row[0]:
             return os.path.realpath(os.path.expanduser(row[0]))
-    except Exception:
+    except sqlite3.Error:
         return None
     return None
 
@@ -830,28 +842,19 @@ def get_container_mirror_warning(
     )
 
 
-def _session_task_id() -> Optional[str]:
-    """Read task_id from the live agent's pinned session state."""
+def _active_execution_binding():
+    """Resolve the live binding or propagate a typed fail-closed state."""
     from agent.agent_runtime_helpers import _current_agent
+    from hermes_cli.execution_bindings import resolve_active_for_agent
 
-    session_id = getattr(_current_agent, "canonical_session_id", None)
-    if not session_id:
-        return None
-    try:
-        from hermes_state import SessionDB
-        db = SessionDB()
-        with db._read_ctx() as c:
-            row = c.execute(
-                "SELECT task_id FROM sessions WHERE id = ?", (session_id,)
-            ).fetchone()
-        if row:
-            return row["task_id"] if isinstance(row, dict) else row[0]
-    except Exception:
-        pass
-    return None
+    return resolve_active_for_agent(_current_agent)
 
 
 def is_write_denied_by_task_gate() -> bool:
-    """Return True if writes are blocked because no task is active."""
-    task_id = os.environ.get("HERMES_KANBAN_TASK") or _session_task_id()
-    return not bool(task_id)
+    """Return True unless the authoritative execution binding permits a task."""
+    from hermes_cli.execution_bindings import PlanStateUnavailable
+
+    try:
+        return _active_execution_binding() is None
+    except PlanStateUnavailable:
+        return True

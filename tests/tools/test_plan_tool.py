@@ -7,9 +7,17 @@ from types import SimpleNamespace
 from tools import plan_tool
 
 
+class _SessionDB:
+    def get_compression_root(self, session_id):
+        assert session_id == "test-session"
+        return "test-compression-root"
+
+
 class _UnavailableAgent:
     canonical_session_id = None
-    session_id = None
+    session_id = "test-session"
+    profile_name = "neo"
+    _session_db = _SessionDB()
     agent_name = "test-agent"
     _session_temperature = None
     _plan_approval_timed_out = None
@@ -82,8 +90,8 @@ def test_new_keeps_unavailable_clarify_as_pending_approval(monkeypatch):
     assert task["status"] == "blocked"
     assert task["block_kind"] == "approval"
     assert authorization["state"] == "pending"
-    assert authorization["execution_session_id"] is None
-    assert authorization["origin_session_id"] is None
+    assert authorization["execution_session_id"] == "test-session"
+    assert authorization["origin_session_id"] == "test-session"
 
 
 def test_new_activates_plan_after_an_approve_response(monkeypatch):
@@ -169,7 +177,9 @@ def test_new_activates_from_dashboard_queue_answer(tmp_path, monkeypatch):
 
     agent = SimpleNamespace(
         canonical_session_id=None,
-        session_id=None,
+        session_id="test-session",
+        profile_name="neo",
+        _session_db=_SessionDB(),
         agent_name="neo",
         _session_temperature=None,
         clarify_callback=dashboard_callback,
@@ -205,5 +215,5 @@ def test_remind_returns_requested_task_status(monkeypatch):
 
     result = plan_tool._cmd_remind(_UnavailableAgent(), "t_remind")
 
-    assert "Task: Status check" in result
+    assert "Historical task: Status check" in result
     assert "Status: blocked" in result

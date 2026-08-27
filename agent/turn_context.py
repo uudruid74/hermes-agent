@@ -54,6 +54,7 @@ def compose_user_api_content(
     content: Any,
     ext_prefetch_cache: str,
     plugin_user_context: str,
+    active_plan_context: str = "",
 ) -> Optional[str]:
     """Compose the API-bound content of the current turn's user message.
 
@@ -80,9 +81,26 @@ def compose_user_api_content(
             injections.append(fenced)
     if plugin_user_context:
         injections.append(plugin_user_context)
+    if active_plan_context:
+        injections.append(active_plan_context)
     if not injections:
         return None
     return content + "\n\n" + "\n\n".join(injections)
+
+
+def active_plan_api_context(agent: Any) -> str:
+    """Render the binding kernel result for the current-turn API sidecar."""
+    if not getattr(agent, "profile_name", None) or not getattr(agent, "session_id", None):
+        return ""
+    from hermes_cli.execution_bindings import PlanStateUnavailable, resolve_active_for_agent
+
+    try:
+        binding = resolve_active_for_agent(agent)
+    except PlanStateUnavailable as exc:
+        return f"[ACTIVE PLAN STATE UNAVAILABLE: {exc}]"
+    if binding is None:
+        return ""
+    return f"[ACTIVE PLAN: task_id={binding.task_id}; revision={binding.revision}]"
 
 
 def substitute_api_content(api_msg: Dict[str, Any]) -> Optional[str]:
@@ -1274,7 +1292,10 @@ def build_turn_context(
     ):
         _turn_user_msg = messages[current_turn_user_idx]
         _api_content = compose_user_api_content(
-            _turn_user_msg.get("content", ""), ext_prefetch_cache, plugin_user_context
+            _turn_user_msg.get("content", ""),
+            ext_prefetch_cache,
+            plugin_user_context,
+            active_plan_api_context(agent),
         )
         if _api_content is not None and _api_content != _turn_user_msg.get("content"):
             _turn_user_msg["api_content"] = _api_content

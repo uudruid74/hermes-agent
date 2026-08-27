@@ -1403,6 +1403,22 @@ CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 
+-- Sole durable authority for the task executed by one conversation lineage.
+-- Session rows own transcript identity only; task binding does not rotate when
+-- compression creates a child session.
+CREATE TABLE IF NOT EXISTS execution_bindings (
+    profile          TEXT NOT NULL,
+    root_session_id  TEXT NOT NULL,
+    task_id          TEXT NOT NULL REFERENCES tasks(id),
+    revision         INTEGER NOT NULL DEFAULT 1,
+    bound_at         INTEGER NOT NULL,
+    updated_at       INTEGER NOT NULL,
+    PRIMARY KEY (profile, root_session_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_execution_bindings_task
+    ON execution_bindings(task_id);
+
 CREATE TABLE IF NOT EXISTS plan_authorizations (
     plan_id TEXT PRIMARY KEY,
     board TEXT NOT NULL DEFAULT 'default',
@@ -2925,12 +2941,24 @@ def write_txn(conn: sqlite3.Connection):
     shadow the original exception with a spurious rollback error.
     """
     _assert_not_delegated_child_mutation()
-    _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
+    # Plan authorization and activation deliberately share one outer
+    # transaction.  A nested caller gets a savepoint rather than attempting a
+    # second BEGIN, so its success remains contingent on the outer commit.
+    nested = conn.in_transaction
+    savepoint = f"hermes_write_{id(conn):x}_{time.time_ns():x}" if nested else ""
+    if nested:
+        conn.execute(f"SAVEPOINT {savepoint}")
+    else:
+        _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
     try:
         yield conn
     except Exception:
         try:
-            conn.execute("ROLLBACK")
+            if nested:
+                conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            else:
+                conn.execute("ROLLBACK")
         except sqlite3.OperationalError:
             # SQLite has already auto-rolled-back the transaction (typical
             # under EIO, lock contention, or corruption). Nothing to undo;
@@ -2938,6 +2966,9 @@ def write_txn(conn: sqlite3.Connection):
             pass
         raise
     else:
+        if nested:
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            return
         try:
             _execute_boundary_with_retry(conn, "COMMIT")
         except Exception:

@@ -327,6 +327,68 @@ def resolve_plan(
     return ReleaseResult(PlanAuthorization.from_row(updated))
 
 
+def resolve_plan_in_txn(
+    conn: sqlite3.Connection,
+    plan_id: str,
+    decision: str,
+    actor: ApprovalActor,
+    *,
+    reason: Optional[str] = None,
+) -> ReleaseResult:
+    """Resolve an authorization inside a caller-owned transaction.
+
+    This is the Plan activation primitive: callers can combine approval,
+    task activation, binding installation, and audit events under one commit.
+    """
+    if decision not in {"approved", "denied"}:
+        raise ValueError("decision must be approved or denied")
+    now = int(time.time())
+    row = conn.execute(
+        "SELECT * FROM plan_authorizations WHERE plan_id = ?", (plan_id,)
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"plan authorization {plan_id} not found")
+    record = PlanAuthorization.from_row(row)
+    if record.state == "approved" and decision == "approved":
+        return ReleaseResult(record, idempotent=True)
+    if record.state != "pending":
+        raise ValueError(f"plan authorization {plan_id} is not pending")
+    if decision == "approved":
+        conn.execute(
+            """
+            UPDATE plan_authorizations
+               SET state = 'approved', approved_at = ?,
+                   approved_by_session_id = ?, approved_by_actor = ?, approved_via = ?
+             WHERE plan_id = ? AND state = 'pending'
+            """,
+            (now, actor.session_id, actor.actor, actor.via, plan_id),
+        )
+    else:
+        conn.execute(
+            """
+            UPDATE plan_authorizations
+               SET state = 'denied', denied_at = ?, denied_by_session_id = ?,
+                   denial_reason = ?
+             WHERE plan_id = ? AND state = 'pending'
+            """,
+            (now, actor.session_id, reason, plan_id),
+        )
+    _append_event(
+        conn,
+        plan_id,
+        record.revision,
+        decision,
+        actor=actor.actor,
+        actor_session_id=actor.session_id,
+        via=actor.via,
+        payload={"reason": reason} if decision == "denied" and reason else None,
+    )
+    updated = conn.execute(
+        "SELECT * FROM plan_authorizations WHERE plan_id = ?", (plan_id,)
+    ).fetchone()
+    return ReleaseResult(PlanAuthorization.from_row(updated))
+
+
 def get_plan_authorization(
     conn: sqlite3.Connection, plan_id: str
 ) -> Optional[PlanAuthorization]:

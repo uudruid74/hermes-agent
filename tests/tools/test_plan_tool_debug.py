@@ -13,6 +13,7 @@ from tools import plan_tool
 
 class _State:
     def __init__(self, task_id: str):
+        self.task_id = task_id
         self.conn = sqlite3.connect(":memory:")
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, task_id TEXT, subject TEXT)")
@@ -42,13 +43,20 @@ class _State:
     def set_session_mood(self, session_id, delta):
         self.moods.append((session_id, delta))
 
+    def get_compression_root(self, session_id):
+        assert session_id == "session"
+        return "compression-root"
+
 
 class _Agent:
     canonical_session_id = "session"
+    session_id = "session"
+    profile_name = "tester"
     agent_name = "tester"
     _session_temperature = 0.4
 
-    def __init__(self):
+    def __init__(self, state):
+        self._session_db = state
         self.callback_calls = 0
 
     def clarify_callback(self, *_args, **_kwargs):
@@ -75,20 +83,24 @@ def _insert_task(conn, task_id, *, assignee, plan_kind="normal", status="manual"
 
 
 def _bind(monkeypatch, conn, state):
+    from hermes_cli.execution_bindings import ExecutionKey, bootstrap_worker_binding
+
     monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
-    monkeypatch.setattr(plan_tool, "_get_session_db", lambda: state)
+    bootstrap_worker_binding(
+        conn, ExecutionKey("tester", "compression-root"), state.task_id
+    )
 
 
 def test_preapproved_debug_plan_skips_callback_and_links_coding_task(monkeypatch):
     conn = _db()
     _insert_task(conn, "coding", assignee="coder", status="running")
     state = _State("coding")
-    agent = _Agent()
+    agent = _Agent(state)
     _bind(monkeypatch, conn, state)
 
     result = plan_tool._cmd_new(
         agent, "debug", "exercise coding task", ["run smoke test"],
-        kind="debug", pre_approved=True,
+        kind="debug", pre_approved=True, parent_task_id="coding", debug_plan_id="coding",
     )
 
     match = re.search(r"TASK APPROVED \((t_[0-9a-f]+)\)", result)
@@ -110,7 +122,7 @@ def test_debug_plan_completion_rewards_coder_not_tester(monkeypatch):
     conn.execute("UPDATE tasks SET previous_task = 'coding' WHERE id = 'debug'")
     conn.commit()
     state = _State("debug")
-    agent = _Agent()
+    agent = _Agent(state)
     _bind(monkeypatch, conn, state)
 
     plan_tool._cmd_done(agent)
@@ -125,7 +137,7 @@ def test_debug_failure_uses_severity_adjusted_tester_rating(monkeypatch):
     _insert_task(conn, "coding", assignee="coder", status="blocked", debug_plan_id="debug")
     _insert_task(conn, "debug", assignee="tester", plan_kind="debug")
     state = _State("debug")
-    agent = _Agent()
+    agent = _Agent(state)
     _bind(monkeypatch, conn, state)
 
     plan_tool._cmd_fail(agent, "easy bug: 0.8")
@@ -141,7 +153,7 @@ def test_debug_crash_penalty_uses_flat_rating_delta(monkeypatch):
     _insert_task(conn, "coding", assignee="coder", status="blocked", debug_plan_id="debug")
     _insert_task(conn, "debug", assignee="tester", plan_kind="debug")
     state = _State("debug")
-    agent = _Agent()
+    agent = _Agent(state)
     _bind(monkeypatch, conn, state)
 
     plan_tool._cmd_fail(agent, json.dumps([{"bug": "process crashed", "kind": "crash", "severity": 1.0}]))
@@ -153,7 +165,7 @@ def test_normal_failure_archives_without_rating_change(monkeypatch):
     conn = _db()
     _insert_task(conn, "normal", assignee="coder")
     state = _State("normal")
-    agent = _Agent()
+    agent = _Agent(state)
     _bind(monkeypatch, conn, state)
 
     plan_tool._cmd_fail(agent, "test failed")
@@ -167,19 +179,21 @@ def test_test_complete_archives_without_mood_or_rating_penalty(monkeypatch):
     conn = _db()
     _insert_task(conn, "test", assignee="tester")
     state = _State("test")
-    agent = _Agent()
+    agent = _Agent(state)
     _bind(monkeypatch, conn, state)
 
     result = plan_tool.plan_tool(agent, "test-complete")
 
     assert "test-complete" in plan_tool.PLAN_TOOL_SCHEMA["parameters"]["properties"]["command"]["enum"]
-    assert "recorded as a test outcome" in result
+    assert "Plan test test-complete" in result
     assert state.ratings == {}
     assert state.moods == []
-    assert state.conn.execute("SELECT task_id FROM sessions WHERE id = 'session'").fetchone()[0] is None
+    assert state.conn.execute("SELECT task_id FROM sessions WHERE id = 'session'").fetchone()[0] == "test"
     assert conn.execute("SELECT status FROM tasks WHERE id = 'test'").fetchone()[0] == "archived"
     comment = conn.execute("SELECT body FROM task_comments WHERE task_id = 'test'").fetchone()[0]
-    event = conn.execute("SELECT kind, payload FROM task_events WHERE task_id = 'test'").fetchone()
+    event = conn.execute(
+        "SELECT kind, payload FROM task_events WHERE task_id = 'test' AND kind = 'plan-test-complete'"
+    ).fetchone()
     assert comment.startswith("TEST COMPLETE at Step 1")
-    assert event["kind"] == "test-complete"
-    assert json.loads(event["payload"]) == {"outcome": "test", "step": 1}
+    assert event["kind"] == "plan-test-complete"
+    assert json.loads(event["payload"])["outcome"] == "test-complete"
