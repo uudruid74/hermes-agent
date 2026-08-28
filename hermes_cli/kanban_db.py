@@ -4424,12 +4424,18 @@ def recompute_ready(
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status, consecutive_failures, max_retries, assignee "
+            "SELECT id, status, consecutive_failures, max_retries, assignee, block_kind "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
+            # Invariant: an approval-gated plan is never auto-promoted. Only a
+            # real human approval (plan_tool approve) may release it; a
+            # dispatcher tick must not flip it to 'ready' where it could be
+            # claimed and executed without approval (#global-plan-approval).
+            if cur_status == "blocked" and row["block_kind"] == "approval":
+                continue
             # Invariant: unassigned tasks are never promoted to 'ready' — they
             # stay held in 'todo' until an operator assigns them. This keeps
             # "unassigned = held, never dispatched" structural.
