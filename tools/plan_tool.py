@@ -99,7 +99,7 @@ def _parse_debug_bugs(reason: str) -> List[Dict[str, Any]]:
 
 
 def _get_agent_name(agent) -> str:
-    return getattr(agent, "agent_name", None) or os.environ.get("HERMES_AGENT_NAME", "agent")
+    return getattr(agent, "agent_name", None) or "agent"
 
 
 def _get_session_id(agent) -> Optional[str]:
@@ -141,7 +141,9 @@ def _resolve_temp(temp: Optional[str], agent) -> Optional[float]:
     except (ValueError, TypeError):
         pass
     # Symbolic: chat, worker, creative
-    profile = getattr(agent, "profile_name", None) or os.environ.get("HERMES_PROFILE", "neo")
+    profile = getattr(agent, "profile_name", None)
+    if not profile:
+        return None
     config_path = os.path.expanduser(f"~/.hermes/profiles/{profile}/config.yaml")
     try:
         import yaml

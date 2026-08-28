@@ -1497,6 +1497,17 @@ def init_agent(
         agent.session_id = f"{timestamp_str}_{short_uuid}"
     agent.canonical_session_id = agent.session_id
 
+    # Profile identity for the strict execution-binding kernel (plan_tool /
+    # write gate).  Stamped once at init like canonical_session_id; the agent
+    # object is the ONLY identity source - no env fallbacks.
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+
+        agent.profile_name = get_active_profile_name() or "default"
+    except Exception:
+        # Deterministic canonical default; never silently misidentify.
+        agent.profile_name = "default"
+
     # Expose session ID to tools (terminal, execute_code) so agents can
     # reference their own session for --resume commands, cross-session
     # coordination, and logging. Keep the ContextVar and os.environ
