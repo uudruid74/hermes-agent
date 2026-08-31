@@ -29,6 +29,16 @@ def test_e164_target_still_requires_phone_platform() -> None:
     assert _parse_target_ref("matrix", "+15551234567")[2] is False
 
 
+def test_buzz_dm_uuid_target_is_explicit() -> None:
+    chat_id, thread_id, is_explicit = _parse_target_ref(
+        "buzz", "966d8e74-f0dd-4fd2-b013-984086de8e05"
+    )
+
+    assert chat_id == "966d8e74-f0dd-4fd2-b013-984086de8e05"
+    assert thread_id is None
+    assert is_explicit is True
+
+
 def test_send_message_routes_whatsapp_group_jid_without_home_fallback() -> None:
     whatsapp_cfg = SimpleNamespace(enabled=True, token=None, extra={"api_url": "http://bridge"})
     config = SimpleNamespace(
