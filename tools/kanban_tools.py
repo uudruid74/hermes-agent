@@ -208,6 +208,31 @@ def _load_gateway_profile_env(env: dict) -> None:
         pass
 
 
+def _load_user_profile_env(env: dict) -> None:
+    """Load Evan's default-profile Buzz identity into *env* for ``send -u``."""
+    try:
+        from hermes_cli.profiles import get_profile_dir
+
+        user_home = get_profile_dir("default")
+    except ImportError:
+        return
+    env_path = user_home / ".env"
+    env["HERMES_HOME"] = str(user_home)
+    env["HERMES_PROFILE"] = "default"
+    if not env_path.exists():
+        return
+    try:
+        from dotenv import dotenv_values
+
+        for key, val in dotenv_values(str(env_path)).items():
+            if key == "BUZZ_PRIVATE_KEY":
+                env[key] = val
+            elif key not in env:
+                env[key] = val
+    except (ImportError, OSError):
+        pass
+
+
 def _notify_kanban_event(tid: str, status: str, summary: Optional[str], task) -> None:
     """Fire a best-effort notification when a task changes status.
 
@@ -278,9 +303,11 @@ def _notify_kanban_event(tid: str, status: str, summary: Optional[str], task) ->
             ["hermes", "send", "-t", target, human_msg],
             capture_output=True, timeout=10, env=notify_env,
         )
+        user_env = notify_env.copy()
+        _load_user_profile_env(user_env)
         subprocess.run(
             ["hermes", "send", "-u", target, json_payload],
-            capture_output=True, timeout=10, env=notify_env,
+            capture_output=True, timeout=10, env=user_env,
         )
     except Exception:
         pass

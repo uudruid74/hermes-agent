@@ -117,13 +117,24 @@ def test_kanban_gateway_origin_keeps_platform_subprocess_path(monkeypatch):
         lambda *_args: {"platform": "telegram", "chat_id": "123", "chat_type": "dm"},
     )
     monkeypatch.setattr(kanban.kb, "get_task", lambda *_args: None)
-    monkeypatch.setattr(kanban, "_load_gateway_profile_env", lambda _env: None)
+    monkeypatch.setattr(
+        kanban,
+        "_load_gateway_profile_env",
+        lambda env: env.update({"HERMES_HOME": "gopher-home", "HERMES_PROFILE": "gopher"}),
+    )
+    monkeypatch.setattr(
+        kanban,
+        "_load_user_profile_env",
+        lambda env: env.update({"HERMES_HOME": "evan-home", "HERMES_PROFILE": "default"}),
+    )
     monkeypatch.setattr(
         "subprocess.run",
-        lambda args, **_kwargs: calls.append(args),
+        lambda args, **kwargs: calls.append((args, kwargs)),
     )
 
     kanban._notify_kanban_status_change("t_gateway", "done", title="Gateway task")
 
-    assert calls[0][:4] == ["hermes", "send", "-t", "telegram:123"]
-    assert calls[1][:4] == ["hermes", "send", "-u", "telegram:123"]
+    assert calls[0][0][:4] == ["hermes", "send", "-t", "telegram:123"]
+    assert calls[0][1]["env"]["HERMES_PROFILE"] == "gopher"
+    assert calls[1][0][:4] == ["hermes", "send", "-u", "telegram:123"]
+    assert calls[1][1]["env"]["HERMES_PROFILE"] == "default"
