@@ -1508,6 +1508,20 @@ def init_agent(
         # Deterministic canonical default; never silently misidentify.
         agent.profile_name = "default"
 
+    # Display identity for plan attribution, ratings, and dashboard agent
+    # grouping. Mirrors profile_name (same slug) so _get_agent_name() in
+    # tools/plan_tool.py resolves instead of falling back to the generic
+    # "agent". Stamped once at init like profile_name; no env fallbacks.
+    # (2026-08-31: commit 4b0954137 dropped the HERMES_AGENT_NAME fallback
+    # without stamping an agent_name replacement, so every plan/dashboard
+    # lookup hardcoded the literal "agent".)
+    try:
+        from hermes_cli.profiles import get_active_profile_name as _apn
+
+        agent.agent_name = _apn() or "default"
+    except Exception:
+        agent.agent_name = "default"
+
     # Expose session ID to tools (terminal, execute_code) so agents can
     # reference their own session for --resume commands, cross-session
     # coordination, and logging. Keep the ContextVar and os.environ
