@@ -98,7 +98,14 @@ _DM_DISCOVERY_EVERY = 5
 
 _DEFAULT_POLL_INTERVAL = 4.0
 _MIN_POLL_INTERVAL = 1.0
-_CLI_TIMEOUT = 30.0
+# Timeout for buzz-cli subprocess calls. This was 30s, which was too tight for
+# the outbound send path on a remote relay: a `buzz messages send` can exceed
+# 30s (sign + post + upload against a busy box), and _send_with_retry does NOT
+# retry timeouts, so the final response was silently killed and never delivered
+# after a long tool call (Evan's "response gets lost on Buzz after a search").
+# Raised to 120s to comfortably span a slow remote send. Reads/membership/etc.
+# are still fast; this only protects against pathological slow sends.
+_CLI_TIMEOUT = 120.0
 
 # WebSocket transport (NIP-42 authenticated Nostr subscription).
 # kind 44100 is Buzz's channel-membership event — used for live DM discovery.
@@ -424,6 +431,7 @@ class BuzzAdapter(BasePlatformAdapter):
         # Runtime state
         self._poll_task: Optional[asyncio.Task] = None
         self._ws_task: Optional[asyncio.Task] = None
+        self._presence_task: Optional[asyncio.Task] = None
         self._ws_ready: Optional[asyncio.Event] = None
         self._ws_active = False  # True while the WS loop owns inbound delivery
         self._membership_since = 0
@@ -557,6 +565,17 @@ class BuzzAdapter(BasePlatformAdapter):
         if transport_used == "poll":
             self._poll_task = asyncio.create_task(self._poll_loop())
         self._mark_connected()
+        # Publish presence so the Buzz app shows the agent as online (green
+        # dot). The relay stores presence in Redis with a 180s TTL and expects
+        # a heartbeat every 60s (buzz-pubsub PRESENCE_TTL_SECS=180, "call on
+        # connect and every 60s heartbeat"). A single publish decays after 3
+        # minutes, so start a heartbeat loop that re-publishes while connected.
+        # Best-effort: a failure here must not fail the whole connect.
+        try:
+            await self._set_presence("online")
+        except Exception:
+            logger.debug("Buzz: presence publish failed (non-fatal)", exc_info=True)
+        self._presence_task = asyncio.create_task(self._presence_heartbeat())
         logger.info(
             "Buzz: connected to %s as %s, watching %d channel(s) via %s%s",
             self.relay_url,
@@ -567,9 +586,55 @@ class BuzzAdapter(BasePlatformAdapter):
         )
         return True
 
+    async def _presence_heartbeat(self) -> None:
+        """Re-publish online presence every 60s while connected.
+
+        The relay's presence TTL is 180s (buzz-pubsub PRESENCE_TTL_SECS), so a
+        single publish decays after 3 minutes. This loop keeps the green dot
+        alive for the life of the connection. Cancelled by disconnect().
+        """
+        try:
+            while True:
+                await asyncio.sleep(60)
+                if not self._ws_active and not self._poll_task:
+                    break
+                try:
+                    await self._set_presence("online")
+                except Exception:
+                    logger.debug("Buzz: presence heartbeat failed (non-fatal)", exc_info=True)
+        except asyncio.CancelledError:
+            pass
+
+    async def _set_presence(self, status: str) -> None:
+        """Publish a presence event (online/away/offline) to the relay.
+
+        The Buzz app's green dot is driven by these NIP-38 presence events.
+        Called on connect (online) and disconnect (offline) so the agent's
+        presence tracks its actual connection state.
+        """
+        code, out, err = await self._run_cli(["users", "set-presence", "--status", status])
+        if code != 0:
+            logger.warning(
+                "Buzz: set-presence %s failed — %s", status, _cli_error_message(err, code)
+            )
+
     async def disconnect(self) -> None:
         """Stop the inbound transport and drop runtime state."""
         self._mark_disconnected()
+        # Stop the presence heartbeat loop.
+        if getattr(self, "_presence_task", None) and not self._presence_task.done():
+            self._presence_task.cancel()
+            try:
+                await self._presence_task
+            except asyncio.CancelledError:
+                pass
+        self._presence_task = None
+        # Publish offline presence so the app stops showing the agent as
+        # online once the connection drops. Best-effort.
+        try:
+            await self._set_presence("offline")
+        except Exception:
+            logger.debug("Buzz: offline presence publish failed (non-fatal)", exc_info=True)
         lock_key = getattr(self, "_lock_key", None)
         if lock_key:
             try:
