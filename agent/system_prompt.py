@@ -318,6 +318,26 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             )
         except Exception:
             _compact_cats = frozenset()
+        # Config-driven demotion — skills.compact_categories in config.yaml
+        # (kanban t_473b9bb0, 2026-08-26): a per-profile list of category
+        # names to demote to names-only in the index, independent of the
+        # coding posture / focus mode so chat/kanban/telegram sessions get
+        # the same always-on overhead cut. Unioned with the posture set so
+        # both mechanisms compose. A scalar string is accepted (comma or
+        # JSON-list) for profiles edited via `hermes config set`.
+        try:
+            from hermes_cli.config import load_config_readonly
+
+            _skills_cfg = (load_config_readonly() or {}).get("skills") or {}
+            _cfg_cats = _skills_cfg.get("compact_categories") or []
+            if isinstance(_cfg_cats, str):
+                _cfg_cats = _cfg_cats.strip().strip("[]").split(",")
+            for _cat in _cfg_cats:
+                _cat = str(_cat).strip().strip("'\"").strip()
+                if _cat:
+                    _compact_cats = _compact_cats | frozenset({_cat})
+        except Exception:
+            pass
         skills_prompt = _r.build_skills_system_prompt(
             available_tools=agent.valid_tool_names,
             available_toolsets=avail_toolsets,
