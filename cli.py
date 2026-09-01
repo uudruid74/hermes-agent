@@ -9798,6 +9798,25 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         except Exception:
             return False
 
+    def _should_handle_interrupt_then_dispatch_inline(
+        self, text: str, has_images: bool = False
+    ) -> bool:
+        """Return True when a busy command must interrupt before dispatching.
+
+        ``/stop``, ``/new``, and ``/reset`` cannot wait in ``_pending_input``:
+        ``process_loop`` is blocked inside ``self.chat()`` until the active turn
+        ends. Their registry-declared busy policy requires a hard interrupt
+        before their normal command handlers run.
+        """
+        if not text or has_images or not _looks_like_slash_command(text):
+            return False
+        if not getattr(self, "_agent_running", False):
+            return False
+        from hermes_cli.commands import is_interrupt_then_dispatch
+
+        command_name = text.split(None, 1)[0].lower().lstrip("/")
+        return is_interrupt_then_dispatch(command_name)
+
     def _should_handle_background_command_inline(
         self, text: str, has_images: bool = False
     ) -> bool:
@@ -15489,6 +15508,23 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     event.app.invalidate()
                     return
 
+                # Commands whose registry policy is interrupt_then_dispatch
+                # (/stop, /new, /reset) must bypass _pending_input: process_loop
+                # cannot drain that queue until the very turn these commands
+                # are meant to interrupt has already finished.
+                if (
+                    self._should_handle_interrupt_then_dispatch_inline(
+                        text, has_images=has_images
+                    )
+                    and self.agent
+                ):
+                    print("\n⚡ Interrupting agent...")
+                    request_hard_interrupt(self.agent)
+                    self.process_command(text)
+                    event.app.current_buffer.reset(append_to_history=True)
+                    event.app.invalidate()
+                    return
+
                 # Handle /steer while the agent is running immediately on the
                 # UI thread.  Queuing through _pending_input would deadlock the
                 # steer until after the agent loop finishes (process_loop is
@@ -15568,6 +15604,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         preview = text if text else f"[{len(images)} image{'s' if len(images) != 1 else ''} attached]"
                         _cprint(f"  Queued for the next turn: {preview[:80]}{'...' if len(preview) > 80 else ''}")
                     elif _effective_mode == "interrupt":
+                        _tools_running = False
                         if not images and text:
                             try:
                                 if (
@@ -15580,12 +15617,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                                     is True
                                     and hasattr(self.agent, "redirect")
                                 ):
+                                    _tools_running = bool(
+                                        getattr(self.agent, "_executing_tools", False)
+                                    )
                                     redirected = bool(self.agent.redirect(text))
                             except Exception:
                                 redirected = False
                         if redirected:
                             preview = text[:80] + ("..." if len(text) > 80 else "")
-                            _cprint(f"  {_ACCENT}↪ Redirected current turn: '{preview}'{_RST}")
+                            if _tools_running:
+                                _cprint(
+                                    f"  {_ACCENT}↪ Stashed as steer — tool running, "
+                                    f"will apply at next tool boundary: '{preview}'{_RST}"
+                                )
+                            else:
+                                _cprint(f"  {_ACCENT}↪ Redirected current turn: '{preview}'{_RST}")
                         else:
                             # Compatibility path for older agents, multimodal
                             # follow-ups, or a turn that finished in the race.

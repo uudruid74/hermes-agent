@@ -21,8 +21,10 @@ prompt_toolkit app.
 
 from __future__ import annotations
 
+import ast
 import importlib
 import sys
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 
@@ -101,6 +103,78 @@ class TestSteerInlineDetector:
         cli = _make_cli()
         cli._agent_running = True
         assert cli._should_handle_steer_command_inline("/steer text", has_images=True) is False
+
+
+class TestInterruptThenDispatchInlineDetector:
+    """Busy commands that must stop first bypass the pending-input queue."""
+
+    def test_detects_stop_new_and_reset_when_agent_running(self):
+        cli = _make_cli()
+        cli._agent_running = True
+
+        for command in ("/stop", "/new", "/reset"):
+            assert cli._should_handle_interrupt_then_dispatch_inline(command) is True
+
+    def test_ignores_commands_that_do_not_require_interrupt(self):
+        cli = _make_cli()
+        cli._agent_running = True
+
+        assert cli._should_handle_interrupt_then_dispatch_inline("/steer revise") is False
+        assert cli._should_handle_interrupt_then_dispatch_inline("/background work") is False
+        assert cli._should_handle_interrupt_then_dispatch_inline("stop without slash") is False
+
+    def test_ignores_interrupt_commands_when_idle_or_multimodal(self):
+        cli = _make_cli()
+        cli._agent_running = False
+        assert cli._should_handle_interrupt_then_dispatch_inline("/stop") is False
+
+        cli._agent_running = True
+        assert cli._should_handle_interrupt_then_dispatch_inline("/stop", has_images=True) is False
+
+    def test_handler_interrupts_before_dispatching_the_command(self):
+        """The UI branch must cancel now instead of queueing the command."""
+        cli_path = Path(__file__).resolve().parents[2] / "cli.py"
+        tree = ast.parse(cli_path.read_text(encoding="utf-8"))
+        handle_enter = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "handle_enter"
+        )
+        branch = next(
+            node
+            for node in ast.walk(handle_enter)
+            if isinstance(node, ast.If)
+            and any(
+                isinstance(child, ast.Call)
+                and isinstance(child.func, ast.Attribute)
+                and child.func.attr == "_should_handle_interrupt_then_dispatch_inline"
+                for child in ast.walk(node.test)
+            )
+        )
+        calls = [
+            child
+            for child in ast.walk(branch)
+            if isinstance(child, ast.Call)
+            and (
+                (isinstance(child.func, ast.Name) and child.func.id == "request_hard_interrupt")
+                or (
+                    isinstance(child.func, ast.Attribute)
+                    and child.func.attr == "process_command"
+                )
+            )
+        ]
+
+        interrupt = next(
+            call
+            for call in calls
+            if isinstance(call.func, ast.Name) and call.func.id == "request_hard_interrupt"
+        )
+        dispatch = next(
+            call
+            for call in calls
+            if isinstance(call.func, ast.Attribute) and call.func.attr == "process_command"
+        )
+        assert interrupt.lineno < dispatch.lineno
 
 
 class TestSteerBusyPathDispatch:
