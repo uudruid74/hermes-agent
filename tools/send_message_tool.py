@@ -488,9 +488,16 @@ def _handle_send(args):
                 return json.dumps(_resolve_err)
             chat_id = _resolved
 
-    # When internal=True (-u/--user flag), inject a synthetic user message
-    # through the live gateway adapter instead of delivering to the platform.
-    # This simulates a real user→agent message with full user identity.
+    # ========================================================================
+    # EVAN-LOCKED: `hermes send -u` IS A USER -> AGENT INJECTION PATH.
+    #
+    # DO NOT CHANGE THIS TO PLATFORM DELIVERY. DO NOT FALL THROUGH TO
+    # `_send_to_platform`. DO NOT REMOVE THE BRIDGE SOCKET FALLBACK. The CLI
+    # runs in a separate process, so its local gateway runner is absent; the
+    # bridge is what preserves a real inbound user message in the target
+    # gateway. Evan has explicitly prohibited modifying this behavior without
+    # his prior approval. See kanban task t_9550c744.
+    # ========================================================================
     if args.get("internal"):
         from gateway.session import SessionSource
         from gateway.platforms.base import MessageEvent, MessageType
@@ -500,6 +507,12 @@ def _handle_send(args):
         user_id = get_session_env("HERMES_SESSION_USER_ID", "") or "cli"
         platform_user_id = get_session_env("HERMES_SESSION_TELEGRAM_ID", "") or user_id
         sender_name = get_session_env("HERMES_SESSION_USER_NAME", "") or "CLI User"
+
+        user_context = {
+            "user_id": user_id,
+            "platform_user_id": platform_user_id,
+            "sender_name": sender_name,
+        }
 
         # Try to get the live gateway adapter and deliver through handle_message.
         runner = None
@@ -511,10 +524,17 @@ def _handle_send(args):
         adapter = runner.adapters.get(platform) if runner is not None else None
 
         if adapter is not None:
+            get_chat_type = getattr(adapter, "get_chat_type", None)
+            chat_type = get_chat_type(chat_id) if callable(get_chat_type) else None
+            if not chat_type:
+                home = config.get_home_channel(platform)
+                chat_type = getattr(home, "chat_type", None) or "group"
+            chat_type = str(chat_type)
+            user_context["chat_type"] = chat_type
             source = SessionSource(
                 platform=platform,
                 chat_id=chat_id,
-                chat_type="dm",
+                chat_type=chat_type,
                 user_id=platform_user_id,
                 user_name=sender_name,
                 thread_id=thread_id,
@@ -537,9 +557,18 @@ def _handle_send(args):
             except Exception as e:
                 return json.dumps(_error(f"Wake event delivery failed: {e}"))
 
-        # No live adapter — the message cannot be injected without a running
-        # gateway. Fall through to platform delivery (preserves existing
-        # behaviour for cron/standalone callers).
+        home = config.get_home_channel(platform)
+        user_context["chat_type"] = str(getattr(home, "chat_type", None) or "group")
+        bridge_result = _ra(
+            _send_via_bridge(
+                platform,
+                chat_id,
+                cleaned_message,
+                thread_id=thread_id,
+                user_context=user_context,
+            )
+        )
+        return json.dumps(bridge_result)
 
     try:
         from model_tools import _run_async
@@ -838,6 +867,59 @@ async def _send_via_adapter(
             f"register a standalone_sender_fn on its PlatformEntry."
         )
     }
+
+
+BRIDGE_SOCKET = "/tmp/hermes/mcp_bridge.sock"
+
+
+async def _send_via_bridge(platform, chat_id, text, *, thread_id=None, user_context=None):
+    """Inject a message through the running gateway's bridge socket."""
+    import socket as _socket
+
+    platform_name = platform.value if hasattr(platform, "value") else str(platform)
+    payload = {
+        "action": "inject",
+        "platform": platform_name,
+        "chat_id": chat_id,
+        "text": text,
+    }
+    if thread_id is not None:
+        payload["thread_id"] = thread_id
+    if user_context:
+        payload["user_context"] = user_context
+        chat_type = user_context.get("chat_type")
+        if chat_type:
+            payload["chat_type"] = chat_type
+
+    try:
+        with _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM) as sock:
+            sock.settimeout(5.0)
+            sock.connect(BRIDGE_SOCKET)
+            sock.sendall((json.dumps(payload) + "\n").encode("utf-8"))
+            data = b""
+            while b"\n" not in data:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+    except _socket.timeout:
+        return {"error": "Bridge socket timed out — gateway may not be running"}
+    except FileNotFoundError:
+        return {"error": f"Bridge socket not found at {BRIDGE_SOCKET} — gateway may not be running"}
+    except ConnectionRefusedError:
+        return {"error": f"Bridge socket connection refused at {BRIDGE_SOCKET} — gateway may not be running"}
+    except OSError as exc:
+        return {"error": f"Bridge send failed: {exc}"}
+
+    if not data:
+        return {"error": "Bridge returned empty response"}
+    try:
+        response = json.loads(data.decode("utf-8"))
+    except json.JSONDecodeError:
+        return {"error": f"Bridge returned invalid JSON: {data[:200]!r}"}
+    if response.get("ok"):
+        return {"success": True, "queued": True}
+    return {"error": f"Bridge inject failed: {response.get('error', 'unknown')}"}
 
 
 async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False):

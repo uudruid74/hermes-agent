@@ -387,8 +387,14 @@ def cmd_send(args: argparse.Namespace) -> None:
     # appropriate platform adapter (bot-token path for Telegram/Discord/Slack/
     # Signal/SMS/WhatsApp; live-adapter path for plugin platforms).
     #
-    # When -u/--user is set, deliver as an agent wake event (internal=True)
-    # to the specified origin channel instead of a platform message.
+    # ========================================================================
+    # EVAN-LOCKED: `hermes send -u` MUST CREATE AN INBOUND USER TURN.
+    #
+    # It is NOT an outbound send. It must retain the user's identity and route
+    # through the gateway bridge when this CLI process has no local adapter.
+    # Do not alter this path, add a platform-delivery fallback, or reinterpret
+    # `internal=True` without Evan's explicit prior approval. See t_9550c744.
+    # ========================================================================
     tool_args: dict = {
         "action": "send",
         "message": message,
