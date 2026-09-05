@@ -68,8 +68,8 @@ _HERMES_CORE_TOOLS = [
     "clarify",
     # Code execution + delegation
     "execute_code", "delegate_task",
-    # Session metadata
-    "set_session",
+    # Session metadata + agent-to-agent messaging
+    "set_session", "tell",
     # Mandatory Action Protocol — plan tool
     "plan_tool",
     # Cronjob management
@@ -268,8 +268,8 @@ TOOLSETS = {
     },
 
     "session": {
-        "description": "Set session metadata — temperature, subject, facts, ego (mood)",
-        "tools": ["set_session"],
+        "description": "Session metadata and agent-to-agent messaging",
+        "tools": ["set_session", "tell"],
         "includes": []
     },
 
