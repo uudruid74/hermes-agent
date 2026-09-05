@@ -134,7 +134,35 @@ def test_kanban_gateway_origin_keeps_platform_subprocess_path(monkeypatch):
 
     kanban._notify_kanban_status_change("t_gateway", "done", title="Gateway task")
 
-    assert calls[0][0][:4] == ["hermes", "send", "-t", "telegram:123"]
-    assert calls[0][1]["env"]["HERMES_PROFILE"] == "gopher"
-    assert calls[1][0][:4] == ["hermes", "send", "-u", "telegram:123"]
-    assert calls[1][1]["env"]["HERMES_PROFILE"] == "default"
+    assert calls[0][0] == ["/home/ekl/bin/bugtool", "check"]
+    assert calls[0][1]["timeout"] == 5
+    assert calls[1][0][:4] == ["hermes", "send", "-t", "telegram:123"]
+    assert calls[1][1]["env"]["HERMES_PROFILE"] == "gopher"
+    assert calls[2][0][:4] == ["hermes", "send", "-u", "telegram:123"]
+    assert calls[2][1]["env"]["HERMES_PROFILE"] == "default"
+
+
+def test_kanban_cli_notification_ignores_bugtool_oserror(monkeypatch):
+    class FakeConnection:
+        def close(self):
+            pass
+
+    calls = []
+
+    def run(args, **kwargs):
+        if args == ["/home/ekl/bin/bugtool", "check"]:
+            raise OSError("bugtool unavailable")
+        calls.append((args, kwargs))
+
+    monkeypatch.setattr(kanban.kb, "connect", lambda: FakeConnection())
+    monkeypatch.setattr(
+        kanban.kb,
+        "get_origin_routing",
+        lambda *_args: {"platform": "telegram", "chat_id": "123", "chat_type": "dm"},
+    )
+    monkeypatch.setattr(kanban.kb, "get_task", lambda *_args: None)
+    monkeypatch.setattr("subprocess.run", run)
+
+    kanban._notify_kanban_status_change("t_gateway", "done", title="Gateway task")
+
+    assert [call[0][2] for call in calls] == ["-t", "-u"]
