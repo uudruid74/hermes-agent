@@ -39,6 +39,12 @@ No polling. No "hey are you done?" No asking — telling.
 
 **Everything is a wake event.** There is no separate "continuation feed" path — kanban updates, cron returns, all arrive as if the user typed them. The agent always has full context.
 
+### 🗣️ Agent-to-Agent `tell`
+
+Agents wake each other directly. `tell(agent, message)` wraps the message, injects it into the target profile's Telegram DM session via `hermes send -u`, and signs it with the sender's profile name. No group chat, no relay board, no human in the middle — Zephyr pings Gopher, Gopher pings back.
+
+The wrapper's reply instruction is **conditional by design**: *"If a reply is required, use the 'tell' command to reply."* The first version mandated a reply unconditionally, and the first round-trip test (2026-09-05) turned into an infinite politeness loop — two agents acking each other into eternity. Now the loop closes itself.
+
 ### 🔌 Session & Plan APIs
 
 The fork introduces two new internal APIs that turn Hermes from a chat loop into a stateful execution environment:
@@ -120,8 +126,8 @@ Six stores, each with a different access cost. The system prompt (`Memory OS`) r
 
 ```
 Location: ~/.hermes/hermes-agent/
-Remote:   https://github.com/uudruid74/hermes-agent.git (remote: gopher)
-Upstream: https://github.com/NousResearch/hermes-agent.git (remote: origin)
+Remote:   https://github.com/uudruid74/hermes-agent.git (remote: origin)
+Upstream: https://github.com/NousResearch/hermes-agent.git (remote: upstream)
 Board:    hermes-fork (hermes kanban boards switch hermes-fork)
 Wiki:     vault/wiki/entities/hermes-agent-fork/
 ```
