@@ -34,7 +34,7 @@ def test_tell_wraps_message_and_targets_agent_profile(monkeypatch):
                 "---\n"
                 "Check the relay.\n"
                 "---\n"
-                "Reply with the tell command.",
+                "If a reply is required, use the 'tell' command to reply.",
             ],
             {"capture_output": True, "text": True, "timeout": 15},
         )

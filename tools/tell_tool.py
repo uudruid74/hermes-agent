@@ -18,7 +18,7 @@ def tell_tool(agent: str, message: str) -> str:
         "---\n"
         f"{message}\n"
         "---\n"
-        "Reply with the tell command."
+        "If a reply is required, use the 'tell' command to reply."
     )
     result = subprocess.run(
         ["hermes", "send", "-u", target, wrapped],
@@ -39,7 +39,7 @@ TELL_SCHEMA = {
     "name": "tell",
     "description": (
         "Send a wrapped message to another Hermes agent profile and wake its Telegram DM "
-        "session. The receiver is instructed to reply with tell."
+        "session. The receiver is told to reply with tell if a reply is required."
     ),
     "parameters": {
         "type": "object",
