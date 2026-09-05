@@ -1,5 +1,6 @@
 """
-MCP bridge server — gateway-side handler for /tmp/hermes/mcp_bridge.sock.
+MCP bridge server — gateway-side handler for the profile-scoped
+``/tmp/hermes/mcp_bridge.<profile>.sock`` endpoint.
 
 The MCP server (gimp_mcp_server.py) runs as a gateway subprocess.  This
 bridge lets it call adapter.watch() / adapter.write_watched() /
@@ -28,7 +29,24 @@ import socket as _socket
 
 logger = logging.getLogger(__name__)
 
-BRIDGE_SOCKET = "/tmp/hermes/mcp_bridge.sock"
+
+def bridge_socket_path(hermes_home=None) -> str:
+    """Return the Unix socket path dedicated to one Hermes profile.
+
+    A host may run several profile gateways simultaneously. Deriving the
+    socket name from the canonical Hermes home keeps a CLI subprocess talking
+    to its own profile's gateway instead of whichever gateway last rebound the
+    former global socket path.
+    """
+    if hermes_home is None:
+        from hermes_constants import get_hermes_home
+
+        hermes_home = get_hermes_home()
+    profile_name = os.path.basename(os.path.normpath(os.fspath(hermes_home)))
+    return os.path.join("/tmp/hermes", f"mcp_bridge.{profile_name}.sock")
+
+
+BRIDGE_SOCKET = bridge_socket_path()
 
 # Map of session_id -> watch handle.
 _session_handles: dict[str, str] = {}

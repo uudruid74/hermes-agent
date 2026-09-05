@@ -14,6 +14,7 @@ import time
 
 from agent.redact import redact_sensitive_text
 from agent.secret_scope import get_secret
+from gateway.mcp_bridge import bridge_socket_path
 
 logger = logging.getLogger(__name__)
 
@@ -882,7 +883,7 @@ async def _send_via_adapter(
     }
 
 
-BRIDGE_SOCKET = "/tmp/hermes/mcp_bridge.sock"
+BRIDGE_SOCKET = bridge_socket_path()
 
 
 async def _send_via_bridge(platform, chat_id, text, *, thread_id=None, user_context=None):
