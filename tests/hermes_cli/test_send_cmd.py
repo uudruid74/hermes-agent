@@ -176,6 +176,71 @@ def test_list_json_includes_configured_platform(monkeypatch, capsys):
     assert payload["platforms"]["telegram"]  # discovered entries preserved
 
 
+def test_list_shows_profile_session_key_routable_target_and_bridge(
+    monkeypatch, capsys
+):
+    import sys
+    import types
+
+    fake_dir = types.ModuleType("gateway.channel_directory")
+    fake_dir.load_directory = lambda: {
+        "updated_at": None,
+        "platforms": {"telegram": [{"id": "123", "name": "Evan (dm)"}]},
+    }
+    fake_dir.format_directory_for_display = lambda platforms=None: "telegram:Evan (dm)"
+    monkeypatch.setitem(sys.modules, "gateway.channel_directory", fake_dir)
+    monkeypatch.setattr(
+        send_cmd,
+        "_list_profile_sessions",
+        lambda: [{
+            "profile": "zephyr",
+            "session_key": "agent:main:telegram:dm:123",
+            "target": "zephyr:telegram:123",
+            "display_name": "Evan",
+            "bridge_socket": "/tmp/hermes/mcp_bridge.zephyr.sock",
+            "platform": "telegram",
+        }],
+        raising=False,
+    )
+
+    rc = send_cmd._list_targets(None, json_mode=False)
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "zephyr:telegram:123" in out
+    assert "agent:main:telegram:dm:123" in out
+    assert "profile: zephyr" in out
+    assert "/tmp/hermes/mcp_bridge.zephyr.sock" in out
+
+
+def test_profile_qualified_user_target_selects_profile_before_send(
+    fake_tool, monkeypatch
+):
+    import hermes_cli.profiles
+
+    profile_home = "/home/user/.hermes/profiles/zephyr"
+    monkeypatch.setattr(send_cmd, "_load_hermes_env", lambda: None)
+    monkeypatch.setattr(hermes_cli.profiles, "profile_exists", lambda name: name == "zephyr")
+    monkeypatch.setattr(hermes_cli.profiles, "get_profile_dir", lambda _name: profile_home)
+    monkeypatch.setenv("HERMES_HOME", "/home/user/.hermes/profiles/neo")
+    monkeypatch.setenv("HERMES_PROFILE", "neo")
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+
+    args = _parse(["-u", "zephyr:telegram:123", "wake"])
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(args)
+
+    assert exc.value.code == 0
+    assert fake_tool.calls == [{
+        "action": "send",
+        "message": "wake",
+        "target": "telegram:123",
+        "internal": True,
+    }]
+    assert __import__("os").environ["HERMES_HOME"] == profile_home
+    assert __import__("os").environ["HERMES_PROFILE"] == "zephyr"
+
+
 # ---------------------------------------------------------------------------
 # Parser registration contract
 # ---------------------------------------------------------------------------

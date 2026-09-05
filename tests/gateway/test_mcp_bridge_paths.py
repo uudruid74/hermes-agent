@@ -12,3 +12,9 @@ def test_bridge_socket_path_is_scoped_to_profile_home():
     assert gopher == "/tmp/hermes/mcp_bridge.gopher.sock"
     assert neo == "/tmp/hermes/mcp_bridge.neo.sock"
     assert gopher != neo
+
+
+def test_bridge_socket_path_names_overridden_root_home_as_default_profile(monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", "/home/user/.hermes")
+
+    assert bridge_socket_path() == "/tmp/hermes/mcp_bridge.default.sock"

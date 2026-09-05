@@ -1287,17 +1287,19 @@ def _load_gateway_profile_env(env: dict) -> None:
         pass
 
 
-def _load_user_profile_env(env: dict) -> None:
-    """Load Evan's default-profile Buzz identity into *env* for ``send -u``."""
+def _load_user_profile_env(env: dict, profile: Optional[str]) -> None:
+    """Select the origin profile for ``send -u`` without changing legacy envs."""
+    if not profile:
+        return
     try:
         from hermes_cli.profiles import get_profile_dir
 
-        user_home = get_profile_dir("default")
-    except ImportError:
+        user_home = get_profile_dir(profile)
+    except (ImportError, ValueError):
         return
     env_path = user_home / ".env"
     env["HERMES_HOME"] = str(user_home)
-    env["HERMES_PROFILE"] = "default"
+    env["HERMES_PROFILE"] = profile
     if not env_path.exists():
         return
     try:
@@ -1415,8 +1417,9 @@ def _notify_kanban_status_change(
         pass
 
     try:
-        user_env = notify_env.copy()
-        _load_user_profile_env(user_env)
+        user_env = os.environ.copy()
+        user_env["HERMES_NOTIFY_CHAT_TYPE"] = chat_type
+        _load_user_profile_env(user_env, origin.get("profile"))
         subprocess.run(
             ["hermes", "send", "-u", target, json_payload],
             capture_output=True, timeout=10, env=user_env,
@@ -1762,6 +1765,7 @@ def _store_cli_origin_routing(conn, task_id: str, channel_flag: str) -> None:
             platform=platform, chat_id=chat_id,
             thread_id=thread_id or "",
             chat_type=chat_type or "",
+            profile=os.environ.get("HERMES_PROFILE", ""),
         )
     except Exception as exc:
         print(f"kanban: failed to store origin routing: {exc}", file=sys.stderr)
@@ -1833,6 +1837,10 @@ def _cmd_create(args: argparse.Namespace) -> int:
                         platform=_platform, chat_id=_chat_id,
                         thread_id=_thread_id or "",
                         chat_type=_chat_type or "",
+                        profile=(
+                            os.environ.get("HERMES_SESSION_PROFILE", "").strip()
+                            or os.environ.get("HERMES_PROFILE", "").strip()
+                        ),
                     )
                 except Exception as exc:
                     print(f"kanban: failed to store origin routing from env: {exc}", file=sys.stderr)

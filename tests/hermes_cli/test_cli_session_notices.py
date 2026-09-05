@@ -114,7 +114,12 @@ def test_kanban_gateway_origin_keeps_platform_subprocess_path(monkeypatch):
     monkeypatch.setattr(
         kanban.kb,
         "get_origin_routing",
-        lambda *_args: {"platform": "telegram", "chat_id": "123", "chat_type": "dm"},
+        lambda *_args: {
+            "platform": "telegram",
+            "chat_id": "123",
+            "chat_type": "dm",
+            "profile": "zephyr",
+        },
     )
     monkeypatch.setattr(kanban.kb, "get_task", lambda *_args: None)
     monkeypatch.setattr(
@@ -125,7 +130,10 @@ def test_kanban_gateway_origin_keeps_platform_subprocess_path(monkeypatch):
     monkeypatch.setattr(
         kanban,
         "_load_user_profile_env",
-        lambda env: env.update({"HERMES_HOME": "evan-home", "HERMES_PROFILE": "default"}),
+        lambda env, profile: env.update({
+            "HERMES_HOME": f"{profile}-home",
+            "HERMES_PROFILE": profile,
+        }),
     )
     monkeypatch.setattr(
         "subprocess.run",
@@ -139,7 +147,7 @@ def test_kanban_gateway_origin_keeps_platform_subprocess_path(monkeypatch):
     assert calls[1][0][:4] == ["hermes", "send", "-t", "telegram:123"]
     assert calls[1][1]["env"]["HERMES_PROFILE"] == "gopher"
     assert calls[2][0][:4] == ["hermes", "send", "-u", "telegram:123"]
-    assert calls[2][1]["env"]["HERMES_PROFILE"] == "default"
+    assert calls[2][1]["env"]["HERMES_PROFILE"] == "zephyr"
 
 
 def test_kanban_cli_notification_ignores_bugtool_oserror(monkeypatch):

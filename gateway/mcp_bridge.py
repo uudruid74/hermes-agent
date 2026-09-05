@@ -43,6 +43,8 @@ def bridge_socket_path(hermes_home=None) -> str:
 
         hermes_home = get_hermes_home()
     profile_name = os.path.basename(os.path.normpath(os.fspath(hermes_home)))
+    if profile_name == ".hermes":
+        profile_name = "default"
     return os.path.join("/tmp/hermes", f"mcp_bridge.{profile_name}.sock")
 
 

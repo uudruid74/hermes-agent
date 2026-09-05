@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Optional
@@ -94,6 +95,78 @@ def _resolve_target(arg_to: Optional[str]) -> Optional[str]:
     return None
 
 
+def _select_user_target_profile(user_target: str) -> str:
+    """Select a profile-qualified wake target and return its platform target."""
+    profile, separator, target = user_target.partition(":")
+    if not separator or not target:
+        return user_target
+
+    from hermes_cli.profiles import get_profile_dir, profile_exists
+
+    try:
+        if not profile_exists(profile):
+            return user_target
+        profile_home = get_profile_dir(profile)
+    except ValueError:
+        return user_target
+
+    os.environ["HERMES_HOME"] = str(profile_home)
+    os.environ["HERMES_PROFILE"] = profile
+    return target
+
+
+def _list_profile_sessions() -> list[dict]:
+    """Return active gateway sessions across profiles as routable wake targets."""
+    from hermes_cli.profiles import list_profiles
+    from hermes_state import SessionDB
+
+    targets = []
+    for profile in list_profiles():
+        db_path = profile.path / "state.db"
+        if not db_path.exists():
+            continue
+
+        session_db = SessionDB(db_path=db_path)
+        try:
+            rows = session_db.list_gateway_sessions(active_only=True)
+        finally:
+            session_db.close()
+
+        for row in rows:
+            origin = {}
+            origin_json = row.get("origin_json")
+            if origin_json:
+                try:
+                    parsed = json.loads(origin_json)
+                except (TypeError, ValueError):
+                    parsed = None
+                if isinstance(parsed, dict):
+                    origin = parsed
+
+            platform = str(origin.get("platform") or row.get("source") or "").lower()
+            chat_id = origin.get("chat_id") or row.get("chat_id")
+            if not platform or chat_id in (None, ""):
+                continue
+            thread_id = origin.get("thread_id") or row.get("thread_id")
+            target = f"{profile.name}:{platform}:{chat_id}"
+            if thread_id:
+                target = f"{target}:{thread_id}"
+            targets.append({
+                "profile": profile.name,
+                "session_key": row.get("session_key") or "",
+                "target": target,
+                "display_name": (
+                    row.get("display_name")
+                    or origin.get("chat_name")
+                    or origin.get("user_name")
+                    or str(chat_id)
+                ),
+                "bridge_socket": f"/tmp/hermes/mcp_bridge.{profile.name}.sock",
+                "platform": platform,
+            })
+    return targets
+
+
 def _emit_result(
     result_json: str,
     *,
@@ -140,13 +213,7 @@ def _emit_result(
 
 
 def _list_targets(platform_filter: Optional[str], *, json_mode: bool) -> int:
-    """Print the channel directory (all configured targets across platforms).
-
-    Uses ``load_directory()`` for structured JSON output and
-    ``format_directory_for_display()`` for the human-readable rendering that
-    the send_message tool itself shows to the model — keeps the two surfaces
-    identical.
-    """
+    """Print channel targets plus profile-qualified active agent sessions."""
     try:
         from gateway.channel_directory import (
             format_directory_for_display,
@@ -158,51 +225,72 @@ def _list_targets(platform_filter: Optional[str], *, json_mode: bool) -> int:
 
     try:
         raw = load_directory()
+        sessions = _list_profile_sessions()
+        from gateway.config import load_gateway_config
+
+        gateway_config = load_gateway_config()
     except Exception as exc:
-        print(f"hermes send: failed to read channel directory: {exc}", file=sys.stderr)
+        print(f"hermes send: failed to read targets: {exc}", file=sys.stderr)
         return _FAILURE_EXIT
 
     platforms = dict(raw.get("platforms") or {})
+    for configured_platform in gateway_config.get_connected_platforms():
+        platform_name = configured_platform.value
+        if platform_name not in {"local", "api_server", "webhook"}:
+            platforms.setdefault(platform_name, [])
+    all_platforms = set(platforms)
+    all_platforms.update(session["platform"] for session in sessions)
 
     if platform_filter:
         key = platform_filter.strip().lower()
-        filtered = {k: v for k, v in platforms.items() if k.lower() == key}
-        if not filtered:
+        platforms = {k: v for k, v in platforms.items() if k.lower() == key}
+        sessions = [session for session in sessions if session["platform"] == key]
+        if not platforms and not sessions:
             print(
                 f"hermes send: no targets found for platform '{platform_filter}'. "
-                f"Configured: {', '.join(sorted(platforms)) or '(none)'}",
+                f"Configured: {', '.join(sorted(all_platforms)) or '(none)'}",
                 file=sys.stderr,
             )
             return _FAILURE_EXIT
-        platforms = filtered
 
     if json_mode:
-        print(json.dumps({"platforms": platforms}, indent=2, default=str))
+        print(json.dumps(
+            {"platforms": platforms, "sessions": sessions},
+            indent=2,
+            default=str,
+        ))
         return _SUCESS_EXIT
 
-    if not any(platforms.values()):
+    if not platforms and not sessions:
         print("No messaging platforms configured or no channels discovered yet.")
         print("Set one up with `hermes gateway setup`, or run the gateway once so")
         print("channel discovery can populate ~/.hermes/channel_directory.json.")
         return _SUCESS_EXIT
 
-    # Human display — when unfiltered, reuse the shared formatter the agent
-    # already sees. When filtered, build a minimal view ourselves.
     if platform_filter is None:
-        print(format_directory_for_display())
-        return _SUCESS_EXIT
+        channel_display = format_directory_for_display(platforms)
+        if channel_display:
+            print(channel_display)
+    else:
+        for plat_name in sorted(platforms):
+            channels = platforms[plat_name]
+            print(f"{plat_name}:")
+            if not channels:
+                print("  (no channels discovered yet)")
+                continue
+            for ch in channels:
+                target_id = ch.get("id", "?")
+                name = ch.get("name", "?")
+                print(f"  {plat_name}:{target_id} — {name}")
+            print()
 
-    for plat_name in sorted(platforms):
-        channels = platforms[plat_name]
-        print(f"{plat_name}:")
-        if not channels:
-            print("  (no channels discovered yet)")
-            continue
-        for ch in channels:
-            target_id = ch.get("id", "?")
-            name = ch.get("name", "?")
-            print(f"  {plat_name}:{target_id} — {name}")
-        print()
+    if sessions:
+        print("Agent sessions (-u):")
+        for session in sessions:
+            print(f"  {session['target']} — {session['display_name']}")
+            print(f"    session: {session['session_key']}")
+            print(f"    profile: {session['profile']}")
+            print(f"    bridge: {session['bridge_socket']}")
 
     return _SUCESS_EXIT
 
@@ -308,6 +396,11 @@ def _load_hermes_env() -> None:
 def cmd_send(args: argparse.Namespace) -> None:
     """Entry point wired into the top-level argparse dispatcher."""
 
+    target = _resolve_target(getattr(args, "to", None))
+    user_flag = _resolve_target(getattr(args, "user", None))
+    if user_flag:
+        user_flag = _select_user_target_profile(user_flag)
+
     # Bridge ~/.hermes/.env and ~/.hermes/config.yaml into os.environ so the
     # gateway config loader (invoked downstream by send_message_tool and by
     # the channel directory) can see platform credentials and home channels.
@@ -321,8 +414,6 @@ def cmd_send(args: argparse.Namespace) -> None:
         exit_code = _list_targets(platform_filter, json_mode=getattr(args, "json", False))
         sys.exit(exit_code)
 
-    target = _resolve_target(getattr(args, "to", None))
-    user_flag = _resolve_target(getattr(args, "user", None))
     if not target and not user_flag:
         print(
             "hermes send: -t/--to PLATFORM[:channel[:thread]] or "
@@ -473,8 +564,9 @@ def register_send_subparser(subparsers) -> argparse.ArgumentParser:
         help=(
             "Simulate user→agent message (routes through handle_message with "
             "full user identity). Format: "
-            "'platform' (home channel), 'platform:chat_id', or "
-            "'platform:chat_id:thread_id'. Use 'cli:session_id' to queue an "
+            "'profile:platform:chat_id', 'platform' (home channel), "
+            "'platform:chat_id', or 'platform:chat_id:thread_id'. Use "
+            "'cli:session_id' to queue an "
             "out-of-band notice for a live CLI session. Examples: -u telegram, "
             "-u telegram:-1001234567890:17585, -u cli:session_id."
         ),

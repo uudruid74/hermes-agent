@@ -29,6 +29,27 @@ def kanban_home(tmp_path, monkeypatch):
     return home
 
 
+def test_origin_routing_persists_profile(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="wake target", assignee="neo")
+        kb.store_origin_routing(
+            conn,
+            task_id,
+            platform="telegram",
+            chat_id="123",
+            chat_type="dm",
+            profile="zephyr",
+        )
+
+        assert kb.get_origin_routing(conn, task_id) == {
+            "platform": "telegram",
+            "chat_id": "123",
+            "thread_id": "",
+            "chat_type": "dm",
+            "profile": "zephyr",
+        }
+
+
 def _init_git_repo(repo: Path) -> None:
     repo.mkdir(parents=True, exist_ok=True)
     subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True, text=True)

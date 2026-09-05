@@ -883,12 +883,11 @@ async def _send_via_adapter(
     }
 
 
-BRIDGE_SOCKET = bridge_socket_path()
-
-
 async def _send_via_bridge(platform, chat_id, text, *, thread_id=None, user_context=None):
     """Inject a message through the running gateway's bridge socket."""
     import socket as _socket
+
+    bridge_socket = bridge_socket_path()
 
     platform_name = platform.value if hasattr(platform, "value") else str(platform)
     payload = {
@@ -908,7 +907,7 @@ async def _send_via_bridge(platform, chat_id, text, *, thread_id=None, user_cont
     try:
         with _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM) as sock:
             sock.settimeout(5.0)
-            sock.connect(BRIDGE_SOCKET)
+            sock.connect(bridge_socket)
             sock.sendall((json.dumps(payload) + "\n").encode("utf-8"))
             data = b""
             while b"\n" not in data:
@@ -919,9 +918,9 @@ async def _send_via_bridge(platform, chat_id, text, *, thread_id=None, user_cont
     except _socket.timeout:
         return {"error": "Bridge socket timed out — gateway may not be running"}
     except FileNotFoundError:
-        return {"error": f"Bridge socket not found at {BRIDGE_SOCKET} — gateway may not be running"}
+        return {"error": f"Bridge socket not found at {bridge_socket} — gateway may not be running"}
     except ConnectionRefusedError:
-        return {"error": f"Bridge socket connection refused at {BRIDGE_SOCKET} — gateway may not be running"}
+        return {"error": f"Bridge socket connection refused at {bridge_socket} — gateway may not be running"}
     except OSError as exc:
         return {"error": f"Bridge send failed: {exc}"}
 

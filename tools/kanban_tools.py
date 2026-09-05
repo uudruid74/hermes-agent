@@ -209,17 +209,19 @@ def _load_gateway_profile_env(env: dict) -> None:
         pass
 
 
-def _load_user_profile_env(env: dict) -> None:
-    """Load Evan's default-profile Buzz identity into *env* for ``send -u``."""
+def _load_user_profile_env(env: dict, profile: Optional[str]) -> None:
+    """Select the origin profile for ``send -u`` without changing legacy envs."""
+    if not profile:
+        return
     try:
         from hermes_cli.profiles import get_profile_dir
 
-        user_home = get_profile_dir("default")
-    except ImportError:
+        user_home = get_profile_dir(profile)
+    except (ImportError, ValueError):
         return
     env_path = user_home / ".env"
     env["HERMES_HOME"] = str(user_home)
-    env["HERMES_PROFILE"] = "default"
+    env["HERMES_PROFILE"] = profile
     if not env_path.exists():
         return
     try:
@@ -309,8 +311,9 @@ def _notify_kanban_event(tid: str, status: str, summary: Optional[str], task) ->
             ["hermes", "send", "-t", target, human_msg],
             capture_output=True, timeout=10, env=notify_env,
         )
-        user_env = notify_env.copy()
-        _load_user_profile_env(user_env)
+        user_env = os.environ.copy()
+        user_env["HERMES_NOTIFY_CHAT_TYPE"] = chat_type
+        _load_user_profile_env(user_env, origin.get("profile"))
         subprocess.run(
             ["hermes", "send", "-u", target, json_payload],
             capture_output=True, timeout=10, env=user_env,
@@ -1628,6 +1631,7 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
             platform=platform, chat_id=chat_id,
             thread_id=thread_id or "",
             chat_type=chat_type or "",
+            profile=notifier_profile or "",
         )
         return True
     except Exception as _exc:
