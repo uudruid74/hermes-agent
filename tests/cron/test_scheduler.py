@@ -286,6 +286,38 @@ class TestDeliverResultWrapping:
         assert "To stop or manage this job" in sent_content
 
 
+    def test_explicit_telegram_target_is_sent_not_replaced_by_origin(self):
+        """An explicit cron destination takes precedence over the job origin."""
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        send_mock = AsyncMock(return_value={"success": True})
+        job = {
+            "id": "explicit-target",
+            "deliver": "telegram:8900123006",
+            "origin": {
+                "platform": "telegram",
+                "chat_id": "-1004406953125",
+                "thread_id": "4",
+            },
+        }
+
+        with (
+            patch("gateway.config.load_gateway_config", return_value=mock_cfg),
+            patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}),
+            patch("tools.send_message_tool._send_to_platform", new=send_mock),
+        ):
+            assert _deliver_result(job, "targeted delivery") is None
+
+        send_mock.assert_awaited_once()
+        send_call = send_mock.await_args
+        assert send_call is not None
+        assert send_call.args[2] == "8900123006"
+
+
     def test_relay_fronted_home_uses_relay_config_and_live_adapter(self, monkeypatch, tmp_path):
         """Persisted Slack home survives restart without native Slack config."""
         from concurrent.futures import Future

@@ -28,7 +28,7 @@ def _run_async_immediately(coro):
     return asyncio.run(coro)
 
 
-def test_internal_send_uses_bridge_and_never_platform_delivery_without_runner(monkeypatch):
+def test_internal_send_to_explicit_telegram_dm_uses_dm_chat_type(monkeypatch):
     telegram_cfg = SimpleNamespace(enabled=True, token="token", extra={}, home_channel=SimpleNamespace(chat_type="forum"))
     config = SimpleNamespace(
         platforms={Platform.TELEGRAM: telegram_cfg},
@@ -73,7 +73,7 @@ def test_internal_send_uses_bridge_and_never_platform_delivery_without_runner(mo
         "user_id": "operator-id",
         "platform_user_id": "telegram-user-id",
         "sender_name": "Operator",
-        "chat_type": "forum",
+        "chat_type": "dm",
     }
 
 

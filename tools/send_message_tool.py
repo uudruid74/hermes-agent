@@ -358,6 +358,23 @@ def _handle_react(args, remove=False):
     return json.dumps({"success": bool(result)})
 
 
+def _resolve_injected_chat_type(platform, chat_id, adapter, config) -> str:
+    """Resolve the session type for a synthetic user injection target."""
+    get_chat_type = getattr(adapter, "get_chat_type", None)
+    chat_type = get_chat_type(chat_id) if callable(get_chat_type) else None
+    if chat_type:
+        return str(chat_type)
+
+    if getattr(platform, "value", platform) == "telegram":
+        from gateway.delivery import looks_like_telegram_private_chat_id
+
+        if looks_like_telegram_private_chat_id(chat_id):
+            return "dm"
+
+    home = config.get_home_channel(platform)
+    return str(getattr(home, "chat_type", None) or "group")
+
+
 def _handle_send(args):
     """Send a message to a platform target."""
     target = args.get("target", "")
@@ -524,12 +541,7 @@ def _handle_send(args):
         adapter = runner.adapters.get(platform) if runner is not None else None
 
         if adapter is not None:
-            get_chat_type = getattr(adapter, "get_chat_type", None)
-            chat_type = get_chat_type(chat_id) if callable(get_chat_type) else None
-            if not chat_type:
-                home = config.get_home_channel(platform)
-                chat_type = getattr(home, "chat_type", None) or "group"
-            chat_type = str(chat_type)
+            chat_type = _resolve_injected_chat_type(platform, chat_id, adapter, config)
             user_context["chat_type"] = chat_type
             source = SessionSource(
                 platform=platform,
@@ -557,8 +569,9 @@ def _handle_send(args):
             except Exception as e:
                 return json.dumps(_error(f"Wake event delivery failed: {e}"))
 
-        home = config.get_home_channel(platform)
-        user_context["chat_type"] = str(getattr(home, "chat_type", None) or "group")
+        user_context["chat_type"] = _resolve_injected_chat_type(
+            platform, chat_id, None, config
+        )
         bridge_result = _ra(
             _send_via_bridge(
                 platform,
