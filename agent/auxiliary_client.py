@@ -7420,6 +7420,7 @@ def _resolve_task_provider_model(
                 "minimax-oauth",
                 "nous",
                 "openai-codex",
+                "openrouter",
                 "qwen-oauth",
                 "xai-oauth",
             }
