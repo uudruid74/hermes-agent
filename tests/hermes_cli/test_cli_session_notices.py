@@ -104,12 +104,105 @@ def test_kanban_cli_origin_queues_session_notice(tmp_path, monkeypatch):
     reopened.close()
 
 
-def test_kanban_gateway_origin_keeps_platform_subprocess_path(monkeypatch):
+def test_origin_profile_env_overrides_inherited_telegram_identity(
+    tmp_path, monkeypatch
+):
+    profile_home = tmp_path / "profiles" / "zephyr"
+    profile_home.mkdir(parents=True)
+    (profile_home / ".env").write_text(
+        "TELEGRAM_BOT_TOKEN=zephyr-token\n"
+        "TELEGRAM_HOME_CHANNEL=123\n"
+        "TELEGRAM_ALLOWED_USERS=456\n",
+        encoding="utf-8",
+    )
+    import hermes_cli.profiles
+
+    monkeypatch.setattr(
+        hermes_cli.profiles, "get_profile_dir", lambda _profile: profile_home
+    )
+    env = {
+        "HERMES_HOME": "/profiles/neo",
+        "HERMES_PROFILE": "neo",
+        "TELEGRAM_BOT_TOKEN": "neo-token",
+        "TELEGRAM_HOME_CHANNEL": "999",
+        "TELEGRAM_ALLOWED_USERS": "888",
+    }
+
+    kanban._load_user_profile_env(env, "zephyr")
+
+    assert env["HERMES_HOME"] == str(profile_home)
+    assert env["HERMES_PROFILE"] == "zephyr"
+    assert env["TELEGRAM_BOT_TOKEN"] == "zephyr-token"
+    assert env["TELEGRAM_HOME_CHANNEL"] == "123"
+    assert env["TELEGRAM_ALLOWED_USERS"] == "456"
+
+
+def test_kanban_wake_uses_origin_profile_bridge_and_identity(monkeypatch):
+    import gateway.mcp_bridge
+    import model_tools
+    import tools.send_message_tool
+
+    calls = []
+    monkeypatch.setattr(
+        gateway.mcp_bridge,
+        "bridge_socket_path",
+        lambda hermes_home=None: f"{hermes_home}/mcp.sock",
+    )
+
+    def send_via_bridge(platform, chat_id, payload, **kwargs):
+        calls.append((platform.value, chat_id, payload, kwargs))
+        return {"success": True, "queued": True}
+
+    monkeypatch.setattr(tools.send_message_tool, "_send_via_bridge", send_via_bridge)
+    monkeypatch.setattr(model_tools, "_run_async", lambda value: value)
+
+    adapter, result = kanban._send_kanban_wake(
+        target="telegram:123:456",
+        platform="telegram",
+        chat_id="123",
+        thread_id="456",
+        chat_type="forum",
+        payload='{"source":"kanban"}',
+        notify_env={
+            "HERMES_HOME": "/profiles/zephyr",
+            "HERMES_SESSION_USER_ID": "evan",
+            "HERMES_SESSION_TELEGRAM_ID": "789",
+            "HERMES_SESSION_USER_NAME": "Evan",
+        },
+    )
+
+    assert adapter == "mcp_bridge:/profiles/zephyr/mcp.sock"
+    assert result == {"success": True, "queued": True}
+    assert calls == [
+        (
+            "telegram",
+            "123",
+            '{"source":"kanban"}',
+            {
+                "thread_id": "456",
+                "user_context": {
+                    "user_id": "evan",
+                    "platform_user_id": "789",
+                    "sender_name": "Evan",
+                    "chat_type": "forum",
+                },
+                "bridge_path": "/profiles/zephyr/mcp.sock",
+            },
+        )
+    ]
+
+
+def test_kanban_gateway_origin_shares_profile_env_and_injects_wake(
+    monkeypatch, caplog
+):
     class FakeConnection:
         def close(self):
             pass
 
-    calls = []
+    subprocess_calls = []
+    wake_calls = []
+    loader_calls = []
+
     monkeypatch.setattr(kanban.kb, "connect", lambda: FakeConnection())
     monkeypatch.setattr(
         kanban.kb,
@@ -122,55 +215,115 @@ def test_kanban_gateway_origin_keeps_platform_subprocess_path(monkeypatch):
         },
     )
     monkeypatch.setattr(kanban.kb, "get_task", lambda *_args: None)
-    monkeypatch.setattr(
-        kanban,
-        "_load_gateway_profile_env",
-        lambda env: env.update({"HERMES_HOME": "gopher-home", "HERMES_PROFILE": "gopher"}),
-    )
-    monkeypatch.setattr(
-        kanban,
-        "_load_user_profile_env",
-        lambda env, profile: env.update({
+
+    def load_origin(env, profile):
+        loader_calls.append(profile)
+        env.update({
             "HERMES_HOME": f"{profile}-home",
             "HERMES_PROFILE": profile,
-        }),
-    )
+            "TELEGRAM_BOT_TOKEN": f"{profile}-token",
+        })
+
+    def send_wake(**kwargs):
+        wake_calls.append(kwargs)
+        return "mcp_bridge:/tmp/hermes/mcp_bridge.zephyr.sock", {
+            "success": True,
+            "queued": True,
+        }
+
+    monkeypatch.setattr(kanban, "_load_user_profile_env", load_origin)
+    monkeypatch.setattr(kanban, "_send_kanban_wake", send_wake)
     monkeypatch.setattr(
         "subprocess.run",
-        lambda args, **kwargs: calls.append((args, kwargs)),
+        lambda args, **kwargs: (
+            subprocess_calls.append((args, kwargs))
+            or SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+        ),
     )
+    caplog.set_level("INFO", logger="hermes_cli.kanban")
 
     kanban._notify_kanban_status_change("t_gateway", "done", title="Gateway task")
 
-    assert calls[0][0] == ["/home/ekl/bin/bugtool", "check"]
-    assert calls[0][1]["timeout"] == 5
-    assert calls[1][0][:4] == ["hermes", "send", "-t", "telegram:123"]
-    assert calls[1][1]["env"]["HERMES_PROFILE"] == "gopher"
-    assert calls[2][0][:4] == ["hermes", "send", "-u", "telegram:123"]
-    assert calls[2][1]["env"]["HERMES_PROFILE"] == "zephyr"
+    assert loader_calls == ["zephyr"]
+    assert len(subprocess_calls) == 1
+    assert subprocess_calls[0][0][:4] == [
+        "hermes", "send", "-t", "telegram:123"
+    ]
+    human_env = subprocess_calls[0][1]["env"]
+    assert human_env["HERMES_PROFILE"] == "zephyr"
+    assert human_env["TELEGRAM_BOT_TOKEN"] == "zephyr-token"
+
+    assert len(wake_calls) == 1
+    assert wake_calls[0]["target"] == "telegram:123"
+    assert wake_calls[0]["notify_env"] is human_env
+    assert not any("-u" in call[0] for call in subprocess_calls)
+    assert "target=telegram:123" in caplog.text
+    assert "adapter=mcp_bridge:/tmp/hermes/mcp_bridge.zephyr.sock" in caplog.text
+    assert "result=success" in caplog.text
 
 
-def test_kanban_cli_notification_ignores_bugtool_oserror(monkeypatch):
+def test_kanban_failed_internal_wake_queues_session_notice(
+    tmp_path, monkeypatch
+):
+    profile_home = tmp_path / "profiles" / "zephyr"
+    profile_home.mkdir(parents=True)
+    db = SessionDB(db_path=profile_home / "state.db")
+    db.create_session("creator-session", "telegram")
+    db.close()
+
     class FakeConnection:
         def close(self):
             pass
-
-    calls = []
-
-    def run(args, **kwargs):
-        if args == ["/home/ekl/bin/bugtool", "check"]:
-            raise OSError("bugtool unavailable")
-        calls.append((args, kwargs))
 
     monkeypatch.setattr(kanban.kb, "connect", lambda: FakeConnection())
     monkeypatch.setattr(
         kanban.kb,
         "get_origin_routing",
-        lambda *_args: {"platform": "telegram", "chat_id": "123", "chat_type": "dm"},
+        lambda *_args: {
+            "platform": "telegram",
+            "chat_id": "123",
+            "chat_type": "dm",
+            "profile": "zephyr",
+        },
     )
-    monkeypatch.setattr(kanban.kb, "get_task", lambda *_args: None)
-    monkeypatch.setattr("subprocess.run", run)
+    monkeypatch.setattr(
+        kanban.kb,
+        "get_task",
+        lambda *_args: SimpleNamespace(
+            session_id="creator-session", created_by="zephyr"
+        ),
+    )
+    monkeypatch.setattr(
+        kanban,
+        "_load_user_profile_env",
+        lambda env, profile: env.update({
+            "HERMES_HOME": str(profile_home),
+            "HERMES_PROFILE": profile,
+        }),
+    )
+    monkeypatch.setattr(
+        kanban,
+        "_send_kanban_wake",
+        lambda **_kwargs: ("mcp_bridge", {"error": "gateway unavailable"}),
+    )
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0, stdout=b"", stderr=b""
+        ),
+    )
+    import hermes_cli.profiles
 
-    kanban._notify_kanban_status_change("t_gateway", "done", title="Gateway task")
+    monkeypatch.setattr(
+        hermes_cli.profiles, "get_profile_dir", lambda _profile: profile_home
+    )
 
-    assert [call[0][2] for call in calls] == ["-t", "-u"]
+    kanban._notify_kanban_status_change(
+        "t_gateway", "done", title="Gateway task", summary="verified"
+    )
+
+    reopened = SessionDB(db_path=profile_home / "state.db")
+    assert reopened.drain_session_notices("creator-session") == [
+        {"text": "✅ Gateway task → done — verified", "level": "info"}
+    ]
+    reopened.close()

@@ -4620,7 +4620,7 @@ def claim_task(
             assignee=claimed.assignee if claimed else None,
         )
     except Exception:
-        pass
+        _log.exception("kanban running notification failed for task=%s", task_id)
     return claimed
 
 
@@ -5328,7 +5328,7 @@ def complete_task(
             assignee=_done_task.assignee if _done_task else None,
         )
     except Exception:
-        pass
+        _log.exception("kanban completion notification failed for task=%s", task_id)
     return True
 
 
@@ -6011,7 +6011,9 @@ def block_task(
                     assignee=_blocked_task.assignee if _blocked_task else None,
                 )
             except Exception:
-                pass
+                _log.exception(
+                    "kanban dependency notification failed for task=%s", task_id
+                )
             return True
 
         # Truly-blocked kinds. Increment the unblock-loop counter when this is a
@@ -6132,7 +6134,7 @@ def block_task(
             assignee=_blocked_task.assignee if _blocked_task else None,
         )
     except Exception:
-        pass
+        _log.exception("kanban blocked notification failed for task=%s", task_id)
     return True
 
 

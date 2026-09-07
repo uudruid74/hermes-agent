@@ -50,6 +50,45 @@ def test_origin_routing_persists_profile(kanban_home):
         }
 
 
+@pytest.mark.parametrize(
+    ("transition", "expected_status", "expected_summary"),
+    [
+        ("complete", "done", "finished"),
+        ("block", "blocked", "needs input"),
+    ],
+)
+def test_terminal_transitions_use_shared_notification_path(
+    kanban_home, monkeypatch, transition, expected_status, expected_summary
+):
+    from hermes_cli import kanban
+
+    notifications = []
+    monkeypatch.setattr(
+        kanban,
+        "_notify_kanban_status_change",
+        lambda *args, **kwargs: notifications.append((args, kwargs)),
+    )
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="terminal notification", assignee="neo"
+        )
+        assert kb.claim_task(conn, task_id) is not None
+        notifications.clear()
+
+        if transition == "complete":
+            assert kb.complete_task(conn, task_id, summary=expected_summary)
+        else:
+            assert kb.block_task(conn, task_id, reason=expected_summary)
+
+    assert len(notifications) == 1
+    args, kwargs = notifications[0]
+    assert args == (task_id, expected_status)
+    assert kwargs["summary"] == expected_summary
+    assert kwargs["title"] == "terminal notification"
+    assert kwargs["assignee"] == "neo"
+
+
 def _init_git_repo(repo: Path) -> None:
     repo.mkdir(parents=True, exist_ok=True)
     subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True, text=True)

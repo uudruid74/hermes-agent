@@ -31,7 +31,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import subprocess
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
@@ -166,168 +165,17 @@ def _stamp_worker_session_metadata(
     return stamped
 
 
-def _load_gateway_profile_env(env: dict) -> None:
-    """Load gateway (gopher) profile credentials into *env* so notification
-    subprocesses can reach messaging platforms even when the current profile
-    (e.g. a kanban worker) doesn't have platform credentials configured.
-
-    The gopher profile lives alongside the current profile under the shared
-    ``~/.hermes/profiles/`` directory.  We derive its path from
-    ``HERMES_HOME`` (which in hermetic worker environments points to the
-    current profile's directory, e.g. ``.../profiles/neo``).
-
-    Two things are needed for ``hermes send`` to deliver:
-    1. Platform credentials (bot tokens) from ``.env``.
-    2. Platform config blocks (``telegram: enabled: true``) from
-       ``config.yaml`` — resolved via ``HERMES_HOME``.
-    We set ``HERMES_HOME`` / ``HERMES_PROFILE`` to the gateway profile so
-    both resolve correctly inside the subprocess.
-    """
-    hermes_home = os.environ.get("HERMES_HOME")
-    if not hermes_home:
-        return
-    from pathlib import Path
-    profiles_dir = Path(hermes_home).parent  # .../profiles/
-    env_path = profiles_dir / "gopher" / ".env"
-    gopher_home = str(profiles_dir / "gopher")
-
-    # Redirect the subprocess to use the gateway profile's config so
-    # ``load_gateway_config()`` finds the platform blocks.  Override (do
-    # NOT setdefault) — the current profile's HERMES_HOME must be replaced,
-    # not preserved.
-    env["HERMES_HOME"] = gopher_home
-    env["HERMES_PROFILE"] = "gopher"
-
-    if not env_path.exists():
-        return
-    try:
-        from dotenv import dotenv_values
-        for key, val in dotenv_values(str(env_path)).items():
-            if key not in env:
-                env[key] = val
-    except Exception:
-        pass
-
-
-def _load_user_profile_env(env: dict, profile: Optional[str]) -> None:
-    """Select the origin profile for ``send -u`` without changing legacy envs."""
-    if not profile:
-        return
-    try:
-        from hermes_cli.profiles import get_profile_dir
-
-        user_home = get_profile_dir(profile)
-    except (ImportError, ValueError):
-        return
-    env_path = user_home / ".env"
-    env["HERMES_HOME"] = str(user_home)
-    env["HERMES_PROFILE"] = profile
-    if not env_path.exists():
-        return
-    try:
-        from dotenv import dotenv_values
-
-        for key, val in dotenv_values(str(env_path)).items():
-            if key == "BUZZ_PRIVATE_KEY":
-                env[key] = val
-            elif key not in env:
-                env[key] = val
-    except (ImportError, OSError):
-        pass
-
-
 def _notify_kanban_event(tid: str, status: str, summary: Optional[str], task) -> None:
-    """Fire a best-effort notification when a task changes status.
+    """Route tool-only events through the shared Kanban notifier."""
+    from hermes_cli.kanban import _notify_kanban_status_change
 
-    Sends two messages:
-    - Human-readable via ``hermes send -t`` with old-style icons, no [Hermes] prefix
-    - JSON payload via ``hermes send -u`` for AI consumption
-
-    Mirrors ``_notify_kanban_status_change`` in ``hermes_cli/kanban.py`` so the
-    worker-side tool calls trigger the same notification as the CLI commands.
-    """
-    try:
-        subprocess.run(
-            ["/home/ekl/bin/bugtool", "check"], capture_output=True, timeout=5,
-        )
-    except (OSError, subprocess.SubprocessError):
-        pass
-
-    try:
-        from hermes_cli import kanban_db as _kb
-        from hermes_cli.kanban import _NOTIFY_EMOJI
-        import json
-        task_title = task.title if task else tid
-        summary_line = ""
-        if summary:
-            summary_line = summary.splitlines()[0][:300]
-
-        conn = _kb.connect()
-        try:
-            origin = _kb.get_origin_routing(conn, tid)
-        finally:
-            conn.close()
-
-        if not (origin and origin.get("platform") and origin.get("chat_id")):
-            return
-
-        platform = origin["platform"].lower()
-        chat_id = origin["chat_id"]
-        thread_id = origin.get("thread_id", "")
-        chat_type = origin.get("chat_type", "group")
-        target = f"{platform}:{chat_id}"
-        if thread_id:
-            target = f"{target}:{thread_id}"
-
-        icon = _NOTIFY_EMOJI.get(status, "❓")
-
-        # Human-readable message via -t (old icons, no [Hermes] prefix)
-        human_parts = [f"{icon} {task_title} → {status}"]
-        if summary_line:
-            human_parts.append(f" — {summary_line}")
-        if status == "blocked":
-            human_parts.append(" — Investigate this blocked task")
-        human_msg = "".join(human_parts)
-
-        # JSON payload via -u
-        json_payload = json.dumps({
-            "source": "kanban",
-            "type": status,
-            "task_id": tid,
-            "title": task_title,
-            "summary": summary_line or None,
-            "assignee": getattr(task, "assignee", None) or "unassigned",
-        })
-
-        # Build a notification environment that carries the gateway
-        # profile's platform credentials (Telegram bot token, etc.) so
-        # ``hermes send`` can deliver even when the current profile
-        # (e.g. a kanban worker like Neo) doesn't have them configured.
-        notify_env = os.environ.copy()
-        notify_env["HERMES_NOTIFY_CHAT_TYPE"] = chat_type
-        _load_gateway_profile_env(notify_env)
-
-        subprocess.run(
-            ["hermes", "send", "-t", target, human_msg],
-            capture_output=True, timeout=10, env=notify_env,
-        )
-        user_env = os.environ.copy()
-        user_env["HERMES_NOTIFY_CHAT_TYPE"] = chat_type
-        _load_user_profile_env(user_env, origin.get("profile"))
-        subprocess.run(
-            ["hermes", "send", "-u", target, json_payload],
-            capture_output=True, timeout=10, env=user_env,
-        )
-    except Exception:
-        pass
-
-
-def _notify_kanban_completion(tid: str, summary: Optional[str], task) -> None:
-    """Fire a best-effort notification when a task completes.
-
-    Convenience wrapper around ``_notify_kanban_event``.
-    """
-    _notify_kanban_event(tid, "done", summary, task)
+    _notify_kanban_status_change(
+        tid,
+        status,
+        summary=summary,
+        title=task.title if task else tid,
+        assignee=getattr(task, "assignee", None),
+    )
 
 
 def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
@@ -949,8 +797,6 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"could not complete {tid} (unknown id or already terminal)"
                 )
             run = kb.latest_run(conn, tid)
-            # Notify origin channel about completion
-            _notify_kanban_completion(tid, summary, task)
             return _ok(task_id=tid, run_id=run.id if run else None)
         finally:
             conn.close()
@@ -1024,8 +870,6 @@ def _handle_block(args: dict, **kw) -> str:
                     f"running/ready)"
                 )
             run = kb.latest_run(conn, tid)
-            # Notify origin channel about the block
-            _notify_kanban_event(tid, "blocked", reason, task)
             # Tell the worker where the task actually landed so it doesn't
             # assume it's sitting in 'blocked' when routing sent it elsewhere.
             landed = kb.get_task(conn, tid)

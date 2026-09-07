@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import logging
 import os
 import shlex
 import subprocess
@@ -27,6 +28,9 @@ from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_swarm as ks
+
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -1257,46 +1261,22 @@ _NOTIFY_EMOJI = {
     "archived": "📦",
 }
 
-def _load_gateway_profile_env(env: dict) -> None:
-    """Load gateway (gopher) profile credentials into *env*.
-
-    See the identically-named function in ``tools/kanban_tools.py`` for docs.
-    """
-    hermes_home = os.environ.get("HERMES_HOME")
-    if not hermes_home:
-        return
-    profiles_dir = Path(hermes_home).parent  # .../profiles/
-    env_path = profiles_dir / "gopher" / ".env"
-    gopher_home = str(profiles_dir / "gopher")
-
-    # Redirect the subprocess to use the gateway profile's config so
-    # ``load_gateway_config()`` finds the platform blocks.  Override (do
-    # NOT setdefault) — the current profile's HERMES_HOME must be replaced,
-    # not preserved.
-    env["HERMES_HOME"] = gopher_home
-    env["HERMES_PROFILE"] = "gopher"
-
-    if not env_path.exists():
-        return
-    try:
-        from dotenv import dotenv_values
-        for key, val in dotenv_values(str(env_path)).items():
-            if key not in env:
-                env[key] = val
-    except Exception:
-        pass
-
-
 def _load_user_profile_env(env: dict, profile: Optional[str]) -> None:
-    """Select the origin profile for ``send -u`` without changing legacy envs."""
+    """Load the origin profile's config and identity into ``env``."""
     if not profile:
         return
     try:
         from hermes_cli.profiles import get_profile_dir
 
         user_home = get_profile_dir(profile)
-    except (ImportError, ValueError):
+    except (ImportError, ValueError) as exc:
+        logger.warning(
+            "kanban notify could not resolve origin profile=%s: %s",
+            profile,
+            exc,
+        )
         return
+
     env_path = user_home / ".env"
     env["HERMES_HOME"] = str(user_home)
     env["HERMES_PROFILE"] = profile
@@ -1306,12 +1286,89 @@ def _load_user_profile_env(env: dict, profile: Optional[str]) -> None:
         from dotenv import dotenv_values
 
         for key, val in dotenv_values(str(env_path)).items():
-            if key == "BUZZ_PRIVATE_KEY":
+            if val is not None:
+                # The origin profile is authoritative. Inherited worker or
+                # dispatcher credentials must never win notification routing.
                 env[key] = val
-            elif key not in env:
-                env[key] = val
-    except (ImportError, OSError):
-        pass
+    except (ImportError, OSError) as exc:
+        logger.warning(
+            "kanban notify could not load origin profile=%s env: %s",
+            profile,
+            exc,
+        )
+
+
+def _enqueue_kanban_session_notice(task: Any, human_msg: str) -> bool:
+    """Queue a notice for the creator's CLI session at its next boundary."""
+    if not (task and task.session_id):
+        return False
+
+    from hermes_cli.profiles import get_profile_dir
+    from hermes_state import SessionDB
+
+    profile_home = get_profile_dir(task.created_by or "default")
+    session_db = SessionDB(db_path=profile_home / "state.db")
+    try:
+        queued = session_db.enqueue_session_notice(task.session_id, human_msg)
+    finally:
+        session_db.close()
+
+    logger.info(
+        "kanban notify target=cli:%s profile=%s adapter=session_notice result=%s",
+        task.session_id,
+        task.created_by or "default",
+        "queued" if queued else "session-not-found",
+    )
+    return queued
+
+
+def _send_kanban_wake(
+    *,
+    target: str,
+    platform: str,
+    chat_id: str,
+    thread_id: str,
+    chat_type: str,
+    payload: str,
+    notify_env: dict,
+) -> tuple[str, dict]:
+    """Inject a Kanban wake through the origin profile's gateway bridge."""
+    from gateway.config import Platform
+    from gateway.mcp_bridge import bridge_socket_path
+    from model_tools import _run_async
+    from tools.send_message_tool import _send_via_bridge
+
+    telegram_id = (
+        notify_env.get("HERMES_SESSION_TELEGRAM_ID", "").strip()
+        or notify_env.get("TELEGRAM_ALLOWED_USERS", "").split(",")[0].strip()
+    )
+    user_id = (
+        notify_env.get("HERMES_SESSION_USER_ID", "").strip()
+        or telegram_id
+        or "cli"
+    )
+    user_context = {
+        "user_id": user_id,
+        "platform_user_id": telegram_id or user_id,
+        "sender_name": (
+            notify_env.get("HERMES_SESSION_USER_NAME", "").strip()
+            or "CLI User"
+        ),
+        "chat_type": chat_type,
+    }
+    profile_home = notify_env.get("HERMES_HOME")
+    bridge_path = bridge_socket_path(profile_home) if profile_home else bridge_socket_path()
+    result = _run_async(
+        _send_via_bridge(
+            Platform(platform),
+            chat_id,
+            payload,
+            thread_id=thread_id or None,
+            user_context=user_context,
+            bridge_path=bridge_path,
+        )
+    )
+    return f"mcp_bridge:{bridge_path}", result
 
 
 def _notify_kanban_status_change(
@@ -1322,26 +1379,13 @@ def _notify_kanban_status_change(
     title: Optional[str] = None,
     assignee: Optional[str] = None,
 ) -> None:
-    """Send a best-effort notification about a kanban task state change.
+    """Best-effort human delivery and LLM wake for a Kanban state change.
 
-    Sends two messages:
-    - Human-readable via ``hermes send -t`` with old-style icons, no [Hermes] prefix
-    - JSON payload via ``hermes send -u`` for AI consumption
-
-    Uses the task's origin routing (``__kanban_origin__`` system comment)
-    to determine the target channel. Falls back to home-channel sends.
-
-    Fails silently on all errors so a broken notification can never block
-    a task transition.
+    Both paths resolve the task's origin profile once. The human message uses
+    ``hermes send -t`` with that profile's credentials; the LLM wake is injected
+    through the same profile's live gateway bridge, never a worker subprocess.
+    Delivery failures are logged and fall back to a creator-session notice.
     """
-    try:
-        subprocess.run(
-            ["/home/ekl/bin/bugtool", "check"], capture_output=True, timeout=5,
-        )
-    except (OSError, subprocess.SubprocessError):
-        pass
-
-    # Resolve origin routing and the CLI session fallback target.
     try:
         conn = kb.connect()
         try:
@@ -1350,16 +1394,17 @@ def _notify_kanban_status_change(
         finally:
             conn.close()
     except Exception:
-        origin = None
-        task = None
+        logger.exception(
+            "kanban notify task=%s status=%s could not resolve origin",
+            task_id,
+            new_status,
+        )
+        return
 
     icon = _NOTIFY_EMOJI.get(new_status, "❓")
     task_label = title or task_id
-    summary_line = ""
-    if summary:
-        summary_line = summary.splitlines()[0][:300]
+    summary_line = summary.splitlines()[0][:300] if summary else ""
 
-    # Human-readable message via -t (old icons, no [Hermes] prefix)
     human_parts = [f"{icon} {task_label} → {new_status}"]
     if summary_line:
         human_parts.append(f" — {summary_line}")
@@ -1367,7 +1412,6 @@ def _notify_kanban_status_change(
         human_parts.append(" — Investigate this blocked task")
     human_msg = "".join(human_parts)
 
-    # JSON payload via -u
     json_payload = json.dumps({
         "source": "kanban",
         "type": new_status,
@@ -1378,19 +1422,14 @@ def _notify_kanban_status_change(
     })
 
     if not (origin and origin.get("platform") and origin.get("chat_id")):
-        if task and task.session_id:
-            try:
-                from hermes_cli.profiles import get_profile_dir
-                from hermes_state import SessionDB
-
-                profile_home = get_profile_dir(task.created_by or "default")
-                session_db = SessionDB(db_path=profile_home / "state.db")
-                try:
-                    session_db.enqueue_session_notice(task.session_id, human_msg)
-                finally:
-                    session_db.close()
-            except Exception:
-                pass
+        try:
+            _enqueue_kanban_session_notice(task, human_msg)
+        except Exception:
+            logger.exception(
+                "kanban notify task=%s status=%s session fallback failed",
+                task_id,
+                new_status,
+            )
         return
 
     platform = origin["platform"].lower()
@@ -1401,31 +1440,83 @@ def _notify_kanban_status_change(
     if thread_id:
         target = f"{target}:{thread_id}"
 
-    # Build a notification environment that carries the gateway
-    # profile's platform credentials so ``hermes send`` can deliver
-    # even when the current CLI profile doesn't have them configured.
     notify_env = os.environ.copy()
     notify_env["HERMES_NOTIFY_CHAT_TYPE"] = chat_type
-    _load_gateway_profile_env(notify_env)
+    _load_user_profile_env(notify_env, origin.get("profile"))
+    profile = notify_env.get("HERMES_PROFILE", "inherited")
 
     try:
-        subprocess.run(
+        completed = subprocess.run(
             ["hermes", "send", "-t", target, human_msg],
-            capture_output=True, timeout=10, env=notify_env,
+            capture_output=True,
+            timeout=10,
+            env=notify_env,
         )
-    except Exception:
-        pass
+        human_result = "success" if completed.returncode == 0 else f"exit-{completed.returncode}"
+        log = logger.info if completed.returncode == 0 else logger.warning
+        log(
+            "kanban notify task=%s status=%s target=%s profile=%s "
+            "adapter=hermes-send-t result=%s",
+            task_id,
+            new_status,
+            target,
+            profile,
+            human_result,
+        )
+    except (OSError, subprocess.SubprocessError):
+        logger.exception(
+            "kanban notify task=%s status=%s target=%s profile=%s "
+            "adapter=hermes-send-t result=error",
+            task_id,
+            new_status,
+            target,
+            profile,
+        )
 
     try:
-        user_env = os.environ.copy()
-        user_env["HERMES_NOTIFY_CHAT_TYPE"] = chat_type
-        _load_user_profile_env(user_env, origin.get("profile"))
-        subprocess.run(
-            ["hermes", "send", "-u", target, json_payload],
-            capture_output=True, timeout=10, env=user_env,
+        adapter, wake_result = _send_kanban_wake(
+            target=target,
+            platform=platform,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            chat_type=chat_type,
+            payload=json_payload,
+            notify_env=notify_env,
         )
+        wake_ok = bool(wake_result.get("success"))
+        log = logger.info if wake_ok else logger.warning
+        log(
+            "kanban notify task=%s status=%s target=%s profile=%s "
+            "adapter=%s result=%s",
+            task_id,
+            new_status,
+            target,
+            profile,
+            adapter,
+            "success" if wake_ok else wake_result.get("error", "error"),
+        )
+        if not wake_ok:
+            _enqueue_kanban_session_notice(task, human_msg)
     except Exception:
-        pass
+        logger.exception(
+            "kanban notify task=%s status=%s target=%s profile=%s "
+            "adapter=internal-wake result=error",
+            task_id,
+            new_status,
+            target,
+            profile,
+        )
+        try:
+            _enqueue_kanban_session_notice(task, human_msg)
+        except Exception:
+            logger.exception(
+                "kanban notify task=%s status=%s target=%s profile=%s "
+                "adapter=session_notice result=error",
+                task_id,
+                new_status,
+                target,
+                profile,
+            )
 
 def _notify_via_gateway(message: str) -> None:
     """Send *message* to every enabled gateway platform's home channel.

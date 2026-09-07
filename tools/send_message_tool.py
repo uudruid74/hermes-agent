@@ -883,11 +883,19 @@ async def _send_via_adapter(
     }
 
 
-async def _send_via_bridge(platform, chat_id, text, *, thread_id=None, user_context=None):
+async def _send_via_bridge(
+    platform,
+    chat_id,
+    text,
+    *,
+    thread_id=None,
+    user_context=None,
+    bridge_path=None,
+):
     """Inject a message through the running gateway's bridge socket."""
     import socket as _socket
 
-    bridge_socket = bridge_socket_path()
+    bridge_socket = bridge_path or bridge_socket_path()
 
     platform_name = platform.value if hasattr(platform, "value") else str(platform)
     payload = {

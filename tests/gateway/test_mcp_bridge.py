@@ -81,6 +81,7 @@ async def _bridge_payload_with_user_identity(monkeypatch):
     class FakeSocket:
         def __init__(self, *_args):
             self.payload = None
+            self.connected_path = None
 
         def __enter__(self):
             return self
@@ -91,8 +92,8 @@ async def _bridge_payload_with_user_identity(monkeypatch):
         def settimeout(self, _timeout):
             return None
 
-        def connect(self, _path):
-            return None
+        def connect(self, path):
+            self.connected_path = path
 
         def sendall(self, payload):
             self.payload = json.loads(payload.decode("utf-8"))
@@ -112,8 +113,10 @@ async def _bridge_payload_with_user_identity(monkeypatch):
             "sender_name": "Evan",
             "chat_type": "forum",
         },
+        bridge_path="/tmp/hermes/mcp_bridge.zephyr.sock",
     )
     assert result == {"success": True, "queued": True}
+    assert fake_socket.connected_path == "/tmp/hermes/mcp_bridge.zephyr.sock"
     assert fake_socket.payload is not None
     assert fake_socket.payload["user_context"]["platform_user_id"] == "8900123006"
     assert fake_socket.payload["chat_type"] == "forum"
