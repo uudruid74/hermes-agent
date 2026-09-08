@@ -2100,7 +2100,8 @@ def warn_deprecated_cwd_env_vars(config: Optional[Dict[str, Any]] = None) -> Non
             f"  \033[33m⚠\033[0m MESSAGING_CWD={messaging_cwd} found in .env — "
             f"this is deprecated."
         )
-    if terminal_cwd_env and not config_has_explicit_cwd:
+    _cwd_resolved_by_bridge = os.environ.get("HERMES_TERMINAL_CWD_RESOLVED") == "1"
+    if terminal_cwd_env and not config_has_explicit_cwd and not _cwd_resolved_by_bridge:
         # TERMINAL_CWD in env but not from config bridge — likely from .env
         lines.append(
             f"  \033[33m⚠\033[0m TERMINAL_CWD={terminal_cwd_env} found in .env — "

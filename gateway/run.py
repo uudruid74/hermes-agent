@@ -2224,6 +2224,13 @@ if not _configured_cwd or _configured_cwd in CWD_PLACEHOLDERS:
         os.environ.pop("TERMINAL_CWD", None)
     else:
         os.environ["TERMINAL_CWD"] = _resolved_cwd
+        # Mark provenance: this value was resolved from config placeholders,
+        # NOT read from .env. warn_deprecated_cwd_env_vars() skips tagged
+        # values so the deprecation linter doesn't fire on the bridge's own
+        # output (false positive seen 2026-09-08: placeholder resolution set
+        # TERMINAL_CWD=/home/ekl, then module-level linter flagged it as a
+        # legacy .env entry).
+        os.environ["HERMES_TERMINAL_CWD_RESOLVED"] = "1"
 
 from gateway.config import (
     ChannelOverride,
