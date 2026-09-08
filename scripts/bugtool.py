@@ -210,6 +210,21 @@ def assigned_worker(text: str) -> Optional[str]:
     return worker if worker in VALID_ASSIGNEES else None
 
 
+def reporter_session(text: str) -> str:
+    """Session id of the agent/human that filed the bug (for origin routing)."""
+    return section_value(text, "Reporter session").strip()
+
+
+def missing_dispatch_fields(text: str) -> list[str]:
+    """Human-readable list of what blocks dispatch (debugging + manual runs)."""
+    missing = [s for s in REQUIRED_SECTIONS if not section_value(text, s)]
+    if not assigned_worker(text):
+        missing.append("Assignee (must be a valid fleet agent)")
+    if not approved_to_run(text):
+        missing.append("Approved to run (checkbox must be checked by Evan)")
+    return missing
+
+
 def approved_to_run(text: str) -> bool:
     """Approval gate: the Assigned section must contain a CHECKED box (- [x]).
     An unchecked box (- [ ]) means the human has NOT approved dispatch."""
@@ -269,6 +284,13 @@ def create_task(
     )
     output = result.stdout + result.stderr
     created = None
+    reporter = reporter_session(text)
+    if reporter:
+        subprocess.run(
+            [HERMES, "kanban", "comment", "--author", "system",
+             created or "", f"__kanban_origin__{{\"platform\": \"session\", \"chat_id\": \"{reporter}\", \"thread_id\": \"\", \"chat_type\": \"\", \"profile\": \"\"}}"],
+            text=True, capture_output=True, check=False,
+        )
     if not result.returncode:
         try:
             response = json.loads(result.stdout)
@@ -342,6 +364,7 @@ def cmd_new(args: argparse.Namespace) -> None:
             "## Repro\n\n\n"
             "## Suspected cause\n\n\n"
             "## Assignee\n\n\n"
+            "## Reporter session\n\n" + os.environ.get("HERMES_SESSION_ID", "") + "\n\n"
             "## Approved to run\n\n- [ ] approved by Evan (check this box ONLY after reviewing the fix spec)\n"
             "## Kanban tasks\n\n\n"
             "## Resolution\n\n\n"
@@ -427,6 +450,22 @@ def cmd_redispatch(args: argparse.Namespace) -> None:
         die("redispatch did not create a task; required sections may be incomplete or a task is live")
 
 
+def cmd_dispatch(args: argparse.Namespace) -> None:
+    """Check gate fields for one bug file; dispatch if approved, else report blockers."""
+    path = bug_path(args.file)
+    with locked_root():
+        text = path.read_text(encoding="utf-8")
+        missing = missing_dispatch_fields(text)
+        if missing:
+            print(f"cannot dispatch {path.name}: missing/incomplete: " + "; ".join(missing))
+            raise SystemExit(1)
+        created = maybe_dispatch_locked(path, text)
+    if created:
+        print(f"dispatched {created} -> {path.name}")
+    else:
+        print(f"nothing to dispatch for {path.name}: live task exists or already dispatched")
+
+
 def cmd_check(_args: argparse.Namespace) -> None:
     pending = [path for path in all_bug_files() if path.parent.name == "pending"]
     for path in pending:
@@ -494,6 +533,9 @@ def parser() -> argparse.ArgumentParser:
     redispatch.add_argument("file")
     redispatch.add_argument("--directive", required=True)
     redispatch.set_defaults(func=cmd_redispatch)
+    dispatch = commands.add_parser("dispatch", help="gate-check one bug file and dispatch if approved")
+    dispatch.add_argument("file")
+    dispatch.set_defaults(func=cmd_dispatch)
     check = commands.add_parser("check")
     check.set_defaults(func=cmd_check)
     listing = commands.add_parser("list")
