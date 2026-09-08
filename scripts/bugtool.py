@@ -401,6 +401,9 @@ def cmd_new(args: argparse.Namespace) -> None:
     slug = normalize_slug(args.slug)
     date = dt.date.fromisoformat(os.environ.get("BUGTOOL_DATE", dt.date.today().isoformat()))
     path = PROJECTS_ROOT / project / "bugs" / "pending" / f"{date.isoformat()}-{slug}.md"
+    session = os.environ.get("HERMES_SESSION_ID", "").strip()
+    agent_name = (os.environ.get("HERMES_AGENT_NAME", "").strip()
+                  or os.environ.get("HERMES_PROFILE", "").strip() or "unknown")
     with locked_root():
         if path.exists():
             die(f"bug already exists: {path}")
