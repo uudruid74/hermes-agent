@@ -65,17 +65,18 @@ def test_invalid_assignee_never_dispatches(monkeypatch, tmp_path):
 
 def test_valid_assignee_plus_checked_box_dispatches_to_that_agent(monkeypatch, tmp_path):
     bt, proot, _ = load_bugtool(monkeypatch, tmp_path)
-    captured = {}
+    calls = []
     def fake_run(args, **kwargs):
-        captured["args"] = list(args)
+        calls.append(list(args))
         return __import__("subprocess").CompletedProcess(args, 0, json.dumps({"id": "t_gate1"}), "")
     monkeypatch.setattr(bt.subprocess, "run", fake_run)
     path = write_bug(proot, assignee="ornith", approved=True)
     created = bt.maybe_dispatch_locked(path, path.read_text())
     assert created == "t_gate1"
-    assert captured["args"][bt.subprocess.list2cmdline and 0 or 0]  # sanity
-    joined = " ".join(str(a) for a in captured["args"])
-    assert "--assignee ornith" in joined  # assignee comes from the bug, not hardcoded
+    joined_all = " ".join(" ".join(str(a) for a in c) for c in calls)
+    assert "--assignee ornith" in joined_all  # assignee comes from the bug, not hardcoded
+    origin_calls = [c for c in calls if any("comment" == str(a) for a in c[:4])]
+    assert any("t_gate1" in " ".join(str(a) for a in c) for c in origin_calls)  # origin comment AFTER task id known
 
 
 def test_check_respects_gates(monkeypatch, tmp_path):

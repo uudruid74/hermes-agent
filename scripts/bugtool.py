@@ -207,8 +207,9 @@ def replace_section(text: str, section: str, value: str) -> str:
 
 
 def assigned_worker(text: str) -> Optional[str]:
-    """Return the assignee from the Assignee section, or None if missing/invalid."""
-    value = section_value(text, ASSIGNEE_SECTION)
+    """Return the assignee from frontmatter (canonical) or the Assignee section."""
+    fm = frontmatter(text)
+    value = (fm.get("assignee") or section_value(text, ASSIGNEE_SECTION)).strip()
     if not value:
         return None
     worker = value.split()[0].strip().strip("`*_").lower()
@@ -219,8 +220,46 @@ _SESSION_MISSING_MARKER = "MISSING-SESSION-ID (bugtool: HERMES_SESSION_ID env wa
 
 
 def reporter_session(text: str) -> str:
-    """Session id of the agent/human that filed the bug (for origin routing)."""
+    """Session id from frontmatter (canonical) or legacy Reporter session section."""
+    fm = frontmatter(text)
+    if fm.get("session"):
+        return fm["session"]
     return section_value(text, "Reporter session").strip()
+
+
+def frontmatter(text: str) -> dict:
+    """Parse YAML-ish frontmatter into a dict (flat key: value strings)."""
+    if not text.startswith("---"):
+        return {}
+    try:
+        end = text.index("\n---", 3)
+    except ValueError:
+        return {}
+    fm = {}
+    for line in text[4:end].splitlines():
+        if ":" in line and not line.startswith((" ", "-")):
+            k, _, v = line.partition(":")
+            fm[k.strip()] = v.strip().strip('"')
+    return fm
+
+
+def frontmatter_block(**fields) -> str:
+    lines = ["---"]
+    for k, v in fields.items():
+        lines.append(f'{k}: "{v}"')
+    lines.append("---")
+    return "\n".join(lines) + "\n"
+
+
+DM_CHAT_ID = "8900123006"  # Evan's telegram DM (same fallback tell uses)
+
+def origin_routing(text: str) -> str:
+    """JSON payload for __kanban_origin__: session id if present, else agent-name → telegram DM."""
+    reporter = reporter_session(text).strip()
+    agent = frontmatter(text).get("filed_by", "").split()[0].lower() if frontmatter(text).get("filed_by") else ""
+    if reporter and not reporter.startswith("MISSING") and re.match(r"^\d{8}_\d{6}_[0-9a-f]{6}$", reporter):
+        return json.dumps({"platform": "session", "chat_id": reporter, "thread_id": "", "chat_type": "", "profile": ""})
+    return json.dumps({"platform": "telegram", "chat_id": DM_CHAT_ID, "thread_id": "", "chat_type": "dm", "profile": agent})
 
 
 def missing_dispatch_fields(text: str) -> list[str]:
@@ -228,8 +267,7 @@ def missing_dispatch_fields(text: str) -> list[str]:
     missing = [s for s in REQUIRED_SECTIONS if not section_value(text, s)]
     if not assigned_worker(text):
         missing.append("Assignee (must be a valid fleet agent)")
-    if reporter_session(text).startswith("MISSING-SESSION-ID") or not reporter_session(text):
-        missing.append("Reporter session (real session id required for notification routing)")
+
     if not approved_to_run(text):
         missing.append("Approved to run (checkbox must be checked by Evan)")
     return missing
@@ -294,13 +332,6 @@ def create_task(
     )
     output = result.stdout + result.stderr
     created = None
-    reporter = reporter_session(text)
-    if reporter:
-        subprocess.run(
-            [HERMES, "kanban", "comment", "--author", "system",
-             created or "", f"__kanban_origin__{{\"platform\": \"session\", \"chat_id\": \"{reporter}\", \"thread_id\": \"\", \"chat_type\": \"\", \"profile\": \"\"}}"],
-            text=True, capture_output=True, check=False,
-        )
     if not result.returncode:
         try:
             response = json.loads(result.stdout)
@@ -310,6 +341,12 @@ def create_task(
             candidate = response.get("id")
             if isinstance(candidate, str) and re.fullmatch(r"t_[A-Za-z0-9]+", candidate):
                 created = candidate
+    if created:
+        subprocess.run(
+            [HERMES, "kanban", "comment", "--author", "system",
+             created, "__kanban_origin__" + origin_routing(text)],
+            text=True, capture_output=True, check=False,
+        )
     if created is None:
         append_dispatch_record(identity, "failed")
         print(f"dispatch failed for {path}: {output.strip()}", file=sys.stderr)
@@ -369,15 +406,27 @@ def cmd_new(args: argparse.Namespace) -> None:
             die(f"bug already exists: {path}")
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
-            f"# {args.title}\n\n"
+            frontmatter_block(
+                title=args.title,
+                type="bug",
+                status="pending",
+                date=date.isoformat(),
+                severity="normal",
+                filed_by=agent_name,
+                assignee="",
+                session=session,
+                tags="bugtool",
+                summary="",
+            )
+            + f"\n# {args.title}\n\n"
             "## Symptom\n\n\n"
             "## Repro\n\n\n"
             "## Suspected cause\n\n\n"
             "## Assignee\n\n\n"
-            "## Reporter session\n\n" + (os.environ.get("HERMES_SESSION_ID", "").strip() or _SESSION_MISSING_MARKER) + "\n\n"
             "## Approved to run\n\n- [ ] approved by Evan (check this box ONLY after reviewing the fix spec)\n"
             "## Kanban tasks\n\n\n"
             "## Resolution\n\n\n"
+            "## Updates\n\n\n"
             "## Failure Reports\n\n",
             encoding="utf-8",
         )
@@ -444,6 +493,30 @@ def cmd_append_failure(args: argparse.Namespace) -> None:
         else:
             maybe_dispatch_locked(path, updated)
     print(f"failure {attempts}/4 appended: {path}")
+
+
+def cmd_update(args: argparse.Namespace) -> None:
+    """Append new information to a bug's ## Updates section + auto-commit."""
+    path = bug_path(args.file)
+    entry = f"### Update ({dt.datetime.now().strftime('%Y-%m-%d %H:%M')}, {os.environ.get('HERMES_AGENT_NAME') or 'unknown'})\n\n{args.note.strip()}\n"
+    with locked_root():
+        text = path.read_text(encoding="utf-8")
+        if "## Updates" not in text:
+            if "## Resolution" in text:
+                text = text.replace("## Resolution", "## Updates\n\n\n## Resolution", 1)
+            else:
+                text += "\n## Updates\n\n\n"
+        idx = text.index("## Updates")
+        nxt = re.search(r"(?m)^## (?!#)", text[idx + len("## Updates"):])
+        insert_at = idx + len("## Updates") + (nxt.start() if nxt else len(text[idx + len("## Updates"):]))
+        text = text[:insert_at] + "\n" + entry + text[insert_at:]
+        path.write_text(text, encoding="utf-8")
+        rel = os.path.relpath(path, "/home/ekl/vault")
+        subprocess.run(["git", "-C", "/home/ekl/vault", "add", rel], capture_output=True, check=False)
+        subprocess.run(["git", "-C", "/home/ekl/vault", "commit", "-m",
+                        f"bug: update {path.stem} ({(os.environ.get('HERMES_AGENT_NAME') or 'unknown')})"],
+                       capture_output=True, check=False)
+    print(f"update appended: {path}")
 
 
 def cmd_resolve(args: argparse.Namespace) -> None:
@@ -547,6 +620,10 @@ def parser() -> argparse.ArgumentParser:
     failure.add_argument("task_id")
     failure.add_argument("summary")
     failure.set_defaults(func=cmd_append_failure)
+    upd = commands.add_parser("update")
+    upd.add_argument("file")
+    upd.add_argument("note")
+    upd.set_defaults(func=cmd_update)
     resolve = commands.add_parser("resolve")
     resolve.add_argument("file")
     resolve.add_argument("summary")

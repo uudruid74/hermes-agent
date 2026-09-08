@@ -5112,6 +5112,66 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+def _bug_autoremove_resolve(task_id: str, title: str, summary: str) -> None:
+    """Best-effort bug-lifecycle hook: BUG: tasks resolve their bug file.
+
+    When a task whose title starts with 'BUG: ' completes, move its bug
+    file from bugs/pending/ to bugs/resolved/, stamp the resolution into
+    frontmatter (status, resolved_by, resolution), and git-commit. Never
+    raises — a broken vault or missing file must not fail the completion.
+    (Evan order 2026-09-08: completing a bug task must resolve the bug.)
+    """
+    import datetime as _dt
+    import re as _re
+    try:
+        if not title or not title.upper().startswith("BUG:"):
+            return
+        vault = Path("/home/ekl/vault")
+        pending = vault / "wiki" / "Projects"
+        slug = title[4:].strip().replace("*", "").replace("?", "").replace("[", "")
+        candidates = sorted(pending.glob(f"*/bugs/pending/*-{slug}.md"))
+        if not candidates:
+            return
+        src_file = candidates[0]
+        resolved_dir = src_file.parent.parent / "resolved"
+        resolved_dir.mkdir(parents=True, exist_ok=True)
+        target = resolved_dir / src_file.name
+        if target.exists():
+            return
+        text = src_file.read_text(encoding="utf-8")
+        today = _dt.date.today().isoformat()
+        agent = os.environ.get("HERMES_AGENT_NAME") or "unknown"
+        # frontmatter status + resolution stamps
+        text = _re.sub(r'(?m)^status: "pending"$', 'status: "resolved"', text, count=1)
+        text = _re.sub(r'(?m)^date: "(\d{4}-\d{2}-\d{2})"$',
+                       lambda m: f'date: "{m.group(1)}"\nresolved: "{today}"\nresolved_by: "{agent}"',
+                       text, count=1)
+        # Resolution section fill (first line of summary as the record)
+        res_line = (summary or "task completed").strip().splitlines()[0][:200]
+        for section in ("## Resolution", "## Fix spec"):
+            if section in text:
+                text = _re.sub(
+                    "(" + _re.escape(section) + r"\n\n)(?=\n## |\Z)",
+                    lambda m: m.group(1) + res_line + "\n",
+                    text, count=1,
+                )
+                break
+        target.write_text(text, encoding="utf-8")
+        src_file.unlink(missing_ok=True)
+        rel_t = os.path.relpath(target, vault)
+        rel_s = os.path.relpath(src_file, vault)
+        subprocess.run(["git", "-C", str(vault), "add", rel_t, rel_s],
+                       capture_output=True, check=False)
+        subprocess.run(["git", "-C", str(vault), "commit", "-m",
+                        f"bug: resolved {src_file.stem} via {task_id} ({agent})"],
+                       capture_output=True, check=False)
+    except Exception:
+        try:
+            _append_event(None, task_id, "bug_autoremove_resolve_failed", {}) if False else None
+        except Exception:
+            pass
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5280,6 +5340,23 @@ def complete_task(
             completed_payload,
             run_id=run_id,
         )
+        # Bug-lifecycle (Evan order 2026-09-08): a completed 'BUG: <slug>'
+        # task auto-resolves its bug file. Title read inside the txn.
+        _bug_title = ""
+        try:
+            _row = conn.execute(
+                "SELECT title FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            _bug_title = (_row[0] or "") if _row else ""
+        except Exception:
+            pass
+    # Post-txn best-effort: resolve the bug file for BUG: tasks.
+    try:
+        _bug_autoremove_resolve(
+            task_id, _bug_title, summary if summary is not None else result
+        )
+    except Exception:
+        logger.debug("bug autoremove hook skipped", exc_info=True)
     # Prose-scan the summary + result for t_<hex> references that do
     # not resolve. Advisory — does not block the completion. Runs in
     # its own txn so the completion itself is already durable by the

@@ -60,6 +60,8 @@ def mock_kanban(monkeypatch, bugtool, create_delay=0.0):
             return subprocess.CompletedProcess(args, 0, json.dumps({"id": task_id}), "")
         if args[:3] == ["hermes", "kanban", "show"]:
             return subprocess.CompletedProcess(args, 0, "Status: ready\n", "")
+        if args[:3] == ["hermes", "kanban", "comment"]:
+            return subprocess.CompletedProcess(args, 0, "", "")
         raise AssertionError(f"unexpected subprocess: {args}")
 
     monkeypatch.setattr(bugtool.subprocess, "run", run)
@@ -129,6 +131,8 @@ def test_create_task_uses_json_id_instead_of_body_task_id(monkeypatch, tmp_path)
         if args[:3] == ["hermes", "kanban", "create"]:
             stdout = json.dumps({"body": "previous task t_old", "id": "t_created1"})
             return subprocess.CompletedProcess(args, 0, stdout, "")
+        if args[:3] == ["hermes", "kanban", "comment"]:
+            return subprocess.CompletedProcess(args, 0, "", "")
         raise AssertionError(f"unexpected subprocess: {args}")
 
     monkeypatch.setattr(bugtool.subprocess, "run", run)
