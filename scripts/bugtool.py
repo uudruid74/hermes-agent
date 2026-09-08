@@ -371,6 +371,18 @@ def cmd_new(args: argparse.Namespace) -> None:
             "## Failure Reports\n\n",
             encoding="utf-8",
         )
+    # Auto-commit the new bug file so it lands in vault history immediately
+    # (the post-commit hook then runs the wiki injector + dispatch check on it).
+    rel = os.path.relpath(path, "/home/ekl/vault")
+    subprocess.run(
+        ["git", "-C", "/home/ekl/vault", "add", rel],
+        capture_output=True, check=False,
+    )
+    subprocess.run(
+        ["git", "-C", "/home/ekl/vault", "commit", "-m",
+         f"bug: {args.title} (filed by {os.environ.get('HERMES_AGENT_NAME', 'unknown-agent')})"],
+        capture_output=True, check=False,
+    )
     print(path)
 
 
