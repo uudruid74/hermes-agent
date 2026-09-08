@@ -548,6 +548,10 @@ def cmd_redispatch(args: argparse.Namespace) -> None:
 def cmd_dispatch(args: argparse.Namespace) -> None:
     """Check gate fields for one bug file; dispatch if approved, else report blockers."""
     path = bug_path(args.file)
+    if path.parent.name != "pending":
+        print(f"nothing to dispatch for {path.name}: only pending/ bugs dispatch "
+              f"(this file is in {path.parent.name}/ — already resolved or archived)")
+        raise SystemExit(0)
     with locked_root():
         text = path.read_text(encoding="utf-8")
         missing = missing_dispatch_fields(text)
