@@ -215,6 +215,9 @@ def assigned_worker(text: str) -> Optional[str]:
     return worker if worker in VALID_ASSIGNEES else None
 
 
+_SESSION_MISSING_MARKER = "MISSING-SESSION-ID (bugtool: HERMES_SESSION_ID env was empty at file time — fix dispatch will reject)"
+
+
 def reporter_session(text: str) -> str:
     """Session id of the agent/human that filed the bug (for origin routing)."""
     return section_value(text, "Reporter session").strip()
@@ -225,6 +228,8 @@ def missing_dispatch_fields(text: str) -> list[str]:
     missing = [s for s in REQUIRED_SECTIONS if not section_value(text, s)]
     if not assigned_worker(text):
         missing.append("Assignee (must be a valid fleet agent)")
+    if reporter_session(text).startswith("MISSING-SESSION-ID") or not reporter_session(text):
+        missing.append("Reporter session (real session id required for notification routing)")
     if not approved_to_run(text):
         missing.append("Approved to run (checkbox must be checked by Evan)")
     return missing
@@ -369,7 +374,7 @@ def cmd_new(args: argparse.Namespace) -> None:
             "## Repro\n\n\n"
             "## Suspected cause\n\n\n"
             "## Assignee\n\n\n"
-            "## Reporter session\n\n" + os.environ.get("HERMES_SESSION_ID", "") + "\n\n"
+            "## Reporter session\n\n" + (os.environ.get("HERMES_SESSION_ID", "").strip() or _SESSION_MISSING_MARKER) + "\n\n"
             "## Approved to run\n\n- [ ] approved by Evan (check this box ONLY after reviewing the fix spec)\n"
             "## Kanban tasks\n\n\n"
             "## Resolution\n\n\n"
