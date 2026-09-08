@@ -404,6 +404,25 @@ def cmd_new(args: argparse.Namespace) -> None:
     session = os.environ.get("HERMES_SESSION_ID", "").strip()
     agent_name = (os.environ.get("HERMES_AGENT_NAME", "").strip()
                   or os.environ.get("HERMES_PROFILE", "").strip() or "unknown")
+    if not session and agent_name != "unknown":
+        # Fallback: most-recently-active session for this agent (state.db).
+        # Covers gateway processes where the ContextVar bridge lost the id
+        # (empty-but-set HERMES_SESSION_ID after restart/rotation).
+        import sqlite3 as _sq
+        import glob as _glob
+        for prof_dir in sorted(_glob.glob(f"/home/ekl/.hermes/profiles/{agent_name.lower()}/state.db")):
+            try:
+                import sqlite3 as _sq
+                conn = _sq.connect(prof_dir)
+                row = conn.execute(
+                    "SELECT id FROM sessions WHERE archived = 0 ORDER BY last_activity_at DESC LIMIT 1"
+                ).fetchone()
+                conn.close()
+                if row and row[0]:
+                    session = row[0]
+                    break
+            except Exception:
+                continue
     with locked_root():
         if path.exists():
             die(f"bug already exists: {path}")
