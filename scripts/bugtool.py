@@ -164,7 +164,12 @@ def normalize_project(value: str) -> str:
 
 
 def bug_path(value: str) -> Path:
-    path = Path(value).expanduser().resolve()
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        # Relative paths from the git hook resolve against the vault root,
+        # not the hook's unpredictable cwd.
+        path = Path("/home/ekl/vault") / path
+    path = path.resolve()
     root = PROJECTS_ROOT.resolve()
     if root not in path.parents:
         die(f"bug file must be under {root}")
