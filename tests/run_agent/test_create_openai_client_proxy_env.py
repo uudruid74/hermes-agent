@@ -130,6 +130,29 @@ def test_create_openai_client_no_proxy_when_env_unset(mock_openai, monkeypatch):
     http_client.close()
 
 
+@patch("run_agent.OpenAI")
+def test_create_codex_client_installs_proactive_rate_limit_hooks(mock_openai, monkeypatch):
+    for key in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY",
+                "https_proxy", "http_proxy", "all_proxy"):
+        monkeypatch.delenv(key, raising=False)
+
+    agent = _make_agent()
+    agent._create_openai_client(
+        {
+            "api_key": "test-key",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+        },
+        reason="test",
+        shared=False,
+    )
+
+    http_client = _extract_http_client(mock_openai.call_args.kwargs)
+    assert isinstance(http_client, httpx.Client)
+    assert len(http_client.event_hooks["request"]) == 1
+    assert len(http_client.event_hooks["response"]) == 1
+    http_client.close()
+
+
 
 
 

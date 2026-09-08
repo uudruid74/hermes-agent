@@ -57,6 +57,21 @@ class TestParseHeaders:
         state = parse_rate_limit_headers({})
         assert state is None
 
+    def test_openai_duration_reset_values(self):
+        state = parse_rate_limit_headers(
+            {
+                "x-ratelimit-limit-tokens": "150000",
+                "x-ratelimit-remaining-tokens": "149984",
+                "x-ratelimit-reset-tokens": "6m0s",
+                "x-ratelimit-reset-requests": "12ms",
+            },
+            provider="openai-codex",
+        )
+
+        assert state is not None
+        assert state.tokens_min.reset_seconds == pytest.approx(360.0)
+        assert state.requests_min.reset_seconds == pytest.approx(0.012)
+
 
 
 

@@ -23,6 +23,7 @@ Header schema (12 headers total):
 from __future__ import annotations
 
 import time
+import re
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Optional
 
@@ -82,9 +83,42 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
+_DURATION_PART_RE = re.compile(r"(\d+(?:\.\d+)?)(ms|s|m|h)")
+_DURATION_MULTIPLIERS = {"ms": 0.001, "s": 1.0, "m": 60.0, "h": 3600.0}
+
+
+def parse_reset_duration_seconds(value: Any) -> Optional[float]:
+    """Parse numeric or OpenAI composite reset durations into seconds.
+
+    OpenAI documents values such as ``12ms``, ``1s``, and ``6m0s``. Longer
+    windows can combine hours, minutes, and fractional seconds.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        pass
+
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    total = 0.0
+    position = 0
+    for match in _DURATION_PART_RE.finditer(text):
+        if match.start() != position:
+            return None
+        total += float(match.group(1)) * _DURATION_MULTIPLIERS[match.group(2)]
+        position = match.end()
+    if position != len(text) or position == 0:
+        return None
+    return total
+
+
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
-        return float(value)
+        parsed = parse_reset_duration_seconds(value)
+        return default if parsed is None else parsed
     except (TypeError, ValueError):
         return default
 

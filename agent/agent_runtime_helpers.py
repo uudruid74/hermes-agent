@@ -2308,6 +2308,18 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
         )
         if keepalive_http is not None:
             client_kwargs["http_client"] = keepalive_http
+    _base_url = str(client_kwargs.get("base_url", "") or "")
+    _is_openai_codex = (
+        agent.provider == "openai-codex"
+        or (
+            base_url_host_matches(_base_url, "chatgpt.com")
+            and "/backend-api/codex" in _base_url.lower()
+        )
+    )
+    if _is_openai_codex and client_kwargs.get("http_client") is not None:
+        from agent.openai_rate_limit_throttle import install_openai_rate_limit_throttle
+
+        install_openai_rate_limit_throttle(client_kwargs["http_client"], agent)
     # Delegate all rate-limit / 5xx retry to hermes's outer conversation loop,
     # which honors Retry-After and applies adaptive/jittered backoff. The OpenAI
     # SDK default (max_retries=2) uses its own 1-2s backoff that ignores
@@ -2345,6 +2357,10 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     # Uses the module-level `OpenAI` name, resolved lazily on first
     # access via __getattr__ below. Tests patch via `run_agent.OpenAI`.
     client = _ra().OpenAI(**client_kwargs)
+    if _is_openai_codex and client_kwargs.get("http_client") is None:
+        from agent.openai_rate_limit_throttle import install_openai_rate_limit_throttle
+
+        install_openai_rate_limit_throttle(getattr(client, "_client", None), agent)
     _ra().logger.info(
         "OpenAI client created (%s, shared=%s) %s",
         reason,

@@ -1706,17 +1706,18 @@ class TestRetryAfterCap:
     Retry-After header up to a 600s ceiling (was 120s, which retried before
     Tier-1 reset windows of ~171s and re-tripped the limit)."""
 
-    def _drive_once(self, agent, retry_after_value):
-        """Raise one 429 carrying ``Retry-After`` and capture the wait the loop
-        chose. Interrupt during the backoff sleep so the test doesn't actually
-        wait, and return the status string that reports the wait time."""
+    def _drive_once(self, agent, retry_after_value, *, status_code=429):
+        """Raise one temporary error carrying ``Retry-After`` and capture the
+        wait the loop chose. Interrupt during backoff so the test stays fast."""
 
         class _RateLimitError(Exception):
             status_code = 429
             response = SimpleNamespace(headers={"retry-after": str(retry_after_value)})
 
             def __str__(self):
-                return "Error code: 429 - Rate limit exceeded."
+                return f"Error code: {self.status_code} - temporary provider failure."
+
+        _RateLimitError.status_code = status_code
 
         def _fake_api_call(api_kwargs):
             raise _RateLimitError()
@@ -1732,18 +1733,28 @@ class TestRetryAfterCap:
             captured.append(msg)
             # Break out of the incremental backoff sleep immediately rather
             # than blocking for the full Retry-After window.
-            if "Waiting" in msg:
+            if "Waiting" in msg or "Retrying in" in msg:
                 agent._interrupt_requested = True
             return original_buffer(msg, *args, **kwargs)
 
         agent._buffer_status = _capture_status
         agent.run_conversation("hello")
-        return next((m for m in captured if "Waiting" in m), "")
+        return next(
+            (m for m in captured if "Waiting" in m or "Retrying in" in m),
+            "",
+        )
 
     def test_retry_after_under_cap_is_honored(self, agent):
-        # 300s > old 120s cap but < new 600s cap → used verbatim.
+        # 300s > old 120s cap but < new 600s cap → used as the floor,
+        # with up to 10% jitter to prevent synchronized retry storms.
         status = self._drive_once(agent, 300)
-        assert "Waiting 300.0s" in status
+        wait = float(status.split("Waiting ", 1)[1].split("s", 1)[0])
+        assert 300.0 <= wait <= 330.0
+
+    def test_503_retry_after_is_honored(self, agent):
+        status = self._drive_once(agent, 45, status_code=503)
+        wait = float(status.split("Retrying in ", 1)[1].split("s", 1)[0])
+        assert 45.0 <= wait <= 49.5
 
 
 

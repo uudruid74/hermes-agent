@@ -128,6 +128,55 @@ def jittered_backoff(
     return delay + jitter
 
 
+def retry_delay_from_headers(
+    headers: Any,
+    *,
+    default_wait: float,
+) -> float:
+    """Return a jittered retry delay that never undercuts server reset hints."""
+    getter = getattr(headers, "get", None)
+    if not callable(getter):
+        return default_wait
+
+    from agent.rate_limit_tracker import parse_reset_duration_seconds
+
+    values: list[float] = []
+    retry_after = parse_retry_after_seconds(headers)
+    if retry_after is not None:
+        # Preserve the established protection against a pathological
+        # Retry-After while allowing resource reset headers to be authoritative.
+        values.append(min(retry_after, 600.0))
+    lowered = (
+        {str(key).lower(): value for key, value in headers.items()}
+        if hasattr(headers, "items")
+        else None
+    )
+    for key in (
+        "x-ratelimit-reset-tokens",
+        "x-ratelimit-reset-project-tokens",
+        "x-ratelimit-reset-requests",
+    ):
+        raw = lowered.get(key) if lowered is not None else getter(key)
+        parsed = parse_reset_duration_seconds(raw)
+        if parsed is not None:
+            values.append(parsed)
+
+    if not values:
+        return default_wait
+    floor = max(values)
+    if floor <= 0:
+        return default_wait
+    return max(
+        default_wait,
+        jittered_backoff(
+            1,
+            base_delay=floor,
+            max_delay=floor,
+            jitter_ratio=0.1,
+        ),
+    )
+
+
 def _error_text(error: Any) -> str:
     """Best-effort flattened provider error text for retry classification."""
     parts = [

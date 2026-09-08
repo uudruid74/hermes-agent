@@ -5,7 +5,12 @@ import threading
 import agent.retry_utils as retry_utils
 from types import SimpleNamespace
 
-from agent.retry_utils import adaptive_rate_limit_backoff, is_zai_coding_overload_error, jittered_backoff
+from agent.retry_utils import (
+    adaptive_rate_limit_backoff,
+    is_zai_coding_overload_error,
+    jittered_backoff,
+    retry_delay_from_headers,
+)
 
 
 def test_backoff_is_exponential():
@@ -208,3 +213,50 @@ class TestParseRetryAfterSeconds:
                 raise RuntimeError("boom")
 
         assert parse_retry_after_seconds(Explosive()) is None
+
+
+def test_retry_delay_uses_largest_server_floor_and_adds_jitter(monkeypatch):
+    recorded = {}
+
+    def _fake_jitter(attempt, *, base_delay, max_delay, jitter_ratio):
+        recorded.update(
+            attempt=attempt,
+            base_delay=base_delay,
+            max_delay=max_delay,
+            jitter_ratio=jitter_ratio,
+        )
+        return base_delay + 7.0
+
+    monkeypatch.setattr(retry_utils, "jittered_backoff", _fake_jitter)
+
+    delay = retry_delay_from_headers(
+        {
+            "Retry-After": "30",
+            "x-ratelimit-reset-tokens": "6m0s",
+        },
+        default_wait=4.0,
+    )
+
+    assert delay == 367.0
+    assert recorded == {
+        "attempt": 1,
+        "base_delay": 360.0,
+        "max_delay": 360.0,
+        "jitter_ratio": 0.1,
+    }
+
+
+def test_retry_delay_falls_back_when_headers_have_no_valid_delay():
+    assert retry_delay_from_headers(
+        {"Retry-After": "not-a-delay"},
+        default_wait=8.0,
+    ) == 8.0
+
+
+def test_retry_delay_does_not_reduce_larger_exponential_backoff(monkeypatch):
+    monkeypatch.setattr(retry_utils, "jittered_backoff", lambda *a, **kw: 3.0)
+
+    assert retry_delay_from_headers(
+        {"Retry-After": "1"},
+        default_wait=8.0,
+    ) == 8.0
