@@ -27,12 +27,15 @@ def load_bugtool(monkeypatch, tmp_path):
     return module, projects_root, state_root
 
 
-def complete_bug_text():
+def complete_bug_text(approved=True):
+    checkbox = "- [x] approved by Evan" if approved else "- [ ] approved by Evan"
     return (
         "# Repeated dispatch\n\n"
         "## Symptom\n\nDuplicates\n\n"
         "## Repro\n\nRun reconciliation\n\n"
         "## Suspected cause\n\nMissing durable state\n\n"
+        "## Assignee\n\nneo\n\n"
+        f"## Approved to run\n\n{checkbox}\n\n"
         "## Kanban tasks\n\n\n"
         "## Failure Reports\n\n"
     )

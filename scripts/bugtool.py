@@ -21,6 +21,11 @@ DISPATCH_LOG = STATE_ROOT / "bugs-dispatched.log"
 HERMES = os.environ.get("BUGTOOL_HERMES", "hermes")
 LIVE_STATUSES = {"todo", "ready", "running", "blocked", "scheduled"}
 REQUIRED_SECTIONS = ("Symptom", "Repro", "Suspected cause")
+ASSIGNEE_SECTION = "Assignee"
+APPROVED_SECTION = "Approved to run"
+# Valid fleet workers a bug can be assigned to. Dispatch requires an assignee
+# from this set AND an explicit human-checked approval box (see approved_to_run).
+VALID_ASSIGNEES = {"neo", "ornith", "gopher", "wintermute", "zephyr"}
 SECTION_ALIASES = {
     "symptom": "Symptom",
     "repro": "Repro",
@@ -196,6 +201,22 @@ def replace_section(text: str, section: str, value: str) -> str:
     return re.sub(pattern, replacement, text, count=1)
 
 
+def assigned_worker(text: str) -> Optional[str]:
+    """Return the assignee from the Assignee section, or None if missing/invalid."""
+    value = section_value(text, ASSIGNEE_SECTION)
+    if not value:
+        return None
+    worker = value.split()[0].strip().strip("`*_").lower()
+    return worker if worker in VALID_ASSIGNEES else None
+
+
+def approved_to_run(text: str) -> bool:
+    """Approval gate: the Assigned section must contain a CHECKED box (- [x]).
+    An unchecked box (- [ ]) means the human has NOT approved dispatch."""
+    value = section_value(text, APPROVED_SECTION)
+    return bool(re.search(r"- \[[xX]\]", value))
+
+
 def required_complete(text: str) -> bool:
     return all(section_value(text, section) for section in REQUIRED_SECTIONS)
 
@@ -223,7 +244,7 @@ def live_task_ids(text: str) -> list[str]:
 
 def task_body(path: Path, text: str, directive: Optional[str] = None) -> str:
     parts = [f"Bug file: {path}"]
-    for section in (*REQUIRED_SECTIONS, "Failure Reports"):
+    for section in (*REQUIRED_SECTIONS, ASSIGNEE_SECTION, APPROVED_SECTION, "Failure Reports"):
         value = section_value(text, section)
         parts.extend((f"## {section}", value or "(none)"))
     if directive:
@@ -237,10 +258,11 @@ def create_task(
     identity: dict[str, object],
     directive: Optional[str] = None,
 ) -> Optional[str]:
+    worker = assigned_worker(text) or "neo"
     append_dispatch_record(identity, "reserved")
     slug = path.stem.split("-", 3)[-1]
     result = subprocess.run(
-        [HERMES, "kanban", "create", "--assignee", "neo", "--body", task_body(path, text, directive), f"BUG: {slug}", "--json"],
+        [HERMES, "kanban", "create", "--assignee", worker, "--body", task_body(path, text, directive), f"BUG: {slug}", "--json"],
         text=True,
         capture_output=True,
         check=False,
@@ -279,6 +301,11 @@ def maybe_dispatch_locked(path: Path, text: str, directive: Optional[str] = None
         return None
     if not required_complete(text):
         return None
+    worker = assigned_worker(text)
+    if not worker:
+        return None  # no valid Assignee: never dispatch
+    if not approved_to_run(text):
+        return None  # human approval checkbox unchecked: never dispatch
     if live_task_ids(text):
         return None
     if failure_count(text) >= 4 and not force:
@@ -314,6 +341,8 @@ def cmd_new(args: argparse.Namespace) -> None:
             "## Symptom\n\n\n"
             "## Repro\n\n\n"
             "## Suspected cause\n\n\n"
+            "## Assignee\n\n\n"
+            "## Approved to run\n\n- [ ] approved by Evan (check this box ONLY after reviewing the fix spec)\n"
             "## Kanban tasks\n\n\n"
             "## Resolution\n\n\n"
             "## Failure Reports\n\n",
