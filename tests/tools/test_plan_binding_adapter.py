@@ -56,6 +56,62 @@ def test_new_approval_binds_compression_root_not_session_or_env(monkeypatch):
     assert tuple(binding) == ("neo", "compression-root", task["id"])
 
 
+def test_new_approval_question_contains_full_plan(monkeypatch):
+    conn = _db()
+    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    seen = {}
+
+    def approve(question, **_kwargs):
+        seen["question"] = question
+        return '{"user_response":"Approve"}'
+
+    monkeypatch.setattr(plan_tool, "clarify_tool", approve)
+
+    plan_tool.plan_tool(
+        _Agent(),
+        "new",
+        title="Visible plan",
+        goal="Keep the full plan visible",
+        steps=["Inspect the prompt", "Render every step"],
+    )
+
+    assert "## Plan: Visible plan" in seen["question"]
+    assert "**Goal:** Keep the full plan visible" in seen["question"]
+    assert "1. Inspect the prompt" in seen["question"]
+    assert "2. Render every step" in seen["question"]
+
+
+def test_approve_question_contains_full_plan(monkeypatch):
+    conn = _db()
+    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    monkeypatch.setattr(
+        plan_tool, "clarify_tool", lambda *_args, **_kwargs: '{"user_response":""}'
+    )
+    agent = _Agent()
+    plan_tool.plan_tool(
+        agent,
+        "new",
+        title="Blocked plan",
+        goal="Show the blocked plan",
+        steps=["Load the goal", "Load all steps"],
+    )
+    task_id = conn.execute("SELECT id FROM tasks").fetchone()[0]
+    seen = {}
+
+    def approve(question, _choices):
+        seen["question"] = question
+        return "Approve"
+
+    agent.clarify_callback = approve
+
+    plan_tool.plan_tool(agent, "approve", task_id=task_id)
+
+    assert "## Plan: Blocked plan" in seen["question"]
+    assert "**Goal:** Show the blocked plan" in seen["question"]
+    assert "1. Load the goal" in seen["question"]
+    assert "2. Load all steps" in seen["question"]
+
+
 def test_new_requires_explicit_matching_parent(monkeypatch):
     conn = _db()
     monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)

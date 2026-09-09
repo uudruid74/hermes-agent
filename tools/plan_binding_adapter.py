@@ -40,7 +40,7 @@ def _insert_request(
     conn, *, task_id: str, title: str, goal: str, steps: list[str], agent,
     board: Optional[str], kind: str, parent_task_id: Optional[str], pre_approved: bool,
     debug_plan_id: Optional[str],
-) -> None:
+) -> str:
     """Create a blocked Plan and its pending durable authorization atomically."""
     from hermes_cli import plan_authorizations
 
@@ -108,6 +108,7 @@ def _insert_request(
         ).rowcount
         if linked != 1:
             raise ValueError(f"debug source task {debug_plan_id} not found")
+    return body
 
 
 def _activate(conn, *, agent, key, task_id: str, parent_task_id: Optional[str], revision: Optional[int]):
@@ -157,7 +158,7 @@ def cmd_new(
 
         task_id = f"t_{uuid.uuid4().hex[:8]}"
         with write_txn(conn):
-            _insert_request(
+            plan_body = _insert_request(
                 conn,
                 task_id=task_id,
                 title=title,
@@ -192,7 +193,7 @@ def cmd_new(
         try:
             response = json.loads(
                 _legacy().clarify_tool(
-                    f"Approve plan {task_id}?\n\n{title}",
+                    f"Approve plan {task_id}?\n\n{plan_body}",
                     choices=["Approve", "Deny"],
                     callback=callback,
                     agent=agent,
@@ -398,7 +399,7 @@ def cmd_approve(agent, task_id: str) -> str:
     callback = getattr(agent, "clarify_callback", None)
     if callback is None:
         return f"ERROR: No clarify callback available. Cannot present plan {task_id} for approval."
-    response = callback(f"Approve plan {task_id}: {task['title']}", ["Approve", "Deny"])
+    response = callback(f"Approve plan {task_id}?\n\n{task['body']}", ["Approve", "Deny"])
     if not response or "appr" not in str(response).lower():
         return f"Plan awaiting approval ({task_id}): no approval was recorded."
     try:
