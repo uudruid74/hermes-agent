@@ -38,6 +38,16 @@ _USAGE_EXIT = 2
 _FAILURE_EXIT = 1
 _SUCESS_EXIT = 0
 
+# Agent-to-agent DM chat id (Evan's Telegram DM). Every agent profile's
+# gateway session lives here. When `-u` is given a BARE PROFILE NAME, send
+# expands it to `profile:telegram:<this id>` — the same mapping the `tell`
+# tool used to hardcode. Keeping the agent→platform mapping in ONE place
+# (here) means callers (tell tool, pente MCP, cron jobs) can pass a bare
+# agent name and never touch session ids or platform details.
+# TODO(evan): graduate to reading each profile's platforms.telegram.home_channel
+# from its config.yaml when a profile needs a different DM.
+_AGENT_DM_CHAT_ID = "8900123006"
+
 
 def _read_message_body(
     positional: Optional[str],
@@ -113,6 +123,27 @@ def _select_user_target_profile(user_target: str) -> str:
     os.environ["HERMES_HOME"] = str(profile_home)
     os.environ["HERMES_PROFILE"] = profile
     return target
+
+
+def _resolve_agent_wake_target(user_flag: str) -> str:
+    """Expand a bare profile name passed to ``-u`` into a profile-qualified
+    telegram wake target (agent wake).
+
+    ``hermes send -u gopher "msg"`` is an AGENT WAKE — it resolves gopher →
+    ``gopher:telegram:<DM id>`` and routes through that profile's gateway
+    bridge exactly like the old ``tell`` tool did. Full targets (with colons)
+    and platform names (``telegram``, ``discord``…) pass through untouched,
+    so existing ``-u telegram`` / ``-u cli:session_id`` semantics are
+    preserved. Profile names never collide with platform names.
+    """
+    clean = user_flag.strip()
+    if ":" in clean:
+        return clean
+    from hermes_cli.profiles import profile_exists
+
+    if profile_exists(clean):
+        return f"{clean}:telegram:{_AGENT_DM_CHAT_ID}"
+    return clean
 
 
 def _list_profile_sessions() -> list[dict]:
@@ -399,6 +430,7 @@ def cmd_send(args: argparse.Namespace) -> None:
     target = _resolve_target(getattr(args, "to", None))
     user_flag = _resolve_target(getattr(args, "user", None))
     if user_flag:
+        user_flag = _resolve_agent_wake_target(user_flag)
         user_flag = _select_user_target_profile(user_flag)
 
     # Bridge ~/.hermes/.env and ~/.hermes/config.yaml into os.environ so the
@@ -530,6 +562,7 @@ def register_send_subparser(subparsers) -> argparse.ArgumentParser:
             "  hermes send -t slack:#eng --subject \"[CI]\" --file build.log\n"
             "  hermes send -t telegram \"MEDIA:/tmp/chart.png\"   # send a media attachment\n"
             "  hermes send -u telegram \"agent wake event\"      # deliver as agent wake\n"
+            "  hermes send -u gopher \"hello\"                   # wake agent profile by name\n"
             "  hermes send -u telegram:-1001234567890:17585 \"cmd\"\n"
             "  hermes send --list                  # all platforms\n"
             "  hermes send --list telegram         # filter by platform\n"
@@ -565,10 +598,12 @@ def register_send_subparser(subparsers) -> argparse.ArgumentParser:
             "Simulate user→agent message (routes through handle_message with "
             "full user identity). Format: "
             "'profile:platform:chat_id', 'platform' (home channel), "
-            "'platform:chat_id', or 'platform:chat_id:thread_id'. Use "
+            "'platform:chat_id', 'platform:chat_id:thread_id', or a BARE "
+            "AGENT PROFILE NAME ('gopher', 'ornith', …) which is expanded to "
+            "the agent's telegram DM wake target. Use "
             "'cli:session_id' to queue an "
             "out-of-band notice for a live CLI session. Examples: -u telegram, "
-            "-u telegram:-1001234567890:17585, -u cli:session_id."
+            "-u gopher, -u telegram:-1001234567890:17585, -u cli:session_id."
         ),
     )
 

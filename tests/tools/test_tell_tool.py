@@ -29,7 +29,7 @@ def test_tell_wraps_message_and_targets_agent_profile(monkeypatch):
                 "hermes",
                 "send",
                 "-u",
-                "gopher:telegram:8900123006",
+                "gopher",
                 "Incoming message from Zephyr follows:\n"
                 "---\n"
                 "Check the relay.\n"

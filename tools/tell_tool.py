@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
-"""Agent-to-agent messaging through ``hermes send -u``."""
+"""Agent-to-agent messaging through ``hermes send -u``.
+
+The agent→platform mapping lives in `hermes send -u`: a bare profile name
+is expanded to the agent's telegram DM (see send_cmd.py
+`_resolve_agent_wake_target`). This tool is a thin wrapper that passes the
+bare agent name through — session ids are transient, agent names are not.
+"""
 
 import json
 import os
 import subprocess
 
 
-_DM_CHAT_ID = "8900123006"
-
-
 def tell_tool(agent: str, message: str) -> str:
     """Wake another Hermes profile with a wrapped agent message."""
     sender = os.environ.get("HERMES_AGENT_NAME") or os.environ.get("HERMES_PROFILE") or "agent"
-    target = f"{agent}:telegram:{_DM_CHAT_ID}"
     wrapped = (
         f"Incoming message from {sender} follows:\n"
         "---\n"
@@ -21,7 +23,7 @@ def tell_tool(agent: str, message: str) -> str:
         "If a reply is required, use the 'tell' command to reply."
     )
     result = subprocess.run(
-        ["hermes", "send", "-u", target, wrapped],
+        ["hermes", "send", "-u", agent, wrapped],
         capture_output=True,
         text=True,
         timeout=15,
