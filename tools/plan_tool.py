@@ -1,7 +1,7 @@
 """
 plan_tool — Mandatory Action Protocol for Hermes agents.
 
-Commands: new, done, dispatch, remind, fail, approve
+Commands: new, advance, handoff, continue, dispatch, remind, fail, approve
 
 Default = Deny All. Without an active task_id in the session, file
 writes, cron creation, and kanban task creation are blocked. The Plan
@@ -377,8 +377,8 @@ def _cmd_new(agent, title: str, goal: str, steps: List[str],
             f"The plan has been recorded. Your next action is:\n\n"
             f">>> STEP 1: {steps[0]} <<<\n\n"
             f"Begin working on Step 1 now. When complete, call "
-            f"plan_tool(command=\"done\") to mark it done and advance to the next step.\n"
-            f"Do NOT call plan_tool 'done' until Step 1 is actually finished."
+            f"plan_tool(command=\"advance\", summary=\"...\") to record the work and advance.\n"
+            f"Do NOT call plan_tool 'advance' until Step 1 is actually finished."
         )
     else:
         # User denied — ask for reason
@@ -420,10 +420,10 @@ def _cmd_new(agent, title: str, goal: str, steps: List[str],
 
 
 # ---------------------------------------------------------------------------
-# command: done
+# command: advance
 # ---------------------------------------------------------------------------
 
-def _cmd_done(agent, status: Optional[str] = None) -> str:
+def _cmd_advance(agent, summary: str) -> str:
     """Mark current step complete. Advance or finish."""
     session_id = _get_session_id(agent)
     if not session_id:
@@ -483,8 +483,7 @@ def _cmd_done(agent, status: Optional[str] = None) -> str:
 
         # Log completion of this step
         note = f"Step {stepno} complete"
-        if status:
-            note += f" — {status}"
+        note += f" — {summary}"
         conn.execute(
             "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
             (task_id, _get_agent_name(agent), note, int(time.time())),
@@ -567,8 +566,7 @@ def _cmd_done(agent, status: Optional[str] = None) -> str:
 
         # Auto-commit if in a git repo
         commit_msg = f"done: {task['title'] or task_id}"
-        if status:
-            commit_msg += f" — {status}"
+        commit_msg += f" — {summary}"
         try:
             import subprocess
             subprocess.run(["git", "add", "-A"], capture_output=True, timeout=10)
@@ -1074,7 +1072,7 @@ def _cmd_approve(agent, task_id: str) -> str:
     return (
         f"Task {task_id} approved: {title}\n\n"
         f"Complete Step 1: {step1}\n"
-        f"Use plan_tool 'done' to mark each step complete."
+        f"Use plan_tool 'advance' with a summary to mark each step complete."
     )
 
 
@@ -1163,9 +1161,11 @@ def _cmd_archive(task_id: str) -> str:
 # Live Plan commands resolve identity only through execution bindings. The
 # historical private helpers above remain provenance and are not dispatched.
 from tools.plan_binding_adapter import (
+    cmd_advance as _cmd_advance,
     cmd_approve as _cmd_approve,
-    cmd_done as _cmd_done,
+    cmd_continue as _cmd_continue,
     cmd_fail as _cmd_fail,
+    cmd_handoff as _cmd_handoff,
     cmd_new as _cmd_new,
     cmd_remind as _cmd_remind,
     cmd_test_complete as _cmd_test_complete,
@@ -1179,7 +1179,7 @@ def plan_tool(
     goal: Optional[str] = None,
     steps: Optional[List[str]] = None,
     temp: Optional[str] = None,
-    status: Optional[str] = None,
+    summary: Optional[str] = None,
     project: Optional[str] = None,
     assignee: Optional[str] = None,
     resume: Optional[str] = None,
@@ -1197,7 +1197,9 @@ def plan_tool(
 
     Commands:
       new           — present a plan for approval
-      done          — mark current step complete
+      advance       — record completed work and advance one step
+      handoff       — replace the current step's in-progress summary
+      continue      — resume a task in the caller's current session
       dispatch      — create + dispatch a kanban task
       remind        — show current plan with step marker
       fail          — mark task as failed
@@ -1220,8 +1222,20 @@ def plan_tool(
             return "ERROR: 'cron' requires cron, root, title, goal, and steps[]"
         return _cmd_cron(agent, cron, root, title, goal, steps, temp, board)
 
-    elif command == "done":
-        return _cmd_done(agent, status)
+    elif command == "advance":
+        if not summary or not summary.strip():
+            return "ERROR: 'advance' requires summary"
+        return _cmd_advance(agent, summary.strip())
+
+    elif command == "handoff":
+        if not summary or not summary.strip():
+            return "ERROR: 'handoff' requires summary"
+        return _cmd_handoff(agent, summary.strip())
+
+    elif command == "continue":
+        if not task_id:
+            return "ERROR: 'continue' requires task_id"
+        return _cmd_continue(agent, task_id)
 
     elif command == "dispatch":
         if not title or not goal or not project or not assignee:
@@ -1253,7 +1267,7 @@ def plan_tool(
         return _cmd_archive(task_id)
 
     else:
-        return f"ERROR: Unknown plan command '{command}'. Valid: new, done, dispatch, remind, fail, test-complete, approve"
+        return f"ERROR: Unknown plan command '{command}'. Valid: new, advance, handoff, continue, dispatch, remind, fail, test-complete, approve, block, archive, cron"
 
 
 # --- Schema ---
@@ -1262,7 +1276,8 @@ PLAN_TOOL_SCHEMA = {
     "name": "plan_tool",
     "description": (
         "Mandatory Action Protocol — create and manage multistep plans. "
-        "Commands: new (present plan for approval), done (mark step complete), "
+        "Commands: new (present plan for approval), advance (record completed work and advance), "
+        "handoff (record in-progress work), continue (resume a task in this session), "
         "dispatch (create kanban task), remind (show current plan), "
         "fail (mark task failed), test-complete (neutral test outcome), approve (unblock plan task), block (emergency block), "
         "archive (block + archive), cron (schedule a recurring plan). "
@@ -1275,8 +1290,8 @@ PLAN_TOOL_SCHEMA = {
         "properties": {
             "command": {
                 "type": "string",
-                "description": "Command: new, done, dispatch, remind, fail, test-complete, approve, block, archive, or cron",
-                "enum": ["new", "done", "dispatch", "remind", "fail", "test-complete", "approve", "block", "archive", "cron"],
+                "description": "Command: new, advance, handoff, continue, dispatch, remind, fail, test-complete, approve, block, archive, or cron",
+                "enum": ["new", "advance", "handoff", "continue", "dispatch", "remind", "fail", "test-complete", "approve", "block", "archive", "cron"],
             },
             "title": {
                 "type": "string",
@@ -1295,9 +1310,9 @@ PLAN_TOOL_SCHEMA = {
                 "type": "string",
                 "description": "Temperature: 'chat', 'worker', 'creative', or float value",
             },
-            "status": {
+            "summary": {
                 "type": "string",
-                "description": "Completion status for 'done' command",
+                "description": "Required for 'advance' and 'handoff'. For 'advance', summarize the work completed in this step, including any files changed. For 'handoff', summarize what has been done and what remains to complete the current step.",
             },
             "project": {
                 "type": "string",
@@ -1317,7 +1332,7 @@ PLAN_TOOL_SCHEMA = {
             },
             "task_id": {
                 "type": "string",
-                "description": "Task ID for 'approve' command",
+                "description": "Task ID for 'approve' or 'continue' command",
             },
             "board": {
                 "type": "string",
@@ -1367,7 +1382,7 @@ registry.register(
         goal=args.get("goal"),
         steps=args.get("steps"),
         temp=args.get("temp"),
-        status=args.get("status"),
+        summary=args.get("summary"),
         project=args.get("project"),
         assignee=args.get("assignee"),
         resume=args.get("resume"),

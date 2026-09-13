@@ -15,6 +15,11 @@ class _SessionDB:
         return "compression-root"
 
 
+class _FlexibleSessionDB:
+    def get_compression_root(self, session_id: str) -> str:
+        return f"root:{session_id}"
+
+
 class _Agent:
     profile_name = "Neo"
     agent_name = "neo"
@@ -142,7 +147,7 @@ def test_new_requires_explicit_matching_parent(monkeypatch):
     assert conn.execute("SELECT previous_task FROM tasks WHERE id=?", (child,)).fetchone()[0] == parent_id
 
 
-def test_terminal_commands_close_binding_without_legacy_session_mutation(monkeypatch):
+def test_advance_closes_binding_and_records_required_summary(monkeypatch):
     conn = _db()
     monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
     monkeypatch.setattr(
@@ -152,8 +157,100 @@ def test_terminal_commands_close_binding_without_legacy_session_mutation(monkeyp
     result = plan_tool.plan_tool(agent, "new", title="Finish", goal="finish", steps=["one"])
     task_id = conn.execute("SELECT task_id FROM execution_bindings").fetchone()[0]
 
-    done = plan_tool.plan_tool(agent, "done")
+    missing = plan_tool.plan_tool(agent, "advance")
+    advanced = plan_tool.plan_tool(agent, "advance", summary="Finished the only step")
 
-    assert "goal was: finish" in done
+    assert missing == "ERROR: 'advance' requires summary"
+    assert "goal was: finish" in advanced
     assert conn.execute("SELECT status FROM tasks WHERE id=?", (task_id,)).fetchone()[0] == "done"
     assert conn.execute("SELECT COUNT(*) FROM execution_bindings").fetchone()[0] == 0
+    body = conn.execute(
+        "SELECT body FROM task_comments WHERE task_id=? "
+        "AND body LIKE '[plan-step-summary:%'",
+        (task_id,),
+    ).fetchone()[0]
+    assert body == "[plan-step-summary:1] Finished the only step"
+
+
+def test_handoff_replaces_current_step_summary_without_advancing(monkeypatch):
+    conn = _db()
+    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    monkeypatch.setattr(
+        plan_tool, "clarify_tool", lambda *_args, **_kwargs: '{"user_response":"Approve"}'
+    )
+    agent = _Agent()
+    plan_tool.plan_tool(
+        agent, "new", title="Handoff", goal="resume safely", steps=["first", "second"]
+    )
+    task_id = conn.execute("SELECT task_id FROM execution_bindings").fetchone()[0]
+
+    assert plan_tool.plan_tool(agent, "handoff") == "ERROR: 'handoff' requires summary"
+    plan_tool.plan_tool(agent, "handoff", summary="Initial scratch note")
+    result = plan_tool.plan_tool(agent, "handoff", summary="Latest scratch note")
+
+    assert "Latest scratch note" in result
+    assert conn.execute(
+        "SELECT task_stepno FROM tasks WHERE id=?", (task_id,)
+    ).fetchone()[0] == 1
+    rows = conn.execute(
+        "SELECT body FROM task_comments WHERE task_id=? "
+        "AND body LIKE '[plan-step-summary:%'",
+        (task_id,),
+    ).fetchall()
+    assert [row[0] for row in rows] == [
+        "[plan-step-summary:1] Latest scratch note"
+    ]
+
+
+def test_continue_rebinds_session_and_agent_and_returns_step_summaries(monkeypatch):
+    conn = _db()
+    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    monkeypatch.setattr(
+        plan_tool, "clarify_tool", lambda *_args, **_kwargs: '{"user_response":"Approve"}'
+    )
+    original = _Agent()
+    plan_tool.plan_tool(
+        original, "new", title="Portable plan", goal="cross sessions", steps=["first", "second"]
+    )
+    task_id = conn.execute("SELECT task_id FROM execution_bindings").fetchone()[0]
+    plan_tool.plan_tool(original, "handoff", summary="Partial first step")
+    plan_tool.plan_tool(original, "advance", summary="Completed first step in tools/a.py")
+    plan_tool.plan_tool(original, "handoff", summary="Started second step in tests/test_a.py")
+    resumed = SimpleNamespace(
+        profile_name="Ornith",
+        agent_name="ornith",
+        session_id="new-session",
+        canonical_session_id="ignored",
+        _session_db=_FlexibleSessionDB(),
+        _session_temperature=None,
+    )
+
+    result = plan_tool.plan_tool(resumed, "continue", task_id=task_id)
+
+    assert "Task: Portable plan" in result
+    assert "Summary: Completed first step in tools/a.py" in result
+    assert "Summary: Started second step in tests/test_a.py" in result
+    assert "→ Step 2: second" in result
+    bindings = conn.execute(
+        "SELECT profile, root_session_id, task_id FROM execution_bindings"
+    ).fetchall()
+    assert [tuple(row) for row in bindings] == [
+        ("ornith", "root:new-session", task_id)
+    ]
+    task = conn.execute(
+        "SELECT assignee, session_id, task_stepno FROM tasks WHERE id=?", (task_id,)
+    ).fetchone()
+    assert tuple(task) == ("ornith", "new-session", 2)
+
+
+def test_schema_replaces_done_and_status_with_advance_summary_handoff_continue():
+    properties = plan_tool.PLAN_TOOL_SCHEMA["parameters"]["properties"]
+    commands = properties["command"]["enum"]
+
+    assert "done" not in commands
+    assert "status" not in properties
+    assert {"advance", "handoff", "continue"}.issubset(commands)
+    assert "files" in properties["summary"]["description"].lower()
+    assert "advance" in properties["summary"]["description"]
+    assert "handoff" in properties["summary"]["description"]
+    assert "Unknown plan command 'done'" in plan_tool.plan_tool(_Agent(), "done")

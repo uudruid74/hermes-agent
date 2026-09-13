@@ -1612,7 +1612,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     goal=next_args.get("goal"),
                     steps=next_args.get("steps"),
                     temp=next_args.get("temp"),
-                    status=next_args.get("status"),
+                    summary=next_args.get("summary"),
                     project=next_args.get("project"),
                     assignee=next_args.get("assignee"),
                     resume=next_args.get("resume"),

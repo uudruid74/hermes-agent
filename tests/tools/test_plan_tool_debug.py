@@ -125,7 +125,7 @@ def test_debug_plan_completion_rewards_coder_not_tester(monkeypatch):
     agent = _Agent(state)
     _bind(monkeypatch, conn, state)
 
-    plan_tool._cmd_done(agent)
+    plan_tool._cmd_advance(agent, "Debug plan completed")
 
     assert state.ratings == {"coder": 20.5}
     assert conn.execute("SELECT status FROM tasks WHERE id = 'debug'").fetchone()[0] == "done"

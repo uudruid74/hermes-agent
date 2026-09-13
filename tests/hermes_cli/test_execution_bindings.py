@@ -187,7 +187,7 @@ def test_intermediate_advance_changes_step_and_binding_revision(tmp_path):
             _key(),
             expected_task_id="t_plan",
             expected_revision=current.revision,
-            status_note="verified first",
+            summary="verified first",
             actor="Wintermute",
         )
 
@@ -257,7 +257,7 @@ def test_final_advance_closes_root_and_removes_binding(tmp_path):
             _key(),
             expected_task_id="t_plan",
             expected_revision=current.revision,
-            status_note=None,
+            summary="verified final step",
             actor="Wintermute",
         )
 
@@ -282,7 +282,7 @@ def test_stale_compare_and_set_does_not_mutate_plan(tmp_path):
                 _key(),
                 expected_task_id="t_plan",
                 expected_revision=current.revision + 1,
-                status_note=None,
+                summary="stale summary",
                 actor="Wintermute",
             )
 
@@ -307,7 +307,7 @@ def test_event_failure_rolls_back_task_binding_comment_and_event(tmp_path, monke
                 _key(),
                 expected_task_id="t_plan",
                 expected_revision=current.revision,
-                status_note="must roll back",
+                summary="must roll back",
                 actor="Wintermute",
             )
 

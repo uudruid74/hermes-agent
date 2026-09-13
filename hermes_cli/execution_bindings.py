@@ -198,6 +198,53 @@ def _binding_payload(key: ExecutionKey, revision: int) -> dict:
     }
 
 
+def _set_step_summary(
+    conn: sqlite3.Connection,
+    task_id: str,
+    step_no: int,
+    summary: str,
+    *,
+    actor: str,
+    now: int,
+) -> None:
+    """Replace the stored summary for one Plan step."""
+    marker = f"[plan-step-summary:{step_no}] "
+    row = conn.execute(
+        "SELECT id FROM task_comments WHERE task_id = ? AND body LIKE ?",
+        (task_id, f"{marker}%"),
+    ).fetchone()
+    body = marker + summary
+    if row is None:
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (task_id, actor, body, now),
+        )
+    else:
+        conn.execute(
+            "UPDATE task_comments SET author = ?, body = ?, created_at = ? "
+            "WHERE id = ?",
+            (actor, body, now, row["id"]),
+        )
+
+
+def plan_step_summaries(conn: sqlite3.Connection, task_id: str) -> dict[int, str]:
+    """Return the stored summary for each Plan step."""
+    summaries = {}
+    rows = conn.execute(
+        "SELECT body FROM task_comments WHERE task_id = ? "
+        "AND body LIKE '[plan-step-summary:%' ORDER BY id",
+        (task_id,),
+    ).fetchall()
+    prefix = "[plan-step-summary:"
+    for row in rows:
+        marker, separator, summary = row["body"].partition("] ")
+        step = marker.removeprefix(prefix)
+        if separator and step.isdigit():
+            summaries[int(step)] = summary
+    return summaries
+
+
 def bootstrap_worker_binding(
     conn: sqlite3.Connection,
     key: ExecutionKey,
@@ -470,6 +517,15 @@ def _close_plan_in_txn(
         event_kind = "plan-test-complete"
         note = f"TEST COMPLETE at Step {step_no}: {step_title}."
 
+    if outcome == "done" and status_note:
+        _set_step_summary(
+            conn,
+            current.task_id,
+            step_no,
+            status_note,
+            actor=actor,
+            now=now,
+        )
     conn.execute(
         "INSERT INTO task_comments (task_id, author, body, created_at) "
         "VALUES (?, ?, ?, ?)",
@@ -581,7 +637,7 @@ def advance_plan(
     *,
     expected_task_id: str,
     expected_revision: int,
-    status_note: Optional[str],
+    summary: str,
     actor: str,
 ) -> PlanStepResult:
     """Complete one step, atomically advancing or closing the active Plan."""
@@ -604,17 +660,17 @@ def advance_plan(
                 outcome="done",
                 reason=None,
                 actor=actor,
-                status_note=status_note,
+                status_note=summary,
             )
 
         now = int(time.time())
-        note = f"Step {step_no} complete"
-        if status_note:
-            note += f" — {status_note}"
-        conn.execute(
-            "INSERT INTO task_comments (task_id, author, body, created_at) "
-            "VALUES (?, ?, ?, ?)",
-            (current.task_id, actor, note, now),
+        _set_step_summary(
+            conn,
+            current.task_id,
+            step_no,
+            summary,
+            actor=actor,
+            now=now,
         )
         changed = conn.execute(
             "UPDATE tasks SET task_stepno = ? "
@@ -658,6 +714,98 @@ def advance_plan(
             restored_task_id=None,
             binding_revision=new_revision,
         )
+
+
+def handoff_plan(
+    conn: sqlite3.Connection,
+    key: ExecutionKey,
+    *,
+    expected_task_id: str,
+    expected_revision: int,
+    summary: str,
+    actor: str,
+) -> PlanStepResult:
+    """Replace the scratch summary for the active step without advancing it."""
+    _validate_key(key)
+    with write_txn(conn):
+        current = _assert_expected_binding(
+            conn, key, expected_task_id, expected_revision
+        )
+        task = _task_row(conn, current.task_id)
+        if task["status"] != "manual":
+            raise InvalidTaskState(
+                f"plan {current.task_id} is not active (status: {task['status']})"
+            )
+        steps, step_no = _steps_for_task(task)
+        now = int(time.time())
+        _set_step_summary(
+            conn,
+            current.task_id,
+            step_no,
+            summary,
+            actor=actor,
+            now=now,
+        )
+        return PlanStepResult(
+            task_id=current.task_id,
+            step_no=step_no,
+            next_step=steps[step_no - 1],
+            closed=False,
+            restored_task_id=None,
+            binding_revision=current.revision,
+        )
+
+
+def continue_plan(
+    conn: sqlite3.Connection,
+    key: ExecutionKey,
+    plan_id: str,
+    *,
+    actor: str,
+    session_id: str,
+) -> ExecutionBinding:
+    """Transfer an active Plan to the caller's agent and current session."""
+    _validate_key(key)
+    if not plan_id:
+        raise ValueError("plan_id must not be empty")
+    if not session_id:
+        raise PlanStateUnavailable("agent session is unavailable")
+    now = int(time.time())
+    with write_txn(conn):
+        task = _task_row(conn, plan_id)
+        if task["status"] != "manual":
+            raise InvalidTaskState(
+                f"plan {plan_id} cannot continue from status {task['status']}"
+            )
+        _steps_for_task(task)
+        prior = conn.execute(
+            "SELECT revision FROM execution_bindings "
+            "WHERE task_id = ? OR (profile = ? AND root_session_id = ?)",
+            (plan_id, key.profile, key.root_session_id),
+        ).fetchall()
+        revision = max((int(row["revision"]) for row in prior), default=0) + 1
+        conn.execute(
+            "DELETE FROM execution_bindings WHERE task_id = ? "
+            "OR (profile = ? AND root_session_id = ?)",
+            (plan_id, key.profile, key.root_session_id),
+        )
+        conn.execute(
+            "INSERT INTO execution_bindings "
+            "(profile, root_session_id, task_id, revision, bound_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (key.profile, key.root_session_id, plan_id, revision, now, now),
+        )
+        changed = conn.execute(
+            "UPDATE tasks SET assignee = ?, session_id = ? "
+            "WHERE id = ? AND status = 'manual'",
+            (actor, session_id, plan_id),
+        ).rowcount
+        if changed != 1:
+            raise InvalidTaskState(f"plan {plan_id} changed during continuation")
+        stored = _get_binding_row(conn, key)
+        if stored is None:
+            raise ExecutionBindingError("plan binding disappeared during continuation")
+        return _binding_from_row(stored)
 
 
 def close_plan(

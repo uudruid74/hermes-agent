@@ -258,20 +258,22 @@ def _current(conn, agent):
     return key, binding, None
 
 
-def cmd_done(agent, status: Optional[str] = None) -> str:
+def cmd_advance(agent, summary: str) -> str:
     from hermes_cli import execution_bindings as bindings
 
     conn = _legacy()._get_kanban_db()
     key, binding, error = _current(conn, agent)
     if error:
         return error
+    if key is None or binding is None:
+        return "ERROR: No active task"
     try:
         result = bindings.advance_plan(
             conn,
             key,
             expected_task_id=binding.task_id,
             expected_revision=binding.revision,
-            status_note=status,
+            summary=summary,
             actor=_legacy()._get_agent_name(agent),
         )
     except bindings.ExecutionBindingError as exc:
@@ -290,6 +292,32 @@ def cmd_done(agent, status: Optional[str] = None) -> str:
                 session_db.update_agent_rating(source["assignee"], 0.5)
         return f"The task goal was: {task['task_goal'] or ''}"
     return f"Complete Step {result.step_no}: {result.next_step}"
+
+
+def cmd_handoff(agent, summary: str) -> str:
+    from hermes_cli import execution_bindings as bindings
+
+    conn = _legacy()._get_kanban_db()
+    key, binding, error = _current(conn, agent)
+    if error:
+        return error
+    if key is None or binding is None:
+        return "ERROR: No active task"
+    try:
+        result = bindings.handoff_plan(
+            conn,
+            key,
+            expected_task_id=binding.task_id,
+            expected_revision=binding.revision,
+            summary=summary,
+            actor=_legacy()._get_agent_name(agent),
+        )
+    except bindings.ExecutionBindingError as exc:
+        return f"ERROR: {exc}"
+    return (
+        f"Handoff recorded for {result.task_id}, Step {result.step_no}: "
+        f"{summary}"
+    )
 
 
 def _terminal(agent, outcome: str, reason: Optional[str]) -> str:
@@ -359,6 +387,30 @@ def cmd_test_complete(agent) -> str:
     return _terminal(agent, "test-complete", None)
 
 
+def _format_plan(conn, task, *, historical: bool, include_summaries: bool) -> str:
+    from hermes_cli import execution_bindings as bindings
+
+    steps = json.loads(task["task_steps"] or "[]")
+    stepno = task["task_stepno"] or 1
+    lines = [
+        ("Historical task: " if historical else "Task: ") + (task["title"] or task["id"]),
+        f"Status: {task['status']}",
+        f"Goal: {task['task_goal'] or ''}",
+        f"Step {stepno}/{len(steps)}",
+        "",
+    ]
+    summaries = (
+        bindings.plan_step_summaries(conn, task["id"])
+        if include_summaries
+        else {}
+    )
+    for index, step in enumerate(steps, 1):
+        lines.append(f"  {'→' if index == stepno else ' '} Step {index}: {step}")
+        if index in summaries:
+            lines.append(f"      Summary: {summaries[index]}")
+    return "\n".join(lines)
+
+
 def cmd_remind(agent, task_id: Optional[str] = None) -> str:
     conn = _legacy()._get_kanban_db()
     historical = task_id is not None
@@ -366,24 +418,35 @@ def cmd_remind(agent, task_id: Optional[str] = None) -> str:
         _key, binding, error = _current(conn, agent)
         if error:
             return error
+        if binding is None:
+            return "ERROR: No active task"
         task_id = binding.task_id
     task = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
     if task is None:
         return f"Task {task_id} not found"
-    steps = json.loads(task["task_steps"] or "[]")
-    stepno = task["task_stepno"] or 1
-    lines = [
-        ("Historical task: " if historical else "Task: ") + (task["title"] or task_id),
-        f"Status: {task['status']}",
-        f"Goal: {task['task_goal'] or ''}",
-        f"Step {stepno}/{len(steps)}",
-        "",
-    ]
-    lines.extend(
-        f"  {'→' if index == stepno else ' '} Step {index}: {step}"
-        for index, step in enumerate(steps, 1)
-    )
-    return "\n".join(lines)
+    return _format_plan(conn, task, historical=historical, include_summaries=False)
+
+
+def cmd_continue(agent, task_id: str) -> str:
+    from hermes_cli import execution_bindings as bindings
+
+    conn = _legacy()._get_kanban_db()
+    session_id = getattr(agent, "session_id", None)
+    if not isinstance(session_id, str) or not session_id:
+        return "PLAN_STATE_UNAVAILABLE: agent session is unavailable"
+    try:
+        key = _identity(agent)
+        bindings.continue_plan(
+            conn,
+            key,
+            task_id,
+            actor=_legacy()._get_agent_name(agent),
+            session_id=session_id,
+        )
+    except (bindings.ExecutionBindingError, ValueError) as exc:
+        return f"ERROR: {exc}"
+    task = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    return _format_plan(conn, task, historical=False, include_summaries=True)
 
 
 def cmd_approve(agent, task_id: str) -> str:
