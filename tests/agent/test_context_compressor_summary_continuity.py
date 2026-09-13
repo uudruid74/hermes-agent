@@ -273,19 +273,8 @@ def test_zero_protect_first_n_still_folds_restart_fossil():
 
 
 
-def test_restart_fossil_survives_summary_abort_then_retry():
-    """An aborted first compaction must not strand the rehydrated fossil.
-
-    Regression for the abort/retry path. The first-compaction self-heal scan
-    (``compression_count < 1``) populates ``_previous_summary`` from a fossil
-    that drifted past the decay probe. If summary generation then aborts
-    (auth / network / ``abort_on_summary_failure``) and returns the transcript
-    unchanged, the aborted attempt must not leave that rehydrated state behind:
-    otherwise the retry — still ``compression_count == 0`` but now with a
-    truthy ``_previous_summary`` — takes the narrow rescan, misses the
-    beyond-window fossil, and then discards the rehydrated summary as
-    cross-session leakage, copying the fossil forward as a stacked summary.
-    """
+def test_restart_fossil_is_folded_into_internal_fallback_state():
+    """A recovered fossil becomes part of the canonical local summary."""
     compressor = _compressor(protect_first_n=1)
     compressor.abort_on_summary_failure = True
     old_summary = "ABORT-RETRY-OLD-SUMMARY durable facts"
@@ -302,22 +291,15 @@ def test_restart_fossil_survives_summary_abort_then_retry():
         {"role": "user", "content": "active request"},
     ]
 
-    # First compaction aborts on a summary-generation failure. The transcript
-    # is returned unchanged AND the self-heal state it rehydrated must be
-    # rolled back, so a retry behaves like the original first compaction.
     with patch.object(compressor, "_generate_summary", return_value=None):
-        aborted = compressor.compress([dict(m) for m in msgs])
-    assert compressor._last_compress_aborted is True
-    assert all(m["content"] for m in aborted)  # returned unchanged
-    assert compressor.compression_count == 0
-    assert compressor._previous_summary is None
-
-    # Retry: the fossil beyond the narrow window is still folded, not copied
-    # forward as a second stacked summary.
-    with patch("agent.context_compressor.call_llm", return_value=_response("fresh summary")):
         result = compressor.compress([dict(m) for m in msgs])
 
-    assert all(old_summary not in str(msg.get("content", "")) for msg in result)
+    assert compressor._last_compress_aborted is False
+    assert compressor._last_summary_fallback_used is True
+    assert compressor.compression_count == 1
+    assert old_summary in (compressor._previous_summary or "")
+    assert "filler 1" in (compressor._previous_summary or "")
+    assert any(old_summary in str(msg.get("content", "")) for msg in result)
     assert sum(
         1 for msg in result if ContextCompressor._is_context_summary_message(msg)
     ) == 1

@@ -202,6 +202,24 @@ def test_handoff_replaces_current_step_summary_without_advancing(monkeypatch):
     ]
 
 
+def test_remind_never_labels_an_explicit_task_historical(monkeypatch):
+    conn = _db()
+    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    monkeypatch.setattr(
+        plan_tool, "clarify_tool", lambda *_args, **_kwargs: '{"user_response":"Approve"}'
+    )
+    agent = _Agent()
+    plan_tool.plan_tool(
+        agent, "new", title="Work in progress", goal="finish it", steps=["keep working"]
+    )
+    task_id = conn.execute("SELECT task_id FROM execution_bindings").fetchone()[0]
+
+    result = plan_tool.plan_tool(agent, "remind", task_id=task_id)
+
+    assert "Task: Work in progress" in result
+    assert "historical" not in result.casefold()
+
+
 def test_continue_rebinds_session_and_agent_and_returns_step_summaries(monkeypatch):
     conn = _db()
     monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
@@ -241,6 +259,39 @@ def test_continue_rebinds_session_and_agent_and_returns_step_summaries(monkeypat
         "SELECT assignee, session_id, task_stepno FROM tasks WHERE id=?", (task_id,)
     ).fetchone()
     assert tuple(task) == ("ornith", "new-session", 2)
+
+
+def test_active_plan_compression_context_is_read_only_and_summary_aware(monkeypatch):
+    from tools import plan_binding_adapter
+
+    conn = _db()
+    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    monkeypatch.setattr(
+        plan_tool, "clarify_tool", lambda *_args, **_kwargs: '{"user_response":"Approve"}'
+    )
+    agent = _Agent()
+    plan_tool.plan_tool(
+        agent,
+        "new",
+        title="Compression plan",
+        goal="survive provider failure",
+        steps=["inspect", "implement"],
+    )
+    task_id = conn.execute("SELECT task_id FROM execution_bindings").fetchone()[0]
+    plan_tool.plan_tool(agent, "handoff", summary="Inspection complete")
+    before = [tuple(row) for row in conn.execute("SELECT * FROM execution_bindings")]
+
+    contexts = plan_binding_adapter.active_plan_compression_context(agent)
+
+    assert contexts is not None
+    full, minimal = contexts
+    assert "Task: Compression plan" in full
+    assert "Summary: Inspection complete" in full
+    assert "Goal: survive provider failure" in minimal
+    assert "Current step 1/2: inspect" in minimal
+    assert "Summary: Inspection complete" in minimal
+    assert [tuple(row) for row in conn.execute("SELECT * FROM execution_bindings")] == before
+    assert conn.execute("SELECT task_stepno FROM tasks WHERE id=?", (task_id,)).fetchone()[0] == 1
 
 
 def test_schema_replaces_done_and_status_with_advance_summary_handoff_continue():

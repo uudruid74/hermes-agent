@@ -549,16 +549,8 @@ class TestSummaryFailureCooldown:
         assert mock_call.call_count == 1
 
 
-class TestAuthFailureAborts:
-    """A 401/403 on the summary call must ABORT compression (preserve the
-    session unchanged) instead of rotating into a degraded child session
-    with a placeholder summary — regardless of abort_on_summary_failure.
-
-    Real incident: a nous token pointed at a stale staging inference URL
-    401'd on every compression attempt, and because abort_on_summary_failure
-    defaults False the session rotated anyway (messages N->N), stranding the
-    user on a fresh-but-broken session that kept failing the same way.
-    """
+class TestSummaryAccessFailureFallback:
+    """Access and quota failures still reach the final CPU-only provider."""
 
     def _msgs(self, n=10):
         return [
@@ -584,8 +576,7 @@ class TestAuthFailureAborts:
 
 
 
-    def test_400_out_of_extra_usage_aborts_instead_of_dropping_context(self):
-        """Quota exhaustion preserves the original messages for a later retry."""
+    def test_400_out_of_extra_usage_uses_internal_fallback(self):
         err = StubProviderError(
             "Error code: 400 - {'error': {'message': 'out of extra usage'}}",
             status_code=400,
@@ -602,13 +593,12 @@ class TestAuthFailureAborts:
         with patch("agent.context_compressor.call_llm", side_effect=err):
             result = c.compress(msgs, current_tokens=999999, force=True)
 
-        assert result == msgs
+        assert result != msgs
         assert c._last_summary_auth_failure is True
-        assert c._last_compress_aborted is True
-        assert c._last_summary_fallback_used is False
+        assert c._last_compress_aborted is False
+        assert c._last_summary_fallback_used is True
 
-    def test_missing_provider_api_key_preserves_original_messages(self):
-        """A configured auxiliary provider without a visible key preserves context."""
+    def test_missing_provider_api_key_uses_internal_fallback(self):
         err = RuntimeError(
             "Provider 'opencode-zen' is set in config.yaml but no API key was "
             "found. Set the OPENCODE-ZEN_API_KEY environment variable, or switch "
@@ -628,12 +618,12 @@ class TestAuthFailureAborts:
         with patch("agent.context_compressor.call_llm", side_effect=err):
             result = c.compress(msgs, current_tokens=999999, force=True)
 
-        assert result == msgs
+        assert result != msgs
         assert c._last_summary_error == str(err)
         assert c._last_summary_auth_failure is True
-        assert c._last_compress_aborted is True
-        assert c._last_summary_fallback_used is False
-        assert c._last_summary_dropped_count == 0
+        assert c._last_compress_aborted is False
+        assert c._last_summary_fallback_used is True
+        assert c._last_summary_dropped_count > 0
 
     def test_402_quota_with_retry_uses_existing_fallback(self):
         """A reset-window quota remains transient instead of aborting compression."""
@@ -974,10 +964,7 @@ class TestAuxModelFallbackSurfacedToCallers:
 
 
 class TestSummaryFailureTrackingForGatewayWarning:
-    """Default behavior (compression.abort_on_summary_failure=False):
-    summary-generation failure inserts a static fallback placeholder and
-    records dropped count + fallback flag so gateway hygiene & /compress
-    can surface a visible warning."""
+    """Internal fallback records enough state for gateway and CLI warnings."""
 
     def test_compress_records_fallback_and_dropped_count_on_summary_failure(self):
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
@@ -1003,7 +990,8 @@ class TestSummaryFailureTrackingForGatewayWarning:
         # Default mode: abort flag must NOT fire.
         assert c._last_compress_aborted is False
         assert any(
-            isinstance(m.get("content"), str) and "Summary generation was unavailable" in m["content"]
+            isinstance(m.get("content"), str)
+            and "CONTEXT WINDOW COMPRESSED — INTERNAL FALLBACK" in m["content"]
             for m in result
         )
 
@@ -1038,8 +1026,11 @@ class TestSummaryFailureTrackingForGatewayWarning:
         with patch("agent.context_compressor.call_llm", side_effect=Exception("timeout")):
             result = c.compress(msgs)
 
-        fallback = next(m["content"] for m in result if "Summary generation was unavailable" in m.get("content", ""))
-        assert "Called tool(s): read_file" in fallback
+        fallback = next(
+            m["content"]
+            for m in result
+            if "CONTEXT WINDOW COMPRESSED — INTERNAL FALLBACK" in m.get("content", "")
+        )
         assert "/tmp/project/app.py" in fallback
         assert secret not in fallback
         assert "ghp_" not in fallback
@@ -1049,11 +1040,8 @@ class TestSummaryFailureTrackingForGatewayWarning:
 
 
 
-class TestAbortOnSummaryFailure:
-    """Opt-in behavior (compression.abort_on_summary_failure=True):
-    summary-generation failure ABORTS compression entirely — returns the
-    original messages unchanged and sets _last_compress_aborted=True so
-    gateway hygiene & /compress can surface a visible warning."""
+class TestInternalFallbackPrecedesAbort:
+    """The legacy abort flag does not skip the final internal provider."""
 
     def _make_msgs(self):
         return [
@@ -1077,22 +1065,20 @@ class TestAbortOnSummaryFailure:
                 abort_on_summary_failure=True,
             )
 
-    def test_compress_aborts_and_preserves_messages_on_summary_failure(self):
+    def test_compress_uses_internal_fallback_on_summary_failure(self):
         c = self._make_compressor()
         msgs = self._make_msgs()
         with patch("agent.context_compressor.call_llm", side_effect=Exception("404 model not found")):
             result = c.compress(msgs)
 
-        assert c._last_compress_aborted is True
+        assert c._last_compress_aborted is False
         assert c._last_summary_error is not None
-        # No fallback inserted, no messages dropped
-        assert c._last_summary_fallback_used is False
-        assert c._last_summary_dropped_count == 0
-        # Original messages preserved byte-for-byte.
-        assert result == msgs
-        # No "Summary generation was unavailable" placeholder leaked in.
-        assert not any(
-            isinstance(m.get("content"), str) and "Summary generation was unavailable" in m["content"]
+        assert c._last_summary_fallback_used is True
+        assert c._last_summary_dropped_count > 0
+        assert result != msgs
+        assert any(
+            isinstance(m.get("content"), str)
+            and "CONTEXT WINDOW COMPRESSED — INTERNAL FALLBACK" in m["content"]
             for m in result
         )
 
@@ -2223,17 +2209,8 @@ class TestSanitizerStripsOrphanedToolCalls:
         # No stub tool messages (which would have call_id != id mismatch)
 
 
-class TestCooldownReentryAbort:
-    """Regression: a second compress() call during the failure cooldown must
-    still abort when the original failure was a network/auth error.
-
-    Before the fix, compress() unconditionally reset _last_summary_network_failure
-    and _last_summary_auth_failure at the top of every call.  When
-    _generate_summary() returned None from the cooldown early-return (without
-    re-setting the flags), the abort guard saw False and fell through to the
-    destructive static-fallback path — reproducing the data-loss scenario from
-    #29559 / #25585 that PR #51881 originally fixed.
-    """
+class TestCooldownReentryFallback:
+    """Cooldown re-entry skips the broken provider but still compresses locally."""
 
     def _msgs(self, n=12):
         return [
@@ -2241,10 +2218,7 @@ class TestCooldownReentryAbort:
             for i in range(n)
         ]
 
-    def test_network_failure_cooldown_reentry_still_aborts(self):
-        """ConnectionError → first compress aborts (PR #51881).  Second
-        compress within the 30s cooldown must ALSO abort — not drop the
-        middle window via the static-fallback path."""
+    def test_network_failure_cooldown_reentry_uses_internal_fallback(self):
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
             c = ContextCompressor(
                 model="test",
@@ -2258,23 +2232,18 @@ class TestCooldownReentryAbort:
         with patch(
             "agent.context_compressor.call_llm",
             side_effect=ConnectionError("Connection error."),
-        ):
+        ) as mock_llm:
             first = c.compress(msgs, current_tokens=999999, force=True)
-        assert first == msgs
-        assert c._last_compress_aborted is True
+            second = c.compress(msgs, current_tokens=999999)
+
+        assert first != msgs
+        assert second != msgs
+        assert mock_llm.call_count == 1
+        assert c._last_compress_aborted is False
         assert c._last_summary_network_failure is True
+        assert c._last_summary_fallback_used is True
 
-        second = c.compress(msgs, current_tokens=999999)
-        assert second == msgs, (
-            "Second compress during cooldown must abort (preserve messages), "
-            "not drop the middle window via static-fallback"
-        )
-        assert c._last_compress_aborted is True
-        assert c._last_summary_fallback_used is False
-
-    def test_auth_failure_cooldown_reentry_still_aborts(self):
-        """Same re-entry hole for auth failures: a 401 sets the flag, cooldown
-        returns None, second compress must still abort."""
+    def test_auth_failure_cooldown_reentry_uses_internal_fallback(self):
         err = Exception("Error code: 401 - invalid api key")
         err.status_code = 401
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
@@ -2287,19 +2256,16 @@ class TestCooldownReentryAbort:
             )
         msgs = self._msgs(12)
 
-        with patch("agent.context_compressor.call_llm", side_effect=err):
+        with patch("agent.context_compressor.call_llm", side_effect=err) as mock_llm:
             first = c.compress(msgs, current_tokens=999999, force=True)
-        assert first == msgs
-        assert c._last_compress_aborted is True
-        assert c._last_summary_auth_failure is True
+            second = c.compress(msgs, current_tokens=999999)
 
-        second = c.compress(msgs, current_tokens=999999)
-        assert second == msgs, (
-            "Second compress during cooldown must abort (preserve messages), "
-            "not drop the middle window via static-fallback"
-        )
-        assert c._last_compress_aborted is True
-        assert c._last_summary_fallback_used is False
+        assert first != msgs
+        assert second != msgs
+        assert mock_llm.call_count == 1
+        assert c._last_compress_aborted is False
+        assert c._last_summary_auth_failure is True
+        assert c._last_summary_fallback_used is True
 
 
 class TestDoubleCompactionSummaryRole:

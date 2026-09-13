@@ -58,6 +58,7 @@ import json
 import logging
 import math
 import os
+import sqlite3
 import tempfile
 import time
 import uuid
@@ -1370,6 +1371,8 @@ def _supported_compression_kwargs(
     focus_topic: Optional[str],
     force: bool,
     memory_context: str,
+    plan_context: str = "",
+    minimal_plan_context: str = "",
 ) -> dict:
     """Return only compression kwargs accepted by an engine callable.
 
@@ -1385,6 +1388,10 @@ def _supported_compression_kwargs(
     }
     if memory_context:
         candidates["memory_context"] = memory_context
+    if plan_context:
+        candidates["plan_context"] = plan_context
+    if minimal_plan_context:
+        candidates["minimal_plan_context"] = minimal_plan_context
     try:
         parameters = inspect.signature(compress_fn).parameters
     except (TypeError, ValueError):
@@ -2762,6 +2769,36 @@ def compress_context(
                     # instead of under-counting the newly visible rows.
                     approx_tokens = 0
 
+        compress_fn = agent.context_compressor.compress
+        try:
+            plan_parameters = inspect.signature(compress_fn).parameters.values()
+            accepts_plan_context = any(
+                parameter.name == "plan_context"
+                or parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in plan_parameters
+            )
+        except (TypeError, ValueError):
+            accepts_plan_context = False
+
+        # Capture active Plan state read-only before compression. The built-in
+        # fallback uses the same summary-aware rendering as plan_tool continue;
+        # plugin engines receive it only when their signature opts in below.
+        plan_context = ""
+        minimal_plan_context = ""
+        if accepts_plan_context:
+            try:
+                from tools.plan_binding_adapter import active_plan_compression_context
+
+                active_plan_contexts = active_plan_compression_context(agent)
+                if active_plan_contexts is not None:
+                    plan_context, minimal_plan_context = active_plan_contexts
+            except (ImportError, OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
+                logger.warning(
+                    "active Plan context unavailable during compression: %s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
+
         # Notify external memory provider before compression discards context.
         # The provider's on_pre_compress() may return a string of insights it
         # wants surfaced inside the compression summary; capture and forward it
@@ -2775,13 +2812,14 @@ def compress_context(
             except Exception:
                 pass
 
-        compress_fn = agent.context_compressor.compress
         compress_kwargs = _supported_compression_kwargs(
             compress_fn,
             current_tokens=approx_tokens,
             focus_topic=focus_topic,
             force=force,
             memory_context=memory_context,
+            plan_context=plan_context,
+            minimal_plan_context=minimal_plan_context,
         )
         if memory_context.strip() and "memory_context" not in compress_kwargs:
             engine_name = getattr(

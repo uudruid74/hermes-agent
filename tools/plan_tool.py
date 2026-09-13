@@ -1159,7 +1159,7 @@ def _cmd_archive(task_id: str) -> str:
 
 
 # Live Plan commands resolve identity only through execution bindings. The
-# historical private helpers above remain provenance and are not dispatched.
+# legacy private helpers above remain provenance and are not dispatched.
 from tools.plan_binding_adapter import (
     cmd_advance as _cmd_advance,
     cmd_approve as _cmd_approve,

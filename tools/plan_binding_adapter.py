@@ -1,6 +1,6 @@
 """Execution-binding-only adapters for live Plan commands.
 
-The historical helpers in :mod:`tools.plan_tool` are retained for provenance,
+The legacy helpers in :mod:`tools.plan_tool` are retained for provenance,
 but live command dispatch resolves runtime identity exclusively through this
 module and ``hermes_cli.execution_bindings``.
 """
@@ -387,23 +387,33 @@ def cmd_test_complete(agent) -> str:
     return _terminal(agent, "test-complete", None)
 
 
-def _format_plan(conn, task, *, historical: bool, include_summaries: bool) -> str:
+def _format_plan(conn, task, *, include_summaries: bool, minimal: bool = False) -> str:
     from hermes_cli import execution_bindings as bindings
 
     steps = json.loads(task["task_steps"] or "[]")
     stepno = task["task_stepno"] or 1
-    lines = [
-        ("Historical task: " if historical else "Task: ") + (task["title"] or task["id"]),
-        f"Status: {task['status']}",
-        f"Goal: {task['task_goal'] or ''}",
-        f"Step {stepno}/{len(steps)}",
-        "",
-    ]
     summaries = (
         bindings.plan_step_summaries(conn, task["id"])
         if include_summaries
         else {}
     )
+    if minimal:
+        current_step = steps[stepno - 1] if 0 < stepno <= len(steps) else ""
+        lines = [
+            f"Goal: {task['task_goal'] or ''}",
+            f"Current step {stepno}/{len(steps)}: {current_step}",
+        ]
+        if stepno in summaries:
+            lines.append(f"Summary: {summaries[stepno]}")
+        return "\n".join(lines)
+
+    lines = [
+        f"Task: {task['title'] or task['id']}",
+        f"Status: {task['status']}",
+        f"Goal: {task['task_goal'] or ''}",
+        f"Step {stepno}/{len(steps)}",
+        "",
+    ]
     for index, step in enumerate(steps, 1):
         lines.append(f"  {'→' if index == stepno else ' '} Step {index}: {step}")
         if index in summaries:
@@ -411,9 +421,24 @@ def _format_plan(conn, task, *, historical: bool, include_summaries: bool) -> st
     return "\n".join(lines)
 
 
+def active_plan_compression_context(agent) -> Optional[tuple[str, str]]:
+    """Return full and minimal context for the active Plan without rebinding it."""
+
+    conn = _legacy()._get_kanban_db()
+    _key, binding, error = _current(conn, agent)
+    if error or binding is None:
+        return None
+    task = conn.execute("SELECT * FROM tasks WHERE id = ?", (binding.task_id,)).fetchone()
+    if task is None:
+        return None
+    return (
+        _format_plan(conn, task, include_summaries=True),
+        _format_plan(conn, task, include_summaries=True, minimal=True),
+    )
+
+
 def cmd_remind(agent, task_id: Optional[str] = None) -> str:
     conn = _legacy()._get_kanban_db()
-    historical = task_id is not None
     if task_id is None:
         _key, binding, error = _current(conn, agent)
         if error:
@@ -424,7 +449,7 @@ def cmd_remind(agent, task_id: Optional[str] = None) -> str:
     task = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
     if task is None:
         return f"Task {task_id} not found"
-    return _format_plan(conn, task, historical=historical, include_summaries=False)
+    return _format_plan(conn, task, include_summaries=False)
 
 
 def cmd_continue(agent, task_id: str) -> str:
@@ -446,7 +471,7 @@ def cmd_continue(agent, task_id: str) -> str:
     except (bindings.ExecutionBindingError, ValueError) as exc:
         return f"ERROR: {exc}"
     task = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
-    return _format_plan(conn, task, historical=False, include_summaries=True)
+    return _format_plan(conn, task, include_summaries=True)
 
 
 def cmd_approve(agent, task_id: str) -> str:

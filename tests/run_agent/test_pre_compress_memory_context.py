@@ -43,7 +43,14 @@ def _configure_engine_state(engine):
     engine._last_aux_model_failure_error = None
 
 
-def test_on_pre_compress_result_reaches_compressor_with_existing_options():
+def test_memory_and_active_plan_context_reach_builtin_compressor(monkeypatch):
+    from tools import plan_binding_adapter
+
+    monkeypatch.setattr(
+        plan_binding_adapter,
+        "active_plan_compression_context",
+        lambda _agent: ("full active plan", "minimal active plan"),
+    )
     manager = MagicMock()
     manager.on_pre_compress.return_value = "Checkpoint id: ctx-orchestrator"
     received = {}
@@ -55,12 +62,16 @@ def test_on_pre_compress_result_reaches_compressor_with_existing_options():
         focus_topic=None,
         force=False,
         memory_context="",
+        plan_context="",
+        minimal_plan_context="",
     ):
         received.update(
             current_tokens=current_tokens,
             focus_topic=focus_topic,
             force=force,
             memory_context=memory_context,
+            plan_context=plan_context,
+            minimal_plan_context=minimal_plan_context,
         )
         return [incoming[0], incoming[-1]]
 
@@ -83,10 +94,22 @@ def test_on_pre_compress_result_reaches_compressor_with_existing_options():
         "focus_topic": "checkpoint continuity",
         "force": True,
         "memory_context": "Checkpoint id: ctx-orchestrator",
+        "plan_context": "full active plan",
+        "minimal_plan_context": "minimal active plan",
     }
 
 
-def test_legacy_engine_receives_only_supported_compression_arguments():
+def test_legacy_engine_receives_only_supported_compression_arguments(monkeypatch):
+    from tools import plan_binding_adapter
+
+    def unexpected_plan_lookup(_agent):
+        raise AssertionError("legacy engine must not trigger plan lookup")
+
+    monkeypatch.setattr(
+        plan_binding_adapter,
+        "active_plan_compression_context",
+        unexpected_plan_lookup,
+    )
     manager = MagicMock()
     manager.on_pre_compress.return_value = "Checkpoint id: unsupported-by-legacy"
     calls = []

@@ -33,6 +33,10 @@ from agent.auxiliary_client import (
 )
 from agent.context_engine import ContextEngine, sanitize_memory_context
 from agent.error_classifier import FailoverReason, classify_api_error
+from agent.internal_compression_fallback import (
+    INTERNAL_FALLBACK_PREFIX,
+    build_internal_fallback,
+)
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
     get_model_context_length,
@@ -689,11 +693,12 @@ def _redact_compaction_text(text: Any) -> str:
       tokens, and URL userinfo never need to survive summarization the way
       they must survive live navigation flows.
     """
-    return redact_sensitive_text(
+    redacted = redact_sensitive_text(
         text or "",
         force=True,
         redact_url_credentials=True,
     )
+    return re.sub(r"\bgh[pousr]_[A-Za-z0-9_.-]+", "[REDACTED]", redacted)
 
 
 def _dedupe_append(items: list[str], value: str, *, limit: int) -> None:
@@ -2288,10 +2293,9 @@ class ContextCompressor(ContextEngine):
         # other value (None, non-numeric, <=0) means "no reservation" so the
         # threshold arithmetic never sees a non-int (e.g. a test MagicMock).
         self.max_tokens = self._coerce_max_tokens(max_tokens)
-        # When True, summary-generation failure aborts compression entirely
-        # (returns messages unchanged, sets _last_compress_aborted=True).
-        # When False (default = historical behavior), insert a
-        # deterministic "summary unavailable" handoff and drop the middle window.
+        # Retained for configuration compatibility. Provider failure now always
+        # tries the deterministic internal compressor; abort is reserved for an
+        # internal result that cannot fit even its minimal recovery form.
         self.abort_on_summary_failure = abort_on_summary_failure
 
         # ── Micro-compaction (per-turn rolling compaction) ─────────
@@ -2388,8 +2392,8 @@ class ContextCompressor(ContextEngine):
         # cleared (see get_active_compression_failure_cooldown).
         self._cooldown_persist_failed: bool = False
         self._last_summary_error: Optional[str] = None
-        # When summary generation fails and a static fallback is inserted,
-        # record how many turns were unrecoverably dropped so callers
+        # When provider summarization fails and the internal fallback is used,
+        # record how many turns were locally compressed so callers
         # (gateway hygiene, /compress) can surface a visible warning.
         self._last_summary_dropped_count: int = 0
         self._last_summary_fallback_used: bool = False
@@ -2400,22 +2404,15 @@ class ContextCompressor(ContextEngine):
         # this flag to know "compression was attempted but aborted, freeze
         # the chat until the user manually retries via /compress".
         self._last_compress_aborted: bool = False
-        # Set True when the summary call failed with an authentication /
-        # permission error (HTTP 401/403). Auth failures are non-recoverable
-        # at the request level — the credential or endpoint is broken — so
-        # compress() must ABORT (preserve the session unchanged) rather than
-        # rotate into a degraded child session with a placeholder summary.
-        # This is independent of the abort_on_summary_failure config flag:
-        # rotating on a broken credential is never the right behavior.
+        # Set when the remote summary provider has an authentication /
+        # permission failure. The flag drives cooldown and diagnostics while
+        # the final internal provider keeps compression available.
         self._last_summary_auth_failure: bool = False
         # Set when summary generation ultimately fails due to a transient
         # network/connection error (httpx/httpcore connection drop, premature
         # stream close, etc.) — distinct from auth failures but treated the
-        # same way by compress(): ABORT and preserve the session unchanged
-        # rather than destroy the middle window for a deterministic
-        # "summary unavailable" marker. Retrying once the network recovers is
-        # strictly better than discarding context for a transient blip
-        # (#29559, #25585). Independent of abort_on_summary_failure.
+        # same way for cooldown and diagnostics; compression falls through to
+        # the deterministic internal provider (#29559, #25585).
         self._last_summary_network_failure: bool = False
         # retrying on the main model, record the failure so gateway /
         # CLI callers can still warn the user even though compression
@@ -2648,7 +2645,7 @@ class ContextCompressor(ContextEngine):
         """Evaluate the automatic-compaction gate on in-memory state only."""
         # Do not trigger compression while the summary LLM is in cooldown.
         # On a 429/transient failure _generate_summary() sets a cooldown and
-        # returns None; compress() then inserts a static fallback marker and
+        # returns None; compress() then uses the internal fallback and
         # returns. Tokens stay above threshold, so without this guard every
         # subsequent turn re-fires _compress_context() — re-inserting the
         # marker and re-entering the loop, making the CLI appear frozen until
@@ -3939,9 +3936,8 @@ This compaction should PRIORITISE preserving all information related to the focu
             # See issue #18458.
             _is_streaming_closed = _is_connection_error(e)
             # Authentication, permission, and exhausted-quota failures are NOT
-            # transient or fixable by retrying the same request. Flag them so
-            # compress() preserves the session instead of rotating into a
-            # degraded child with a placeholder summary. We still allow the
+            # transient or fixable by retrying the same request. Flag them for
+            # cooldown and diagnostics. We still allow the
             # one-shot fallback to the MAIN model below when the failure came
             # from a distinct auxiliary summary_model; only a failure on the
             # main model — or a fallback that also access/quota-fails — makes
@@ -4038,11 +4034,8 @@ This compaction should PRIORITISE preserving all information related to the focu
             self._last_summary_error = err_text
             # A terminal connection/network failure (we reach this branch only
             # after any main-model fallback has already been tried or is
-            # unavailable). Flag it so compress() ABORTS and preserves the
-            # session unchanged instead of destroying the middle window for a
-            # placeholder marker — retrying once the network recovers is
-            # strictly better than dropping context (#29559, #25585). Mirrors
-            # the auth-failure carve-out; independent of abort_on_summary_failure.
+            # unavailable). Flag it for cooldown and diagnostics before the
+            # deterministic internal provider runs (#29559, #25585).
             if _is_streaming_closed:
                 self._last_summary_network_failure = True
             logger.warning(
@@ -4071,7 +4064,12 @@ This compaction should PRIORITISE preserving all information related to the focu
         # summarizer prompt.
         if _MERGED_SUMMARY_DELIMITER in text:
             text = text.split(_MERGED_SUMMARY_DELIMITER, 1)[1].strip()
-        for prefix in (SUMMARY_PREFIX, LEGACY_SUMMARY_PREFIX, *_HISTORICAL_SUMMARY_PREFIXES):
+        for prefix in (
+            SUMMARY_PREFIX,
+            INTERNAL_FALLBACK_PREFIX,
+            LEGACY_SUMMARY_PREFIX,
+            *_HISTORICAL_SUMMARY_PREFIXES,
+        ):
             if text.startswith(prefix):
                 text = text[len(prefix):].lstrip()
                 break
@@ -4095,7 +4093,11 @@ This compaction should PRIORITISE preserving all information related to the focu
     @staticmethod
     def _starts_with_summary_prefix(text: str) -> bool:
         """Return True if *text* begins with any known handoff prefix."""
-        if text.startswith(SUMMARY_PREFIX) or text.startswith(LEGACY_SUMMARY_PREFIX):
+        if (
+            text.startswith(SUMMARY_PREFIX)
+            or text.startswith(INTERNAL_FALLBACK_PREFIX)
+            or text.startswith(LEGACY_SUMMARY_PREFIX)
+        ):
             return True
         return any(text.startswith(p) for p in _HISTORICAL_SUMMARY_PREFIXES)
 
@@ -5938,6 +5940,8 @@ This compaction should PRIORITISE preserving all information related to the focu
         focus_topic: Optional[str] = None,
         force: bool = False,
         memory_context: str = "",
+        plan_context: str = "",
+        minimal_plan_context: str = "",
     ) -> List[Dict[str, Any]]:
         """Compress conversation messages by summarizing middle turns.
 
@@ -5974,6 +5978,10 @@ This compaction should PRIORITISE preserving all information related to the focu
                 summary path.  Auto-compress callers pass False.
             memory_context: Optional provider-supplied context to preserve in
                 the summary prompt. Whitespace-only values are ignored.
+            plan_context: Full read-only rendering of the active Plan, including
+                per-step summaries, for the internal fallback.
+            minimal_plan_context: Goal, current step, and current-step summary
+                used only when the full Plan plus recent tail cannot fit.
         """
         # Reset per-call summary failure state — callers inspect these fields
         # after compress() returns to decide whether to surface a warning.
@@ -5990,11 +5998,9 @@ This compaction should PRIORITISE preserving all information related to the focu
         # _generate_summary() on a terminal failure and are already cleared on
         # a successful summary.  Resetting them eagerly defeats the cooldown
         # protection: _generate_summary() returns None from the cooldown
-        # early-return without re-asserting these flags, so the abort guard
-        # below would see False and fall through to the destructive
-        # static-fallback — the exact data-loss #29559 describes.  Letting them
-        # persist across compress() calls is safe because a successful summary
-        # always clears both.
+        # early-return without re-asserting these flags. Letting them persist
+        # across compress() calls preserves diagnostics; a successful remote
+        # summary always clears both.
         telemetry = self._begin_compression_telemetry(current_tokens=current_tokens)
         telemetry["chunk_count"] = 0
 
@@ -6331,75 +6337,60 @@ This compaction should PRIORITISE preserving all information related to the focu
                 self._summary_has_user_turn = _summary_has_user_turn_before_scan
                 raise
 
-        # If summary generation failed, behavior splits on
-        # ``abort_on_summary_failure`` (config: compression.abort_on_summary_failure):
-        #   True  → ABORT compression entirely. Return messages unchanged
-        #           and set _last_compress_aborted=True so callers can warn
-        #           the user and stop the auto-compress retry loop.
-        #   False → Fall through to the default fallback path below: insert
-        #           a deterministic "summary unavailable" handoff and drop
-        #           the middle window.  Records _last_summary_fallback_used /
-        #           _last_summary_dropped_count for gateway hygiene to
-        #           surface a warning.
-        # Default is False (historical behavior).
-        #
-        # EXCEPTION — terminal access/quota AND transient network failures
-        # always abort. Missing credentials, 401/402/403 access failures, and
-        # confirmed non-resetting quota exhaustion cannot be repaired by
-        # retrying the same summary request. A connection/stream-close error
-        # means the network blipped at the compaction moment (#29559). In all
-        # of these cases, rotating into a child session with a placeholder
-        # summary degrades the conversation for zero benefit. Preserve it
-        # unchanged until access is restored or connectivity recovers.
-        if not summary and not feasibility_skip and (
-            self.abort_on_summary_failure
-            or self._last_summary_auth_failure
-            or self._last_summary_network_failure
-        ):
-            n_skipped = compress_end - compress_start
-            self._last_summary_dropped_count = 0  # nothing actually dropped
-            self._last_summary_fallback_used = False
-            self._last_compress_aborted = True
-            if self._last_summary_auth_failure:
-                telemetry["failure_class"] = "summary_auth_failure"
-            elif self._last_summary_network_failure:
-                telemetry["failure_class"] = "summary_network_failure"
+        # Provider failure is not terminal: the internal CPU fallback below is
+        # the last compression provider. Only abort if that fallback cannot fit
+        # even its minimal active-Plan payload under the configured target.
+        if not summary:
+            fallback = build_internal_fallback(
+                messages,
+                protect_head_count=self._protect_head_size(messages),
+                protect_last_n=self.protect_last_n,
+                target_tokens=self.tail_token_budget,
+                plan_context=plan_context,
+                minimal_plan_context=minimal_plan_context,
+                memory_context=memory_context,
+                previous_summary=self._previous_summary or "",
+            )
+            if fallback is None:
+                self._last_summary_dropped_count = 0
+                self._last_summary_fallback_used = False
+                self._last_compress_aborted = True
+                self._previous_summary = _previous_summary_before_scan
+                self._summary_has_user_turn = _summary_has_user_turn_before_scan
+                telemetry["failure_class"] = "internal_fallback_over_budget"
+                if not self.quiet_mode:
+                    logger.warning(
+                        "Internal compression fallback could not fit under the "
+                        "%d-token target; preserving the transcript unchanged.",
+                        self.tail_token_budget,
+                    )
+                return messages
+
+            summary = _redact_compaction_text(fallback.summary)
+            self._previous_summary = self._strip_summary_prefix(summary)
+            compress_start = fallback.head_count
+            compress_end = fallback.tail_start
+            tail_start = fallback.tail_start
+            n_dropped = max(0, compress_end - compress_start)
+            self._last_summary_dropped_count = n_dropped
+            self._last_summary_fallback_used = True
+            telemetry["fallback_used"] = True
+            telemetry["fallback_mode"] = fallback.mode
+            if feasibility_skip:
+                telemetry["failure_class"] = (
+                    telemetry.get("failure_class") or "feasibility_skip"
+                )
             else:
-                telemetry["failure_class"] = "summary_generation_aborted"
-            # Roll back the self-heal rehydration so this aborted attempt is a
-            # true no-op: the next attempt must re-run the full first-compaction
-            # scan instead of narrow-rescanning against a half-populated state
-            # and discarding a legitimately rehydrated fossil (#57835).
-            self._previous_summary = _previous_summary_before_scan
+                telemetry["failure_class"] = (
+                    telemetry.get("failure_class") or "summary_generation_failed"
+                )
             if not self.quiet_mode:
-                if self._last_summary_auth_failure:
-                    logger.warning(
-                        "Summary generation failed with a terminal access or "
-                        "quota error — aborting compression. %d message(s) "
-                        "preserved unchanged; the session was NOT rotated. "
-                        "Check the provider credential, permission, quota, or "
-                        "inference endpoint, then retry with /compress or "
-                        "start fresh with /new.",
-                        n_skipped,
-                    )
-                elif self._last_summary_network_failure:
-                    logger.warning(
-                        "Summary generation failed with a network/connection "
-                        "error — aborting compression. %d message(s) preserved "
-                        "unchanged; the session was NOT rotated. This is "
-                        "transient: retry with /compress once connectivity "
-                        "recovers, or continue the conversation as-is.",
-                        n_skipped,
-                    )
-                else:
-                    logger.warning(
-                        "Summary generation failed — aborting compression "
-                        "(compression.abort_on_summary_failure=true). "
-                        "%d message(s) preserved unchanged. Conversation is "
-                        "frozen until the next /compress or /new.",
-                        n_skipped,
-                    )
-            return messages
+                logger.warning(
+                    "Using internal %s compression fallback after summary "
+                    "provider failure; dropping %d message(s).",
+                    fallback.mode,
+                    n_dropped,
+                )
 
         # Phase 4: Assemble compressed message list
         compressed = []
@@ -6425,33 +6416,6 @@ This compaction should PRIORITISE preserving all information related to the focu
             stripped = self._strip_context_summary_handoff_message(msg)
             if stripped is not None:
                 compressed.append(stripped)
-
-        # If LLM summary failed, insert a deterministic fallback so the model
-        # gets at least locally recoverable continuity anchors instead of a
-        # content-free "N messages were removed" marker.
-        if not summary:
-            if not self.quiet_mode:
-                if feasibility_skip:
-                    logger.info("Feasibility skip — inserting deterministic fallback context summary")
-                else:
-                    logger.warning("Summary generation failed — inserting deterministic fallback context summary")
-            n_dropped = compress_end - compress_start
-            self._last_summary_dropped_count = n_dropped
-            self._last_summary_fallback_used = True
-            telemetry["fallback_used"] = True
-            if feasibility_skip:
-                # Deliberate optimization, not a summary failure — keep the
-                # telemetry class distinct so dashboards don't count skips
-                # as aux-model breakage.
-                telemetry["failure_class"] = telemetry.get("failure_class") or "feasibility_skip"
-            else:
-                telemetry["failure_class"] = telemetry.get("failure_class") or "summary_generation_failed"
-            summary = self._build_static_fallback_summary(
-                turns_to_summarize,
-                # A stale error from an earlier real failure must not be
-                # embedded into a deliberate feasibility skip's fallback.
-                reason=None if feasibility_skip else self._last_summary_error,
-            )
 
         tail_messages: List[Dict[str, Any]] = []
         # Start at tail_start (not compress_end): the restart-decay scan may
@@ -6546,8 +6510,8 @@ This compaction should PRIORITISE preserving all information related to the focu
         # which backends checking for actual query text still reject. Count
         # only user messages with non-empty text as "surviving"; when the
         # guard fires, the real (never fabricated) summary text lands in a
-        # role="user" slot, which is always non-empty (falls back to
-        # ``_build_static_fallback_summary`` above when generation fails).
+        # role="user" slot, which is always non-empty (the internal fallback
+        # above also always emits text when generation fails).
         if not _force_user_leading:
             def _is_nonempty_user_turn(message: Dict[str, Any]) -> bool:
                 return message.get("role") == "user" and bool(
