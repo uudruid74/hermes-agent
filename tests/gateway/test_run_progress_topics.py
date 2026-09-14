@@ -928,6 +928,38 @@ async def _run_with_agent(
     return adapter, result
 
 
+class TellEchoAgent:
+    def __init__(self, **kwargs):
+        self.tell_echo_callback = None
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        assert self.tell_echo_callback is not None
+        self.tell_echo_callback("gopher: exact message body")
+        return {
+            "final_response": "",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+@pytest.mark.asyncio
+async def test_tell_echo_bypasses_interim_message_setting_and_targets_origin(monkeypatch, tmp_path):
+    adapter, _result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        TellEchoAgent,
+        session_id="sess-tell-echo",
+        config_data={"display": {"interim_assistant_messages": False}},
+        chat_id="-1001",
+        thread_id="17585",
+    )
+
+    assert [call["content"] for call in adapter.sent] == ["gopher: exact message body"]
+    assert adapter.sent[0]["chat_id"] == "-1001"
+    assert adapter.sent[0]["metadata"]["thread_id"] == "17585"
+
+
 @pytest.mark.asyncio
 async def test_retryable_overflow_edit_keeps_editable_bubble_identity(monkeypatch, tmp_path):
     """A transient split edit must retain can_edit and the current message ID."""

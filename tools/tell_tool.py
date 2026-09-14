@@ -15,7 +15,7 @@ import json
 import logging
 import os
 import subprocess
-from typing import Callable, Optional
+from typing import Callable
 
 logger = logging.getLogger(__name__)
 
@@ -23,9 +23,9 @@ logger = logging.getLogger(__name__)
 def tell_tool(
     agent: str,
     message: str,
-    echo_callback: Optional[Callable[[str], None]] = None,
+    echo_callback: Callable[[str], object],
 ) -> str:
-    """Wake another Hermes profile; always echo and log the exact outbound payload."""
+    """Wake another Hermes profile after exposing the exact message to the caller."""
     sender = os.environ.get("HERMES_AGENT_NAME") or os.environ.get("HERMES_PROFILE") or "agent"
     wrapped = (
         f"Incoming message from {sender} follows:\n"
@@ -35,12 +35,9 @@ def tell_tool(
         "If a reply is required, use the 'tell' command to reply."
     )
 
-    # Mandatory audit trail: the exact outbound payload is logged unconditionally
-    # and echoed to the calling session whenever a transport callback is present.
-    # There is no opt-out — no secret agent-to-agent traffic.
-    logger.info("tell %s -> %s: %s", sender, agent, wrapped)
-    if echo_callback is not None:
-        echo_callback(wrapped)
+    echo = f"{agent}: {message}"
+    logger.info("%s", echo)
+    echo_callback(echo)
 
     result = subprocess.run(
         ["hermes", "send", "-u", agent, wrapped],
@@ -86,9 +83,10 @@ registry.register(
     name="tell",
     toolset="session",
     schema=TELL_SCHEMA,
-    handler=lambda args, **_kw: tell_tool(
+    handler=lambda args, **kw: tell_tool(
         agent=args["agent"],
         message=args["message"],
+        echo_callback=kw["echo_callback"],
     ),
     emoji="📨",
 )

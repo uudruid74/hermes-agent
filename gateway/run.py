@@ -4286,6 +4286,30 @@ class TurnRunner:
                     ctx._cleanup_msg_ids.append(str(mid))
             _fut.add_done_callback(_track_status_id)
 
+    def _tell_echo_callback_sync(self, message: str) -> None:
+        """Deliver a tell audit echo to the exact originating chat/thread."""
+        ctx = self._ctx
+        adapter = self._runner._adapter_for_source(ctx.source)
+        if adapter is None or not ctx._run_still_current():
+            raise RuntimeError("tell origin is no longer available")
+
+        future = safe_schedule_threadsafe(
+            adapter.send(
+                ctx.source.chat_id,
+                message,
+                metadata=ctx._status_thread_metadata,
+            ),
+            ctx._loop_for_step,
+            logger=logger,
+            log_message="tell echo delivery scheduling error",
+        )
+        if future is None:
+            raise RuntimeError("tell echo could not be scheduled")
+
+        result = future.result(timeout=15)
+        if not getattr(result, "success", False):
+            raise RuntimeError(f"tell echo delivery failed: {getattr(result, 'error', None) or 'unknown error'}")
+
     def run_sync(self):
         ctx = self._ctx
         # Historical note: as a nested closure this body declared
@@ -4762,6 +4786,7 @@ class TurnRunner:
         agent.step_callback = ctx._step_callback_sync if ctx._hooks_ref.loaded_hooks else None
         agent.stream_delta_callback = _stream_delta_cb
         agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
+        agent.tell_echo_callback = self._tell_echo_callback_sync
         agent.status_callback = ctx._status_callback_sync
         # Credits / out-of-band notices (usage bands, depletion, restored).
         # Messaging has no persistent status bar, so each notice is a

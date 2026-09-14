@@ -3,6 +3,8 @@
 import json
 from types import SimpleNamespace
 
+import pytest
+
 from tools import tell_tool
 
 
@@ -14,6 +16,7 @@ def test_tell_wraps_message_and_targets_agent_profile(monkeypatch):
     monkeypatch.setenv("HERMES_AGENT_NAME", "Zephyr")
     monkeypatch.setenv("HERMES_PROFILE", "ignored-profile")
     calls = []
+    echoes = []
 
     def fake_run(command, **kwargs):
         calls.append((command, kwargs))
@@ -21,7 +24,13 @@ def test_tell_wraps_message_and_targets_agent_profile(monkeypatch):
 
     monkeypatch.setattr(tell_tool.subprocess, "run", fake_run)
 
-    result = json.loads(tell_tool.tell_tool(agent="gopher", message="Check the relay."))
+    result = json.loads(
+        tell_tool.tell_tool(
+            agent="gopher",
+            message="Check the relay.",
+            echo_callback=echoes.append,
+        )
+    )
 
     assert calls == [
         (
@@ -39,6 +48,7 @@ def test_tell_wraps_message_and_targets_agent_profile(monkeypatch):
             {"capture_output": True, "text": True, "timeout": 15},
         )
     ]
+    assert echoes == ["gopher: Check the relay."]
     assert result == {"returncode": 0, "stdout": "sent\n", "stderr": ""}
 
 
@@ -51,54 +61,86 @@ def test_tell_uses_profile_when_agent_name_is_absent(monkeypatch):
         lambda *_args, **_kwargs: _completed(),
     )
 
-    result = json.loads(tell_tool.tell_tool(agent="zephyr", message="Reply test."))
+    result = json.loads(
+        tell_tool.tell_tool(
+            agent="zephyr",
+            message="Reply test.",
+            echo_callback=lambda _message: None,
+        )
+    )
 
     assert result["returncode"] == 0
 
 
-def test_tell_echoes_exact_outbound_payload_to_origin(monkeypatch):
-    monkeypatch.setenv("HERMES_AGENT_NAME", "Zephyr")
-    sent = []
+def test_tell_echoes_exact_message_to_origin_before_send(monkeypatch):
+    events = []
     echoes = []
 
     def fake_run(command, **kwargs):
-        sent.append(command[-1])
+        events.append("send")
         return _completed()
+
+    def capture_echo(payload):
+        events.append("echo")
+        echoes.append(payload)
 
     monkeypatch.setattr(tell_tool.subprocess, "run", fake_run)
 
     tell_tool.tell_tool(
         agent="gopher",
-        message="Check the relay.",
-        echo_callback=echoes.append,
+        message="line one\n[REDACTED must remain literal]\nline three",
+        echo_callback=capture_echo,
     )
 
-    # The echo is an exact copy of the payload delivered to the other agent.
-    assert len(sent) == 1
-    assert echoes == sent
+    assert events == ["echo", "send"]
+    assert echoes == ["gopher: line one\n[REDACTED must remain literal]\nline three"]
 
 
-def test_tell_logs_exact_outbound_payload(monkeypatch):
-    monkeypatch.setenv("HERMES_AGENT_NAME", "Zephyr")
+def test_tell_requires_echo_callback_and_does_not_send_without_one(monkeypatch):
+    calls = []
+    monkeypatch.setattr(tell_tool.subprocess, "run", lambda *_a, **_kw: calls.append(True))
+
+    with pytest.raises(TypeError):
+        tell_tool.tell_tool(agent="gopher", message="This must not be secret.")
+
+    assert calls == []
+
+
+def test_tell_does_not_send_when_origin_echo_delivery_fails(monkeypatch):
+    calls = []
+    monkeypatch.setattr(tell_tool.subprocess, "run", lambda *_a, **_kw: calls.append(True))
+
+    def fail_echo(_message):
+        raise RuntimeError("origin unavailable")
+
+    with pytest.raises(RuntimeError, match="origin unavailable"):
+        tell_tool.tell_tool(
+            agent="gopher",
+            message="This must not be secret.",
+            echo_callback=fail_echo,
+        )
+
+    assert calls == []
+
+
+def test_tell_logs_exact_echo(monkeypatch):
     monkeypatch.setattr(tell_tool.subprocess, "run", lambda *_args, **_kwargs: _completed())
     logs = []
+    monkeypatch.setattr(tell_tool.logger, "info", lambda *args, **_kwargs: logs.append(args))
 
-    monkeypatch.setattr(tell_tool.logger, "info", lambda *a, **kw: logs.append(a))
+    tell_tool.tell_tool(
+        agent="gopher",
+        message="Check the relay.",
+        echo_callback=lambda _message: None,
+    )
 
-    tell_tool.tell_tool(agent="gopher", message="Check the relay.")
-
-    assert len(logs) == 1
-    # The exact payload is part of the log call (format + args).
-    assert "Check the relay." in " ".join(str(x) for x in logs[0])
+    assert logs == [("%s", "gopher: Check the relay.")]
 
 
-def test_tell_preserves_send_failure_result_and_echoes_exact_payload(monkeypatch):
-    monkeypatch.setenv("HERMES_AGENT_NAME", "Gopher")
-    sent = []
+def test_tell_preserves_send_failure_result_and_echoes_first(monkeypatch):
     echoes = []
 
     def fake_run(command, **kwargs):
-        sent.append(command[-1])
         return _completed(
             returncode=1,
             stdout="",
@@ -115,7 +157,7 @@ def test_tell_preserves_send_failure_result_and_echoes_exact_payload(monkeypatch
         )
     )
 
-    assert echoes == sent
+    assert echoes == ["zephyr: Are you there?"]
     assert result == {
         "returncode": 1,
         "stdout": "",
@@ -123,7 +165,7 @@ def test_tell_preserves_send_failure_result_and_echoes_exact_payload(monkeypatch
     }
 
 
-def test_agent_runtime_routes_tell_to_origin_callback(monkeypatch):
+def test_agent_runtime_routes_tell_to_mandatory_origin_callback(monkeypatch):
     from agent.agent_runtime_helpers import invoke_tool
 
     monkeypatch.setenv("HERMES_AGENT_NAME", "Neo")
@@ -137,7 +179,7 @@ def test_agent_runtime_routes_tell_to_origin_callback(monkeypatch):
     monkeypatch.setattr(tell_tool.subprocess, "run", fake_run)
     agent = SimpleNamespace(
         _memory_manager=None,
-        interim_assistant_callback=echoes.append,
+        tell_echo_callback=echoes.append,
         session_id="session-1",
     )
 
@@ -153,9 +195,30 @@ def test_agent_runtime_routes_tell_to_origin_callback(monkeypatch):
         )
     )
 
-    assert echoes == sent
-    assert echoes and "Trace this." in echoes[0]
+    assert echoes == ["wintermute: Trace this."]
+    assert sent and "Trace this." in sent[0]
     assert result["returncode"] == 0
+
+
+def test_agent_runtime_refuses_tell_without_origin_callback(monkeypatch):
+    from agent.agent_runtime_helpers import invoke_tool
+
+    calls = []
+    monkeypatch.setattr(tell_tool.subprocess, "run", lambda *_a, **_kw: calls.append(True))
+    agent = SimpleNamespace(_memory_manager=None, session_id="session-1")
+
+    with pytest.raises(RuntimeError, match="origin echo callback"):
+        invoke_tool(
+            agent,
+            "tell",
+            {"agent": "wintermute", "message": "Do not send secretly."},
+            "",
+            pre_tool_block_checked=True,
+            skip_tool_request_middleware=True,
+            skip_tool_execution_middleware=True,
+        )
+
+    assert calls == []
 
 
 def test_tell_is_owned_by_agent_runtime():

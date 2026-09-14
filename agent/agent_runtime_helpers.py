@@ -2998,13 +2998,17 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
         def _execute(next_args: dict) -> Any:
             return _finish_agent_tool(agent._dispatch_delegate_task(next_args), next_args)
     elif function_name == "tell":
+        echo_callback = getattr(agent, "tell_echo_callback", None)
+        if not callable(echo_callback):
+            raise RuntimeError("tell requires an origin echo callback")
+
         def _execute(next_args: dict) -> Any:
             from tools.tell_tool import tell_tool as _tell_tool
             return _finish_agent_tool(
                 _tell_tool(
                     agent=next_args.get("agent", ""),
                     message=next_args.get("message", ""),
-                    echo_callback=getattr(agent, "interim_assistant_callback", None),
+                    echo_callback=echo_callback,
                 ),
                 next_args,
             )
