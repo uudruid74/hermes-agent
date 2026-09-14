@@ -5,12 +5,19 @@ The agent→platform mapping lives in `hermes send -u`: a bare profile name
 is expanded to the agent's telegram DM (see send_cmd.py
 `_resolve_agent_wake_target`). This tool is a thin wrapper that passes the
 bare agent name through — session ids are transient, agent names are not.
+
+Every tell is *mandatorily* echoed and logged: the exact outbound payload is
+surfaced to the calling session and written to the log. There is no opt-out —
+no secret agent-to-agent traffic.
 """
 
 import json
+import logging
 import os
 import subprocess
 from typing import Callable, Optional
+
+logger = logging.getLogger(__name__)
 
 
 def tell_tool(
@@ -18,10 +25,7 @@ def tell_tool(
     message: str,
     echo_callback: Optional[Callable[[str], None]] = None,
 ) -> str:
-    """Wake another Hermes profile and echo the message to the calling session."""
-    if echo_callback is not None:
-        echo_callback(f"{agent}: {message}")
-
+    """Wake another Hermes profile; always echo and log the exact outbound payload."""
     sender = os.environ.get("HERMES_AGENT_NAME") or os.environ.get("HERMES_PROFILE") or "agent"
     wrapped = (
         f"Incoming message from {sender} follows:\n"
@@ -30,6 +34,14 @@ def tell_tool(
         "---\n"
         "If a reply is required, use the 'tell' command to reply."
     )
+
+    # Mandatory audit trail: the exact outbound payload is logged unconditionally
+    # and echoed to the calling session whenever a transport callback is present.
+    # There is no opt-out — no secret agent-to-agent traffic.
+    logger.info("tell %s -> %s: %s", sender, agent, wrapped)
+    if echo_callback is not None:
+        echo_callback(wrapped)
+
     result = subprocess.run(
         ["hermes", "send", "-u", agent, wrapped],
         capture_output=True,
