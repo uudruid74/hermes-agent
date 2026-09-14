@@ -279,6 +279,50 @@ def _fits(
     )
 
 
+def _fit_tail_start(
+    messages: list[dict[str, Any]],
+    head_count: int,
+    tail_start: int,
+    summary: str,
+    target_tokens: int,
+) -> int | None:
+    """Advance *tail_start* forward until the assembled payload fits.
+
+    ``_verbatim_tail_start`` answers "which messages does the template
+    display as the recent conversation" — it walks back until it has seen
+    ``protect_last_n`` *visible* rows, and tool results / assistant
+    tool-call rows are stepped over without being counted.  The index it
+    returns therefore marks the start of a region that can be far larger
+    than the rows the caller actually wanted to keep: on a tool-heavy
+    session, 8 visible turns spanned 57 rows / 2.9x the fallback target.
+
+    Protecting that whole scanned region verbatim is not required — the
+    scaffolding in it is summarised by the lexrank pass like any other
+    middle content.  So: take the visible-based start as the *widest*
+    candidate and shrink it until ``_fits`` succeeds, keeping the region
+    contiguous (the compressor emits ``messages[tail_start:]`` verbatim)
+    and never leaving an orphaned tool result at the boundary.
+
+    Returns the fitted start, or ``None`` when even the newest message
+    plus the summary cannot fit under the target.
+    """
+    total = len(messages)
+    start = max(0, min(tail_start, total))
+    # ``head_count`` bounds the region we may consume: everything before it
+    # is the protected head.
+    limit = max(head_count, total - 1)
+    while start <= limit:
+        # Never begin the verbatim region on a bare tool result — its
+        # assistant tool-call row would be dropped, orphaning the pair and
+        # making the transcript invalid for the provider.
+        while start < limit and messages[start].get("role") == "tool":
+            start += 1
+        if _fits(messages, head_count, start, summary, target_tokens):
+            return start
+        start += 1
+    return None
+
+
 def _plan_summary(plan_context: str, notes: list[str]) -> str:
     parts = [INTERNAL_FALLBACK_PREFIX, "## Active Plan", plan_context.strip()]
     if notes:
@@ -304,21 +348,39 @@ def _fitted_plan_summary(
     notes: list[str],
     target_tokens: int,
     minimal: bool = False,
-) -> str | None:
-    """Keep each priority-ordered note that fits beside the required Plan."""
+) -> tuple[str, int] | None:
+    """Keep each priority-ordered note that fits beside the required Plan.
+
+    Returns ``(summary, fitted_tail_start)``.  The tail start is a
+    *preference* from ``_verbatim_tail_start`` that is advanced forward only
+    as far as the token target requires (see ``_fit_tail_start``), so the
+    protected region is the largest that still fits.
+    """
 
     builder = _minimal_plan_summary if minimal else _plan_summary
     selected_notes: list[str] = []
     summary = builder(plan_context, selected_notes)
-    if not _fits(messages, head_count, tail_start, summary, target_tokens):
-        return None
-
+    # Note selection runs against the FULL requested tail, exactly as
+    # before: shrinking the tail early would free budget that lets
+    # lower-priority notes in, which is not what "keep the notes that fit
+    # beside the protected tail" means.
     for note in notes:
         candidate = builder(plan_context, [*selected_notes, note])
         if _fits(messages, head_count, tail_start, candidate, target_tokens):
             selected_notes.append(note)
             summary = candidate
-    return summary
+
+    if _fits(messages, head_count, tail_start, summary, target_tokens):
+        return summary, tail_start
+    # Last resort: the requested tail cannot fit beside the plan at all.
+    # Shrink the verbatim region (summarising its scaffolding) rather than
+    # aborting — an abort here is terminal for the session.
+    fitted_start = _fit_tail_start(
+        messages, head_count, tail_start, summary, target_tokens
+    )
+    if fitted_start is None:
+        return None
+    return summary, fitted_start
 
 
 def _lexrank_summary(selected: list[_Unit]) -> str:
@@ -363,7 +425,7 @@ def build_internal_fallback(
     notes = _session_notes(messages, memory_context, previous_summary)
 
     if plan_context.strip():
-        summary = _fitted_plan_summary(
+        fitted = _fitted_plan_summary(
             messages,
             head_count=head_count,
             tail_start=tail_start,
@@ -371,8 +433,9 @@ def build_internal_fallback(
             notes=notes,
             target_tokens=target_tokens,
         )
-        if summary is not None:
-            return InternalFallback(summary, head_count, tail_start, "plan")
+        if fitted is not None:
+            summary, fitted_tail_start = fitted
+            return InternalFallback(summary, head_count, fitted_tail_start, "plan")
 
         system_head = 1 if messages and messages[0].get("role") == "system" else 0
         minimal_tail_start = _verbatim_tail_start(
@@ -390,10 +453,11 @@ def build_internal_fallback(
             minimal=True,
         )
         if minimal is not None:
+            summary, fitted_tail_start = minimal
             return InternalFallback(
-                minimal,
+                summary,
                 system_head,
-                minimal_tail_start,
+                fitted_tail_start,
                 "plan-minimal",
             )
         return None
@@ -420,8 +484,11 @@ def build_internal_fallback(
     candidates = middle_units + note_units
     if not candidates:
         summary = _lexrank_summary([])
-        if _fits(messages, head_count, tail_start, summary, target_tokens):
-            return InternalFallback(summary, head_count, tail_start, "lexrank")
+        fitted_start = _fit_tail_start(
+            messages, head_count, tail_start, summary, target_tokens
+        )
+        if fitted_start is not None:
+            return InternalFallback(summary, head_count, fitted_start, "lexrank")
         return None
 
     all_vectors = _tfidf_vectors(
@@ -453,6 +520,15 @@ def build_internal_fallback(
             selected = candidate_selection
 
     summary = _lexrank_summary(selected)
-    if not _fits(messages, head_count, tail_start, summary, target_tokens):
+    if _fits(messages, head_count, tail_start, summary, target_tokens):
+        return InternalFallback(summary, head_count, tail_start, "lexrank")
+    # Last resort: the requested verbatim tail cannot fit at all.  Shrink
+    # the region (summarising its tool scaffolding) instead of aborting —
+    # an abort here is terminal for the session, and the scaffolding rows
+    # were never asked to be protected verbatim.
+    fitted_start = _fit_tail_start(
+        messages, head_count, tail_start, summary, target_tokens
+    )
+    if fitted_start is None:
         return None
-    return InternalFallback(summary, head_count, tail_start, "lexrank")
+    return InternalFallback(summary, head_count, fitted_start, "lexrank")
