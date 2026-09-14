@@ -99,6 +99,96 @@ def _init_git_repo(repo: Path) -> None:
     subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True, text=True)
 
 
+@pytest.mark.parametrize(
+    ("title", "body_template"),
+    [
+        ("Fix completion notifications", "Bug file: {pending}"),
+        ("BUG: renamed-slug", "Bug file: {pending}"),
+        ("BUG: canonical-slug", "## Description\n\nLegacy task body."),
+    ],
+)
+def test_complete_task_resolves_bug_file_from_body_or_legacy_title(
+    kanban_home, tmp_path, monkeypatch, title, body_template
+):
+    vault = tmp_path / "vault"
+    _init_git_repo(vault)
+    pending = (
+        vault
+        / "wiki"
+        / "Projects"
+        / "Hermes-Agent"
+        / "bugs"
+        / "pending"
+        / "2026-09-14-canonical-slug.md"
+    )
+    pending.parent.mkdir(parents=True)
+    pending.write_text(
+        '---\nstatus: "pending"\ndate: "2026-09-14"\n---\n\n'
+        "## Resolution\n\n\n## Failure Reports\n\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["git", "-C", str(vault), "add", "."],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(vault), "commit", "-m", "file bug"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    monkeypatch.setattr(kb, "_BUG_VAULT", vault)
+    monkeypatch.setenv("HERMES_AGENT_NAME", "Neo")
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title=title,
+            body=body_template.format(pending=pending),
+            assignee="neo",
+        )
+        assert kb.complete_task(conn, task_id, summary="Resolved canonical bug")
+
+    resolved = pending.parent.parent / "resolved" / pending.name
+    assert not pending.exists()
+    assert resolved.exists()
+    text = resolved.read_text(encoding="utf-8")
+    assert 'status: "resolved"' in text
+    assert 'resolved_by: "Neo"' in text
+    assert "Resolved canonical bug" in text
+    commit_subject = subprocess.run(
+        ["git", "-C", str(vault), "log", "-1", "--format=%s"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert task_id in commit_subject
+
+
+def test_complete_task_ignores_bug_file_path_outside_pending_tree(
+    kanban_home, tmp_path, monkeypatch
+):
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    outside = tmp_path / "outside.md"
+    original = 'status: "pending"\n'
+    outside.write_text(original, encoding="utf-8")
+    monkeypatch.setattr(kb, "_BUG_VAULT", vault)
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Fix an unrelated file",
+            body=f"Bug file: {outside}",
+            assignee="neo",
+        )
+        assert kb.complete_task(conn, task_id, summary="Should not move it")
+
+    assert outside.read_text(encoding="utf-8") == original
+
+
 # ---------------------------------------------------------------------------
 # Schema / init
 # ---------------------------------------------------------------------------

@@ -5132,27 +5132,48 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
-def _bug_autoremove_resolve(task_id: str, title: str, summary: str) -> None:
-    """Best-effort bug-lifecycle hook: BUG: tasks resolve their bug file.
+_BUG_VAULT = Path("/home/ekl/vault")
 
-    When a task whose title starts with 'BUG: ' completes, move its bug
-    file from bugs/pending/ to bugs/resolved/, stamp the resolution into
-    frontmatter (status, resolved_by, resolution), and git-commit. Never
-    raises — a broken vault or missing file must not fail the completion.
+
+def _bug_autoremove_resolve(
+    task_id: str, title: str, body: str, summary: Optional[str]
+) -> None:
+    """Resolve the bug file named by a completed task.
+
+    Prefer the canonical ``Bug file:`` path stored by bugtool in the task
+    body. Legacy tasks without that line fall back to their ``BUG:`` title.
+    Move the file from bugs/pending/ to bugs/resolved/, stamp the resolution
+    into frontmatter (status, resolved_by, resolution), and git-commit.
+    A broken vault or missing file must not fail task completion.
     (Evan order 2026-09-08: completing a bug task must resolve the bug.)
     """
     import datetime as _dt
     import re as _re
     try:
-        if not title or not title.upper().startswith("BUG:"):
-            return
-        vault = Path("/home/ekl/vault")
+        vault = _BUG_VAULT
         pending = vault / "wiki" / "Projects"
-        slug = title[4:].strip().replace("*", "").replace("?", "").replace("[", "")
-        candidates = sorted(pending.glob(f"*/bugs/pending/*-{slug}.md"))
-        if not candidates:
-            return
-        src_file = candidates[0]
+        body_match = _re.search(r"(?m)^Bug file:\s*(.+?)\s*$", body or "")
+        if body_match:
+            src_file = Path(body_match.group(1)).expanduser()
+            if not src_file.is_absolute():
+                src_file = vault / src_file
+            src_file = src_file.resolve()
+            pending_root = pending.resolve()
+            if (
+                pending_root not in src_file.parents
+                or src_file.parent.name != "pending"
+                or src_file.parent.parent.name != "bugs"
+                or not src_file.is_file()
+            ):
+                return
+        else:
+            if not title or not title.upper().startswith("BUG:"):
+                return
+            slug = title[4:].strip().replace("*", "").replace("?", "").replace("[", "")
+            candidates = sorted(pending.glob(f"*/bugs/pending/*-{slug}.md"))
+            if not candidates:
+                return
+            src_file = candidates[0]
         resolved_dir = src_file.parent.parent / "resolved"
         resolved_dir.mkdir(parents=True, exist_ok=True)
         target = resolved_dir / src_file.name
@@ -5186,10 +5207,7 @@ def _bug_autoremove_resolve(task_id: str, title: str, summary: str) -> None:
                         f"bug: resolved {src_file.stem} via {task_id} ({agent})"],
                        capture_output=True, check=False)
     except Exception:
-        try:
-            _append_event(None, task_id, "bug_autoremove_resolve_failed", {}) if False else None
-        except Exception:
-            pass
+        _log.debug("bug autoremove resolution failed for task=%s", task_id, exc_info=True)
 
 
 def complete_task(
@@ -5360,23 +5378,23 @@ def complete_task(
             completed_payload,
             run_id=run_id,
         )
-        # Bug-lifecycle (Evan order 2026-09-08): a completed 'BUG: <slug>'
-        # task auto-resolves its bug file. Title read inside the txn.
-        _bug_title = ""
-        try:
-            _row = conn.execute(
-                "SELECT title FROM tasks WHERE id = ?", (task_id,)
-            ).fetchone()
-            _bug_title = (_row[0] or "") if _row else ""
-        except Exception:
-            pass
-    # Post-txn best-effort: resolve the bug file for BUG: tasks.
+        # Bug-lifecycle (Evan order 2026-09-08): a completed bug task
+        # auto-resolves its bug file. Identity is read inside the txn.
+        _bug_row = conn.execute(
+            "SELECT title, body FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        _bug_title = (_bug_row[0] or "") if _bug_row else ""
+        _bug_body = (_bug_row[1] or "") if _bug_row else ""
+    # Post-txn best-effort: resolve the bug file named by body or legacy title.
     try:
         _bug_autoremove_resolve(
-            task_id, _bug_title, summary if summary is not None else result
+            task_id,
+            _bug_title,
+            _bug_body,
+            summary if summary is not None else result,
         )
     except Exception:
-        logger.debug("bug autoremove hook skipped", exc_info=True)
+        _log.debug("bug autoremove hook skipped", exc_info=True)
     # Prose-scan the summary + result for t_<hex> references that do
     # not resolve. Advisory — does not block the completion. Runs in
     # its own txn so the completion itself is already durable by the
