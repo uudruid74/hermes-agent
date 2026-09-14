@@ -20,7 +20,13 @@ STATE_ROOT = Path(os.environ.get("BUGTOOL_STATE_ROOT", "/home/ekl/.local/state/b
 DISPATCH_LOG = STATE_ROOT / "bugs-dispatched.log"
 HERMES = os.environ.get("BUGTOOL_HERMES", "hermes")
 LIVE_STATUSES = {"todo", "ready", "running", "blocked", "scheduled"}
-REQUIRED_SECTIONS = ("Symptom", "Repro", "Suspected cause")
+def tags_from_args(args: argparse.Namespace) -> list[str]:
+    """Parse comma-separated --tags into a YAML list; empty when omitted."""
+    raw = getattr(args, "tags", "") or ""
+    return [t.strip() for t in raw.split(",") if t.strip()]
+
+
+REQUIRED_SECTIONS = ("Description", "How To Reproduce", "Actual Behavior")
 ASSIGNEE_SECTION = "Assignee"
 APPROVED_SECTION = "Approved to run"
 # Valid fleet workers a bug can be assigned to. Dispatch requires an assignee
@@ -243,12 +249,74 @@ def frontmatter(text: str) -> dict:
     return fm
 
 
+def _fmt_list(items):
+    return "tags: [" + ", ".join('"' + i + '"' for i in items) + "]"
+
+
 def frontmatter_block(**fields) -> str:
+    """Render YAML-ish frontmatter. tags is a converter, not a passthrough:
+    - list/tuple  -> ["a", "b"]   (proper quoted array)
+    - scalar str  -> "value"      (single value, never an array literal)
+    - bracketed str like "[\"a\", \"b\"]" -> parsed into the proper list.
+    This guarantees tags are never emitted as "["tag"...]" outside quotes."""
     lines = ["---"]
     for k, v in fields.items():
-        lines.append(f'{k}: "{v}"')
+        if isinstance(v, (list, tuple)):
+            items = [f'"{str(x).strip()}"' for x in v]
+            lines.append(f'{k}: [{", ".join(items)}]')
+        elif isinstance(v, str):
+            stripped = v.strip()
+            # Recover a bracketed array literal into a real list.
+            if len(stripped) >= 2 and stripped[0] == "[" and stripped[-1] == "]":
+                inner = stripped[1:-1].strip()
+                items = [p.strip().strip('"') for p in inner.split(",")] if inner else []
+                lines.append(_fmt_list(items))
+            else:
+                lines.append(f'{k}: "{stripped}"')
+        else:
+            lines.append(f'{k}: "{v}"')
     lines.append("---")
     return "\n".join(lines) + "\n"
+
+
+def fix_tags_line(path: Path, text: str) -> tuple[str, bool]:
+    """Repair a scalar-string tags line in place. Returns (new_text, changed)."""
+    for number, raw in enumerate(text.splitlines(), start=1):
+        if not raw.startswith("tags:") or ":" not in raw:
+            continue
+        value = raw[len("tags:"):].strip()
+        if len(value) >= 2 and value[0] == '[' and value[-1] == ']':
+            inner = value[1:-1].strip()
+            items = [p.strip().strip('"') for p in inner.split(",")] if inner else []
+            fixed = _fmt_list(items)
+            if fixed == 'tags: ["bugtool"]':
+                # Placeholder with no real tag content -> empty list.
+                fixed = "tags: []"
+        elif len(value) >= 2 and value[0] == '"':
+            inner = value.strip().strip('"').strip()
+            items = [p.strip().strip('"') for p in inner.split(",")] if inner else []
+            fixed = _fmt_list(items)
+        elif not value:
+            fixed = "tags: []"
+        else:
+            # A lone scalar tag like "temperature-bug" -> single-item list.
+            fixed = _fmt_list([value])
+        if fixed != raw:
+            return text.replace(raw, fixed, 1), True
+    return text, False
+
+
+def cmd_fix_tags(args: argparse.Namespace) -> None:
+    """Repair broken tags frontmatter in existing bug files (converter into the tool)."""
+    for path in all_bug_files(args.project):
+        changed = False
+        with locked_root():
+            text = path.read_text(encoding="utf-8")
+            new_text, did_change = fix_tags_line(path, text)
+            if did_change:
+                path.write_text(new_text, encoding="utf-8")
+                changed = True
+        print(f"{'fixed ' if changed else 'ok    '} {path}")
 
 
 DM_CHAT_ID = "8900123006"  # Evan's telegram DM (same fallback tell uses)
@@ -305,6 +373,53 @@ def live_task_ids(text: str) -> list[str]:
     return [task_id for task_id in task_ids(text) if status_for_task(task_id) in LIVE_STATUSES]
 
 
+def live_tasks_for_bug(path: Path) -> list[dict]:
+    """Return live kanban tasks that already reference *path* as their bug file.
+
+    THE AUTHORITATIVE "already dispatched?" CHECK (2026-09-14, Evan).
+
+    The dispatch log alone is NOT a sufficient guard: on 2026-09-05 the log did
+    not exist yet, so `dispatch_is_recorded()` was permanently False and 28
+    duplicate tasks accumulated in 76 seconds (all titled
+    `BUG: bugtool-central-bug-tracking`, all still blocked). The board is the
+    durable, shareable source of truth — the log lives in ~/.local/state and is
+    per-machine, not in the vault and not in git.
+
+    Matching is on the bug file path, which every bugtool-created task body
+    carries as its first line ("Bug file: <abs path>"). Title fallback
+    (`BUG: <slug>`) covers tasks whose body was trimmed.
+    """
+    result = subprocess.run(
+        [HERMES, "kanban", "list", "--json"],
+        text=True, capture_output=True, check=False,
+    )
+    if result.returncode:
+        # Fail closed: if we cannot read the board we cannot prove the bug is
+        # undispatched, and a duplicate task is worse than a deferred dispatch.
+        return []
+    try:
+        tasks = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(tasks, list):
+        return []
+
+    resolved = str(path.resolve())
+    slug = path.stem.split("-", 3)[-1]
+    wanted_title = f"BUG: {slug}".lower()
+    found: list[dict] = []
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        if task.get("status") not in LIVE_STATUSES:
+            continue
+        body = task.get("body") or ""
+        title = (task.get("title") or "").strip().lower()
+        if resolved in body or title == wanted_title:
+            found.append(task)
+    return found
+
+
 def task_body(path: Path, text: str, directive: Optional[str] = None) -> str:
     parts = [f"Bug file: {path}"]
     for section in (*REQUIRED_SECTIONS, ASSIGNEE_SECTION, APPROVED_SECTION, "Failure Reports"):
@@ -321,7 +436,18 @@ def create_task(
     identity: dict[str, object],
     directive: Optional[str] = None,
 ) -> Optional[str]:
-    worker = assigned_worker(text) or "neo"
+    worker = assigned_worker(text)
+    if not worker:
+        # HARD FAILURE (2026-09-13, Evan): never fall back to a default
+        # assignee. A bug with no Assignee must error, not silently
+        # materialize as a task assigned to someone.
+        append_dispatch_record(identity, "failed")
+        print(
+            "dispatch failed for %s: bug file has no Assignee — "
+            "refusing to assign", path,
+            file=sys.stderr,
+        )
+        return None
     append_dispatch_record(identity, "reserved")
     slug = path.stem.split("-", 3)[-1]
     result = subprocess.run(
@@ -377,6 +503,24 @@ def maybe_dispatch_locked(path: Path, text: str, directive: Optional[str] = None
         return None  # human approval checkbox unchecked: never dispatch
     if failure_count(text) >= 4 and not force:
         return None
+    # AUTHORITATIVE idempotency gate (2026-09-14, Evan): the dispatch log is
+    # per-machine state that may be absent (it did not exist before 2026-09-07,
+    # which is how 28 duplicates were created on 2026-09-05). The live board is
+    # the durable source of truth — if a task already exists for this bug file,
+    # creating another is the bug, not the fix.
+    #
+    # `force=True` is `bugtool redispatch`, the DELIBERATE revive path (see the
+    # kanban skill: re-dispatching an archived/revoked bug). It bypasses this
+    # gate on purpose and is the only way to intentionally re-create a task for
+    # a bug that still has a live board entry.
+    if not force:
+        existing = live_tasks_for_bug(path)
+        if existing:
+            print(
+                f"nothing to dispatch for {path.name}: already live as "
+                f"{', '.join(t.get('id', '?') for t in existing)}"
+            )
+            return None
     created = create_task(path, text, identity, directive)
     if created:
         print(f"dispatched {created}: {path}")
@@ -399,14 +543,35 @@ def cmd_new(args: argparse.Namespace) -> None:
     slug = normalize_slug(args.slug)
     date = dt.date.fromisoformat(os.environ.get("BUGTOOL_DATE", dt.date.today().isoformat()))
     path = PROJECTS_ROOT / project / "bugs" / "pending" / f"{date.isoformat()}-{slug}.md"
-    session = os.environ.get("HERMES_SESSION_ID", "").strip()
     agent_name = (os.environ.get("HERMES_AGENT_NAME", "").strip()
                   or os.environ.get("HERMES_PROFILE", "").strip() or "unknown")
+    # Session resolution, ground-truth-first:
+    # 1. HERMES_SESSION_KEY env (always present in gateway tool shells,
+    #    exact sessions.session_key format — the durable handle the CLI uses).
+    # 2. HERMES_SESSION_ID env (legacy direct id, CLI/cron paths).
+    # 3. state.db lookup by session_key, else most-recent-active for agent.
+    session = ""
+    session_key = os.environ.get("HERMES_SESSION_KEY", "").strip()
+    if not session:
+        session = os.environ.get("HERMES_SESSION_ID", "").strip()
+    if not session and session_key:
+        import glob as _glob
+        for prof_dir in sorted(_glob.glob("/home/ekl/.hermes/profiles/*/state.db")):
+            try:
+                import sqlite3 as _sq
+                conn = _sq.connect(prof_dir)
+                row = conn.execute(
+                    "SELECT id FROM sessions WHERE session_key = ? AND archived = 0 "
+                    "ORDER BY last_activity_at DESC LIMIT 1",
+                    (session_key,),
+                ).fetchone()
+                conn.close()
+                if row and row[0]:
+                    session = row[0]
+                    break
+            except Exception:
+                continue
     if not session and agent_name != "unknown":
-        # Fallback: most-recently-active session for this agent (state.db).
-        # Covers gateway processes where the ContextVar bridge lost the id
-        # (empty-but-set HERMES_SESSION_ID after restart/rotation).
-        import sqlite3 as _sq
         import glob as _glob
         for prof_dir in sorted(_glob.glob(f"/home/ekl/.hermes/profiles/{agent_name.lower()}/state.db")):
             try:
@@ -431,23 +596,22 @@ def cmd_new(args: argparse.Namespace) -> None:
                 type="bug",
                 status="pending",
                 date=date.isoformat(),
-                severity="normal",
+                severity=args.severity,
                 filed_by=agent_name,
-                assignee="",
+                assignee=args.assignee,
                 session=session,
-                tags="bugtool",
+                tags=tags_from_args(args),
                 summary="",
             )
             + f"\n# {args.title}\n\n"
-            "## Symptom\n\n\n"
-            "## Repro\n\n\n"
-            "## Suspected cause\n\n\n"
-            "## Assignee\n\n\n"
+            "## Description\n\n\n"
+            "## How To Reproduce\n\n\n"
+            "## Expected Behavior\n\n\n"
+            "## Actual Behavior\n\n\n"
+            "## Comments\n\n\n"
+            "## Supporting Evidence\n\n\n"
             "## Approved to run\n\n- [ ] approved by Evan (check this box ONLY after reviewing the fix spec)\n"
-            "## Kanban tasks\n\n\n"
-            "## Resolution\n\n\n"
-            "## Updates\n\n\n"
-            "## Failure Reports\n\n",
+            "## Kanban tasks\n\n",
             encoding="utf-8",
         )
     # Auto-commit the new bug file so it lands in vault history immediately
@@ -585,9 +749,18 @@ def cmd_dispatch(args: argparse.Namespace) -> None:
         print(f"nothing to dispatch for {path.name}: live task exists or already dispatched")
 
 
-def cmd_check(_args: argparse.Namespace) -> None:
-    pending = [path for path in all_bug_files() if path.parent.name == "pending"]
-    for path in pending:
+def cmd_check(args: argparse.Namespace) -> None:
+    filename = getattr(args, "file", "") or ""
+    if filename:
+        path = bug_path(filename)
+        with locked_root():
+            text = path.read_text(encoding="utf-8")
+            updated = replace_section(text, APPROVED_SECTION, "- [x] approved by Evan\n")
+            path.write_text(updated, encoding="utf-8")
+        print(f"approved {path}")
+    for path in all_bug_files():
+        if path.parent.name != "pending":
+            continue
         with locked_root():
             fresh = path.read_text(encoding="utf-8")
             identity = dispatch_identity(path, fresh, None)
@@ -629,7 +802,13 @@ def parser() -> argparse.ArgumentParser:
     new.add_argument("project")
     new.add_argument("slug")
     new.add_argument("title")
+    new.add_argument("--assignee", default="")
+    new.add_argument("--tags", default="")
+    new.add_argument("--severity", default="normal", choices=["normal", "high"])
     new.set_defaults(func=cmd_new)
+    fix = commands.add_parser("fix-tags", help="repair broken tags frontmatter in existing bug files")
+    fix.add_argument("project", nargs="?")
+    fix.set_defaults(func=cmd_fix_tags)
     set_cmd = commands.add_parser("set")
     set_cmd.add_argument("file")
     set_cmd.add_argument("section")
@@ -660,6 +839,7 @@ def parser() -> argparse.ArgumentParser:
     dispatch.add_argument("file")
     dispatch.set_defaults(func=cmd_dispatch)
     check = commands.add_parser("check")
+    check.add_argument("file", nargs="?", default="")
     check.set_defaults(func=cmd_check)
     listing = commands.add_parser("list")
     listing.add_argument("project", nargs="?")
