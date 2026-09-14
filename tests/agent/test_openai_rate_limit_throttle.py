@@ -1,13 +1,16 @@
 """Codex HTTP throttle: shared token pacing before OpenAI rejects a request."""
 
 import json
+from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
 
 import pytest
 
 import agent.openai_rate_limit_throttle as throttle_module
 from agent.openai_rate_limit_throttle import (
+    DEFAULT_OPENAI_CODEX_RATE_LIMIT_POLICY,
     OpenAIRateLimitThrottle,
+    OpenAIRateLimitPolicy,
     install_openai_rate_limit_throttle,
 )
 
@@ -148,6 +151,96 @@ def test_idle_traffic_resets_ramp_to_one_million_tpm(throttle):
 
     state = json.loads(limiter.state_path.read_text())
     assert state["ramp_tpm"] == pytest.approx(1_000_000.0)
+
+
+def test_default_config_exposes_current_codex_throttle_policy():
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+    assert DEFAULT_CONFIG["rate_limits"]["openai_codex"] == {
+        "base_tpm": 1_000_000,
+        "backdown_factor": 0.5,
+        "reservation_window_seconds": 60,
+        "idle_reset_seconds": 60,
+        "ramp_interval_seconds": 900,
+        "ramp_multiplier": 1.5,
+        "retry_after_cap_seconds": 600,
+    }
+
+
+def test_policy_is_immutable_and_rejects_invalid_values():
+    with pytest.raises(FrozenInstanceError):
+        DEFAULT_OPENAI_CODEX_RATE_LIMIT_POLICY.base_tpm = 1
+
+    with pytest.raises(ValueError, match="backdown_factor"):
+        OpenAIRateLimitPolicy.from_config({"backdown_factor": 0})
+    with pytest.raises(ValueError, match="unknown"):
+        OpenAIRateLimitPolicy.from_config({"unknown": 1})
+
+
+def test_custom_policy_controls_pacing_backdown_and_retry_cap(tmp_path, monkeypatch):
+    clock = _Clock()
+    monkeypatch.setattr(
+        throttle_module, "jittered_backoff", lambda *a, **kw: kw["base_delay"] + 1.0
+    )
+    policy = OpenAIRateLimitPolicy.from_config(
+        {
+            "base_tpm": 100,
+            "backdown_factor": 0.25,
+            "reservation_window_seconds": 10,
+            "idle_reset_seconds": 300,
+            "ramp_interval_seconds": 20,
+            "ramp_multiplier": 1.25,
+            "retry_after_cap_seconds": 7,
+        }
+    )
+    limiter = OpenAIRateLimitThrottle(
+        policy=policy,
+        state_path=tmp_path / "custom-openai.json",
+        clock=clock.time,
+        sleep=clock.sleep,
+    )
+
+    assert limiter.reserve(80) == 0
+    assert limiter.reserve(30) == pytest.approx(10)
+
+    limiter.after_response(_response(429, {"Retry-After": "999"}))
+
+    state = json.loads(limiter.state_path.read_text())
+    assert state["ramp_tpm"] == pytest.approx(25)
+    assert 7 <= state["blocked_until"] - clock.time() <= 7.7
+
+
+def test_install_loads_one_policy_from_config(monkeypatch):
+    import hermes_cli.config
+
+    custom = {
+        "rate_limits": {
+            "openai_codex": {
+                "base_tpm": 600_000,
+                "backdown_factor": 0.35,
+                "idle_reset_seconds": 300,
+                "ramp_multiplier": 1.25,
+            }
+        }
+    }
+    monkeypatch.setattr(hermes_cli.config, "load_config_readonly", lambda: custom)
+    client = SimpleNamespace(event_hooks={"request": [], "response": []})
+    agent = SimpleNamespace(
+        _interrupt_requested=False, _emit_status=lambda _message: None
+    )
+
+    limiter = install_openai_rate_limit_throttle(client, agent)
+
+    assert limiter.policy == OpenAIRateLimitPolicy(
+        base_tpm=600_000,
+        backdown_factor=0.35,
+        reservation_window_seconds=60,
+        idle_reset_seconds=300,
+        ramp_interval_seconds=900,
+        ramp_multiplier=1.25,
+        retry_after_cap_seconds=600,
+    )
+    assert agent._openai_codex_rate_limit_policy is limiter.policy
 
 
 def test_install_is_idempotent():

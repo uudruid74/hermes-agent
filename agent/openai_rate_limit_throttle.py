@@ -7,6 +7,8 @@ import logging
 import os
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass
+from math import isfinite
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping
 
@@ -16,11 +18,73 @@ from utils import atomic_json_write
 
 logger = logging.getLogger(__name__)
 
-_BASE_RAMP_TPM = 1_000_000.0
-_RAMP_INTERVAL_SECONDS = 15 * 60.0
-_RAMP_MULTIPLIER = 1.5
-_TOKEN_WINDOW_SECONDS = 60.0
 _HOOK_MARKER = "_hermes_openai_rate_limit_throttle"
+
+
+@dataclass(frozen=True)
+class OpenAIRateLimitPolicy:
+    """Validated immutable policy for the OpenAI Codex preflight throttle."""
+
+    base_tpm: float = 1_000_000.0
+    backdown_factor: float = 0.5
+    reservation_window_seconds: float = 60.0
+    idle_reset_seconds: float = 60.0
+    ramp_interval_seconds: float = 15 * 60.0
+    ramp_multiplier: float = 1.5
+    retry_after_cap_seconds: float = 600.0
+
+    @classmethod
+    def from_config(cls, config: Mapping[str, Any] | None) -> "OpenAIRateLimitPolicy":
+        if config is None:
+            return cls()
+        if not isinstance(config, Mapping):
+            raise ValueError("rate_limits.openai_codex must be a mapping")
+
+        known = set(cls.__dataclass_fields__)
+        unknown = sorted(set(config) - known)
+        if unknown:
+            raise ValueError(
+                "rate_limits.openai_codex has unknown setting(s): "
+                + ", ".join(unknown)
+            )
+
+        values: dict[str, float] = {}
+        defaults = cls()
+        for name in known:
+            raw = config.get(name, getattr(defaults, name))
+            if isinstance(raw, bool):
+                raise ValueError(f"rate_limits.openai_codex.{name} must be numeric")
+            try:
+                value = float(raw)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"rate_limits.openai_codex.{name} must be numeric"
+                ) from exc
+            if not isfinite(value):
+                raise ValueError(f"rate_limits.openai_codex.{name} must be finite")
+            values[name] = value
+
+        for name in (
+            "base_tpm",
+            "reservation_window_seconds",
+            "idle_reset_seconds",
+            "ramp_interval_seconds",
+            "retry_after_cap_seconds",
+        ):
+            if values[name] <= 0:
+                raise ValueError(f"rate_limits.openai_codex.{name} must be greater than 0")
+        if not 0 < values["backdown_factor"] <= 1:
+            raise ValueError(
+                "rate_limits.openai_codex.backdown_factor must be greater than 0 and at most 1"
+            )
+        if values["ramp_multiplier"] < 1:
+            raise ValueError(
+                "rate_limits.openai_codex.ramp_multiplier must be at least 1"
+            )
+        return cls(**values)
+
+
+DEFAULT_OPENAI_CODEX_RATE_LIMIT_POLICY = OpenAIRateLimitPolicy()
 
 
 def _default_state_path() -> Path:
@@ -83,12 +147,14 @@ class OpenAIRateLimitThrottle:
     def __init__(
         self,
         *,
+        policy: OpenAIRateLimitPolicy = DEFAULT_OPENAI_CODEX_RATE_LIMIT_POLICY,
         state_path: Path | None = None,
         clock: Callable[[], float] = time.time,
         sleep: Callable[[float], None] = time.sleep,
         interrupt_check: Callable[[], bool] | None = None,
         status_callback: Callable[[str], None] | None = None,
     ) -> None:
+        self.policy = policy
         self.state_path = state_path or _default_state_path()
         self.lock_path = self.state_path.with_suffix(self.state_path.suffix + ".lock")
         self._clock = clock
@@ -120,7 +186,7 @@ class OpenAIRateLimitThrottle:
             for item in reservations
             if isinstance(item, dict)
             and isinstance(item.get("at"), (int, float))
-            and now - float(item["at"]) < _TOKEN_WINDOW_SECONDS
+            and now - float(item["at"]) < self.policy.reservation_window_seconds
         ]
 
         reset_at = float(state.get("reset_at", 0.0) or 0.0)
@@ -129,19 +195,23 @@ class OpenAIRateLimitThrottle:
             state["remaining_tokens"] = limit
             state["reset_at"] = 0.0
 
-        ramp_tpm = float(state.get("ramp_tpm", _BASE_RAMP_TPM) or _BASE_RAMP_TPM)
+        ramp_tpm = float(
+            state.get("ramp_tpm", self.policy.base_tpm) or self.policy.base_tpm
+        )
         last_request_at = float(state.get("last_request_at", 0.0) or 0.0)
         ramp_updated_at = float(state.get("ramp_updated_at", now) or now)
-        if last_request_at and now - last_request_at > _TOKEN_WINDOW_SECONDS:
-            ramp_tpm = _BASE_RAMP_TPM
+        if last_request_at and now - last_request_at > self.policy.idle_reset_seconds:
+            ramp_tpm = self.policy.base_tpm
             ramp_updated_at = now
-        elif last_request_at and now - ramp_updated_at >= _RAMP_INTERVAL_SECONDS:
-            intervals = int((now - ramp_updated_at) // _RAMP_INTERVAL_SECONDS)
-            ramp_tpm *= _RAMP_MULTIPLIER**intervals
+        elif last_request_at and now - ramp_updated_at >= self.policy.ramp_interval_seconds:
+            intervals = int(
+                (now - ramp_updated_at) // self.policy.ramp_interval_seconds
+            )
+            ramp_tpm *= self.policy.ramp_multiplier**intervals
             server_limit = int(state.get("limit_tokens", 0) or 0)
             if server_limit > 0:
                 ramp_tpm = min(ramp_tpm, float(server_limit))
-            ramp_updated_at += intervals * _RAMP_INTERVAL_SECONDS
+            ramp_updated_at += intervals * self.policy.ramp_interval_seconds
         state["ramp_tpm"] = ramp_tpm
         state["ramp_updated_at"] = ramp_updated_at
 
@@ -172,7 +242,10 @@ class OpenAIRateLimitThrottle:
             if reservations and reserved_tokens + min(tokens, int(ramp_tpm)) > ramp_tpm:
                 earliest = min(float(item["at"]) for item in reservations)
                 self._save_state(state)
-                return max(0.0, earliest + _TOKEN_WINDOW_SECONDS - now)
+                return max(
+                    0.0,
+                    earliest + self.policy.reservation_window_seconds - now,
+                )
 
             reservations.append({"at": now, "tokens": min(tokens, int(ramp_tpm))})
             state["last_request_at"] = now
@@ -235,15 +308,17 @@ class OpenAIRateLimitThrottle:
             delay = retry_delay_from_headers(
                 headers,
                 default_wait=default_wait,
+                retry_after_cap_seconds=self.policy.retry_after_cap_seconds,
             )
             with _exclusive_lock(self.lock_path):
                 state = self._load_state()
                 self._apply_elapsed_time(state, now)
                 ramp_tpm = float(
-                    state.get("ramp_tpm", _BASE_RAMP_TPM) or _BASE_RAMP_TPM
+                    state.get("ramp_tpm", self.policy.base_tpm)
+                    or self.policy.base_tpm
                 )
                 server_limit = int(state.get("limit_tokens", 0) or 0)
-                backed_down = ramp_tpm / 2.0
+                backed_down = ramp_tpm * self.policy.backdown_factor
                 if server_limit > 0:
                     backed_down = min(backed_down, float(server_limit))
                 state["ramp_tpm"] = max(1.0, backed_down)
@@ -293,7 +368,10 @@ class OpenAIRateLimitThrottle:
             state["reset_at"] = now + float(tightest[2])
             state["captured_at"] = now
             state["ramp_tpm"] = min(
-                float(state.get("ramp_tpm", _BASE_RAMP_TPM) or _BASE_RAMP_TPM),
+                float(
+                    state.get("ramp_tpm", self.policy.base_tpm)
+                    or self.policy.base_tpm
+                ),
                 float(tightest[0]),
             )
             self._save_state(state)
@@ -316,7 +394,19 @@ def install_openai_rate_limit_throttle(
         )
         return None
 
+    policy = getattr(agent, "_openai_codex_rate_limit_policy", None)
+    if not isinstance(policy, OpenAIRateLimitPolicy):
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly()
+        rate_limits = config.get("rate_limits", {})
+        if not isinstance(rate_limits, Mapping):
+            raise ValueError("rate_limits must be a mapping")
+        policy = OpenAIRateLimitPolicy.from_config(rate_limits.get("openai_codex"))
+        agent._openai_codex_rate_limit_policy = policy
+
     throttle = OpenAIRateLimitThrottle(
+        policy=policy,
         interrupt_check=lambda: bool(getattr(agent, "_interrupt_requested", False)),
         status_callback=getattr(agent, "_emit_status", None),
     )

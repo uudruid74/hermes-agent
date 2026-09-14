@@ -10,6 +10,20 @@ DEFAULT_CONFIG = {
     "fallback_providers": [],
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
+    # OpenAI Codex preflight token throttle. These defaults preserve the
+    # established behavior while allowing profiles to choose a more
+    # conservative ramp without modifying source code.
+    "rate_limits": {
+        "openai_codex": {
+            "base_tpm": 1_000_000,
+            "backdown_factor": 0.5,
+            "reservation_window_seconds": 60,
+            "idle_reset_seconds": 60,
+            "ramp_interval_seconds": 900,
+            "ramp_multiplier": 1.5,
+            "retry_after_cap_seconds": 600,
+        },
+    },
     # SQLite journal mode used by every Hermes database opener. WAL is the
     # normal default; set DELETE for weak-fsync/shared filesystems where WAL is
     # not crash-safe (for example macOS virtiofs, NFS, or SMB).

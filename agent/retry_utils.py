@@ -132,6 +132,7 @@ def retry_delay_from_headers(
     headers: Any,
     *,
     default_wait: float,
+    retry_after_cap_seconds: float = 600.0,
 ) -> float:
     """Return a jittered retry delay that never undercuts server reset hints."""
     getter = getattr(headers, "get", None)
@@ -145,7 +146,7 @@ def retry_delay_from_headers(
     if retry_after is not None:
         # Preserve the established protection against a pathological
         # Retry-After while allowing resource reset headers to be authoritative.
-        values.append(min(retry_after, 600.0))
+        values.append(min(retry_after, retry_after_cap_seconds))
     lowered = (
         {str(key).lower(): value for key, value in headers.items()}
         if hasattr(headers, "items")
