@@ -27,6 +27,7 @@ _SESSION_NOTE_RE = re.compile(
 )
 _PRUNED_SKILL_RE = re.compile(r"\[SKILL_PRUNED:[^\]\n]+\]")
 _MAX_UNIT_CHARS = 1_200
+_MAX_CANDIDATE_UNITS = 256
 _ASSEMBLY_RESERVE_TOKENS = 24
 
 
@@ -72,9 +73,15 @@ def _template_visible_role(message: dict[str, Any]) -> str | None:
 def _verbatim_tail_start(
     messages: list[dict[str, Any]], head_count: int, protect_last_n: int
 ) -> int:
-    """Keep at least ``protect_last_n`` while avoiding summary/tail merging."""
+    """Keep the configured number of template-visible messages verbatim."""
 
-    tail_start = max(head_count, len(messages) - max(protect_last_n, 0))
+    visible_needed = max(protect_last_n, 0)
+    tail_start = len(messages)
+    visible_kept = 0
+    while tail_start > head_count and visible_kept < visible_needed:
+        tail_start -= 1
+        if _template_visible_role(messages[tail_start]) is not None:
+            visible_kept += 1
     if tail_start >= len(messages):
         return tail_start
     last_head_role = next(
@@ -144,20 +151,27 @@ def _session_notes(
     candidates: list[str] = []
     if memory_context and memory_context.strip():
         candidates.append(memory_context.strip())
-    if previous_summary:
-        candidates.extend(_PRUNED_SKILL_RE.findall(previous_summary))
     for source in [previous_summary, *[_content_text(msg.get("content")) for msg in messages]]:
         if not source:
             continue
+        candidates.extend(_PRUNED_SKILL_RE.findall(source))
         candidates.extend(match.strip() for match in _SESSION_NOTE_RE.findall(source))
 
     notes: list[str] = []
     seen: set[str] = set()
-    for candidate in candidates:
+    prioritized = sorted(
+        candidates,
+        key=lambda note: 0 if _PRUNED_SKILL_RE.fullmatch(note.strip()) else 1,
+    )
+    for candidate in prioritized:
         normalized = re.sub(r"\s+", " ", candidate).strip()
+        if len(normalized) > _MAX_UNIT_CHARS:
+            normalized = normalized[:_MAX_UNIT_CHARS].rstrip() + "…"
         if normalized and normalized not in seen:
             seen.add(normalized)
             notes.append(normalized)
+            if len(notes) >= _MAX_CANDIDATE_UNITS:
+                break
     return notes
 
 
@@ -165,7 +179,7 @@ def _tfidf_vectors(texts: list[str]) -> list[dict[str, float]]:
     token_counts = [Counter(_TOKEN_RE.findall(text.casefold())) for text in texts]
     document_frequency: Counter[str] = Counter()
     for counts in token_counts:
-        document_frequency.update(counts)
+        document_frequency.update(counts.keys())
 
     document_count = len(texts)
     vectors: list[dict[str, float]] = []
@@ -202,6 +216,20 @@ def _lexrank(vectors: list[dict[str, float]], threshold: float = 0.1) -> list[fl
     count = len(vectors)
     if not count:
         return []
+    if count > _MAX_CANDIDATE_UNITS:
+        sampled_indices = [
+            index * (count - 1) // (_MAX_CANDIDATE_UNITS - 1)
+            for index in range(_MAX_CANDIDATE_UNITS)
+        ]
+        sampled_scores = _lexrank(
+            [vectors[index] for index in sampled_indices],
+            threshold=threshold,
+        )
+        scores = [0.0] * count
+        for index, score in zip(sampled_indices, sampled_scores):
+            scores[index] = score
+        return scores
+
     graph: list[list[float]] = [[0.0] * count for _ in range(count)]
     for left in range(count):
         for right in range(left + 1, count):
@@ -259,10 +287,38 @@ def _plan_summary(plan_context: str, notes: list[str]) -> str:
     return "\n\n".join(parts)
 
 
-def _minimal_plan_summary(minimal_plan_context: str) -> str:
-    return "\n\n".join(
-        [INTERNAL_FALLBACK_PREFIX, "## Active Plan", minimal_plan_context.strip()]
-    )
+def _minimal_plan_summary(minimal_plan_context: str, notes: list[str]) -> str:
+    parts = [INTERNAL_FALLBACK_PREFIX, "## Active Plan", minimal_plan_context.strip()]
+    if notes:
+        parts.extend(["## Session Notes", "\n".join(f"- {note}" for note in notes)])
+    parts.append(VERBATIM_CONTEXT_MARKER)
+    return "\n\n".join(parts)
+
+
+def _fitted_plan_summary(
+    messages: list[dict[str, Any]],
+    *,
+    head_count: int,
+    tail_start: int,
+    plan_context: str,
+    notes: list[str],
+    target_tokens: int,
+    minimal: bool = False,
+) -> str | None:
+    """Keep each priority-ordered note that fits beside the required Plan."""
+
+    builder = _minimal_plan_summary if minimal else _plan_summary
+    selected_notes: list[str] = []
+    summary = builder(plan_context, selected_notes)
+    if not _fits(messages, head_count, tail_start, summary, target_tokens):
+        return None
+
+    for note in notes:
+        candidate = builder(plan_context, [*selected_notes, note])
+        if _fits(messages, head_count, tail_start, candidate, target_tokens):
+            selected_notes.append(note)
+            summary = candidate
+    return summary
 
 
 def _lexrank_summary(selected: list[_Unit]) -> str:
@@ -307,19 +363,50 @@ def build_internal_fallback(
     notes = _session_notes(messages, memory_context, previous_summary)
 
     if plan_context.strip():
-        for keep_notes in range(len(notes), -1, -1):
-            summary = _plan_summary(plan_context, notes[:keep_notes])
-            if _fits(messages, head_count, tail_start, summary, target_tokens):
-                return InternalFallback(summary, head_count, tail_start, "plan")
+        summary = _fitted_plan_summary(
+            messages,
+            head_count=head_count,
+            tail_start=tail_start,
+            plan_context=plan_context,
+            notes=notes,
+            target_tokens=target_tokens,
+        )
+        if summary is not None:
+            return InternalFallback(summary, head_count, tail_start, "plan")
 
         system_head = 1 if messages and messages[0].get("role") == "system" else 0
-        minimal = _minimal_plan_summary(minimal_plan_context or plan_context)
-        if _fits(messages, system_head, len(messages), minimal, target_tokens):
-            return InternalFallback(minimal, system_head, len(messages), "plan-minimal")
+        minimal_tail_start = _verbatim_tail_start(
+            messages,
+            system_head,
+            protect_last_n,
+        )
+        minimal = _fitted_plan_summary(
+            messages,
+            head_count=system_head,
+            tail_start=minimal_tail_start,
+            plan_context=minimal_plan_context or plan_context,
+            notes=notes,
+            target_tokens=target_tokens,
+            minimal=True,
+        )
+        if minimal is not None:
+            return InternalFallback(
+                minimal,
+                system_head,
+                minimal_tail_start,
+                "plan-minimal",
+            )
         return None
 
     middle_messages = messages[head_count:tail_start]
     middle_units = _message_units(middle_messages, start_index=head_count)
+    marker_notes = {note for note in notes if _PRUNED_SKILL_RE.fullmatch(note)}
+    if marker_notes:
+        middle_units = [
+            unit
+            for unit in middle_units
+            if not any(marker in unit.text for marker in marker_notes)
+        ]
     recent_units = _message_units(messages[tail_start:], start_index=tail_start)
     note_units = [
         _Unit(
@@ -351,17 +438,15 @@ def build_internal_fallback(
         if _PRUNED_SKILL_RE.search(unit.text):
             score = 2.0
         elif unit.is_note:
-            score = score * 1.25 if relevant > 0.0 else -1.0
+            score = 1.25 + 0.4 * relevant
         scores.append(score)
 
     ranked = sorted(
         zip(candidates, scores),
         key=lambda item: (-item[1], item[0].order),
-    )
+    )[:_MAX_CANDIDATE_UNITS]
     selected: list[_Unit] = []
-    for unit, score in ranked:
-        if score < 0:
-            continue
+    for unit, _score in ranked:
         candidate_selection = [*selected, unit]
         summary = _lexrank_summary(candidate_selection)
         if _fits(messages, head_count, tail_start, summary, target_tokens):

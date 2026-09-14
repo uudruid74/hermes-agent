@@ -1,7 +1,15 @@
 from __future__ import annotations
 
+from unittest.mock import patch
+
 from agent.context_compressor import ContextCompressor
-from agent.internal_compression_fallback import build_internal_fallback
+from agent.internal_compression_fallback import (
+    InternalFallback,
+    _lexrank,
+    _session_notes,
+    _tfidf_vectors,
+    build_internal_fallback,
+)
 
 
 def _message(role: str, content: str) -> dict:
@@ -50,7 +58,7 @@ def test_active_plan_fallback_degrades_to_goal_current_step_and_summary():
         _message("system", "system prompt"),
         _message("user", "opening request"),
         *[_message("assistant", "old " * 200) for _ in range(5)],
-        _message("user", "recent " * 400),
+        _message("user", "recent " * 10),
     ]
     full = (
         "Task: Huge plan\nGoal: Recover safely\nStep 2/20\n"
@@ -65,7 +73,7 @@ def test_active_plan_fallback_degrades_to_goal_current_step_and_summary():
         messages,
         protect_head_count=2,
         protect_last_n=1,
-        target_tokens=120,
+        target_tokens=220,
         plan_context=full,
         minimal_plan_context=minimal,
     )
@@ -73,10 +81,10 @@ def test_active_plan_fallback_degrades_to_goal_current_step_and_summary():
     assert fallback is not None
     assert fallback.mode == "plan-minimal"
     assert fallback.head_count == 1
-    assert fallback.tail_start == len(messages)
+    assert fallback.tail_start == len(messages) - 1
     assert minimal in fallback.summary
     assert "EXTRA STEP DETAIL" not in fallback.summary
-    assert "verbatim" not in fallback.summary.lower()
+    assert "verbatim" in fallback.summary.lower()
 
 
 def test_active_plan_fallback_fails_when_minimal_context_cannot_fit():
@@ -92,6 +100,110 @@ def test_active_plan_fallback_fails_when_minimal_context_cannot_fit():
     )
 
     assert fallback is None
+
+
+def test_tail_protection_counts_template_visible_messages():
+    latest = {
+        "role": "user",
+        "content": "LATEST ACTIONABLE",
+        "metadata": {"directive": "stop"},
+    }
+    messages = [
+        _message("system", "system prompt"),
+        _message("user", "opening"),
+        _message("assistant", "old result"),
+        latest,
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "call-1"}]},
+        {"role": "tool", "content": "tool result", "tool_call_id": "call-1"},
+    ]
+
+    fallback = build_internal_fallback(
+        messages,
+        protect_head_count=2,
+        protect_last_n=2,
+        target_tokens=1_000,
+    )
+
+    assert fallback is not None
+    assert latest in messages[fallback.tail_start :]
+
+
+def test_plan_minimal_preserves_recent_verbatim_tail():
+    latest = {
+        "role": "user",
+        "content": "Do not restart anything yet.",
+        "metadata": {"directive": "stop"},
+    }
+    messages = [
+        _message("system", "system prompt"),
+        _message("user", "opening"),
+        _message("assistant", "old result"),
+        latest,
+    ]
+
+    fallback = build_internal_fallback(
+        messages,
+        protect_head_count=2,
+        protect_last_n=1,
+        target_tokens=220,
+        plan_context="Task: Huge plan\n" + ("detail " * 1_000),
+        minimal_plan_context="Goal: recover\nCurrent step: preserve latest directive",
+    )
+
+    assert fallback is not None
+    assert fallback.mode == "plan-minimal"
+    assert fallback.tail_start <= messages.index(latest)
+    assert latest in messages[fallback.tail_start :]
+    assert "verbatim" in fallback.summary.lower()
+
+
+def test_active_plan_keeps_current_pruned_skill_marker():
+    marker = "[SKILL_PRUNED: reload with skill_view(name='critical')]"
+    messages = [
+        _message("system", "system prompt"),
+        _message("user", "opening"),
+        _message("assistant", marker),
+        _message("user", "current request"),
+        _message("assistant", "current result"),
+    ]
+
+    fallback = build_internal_fallback(
+        messages,
+        protect_head_count=2,
+        protect_last_n=2,
+        target_tokens=1_000,
+        plan_context="Task: T\nGoal: G\nStep 1/1",
+        minimal_plan_context="Goal: G\nCurrent step 1/1: S",
+    )
+
+    assert fallback is not None
+    assert marker in fallback.summary
+
+
+def test_active_plan_keeps_small_note_when_earlier_note_is_oversized():
+    small_note = "Keep the restart prohibition."
+    messages = [
+        _message("system", "system prompt"),
+        _message("user", "opening"),
+        _message("assistant", "old result"),
+        _message("user", "current request"),
+        _message("assistant", "current result"),
+    ]
+
+    fallback = build_internal_fallback(
+        messages,
+        protect_head_count=2,
+        protect_last_n=2,
+        target_tokens=180,
+        plan_context="Task: T\nGoal: G\nStep 1/1",
+        minimal_plan_context="Goal: G\nCurrent step 1/1: S",
+        memory_context="oversized " * 1_000,
+        previous_summary=f"## Session Notes\n{small_note}",
+    )
+
+    assert fallback is not None
+    assert small_note in fallback.summary
+    assert "oversized oversized" not in fallback.summary
 
 
 def test_lexrank_fallback_keeps_relevant_middle_in_chronological_order():
@@ -147,6 +259,63 @@ def test_relevant_session_notes_receive_a_ranking_boost_but_are_budgeted():
     assert "Unrelated old weather" not in fallback.summary
 
 
+def test_session_note_survives_without_recent_lexical_overlap_when_it_fits():
+    messages = [
+        _message("system", "system prompt"),
+        _message("user", "opening"),
+        _message("assistant", "old details"),
+        _message("user", "more old details"),
+        _message("user", "current request"),
+        _message("assistant", "current result"),
+    ]
+
+    fallback = build_internal_fallback(
+        messages,
+        protect_head_count=2,
+        protect_last_n=2,
+        target_tokens=1_000,
+        memory_context="Critical deployment note: never restart the database automatically.",
+    )
+
+    assert fallback is not None
+    assert "never restart the database automatically" in fallback.summary
+
+
+def test_session_note_collection_is_bounded():
+    messages = [
+        _message("assistant", f"## Session Notes\nnote-{index}")
+        for index in range(300)
+    ]
+
+    notes = _session_notes(messages, "m" * 2_400, "")
+
+    assert len(notes) == 256
+    assert max(map(len, notes)) <= 1_201
+
+
+def test_tfidf_document_frequency_counts_documents_not_occurrences():
+    vector = _tfidf_vectors(["alpha alpha common", "common beta"])[0]
+
+    assert vector["alpha"] > 0.93
+
+
+def test_lexrank_pairwise_work_is_bounded(monkeypatch):
+    calls = 0
+
+    def _counted_cosine(left, right):
+        nonlocal calls
+        calls += 1
+        return 1.0 if left and right else 0.0
+
+    monkeypatch.setattr(
+        "agent.internal_compression_fallback._cosine",
+        _counted_cosine,
+    )
+    _lexrank([{"token": 1.0} for _ in range(300)])
+
+    assert calls <= (256 * 255) // 2
+
+
 def test_pruned_skill_reload_markers_survive_without_recent_term_overlap():
     marker = "[SKILL_PRUNED: reload with skill_view(name='example')]"
     messages = [
@@ -189,6 +358,78 @@ def test_pruned_skill_reload_markers_survive_from_previous_summary():
 
     assert fallback is not None
     assert marker in fallback.summary
+
+
+def test_internal_only_never_calls_summary_provider():
+    compressor = ContextCompressor(
+        model="test/model",
+        config_context_length=64_000,
+        protect_first_n=1,
+        protect_last_n=2,
+        summary_target_ratio=0.2,
+        internal_only=True,
+        quiet_mode=True,
+    )
+    messages = [
+        _message("system", "system prompt"),
+        _message("user", "opening"),
+        *[
+            _message("assistant", f"old {index} " + ("x" * 500))
+            for index in range(10)
+        ],
+        _message("user", "current request"),
+        _message("assistant", "current result"),
+    ]
+
+    with patch.object(
+        compressor,
+        "_generate_summary",
+        side_effect=AssertionError("internal-only mode called the summary provider"),
+    ):
+        result = compressor.compress(messages)
+
+    assert result is not messages
+    assert compressor._last_summary_fallback_used is True
+
+
+def test_fallback_never_returns_a_transcript_over_its_target():
+    compressor = ContextCompressor(
+        model="test/model",
+        config_context_length=64_000,
+        protect_first_n=1,
+        protect_last_n=1,
+        summary_target_ratio=0.2,
+        quiet_mode=True,
+    )
+    compressor.tail_token_budget = 142
+    messages = [
+        _message("system", "system prompt"),
+        _message("user", "opening"),
+        *[
+            _message("assistant", f"old details {index} " + ("x " * 100))
+            for index in range(4)
+        ],
+        _message("user", "current request"),
+        _message("assistant", "recent result"),
+    ]
+    oversized = InternalFallback(
+        summary="locally reconstructed context " * 30,
+        head_count=1,
+        tail_start=7,
+        mode="lexrank",
+    )
+
+    with (
+        patch.object(compressor, "_generate_summary", return_value=None),
+        patch(
+            "agent.context_compressor.build_internal_fallback",
+            return_value=oversized,
+        ),
+    ):
+        result = compressor.compress(messages, force=True)
+
+    assert result == messages
+    assert compressor._last_compress_aborted is True
 
 
 def _compressor_messages() -> list[dict]:

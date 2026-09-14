@@ -2015,6 +2015,9 @@ def init_agent(
     compression_abort_on_summary_failure = str(
         _compression_cfg.get("abort_on_summary_failure", False)
     ).lower() in {"true", "1", "yes"}
+    compression_internal_only = is_truthy_value(
+        _compression_cfg.get("internal_only"), default=False
+    )
     # Per-model threshold overrides: keys are substring-matched against the
     # model name (longest match wins). Empty dict = use the global threshold
     # for all models (backward compatible).
@@ -2514,6 +2517,7 @@ def init_agent(
             provider=agent.provider,
             api_mode=agent.api_mode,
             abort_on_summary_failure=compression_abort_on_summary_failure,
+            internal_only=compression_internal_only,
             max_tokens=agent.max_tokens,
             model_thresholds=compression_model_thresholds,
             threshold_tokens_cap=compression_threshold_tokens,
@@ -2533,7 +2537,11 @@ def init_agent(
     # Apply micro-compaction settings to the compressor (feature is opt-in)
     _cc = getattr(agent, "context_compressor", None)
     if _cc is not None and hasattr(_cc, "_micro_compact_enabled"):
-        _cc._micro_compact_enabled = compression_micro_compact
+        # internal_only is a complete no-summary-LLM contract; rolling
+        # micro-compaction has its own provider call path, so suppress it too.
+        _cc._micro_compact_enabled = (
+            compression_micro_compact and not compression_internal_only
+        )
     if _cc is not None and hasattr(_cc, "_micro_compact_every_n_turns"):
         _cc._micro_compact_every_n_turns = compression_micro_compact_every_n_turns
     if _cc is not None and hasattr(_cc, "_micro_compact_defrag_threshold_tokens"):

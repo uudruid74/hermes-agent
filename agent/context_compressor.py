@@ -99,6 +99,10 @@ def _is_summary_access_or_quota_error(exc: Exception) -> bool:
 
 
 HISTORICAL_TASK_HEADING = "## Historical Task Snapshot"
+# Downstream assembly can add up to ~130 estimated tokens (system note,
+# end marker, and merged-summary delimiters) after the fallback helper returns.
+# This is additional to the helper's own 24-token structural reserve.
+_INTERNAL_FALLBACK_POST_ASSEMBLY_RESERVE_TOKENS = 128
 
 
 SUMMARY_PREFIX = (
@@ -2222,6 +2226,7 @@ class ContextCompressor(ContextEngine):
         provider: str = "",
         api_mode: str = "",
         abort_on_summary_failure: bool = False,
+        internal_only: bool = False,
         max_tokens: int | None = None,
         model_thresholds: dict[str, float] | None = None,
         threshold_tokens_cap: Any = None,
@@ -2297,6 +2302,7 @@ class ContextCompressor(ContextEngine):
         # tries the deterministic internal compressor; abort is reserved for an
         # internal result that cannot fit even its minimal recovery form.
         self.abort_on_summary_failure = abort_on_summary_failure
+        self.internal_only = bool(internal_only)
 
         # ── Micro-compaction (per-turn rolling compaction) ─────────
         # Default: OFF. Each pass rewrites already-sent history, so it breaks
@@ -6317,7 +6323,11 @@ This compaction should PRIORITISE preserving all information related to the focu
                         self.threshold_tokens, self._prellm_skip_count,
                     )
 
-        if feasibility_skip:
+        internal_only = bool(getattr(self, "internal_only", False))
+        if internal_only:
+            summary = None
+            telemetry["failure_class"] = "internal_only"
+        elif feasibility_skip:
             summary = None  # No LLM call; Phase 4 inserts the deterministic fallback
         else:
             # Deriving the auto focus topic scans recent user turns — only pay
@@ -6345,7 +6355,11 @@ This compaction should PRIORITISE preserving all information related to the focu
                 messages,
                 protect_head_count=self._protect_head_size(messages),
                 protect_last_n=self.protect_last_n,
-                target_tokens=self.tail_token_budget,
+                target_tokens=max(
+                    0,
+                    self.tail_token_budget
+                    - _INTERNAL_FALLBACK_POST_ASSEMBLY_RESERVE_TOKENS,
+                ),
                 plan_context=plan_context,
                 minimal_plan_context=minimal_plan_context,
                 memory_context=memory_context,
@@ -6376,7 +6390,9 @@ This compaction should PRIORITISE preserving all information related to the focu
             self._last_summary_fallback_used = True
             telemetry["fallback_used"] = True
             telemetry["fallback_mode"] = fallback.mode
-            if feasibility_skip:
+            if internal_only:
+                telemetry["failure_class"] = "internal_only"
+            elif feasibility_skip:
                 telemetry["failure_class"] = (
                     telemetry.get("failure_class") or "feasibility_skip"
                 )
@@ -6385,10 +6401,16 @@ This compaction should PRIORITISE preserving all information related to the focu
                     telemetry.get("failure_class") or "summary_generation_failed"
                 )
             if not self.quiet_mode:
+                reason = (
+                    "by configuration"
+                    if internal_only
+                    else "after summary provider failure"
+                )
                 logger.warning(
-                    "Using internal %s compression fallback after summary "
-                    "provider failure; dropping %d message(s).",
+                    "Using internal %s compression fallback %s; "
+                    "dropping %d message(s).",
                     fallback.mode,
+                    reason,
                     n_dropped,
                 )
 
@@ -6643,8 +6665,6 @@ This compaction should PRIORITISE preserving all information related to the focu
                 _merge_summary_into_tail = False
             compressed.append(msg)
 
-        self.compression_count += 1
-
         compressed = self._sanitize_tool_pairs(compressed)
 
         # Replace image parts in all compressed messages before the newest
@@ -6656,6 +6676,27 @@ This compaction should PRIORITISE preserving all information related to the focu
         compressed = _strip_historical_media(compressed)
 
         new_estimate = estimate_messages_tokens_rough(compressed)
+        if (
+            self._last_summary_fallback_used
+            and new_estimate > self.tail_token_budget
+        ):
+            self._last_summary_dropped_count = 0
+            self._last_summary_fallback_used = False
+            self._last_compress_aborted = True
+            self._previous_summary = _previous_summary_before_scan
+            self._summary_has_user_turn = _summary_has_user_turn_before_scan
+            telemetry["failure_class"] = "internal_fallback_final_over_budget"
+            if not self.quiet_mode:
+                logger.warning(
+                    "Assembled internal compression fallback exceeded the "
+                    "%d-token target (%d tokens); preserving the transcript "
+                    "unchanged.",
+                    self.tail_token_budget,
+                    new_estimate,
+                )
+            return messages
+
+        self.compression_count += 1
 
         # Anti-thrashing: measure effectiveness on a like-for-like basis.
         #
