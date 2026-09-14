@@ -1349,6 +1349,19 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
     # Strip image parts for non-vision models (no-op when vision-capable).
     _msgs_for_chat = agent._prepare_messages_for_non_vision_model(api_messages)
 
+    # Gopher: fix for temperature-never-sent bug
+    # Determine if we are a kanban worker
+    import os
+    is_kanban_worker = bool(os.environ.get('HERMES_KANBAN_TASK') or getattr(agent, '_subagent_id', None))
+    # Get temperature from agent config
+    config = getattr(agent, 'config', {})
+    model_config = config.get('model', {})
+    base_temp = model_config.get('temperature', 0.7)
+    if is_kanban_worker:
+        temp = model_config.get('worker_temperature', base_temp)
+    else:
+        temp = base_temp
+
     return _ct.build_kwargs(
         model=agent.model,
         messages=_msgs_for_chat,
@@ -1356,7 +1369,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         base_url=agent.base_url,
         timeout=agent._resolved_api_call_timeout(),
         max_tokens=agent.max_tokens,
-        ephemeral_max_output_tokens=_ephemeral_out,
+        ephemeral_max_output_tokens=getattr(agent, "_ephemeral_max_output_tokens", None),
         max_tokens_param_fn=agent._max_tokens_param,
         reasoning_config=agent.reasoning_config,
         request_overrides=agent.request_overrides,
@@ -1384,6 +1397,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         lmstudio_reasoning_options=agent._lmstudio_reasoning_options_cached() if _is_lmstudio else None,
         anthropic_max_output=_ant_max,
         provider_name=agent.provider,
+        temperature=temp
     )
 
 
