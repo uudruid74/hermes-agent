@@ -2793,8 +2793,11 @@ class ContextCompressor(ContextEngine):
 
         latest_tool_call_idx = -1
         latest_tool_call_ids: set[str] = set()
+        latest_assistant_idx = -1
         if collapse_historical_tool_calls:
             for i in range(len(result) - 1, -1, -1):
+                if latest_assistant_idx < 0 and result[i].get("role") == "assistant":
+                    latest_assistant_idx = i
                 tool_calls = result[i].get("tool_calls") or []
                 if result[i].get("role") != "assistant" or not tool_calls:
                     continue
@@ -2966,6 +2969,28 @@ class ContextCompressor(ContextEngine):
                 result[idx] = replacement
             return modified
 
+        def _strip_historical_reasoning_at(idx: int) -> bool:
+            """Drop provider replay/thinking blobs from historical assistant rows.
+
+            Keeps the newest assistant turn's thinking verbatim; strips
+            ``reasoning``, ``reasoning_content`` and ``codex_*`` replay
+            fields from anything older (and outside the prune boundary).
+            Return True if a blob was removed.
+            """
+            msg = result[idx]
+            if msg.get("role") != "assistant":
+                return False
+            if idx == latest_assistant_idx:
+                return False
+            modified = False
+            for key in _REPLAY_BUDGET_KEYS:
+                if msg.get(key) is not None:
+                    msg = {**msg, key: None}
+                    modified = True
+            if modified:
+                result[idx] = msg
+            return modified
+
         # Pass 2: Replace old tool results with informative summaries
         for i in range(max(0, prune_boundary)):
             _demote_tool_result_at(i)
@@ -2980,6 +3005,19 @@ class ContextCompressor(ContextEngine):
         # the window. See ``_truncate_tool_call_args_json`` docstring.
         for i in range(max(0, prune_boundary)):
             _truncate_tool_call_args_at(i)
+
+        # Pass 3b: Strip historical provider replay/thinking blobs
+        # (reasoning, reasoning_content, codex_reasoning_items, ...) from
+        # assistant rows. The newest assistant turn keeps its thinking —
+        # it is the active context — but older blobs are invisible to the
+        # visible-content accounting yet still charge the full replay cost
+        # on every subsequent request (LM-Studio "Truncate Middle" tails
+        # measured 122K chars of reasoning_content in a 173-msg session).
+        # Without this the collapse pass fits the tool-call half of the
+        # tail but the fallback still aborts over the thinking half.
+        if collapse_historical_tool_calls:
+            for i in range(max(0, prune_boundary)):
+                _strip_historical_reasoning_at(i)
 
         # Pass 4 (issue #61932): protected-tail pressure demotion.
         # After multiple in-place compactions the transcript can be short
