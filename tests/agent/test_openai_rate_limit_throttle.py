@@ -29,7 +29,19 @@ class _Clock:
 
 
 def _response(status, headers=None):
-    return SimpleNamespace(status_code=status, headers=headers or {})
+    return SimpleNamespace(
+        status_code=status,
+        headers=headers or {},
+        content=b"",
+    )
+
+
+def _usage_limit_response(status, headers=None):
+    """429 with an OpenAI usage_limit_reached body carrying resets_at."""
+    body = json.dumps(
+        {"error": {"type": "usage_limit_reached", "resets_at": 1789369391}}
+    ).encode()
+    return SimpleNamespace(status_code=status, headers=headers or {}, content=body)
 
 
 def _request(byte_count):
@@ -76,6 +88,26 @@ def test_429_uses_reset_tokens_as_floor_and_backs_down_ramp(throttle):
     assert classification == "slow_down"
     assert 360.0 <= state["blocked_until"] - clock.time() <= 396.0
     assert state["ramp_tpm"] == pytest.approx(2_000_000.0)
+
+
+def test_429_persists_usage_limit_resets_at_as_quota_deadline(throttle):
+    """A usage_limit_reached 429 body's resets_at is persisted as
+    quota_reset_at for the kanban respawn guard (2026-09-14, Evan)."""
+    limiter, _clock = throttle
+    limiter._save_state({
+        "ramp_tpm": 1.0,
+        "ramp_updated_at": _clock.time(),
+        "last_request_at": _clock.time(),
+        "reservations": [],
+    })
+
+    classification = limiter.after_response(
+        _usage_limit_response(429, {"Retry-After": "30"})
+    )
+
+    state = json.loads(limiter.state_path.read_text())
+    assert classification == "slow_down"
+    assert state.get("quota_reset_at") == 1789369391.0
 
 
 def test_429_backs_down_initial_one_million_tpm_ramp(throttle):

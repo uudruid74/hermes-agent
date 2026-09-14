@@ -419,6 +419,51 @@ def test_respawn_guard_defers_rate_limited_within_cooldown(
         assert kb.check_respawn_guard(conn, tid) is None
 
 
+def test_check_respawn_guard_defers_until_quota_reset_deadline(
+    kanban_home, monkeypatch,
+):
+    """A rate-limited run stays deferred past the base cooldown when an
+    absolute quota_reset_at deadline is persisted (2026-09-14, Evan): the
+    task must NOT respawn into a still-exhausted account window just because
+    the short cooldown elapsed — honor the provider's own reset deadline,
+    plus a stable per-task jitter."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
+    now = 5_000_000
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="rl-deadline", assignee="a")
+        kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
+        conn.execute(
+            "UPDATE task_runs SET outcome='rate_limited', status='rate_limited', "
+            "ended_at=? WHERE id=?",
+            (now, run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+            "last_failure_error=? WHERE id=?",
+            ("pid 1 exited rate-limited (quota wall) — requeued", tid),
+        )
+        conn.commit()
+
+        # No persisted deadline: past cooldown → allowed.
+        monkeypatch.setattr(_kb, "_quota_reset_deadline", lambda: None)
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 400)
+        assert kb.check_respawn_guard(conn, tid) is None
+
+        # Deadline set in the future → still deferred beyond the cooldown.
+        monkeypatch.setattr(_kb, "_quota_reset_deadline", lambda: float(now + 1000))
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 400)
+        assert kb.check_respawn_guard(conn, tid) == "rate_limit_cooldown"
+
+        # Past deadline + max jitter → allowed again.
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 4000)
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
 
 
 

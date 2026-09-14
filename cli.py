@@ -14633,8 +14633,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 print(f"\n⏩ Delivering leftover /steer as next turn: '{preview}'")
                 self._pending_input.put(_leftover_steer)
 
+            # Stash the turn result for automation callers (notably the
+            # kanban worker `-q` path) that need the failure classification
+            # after `chat()` returns only the response string. #2026-09-14
+            self._last_kanban_failure = result if isinstance(result, dict) else None
+
             return response
-            
+
         except Exception as e:
             print(f"Error: {e}")
             return None
@@ -18842,6 +18847,28 @@ def main(
                 cli._show_security_advisories()
                 cli.chat(query, images=single_query_images or None)
                 cli._print_exit_summary(clear_screen=False)
+                # Kanban workers launched with `hermes -p X chat -q …` must
+                # signal a provider quota wall with the EX_TEMPFAIL sentinel,
+                # exactly like the -Q quiet path does. Without it, the worker
+                # exits 0 on a 429 and the dispatcher's reaper classifies the
+                # run as a clean-exit PROTOCOL VIOLATION — the quota guard
+                # never engages and the task respawn-loops (observed 09-14:
+                # t_2cd24fd9, 5 runs in 40 min). chat() only returns the
+                # response string, so the failure dict is stashed on the CLI
+                # instance; read it here.
+                _last_fail = getattr(cli, "_last_kanban_failure", None)
+                if (
+                    _last_fail
+                    and os.environ.get("HERMES_KANBAN_TASK")
+                    and _last_fail.get("failure_reason") in ("rate_limit", "billing")
+                ):
+                    try:
+                        from hermes_cli.kanban_db import (
+                            KANBAN_RATE_LIMIT_EXIT_CODE as _RL_CODE,
+                        )
+                    except Exception:
+                        _RL_CODE = 1
+                    sys.exit(_RL_CODE)
         finally:
             _finalize_single_query(cli)
         return

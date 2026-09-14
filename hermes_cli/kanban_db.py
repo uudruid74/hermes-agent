@@ -4533,6 +4533,26 @@ def claim_task(
                 {"reason": "parents_not_done"},
             )
             return None
+        # Structural invariant: an unassigned task can never run. A task
+        # with no assignee must stay 'ready' (or be demoted to 'todo') and
+        # be triaged to an owner; a worker cannot claim it. This prevents
+        # the dispatcher from spawning a nameless worker and stops the
+        # 'ready (unassigned)' → running footgun (2026-09-13, Evan).
+        unassigned = conn.execute(
+            "SELECT 1 FROM tasks WHERE id = ? AND (assignee IS NULL OR assignee = '')",
+            (task_id,),
+        ).fetchone()
+        if unassigned:
+            conn.execute(
+                "UPDATE tasks SET status = 'todo' "
+                "WHERE id = ? AND status = 'ready'",
+                (task_id,),
+            )
+            _append_event(
+                conn, task_id, "claim_rejected",
+                {"reason": "unassigned"},
+            )
+            return None
         # Defensive: if a prior run somehow leaked (invariant violation from
         # an unknown code path), close it as 'reclaimed' so we don't strand
         # it when the CAS resets the pointer below. No-op when the invariant
@@ -8410,6 +8430,48 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
 _clear_spawn_failures = _clear_failure_counter
 
 
+def _quota_reset_deadline() -> Optional[float]:
+    """Return the persisted absolute account-quota reset deadline, or None.
+
+    Reads ``rate_limits/openai.json`` for the current HERMES_HOME AND every
+    profile under ``~/.hermes/profiles/*`` and returns the furthest-future
+    ``quota_reset_at`` found. The OpenAI usage limit is ACCOUNT-level — one
+    account, shared by every profile (and every kanban worker) — so whichever
+    profile's throttle process recorded the provider's ``resets_at`` first is
+    the deadline for all of them. The dispatcher usually runs under a
+    different profile than the worker that hit the 429, so scanning is
+    required for the guard to see the wall at all.
+    2026-09-14 (Evan): persist + honor the provider's own reset deadline.
+    """
+    candidates: list[float] = []
+    homes: list[Path] = []
+    try:
+        from hermes_constants import get_hermes_home
+
+        homes.append(Path(get_hermes_home()))
+        # Every sibling profile directory that exists on this host.
+        profiles_root = Path(get_hermes_home()).parent / "profiles"
+        if profiles_root.is_dir():
+            for profile_dir in profiles_root.iterdir():
+                if profile_dir.is_dir():
+                    homes.append(profile_dir)
+    except ImportError:
+        pass
+    for home in homes:
+        try:
+            state_path = home / "rate_limits" / "openai.json"
+            raw = state_path.read_text(encoding="utf-8")
+            state = json.loads(raw)
+            if not isinstance(state, dict):
+                continue
+            deadline = state.get("quota_reset_at")
+            if isinstance(deadline, (int, float)) and float(deadline) > 0:
+                candidates.append(float(deadline))
+        except (OSError, ValueError, TypeError):
+            continue
+    return max(candidates) if candidates else None
+
+
 def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
     """Return a guard reason if ``task_id`` should NOT be re-spawned, else None.
 
@@ -8474,6 +8536,14 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     #    the regex would otherwise match → defer forever (no failure counter
     #    increment on this path means the breaker can never free it).
     #
+    #    When the profile's OpenAI throttle state carries an absolute
+    #    ``quota_reset_at`` (persisted by openai_rate_limit_throttle from the
+    #    429 body's ``resets_at``), we defer until that wall PLUS a stable
+    #    per-task jitter (2–20 min, hashed on task_id) so the first post-reset
+    #    probes don't stampede. 2026-09-14: without the absolute deadline the
+    #    task would respawn in ~5 min into a still-exhausted window and burn
+    #    the crash-loop all over again.
+    #
     #    We look at the LATEST run only (ORDER BY ended_at DESC LIMIT 1): if a
     #    newer crash/completion superseded the rate-limit run, this guard
     #    no longer applies and the normal paths take over.
@@ -8496,6 +8566,14 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         ended_at = latest_run["ended_at"]
         if ended_at is not None and (now - int(ended_at)) < rl_cooldown:
             return "rate_limit_cooldown"
+        # Cooldown elapsed — consult the persisted absolute quota wall before
+        # allowing the respawn.
+        _deadline = _quota_reset_deadline()
+        if _deadline is not None:
+            # Stable per-task jitter: hash task_id into [120, 1200] seconds.
+            _jitter = 120 + (int(hashlib.sha1(task_id.encode()).hexdigest(), 16) % 1081)
+            if now < _deadline + _jitter:
+                return "rate_limit_cooldown"
         # Cooldown elapsed — allow the respawn. Return early so the
         # blocker_auth check below doesn't catch the rate-limit text we
         # stamped on the task; this path intentionally retries forever

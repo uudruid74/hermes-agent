@@ -327,6 +327,29 @@ class OpenAIRateLimitThrottle:
                     float(state.get("blocked_until", 0.0) or 0.0),
                     now + delay,
                 )
+                # Persist an absolute account-quota reset deadline when the
+                # provider tells us one (e.g. OpenAI `usage_limit_reached` 429
+                # carries `resets_at` as epoch seconds). The kanban respawn
+                # guard reads this to defer workers until the quota window
+                # clears instead of respawning into an exhausted account.
+                # Parsed defensively: some proxies report 429s with the same
+                # status code but no structured body.
+                _quota_reset = None
+                try:
+                    _body = getattr(response, "content", b"") or b""
+                    if isinstance(_body, bytes):
+                        _parsed = json.loads(_body.decode("utf-8", "replace"))
+                    else:
+                        _parsed = json.loads(_body)
+                    _err = (_parsed or {}).get("error") or {}
+                    if isinstance(_err, dict):
+                        _ra = _err.get("resets_at") or _err.get("reset_at")
+                        if isinstance(_ra, (int, float)) and _ra > 0:
+                            _quota_reset = float(_ra)
+                except Exception:
+                    _quota_reset = None
+                if _quota_reset is not None and _quota_reset > now:
+                    state["quota_reset_at"] = _quota_reset
                 self._save_state(state)
             logger.warning(
                 "OpenAI slow_down (HTTP 429); shared request rate backed down for %.1fs",
