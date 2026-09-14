@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# prepare-commit-msg — stamp agent attribution into commit messages.
+#
+# Installed by scripts/install-git-hooks.sh. Do not edit .git/hooks directly;
+# edit this file and re-run the installer.
+#
+# WHY: every Hermes agent commits under the shared git identity
+# `Evan Langlois <ekl@taro3.local>`, so without an explicit trailer a commit
+# cannot be attributed to the agent that wrote it. That is the "ghost commit"
+# class: the author field proves nothing, and a forgotten trailer makes the
+# commit permanently anonymous. This hook makes attribution a mechanism
+# instead of a convention.
+#
+# IDENTITY SOURCE (Evan, 2026-09-07, decided): `HERMES_AGENT_NAME` is THE
+# single source of agent identity. `HERMES_PROFILE` is *route state* — it is
+# mutated at runtime to the send/notification target — so it must never be
+# read as an author. Never fall back to git's global user.name.
+#
+# Human commits (no HERMES_AGENT_NAME in the environment) are left untouched.
+#
+# Args (from git):
+#   $1  path to the file holding the proposed commit message
+#   $2  source of the message: message | template | merge | squash | commit
+#   $3  commit object name (sha) — present for `commit`/`merge` sources
+#
+# A hook must NEVER abort a commit. This script always exits 0.
+
+# Deliberately no `set -e`: a non-zero exit from prepare-commit-msg aborts the
+# commit, which would be far worse than a missing trailer. Every step is
+# guarded explicitly instead.
+
+msg_file="${1:-}"
+source_kind="${2:-}"
+
+# Nothing to annotate if git gave us no message file.
+if [ -z "$msg_file" ] || [ ! -f "$msg_file" ]; then
+    exit 0
+fi
+
+# Skip bookkeeping message sources. `merge`/`squash` messages belong to a
+# merge, not to the commit that introduced the work; `commit` means the
+# message is being reused from an existing commit (amend / cherry-pick) that
+# already carries — or already lacked — its own trailer. Stamping those would
+# attribute a merge or an amend to whoever happened to be running it.
+case "$source_kind" in
+    merge|squash|commit)
+        exit 0
+        ;;
+esac
+
+agent="${HERMES_AGENT_NAME:-}"
+
+# No agent in the environment => a human commit at a terminal. Leave it alone.
+# (Do NOT substitute a generic label: that would misattribute human commits.)
+if [ -z "$agent" ]; then
+    exit 0
+fi
+
+# `HERMES_AGENT_NAME` is exported into the whole process tree an agent spawns —
+# including a shell a human opens *inside* that tree. So its presence alone does
+# not prove an agent is the committer; stamping on that signal alone would
+# attribute a human's commit to whichever agent happened to be running.
+#
+# Discriminator: a controlling terminal. Verified on this box —
+#   * agent (Hermes terminal tool): no controlling tty at all. `ps -o tty=` is
+#     `?` and /dev/tty cannot be opened. stdin/stdout are pipes.
+#   * human (interactive shell, even one launched inside an agent session):
+#     has a controlling tty and can open /dev/tty.
+# Note `[ -t 0 ]` is useless here: git redirects the hook's stdin, so stdin is
+# never a tty even for a real human commit. Test the controlling terminal.
+# The subshell keeps a failed open from writing "No such device or address" to
+# stderr on every agent commit.
+if (exec 3</dev/tty) 2>/dev/null; then
+    exit 0
+fi
+
+# Idempotent: never add a second trailer, and respect a hand-written one.
+if grep -qE '^Agent: ' "$msg_file" 2>/dev/null; then
+    exit 0
+fi
+
+# Append after a blank line so the trailer is a git trailer block. If the
+# message already ends with a blank line we don't add a second one.
+if [ -s "$msg_file" ] && [ -n "$(tail -c 1 "$msg_file" 2>/dev/null)" ]; then
+    printf '\n' >> "$msg_file"
+fi
+printf '\nAgent: %s\n' "$agent" >> "$msg_file"
+
+exit 0
