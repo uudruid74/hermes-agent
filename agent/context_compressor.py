@@ -1826,7 +1826,19 @@ class ContextCompressor(ContextEngine):
                     self._fallback_compression_streak,
                 )
             return
-        if used_fallback:
+        # ── internal_only: a successful commit is a SUCCESS ────────────────
+        # On internal_only profiles (compression.internal_only) the
+        # deterministic CPU fallback IS the primary compressor — compress()
+        # never calls _generate_summary there.  So used_fallback=True means
+        # "the intended compressor did its job", not "the summary model
+        # degraded to a fallback".  Counting it as a strike latched the >=2
+        # anti-thrash breaker after two healthy compressions and permanently
+        # blocked auto-compression with "blocked (ineffective)" while tokens
+        # kept climbing — the 2026-09-14 Ornith bug.  A success must clear the
+        # streak exactly like a successful LLM summary does.
+        # Evan directive 2026-09-14: "I don't want our fallback tripping
+        # that."  Do NOT re-add a strike here without an explicit instruction.
+        if used_fallback and not getattr(self, "internal_only", False):
             self._fallback_compression_streak += 1
             if not self.quiet_mode:
                 logger.warning(
@@ -2651,6 +2663,23 @@ class ContextCompressor(ContextEngine):
 
     def _automatic_compression_blocked_locally(self) -> bool:
         """Evaluate the automatic-compaction gate on in-memory state only."""
+        # ── internal_only: no summary LLM exists to protect ────────────────
+        # Both halves of this gate guard the SUMMARY-LLM path:
+        #   * the cooldown defers retries while a failed/rate-limited summary
+        #     model recovers (#11529), and
+        #   * the anti-thrash breaker backs off when repeated summaries saved
+        #     little (#14694).
+        # Neither failure mode can happen on an internal_only profile: the
+        # deterministic CPU fallback is the primary compressor, it makes no
+        # provider call, and it either produces a fitting payload or returns
+        # None (handled by the over-budget path, not by this breaker).
+        # Leaving the gate armed is what permanently blocked Ornith's
+        # auto-compression with "blocked (ineffective)" (2026-09-14).
+        # Evan directive 2026-09-14: "This compression was supposed to bypass
+        # that circuit breaker. I want it to fire often."  Do NOT re-arm this
+        # gate for internal_only without an explicit instruction.
+        if getattr(self, "internal_only", False):
+            return False
         # Do not trigger compression while the summary LLM is in cooldown.
         # On a 429/transient failure _generate_summary() sets a cooldown and
         # returns None; compress() then uses the internal fallback and
