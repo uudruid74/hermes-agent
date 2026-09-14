@@ -2738,6 +2738,7 @@ class ContextCompressor(ContextEngine):
         self, messages: List[Dict[str, Any]], protect_tail_count: int,
         protect_tail_tokens: int | None = None,
         min_prune_chars: int = 200,
+        collapse_historical_tool_calls: bool = False,
     ) -> tuple[List[Dict[str, Any]], int]:
         """Replace old tool result contents with informative 1-line summaries.
 
@@ -2748,7 +2749,10 @@ class ContextCompressor(ContextEngine):
 
         Also deduplicates identical tool results (e.g. reading the same file
         5x keeps only the newest full copy) and truncates large tool_call
-        arguments in assistant messages outside the protected tail.
+        arguments in assistant messages outside the protected tail. When
+        ``collapse_historical_tool_calls`` is true, every older tool call drops
+        its assistant commentary and arguments while the newest call batch and
+        matching results remain verbatim.
 
         Walks backward from the end, protecting the most recent messages that
         fall within ``protect_tail_tokens`` (when provided) OR the last
@@ -2786,6 +2790,24 @@ class ContextCompressor(ContextEngine):
                         name = getattr(fn, "name", "unknown") if fn else "unknown"
                         args_str = getattr(fn, "arguments", "") if fn else ""
                         call_id_to_tool[cid] = (name, args_str)
+
+        latest_tool_call_idx = -1
+        latest_tool_call_ids: set[str] = set()
+        if collapse_historical_tool_calls:
+            for i in range(len(result) - 1, -1, -1):
+                tool_calls = result[i].get("tool_calls") or []
+                if result[i].get("role") != "assistant" or not tool_calls:
+                    continue
+                latest_tool_call_idx = i
+                for tc in tool_calls:
+                    cid = (
+                        tc.get("id", "")
+                        if isinstance(tc, dict)
+                        else getattr(tc, "id", "")
+                    )
+                    if cid:
+                        latest_tool_call_ids.add(cid)
+                break
 
         # Determine the prune boundary
         if protect_tail_tokens is not None and protect_tail_tokens > 0:
@@ -2863,6 +2885,11 @@ class ContextCompressor(ContextEngine):
             msg = result[idx]
             if msg.get("role") != "tool":
                 return False
+            if (
+                collapse_historical_tool_calls
+                and msg.get("tool_call_id") in latest_tool_call_ids
+            ):
+                return False
             content = msg.get("content", "")
             if isinstance(content, list):
                 stripped = _strip_image_parts_from_parts(content)
@@ -2909,23 +2936,34 @@ class ContextCompressor(ContextEngine):
             return True
 
         def _truncate_tool_call_args_at(idx: int) -> bool:
-            """Shrink large tool_call argument payloads at ``idx``."""
+            """Shrink historical tool-call payloads at ``idx``."""
             msg = result[idx]
             if msg.get("role") != "assistant" or not msg.get("tool_calls"):
                 return False
+            if collapse_historical_tool_calls and idx == latest_tool_call_idx:
+                return False
             new_tcs = []
-            modified = False
+            modified = collapse_historical_tool_calls and bool(msg.get("content"))
             for tc in msg["tool_calls"]:
                 if isinstance(tc, dict):
                     args = tc.get("function", {}).get("arguments", "")
-                    if len(args) > 500:
+                    if collapse_historical_tool_calls and args != "{}":
+                        tc = {
+                            **tc,
+                            "function": {**tc["function"], "arguments": "{}"},
+                        }
+                        modified = True
+                    elif len(args) > 500:
                         new_args = _truncate_tool_call_args_json(args)
                         if new_args != args:
                             tc = {**tc, "function": {**tc["function"], "arguments": new_args}}
                             modified = True
                 new_tcs.append(tc)
             if modified:
-                result[idx] = {**msg, "tool_calls": new_tcs}
+                replacement = {**msg, "tool_calls": new_tcs}
+                if collapse_historical_tool_calls:
+                    replacement["content"] = ""
+                result[idx] = replacement
             return modified
 
         # Pass 2: Replace old tool results with informative summaries
@@ -6063,6 +6101,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                 messages,
                 protect_tail_count=1,
                 protect_tail_tokens=None,
+                collapse_historical_tool_calls=True,
             )
 
         # Phase 1: Prune old tool results (cheap, no LLM call)

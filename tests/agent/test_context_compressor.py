@@ -1584,7 +1584,7 @@ class TestTokenBudgetTailProtection:
         assert len(result) < len(messages)
 
     def test_oversized_last_n_tail_collapses_tools_before_internal_fallback(self):
-        """Tool-heavy visible tails must leave room for the LexRank fallback."""
+        """Historical call arguments must not crowd the visible last-N tail."""
         with patch(
             "agent.context_compressor.get_model_context_length", return_value=100_000
         ):
@@ -1596,45 +1596,83 @@ class TestTokenBudgetTailProtection:
                 quiet_mode=True,
                 internal_only=True,
             )
-        c.tail_token_budget = 1_400
-        old_first = "first output " + ("x" * 1_200)
-        old_second = "second output " + ("y" * 1_200)
-        newest = "newest output " + ("z" * 1_200)
-        messages = [
+        c.tail_token_budget = 1_800
+        old_args = '{"payload":"' + ("x" * 420) + '"}'
+        newest_args = '{"payload":"' + ("z" * 420) + '"}'
+        messages: list[dict] = [
             {"role": "system", "content": "system prompt"},
             {"role": "user", "content": "opening request"},
-            {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [{"id": "c1", "function": {"name": "terminal", "arguments": "{}"}}],
-            },
-            {"role": "tool", "content": old_first, "tool_call_id": "c1"},
-            {"role": "assistant", "content": "first result reviewed"},
-            {"role": "user", "content": "continue"},
-            {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [{"id": "c2", "function": {"name": "terminal", "arguments": "{}"}}],
-            },
-            {"role": "tool", "content": old_second, "tool_call_id": "c2"},
-            {"role": "assistant", "content": "second result reviewed"},
-            {"role": "user", "content": "one more check"},
-            {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [{"id": "c3", "function": {"name": "terminal", "arguments": "{}"}}],
-            },
-            {"role": "tool", "content": newest, "tool_call_id": "c3"},
         ]
+        for index in range(12):
+            call_id = f"old-{index}"
+            messages.extend(
+                [
+                    {
+                        "role": "assistant",
+                        "content": "historical tool commentary " + ("c" * 420),
+                        "tool_calls": [
+                            {
+                                "id": call_id,
+                                "function": {
+                                    "name": "terminal",
+                                    "arguments": old_args,
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "content": f"old output {index} " + ("y" * 1_200),
+                        "tool_call_id": call_id,
+                    },
+                ]
+            )
+        newest = "newest output " + ("n" * 1_200)
+        messages.extend(
+            [
+                {"role": "user", "content": "run the latest check"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "newest",
+                            "function": {
+                                "name": "terminal",
+                                "arguments": newest_args,
+                            },
+                        }
+                    ],
+                },
+                {"role": "tool", "content": newest, "tool_call_id": "newest"},
+                {"role": "assistant", "content": "latest result reviewed"},
+            ]
+        )
+
+        pruned, _ = c._prune_old_tool_results(
+            messages,
+            protect_tail_count=1,
+            collapse_historical_tool_calls=True,
+        )
+        assert pruned[2]["content"] == ""
+        assert pruned[2]["tool_calls"][0]["function"]["arguments"] == "{}"
+        assert messages[2]["content"].startswith("historical tool commentary")
+        assert messages[2]["tool_calls"][0]["function"]["arguments"] == old_args
+        assert pruned[-3]["tool_calls"][0]["function"]["arguments"] == newest_args
+        assert pruned[-2]["content"] == newest
 
         result = c.compress(messages, current_tokens=90_000)
 
         tool_contents = [msg["content"] for msg in result if msg.get("role") == "tool"]
+        newest_call = next(
+            msg for msg in result
+            if msg.get("role") == "assistant"
+            and any(tc.get("id") == "newest" for tc in msg.get("tool_calls") or [])
+        )
         assert c._last_compress_aborted is False
         assert c._last_summary_fallback_used is True
-        assert old_first not in tool_contents
-        assert old_second not in tool_contents
         assert newest in tool_contents
+        assert newest_call["tool_calls"][0]["function"]["arguments"] == newest_args
 
     def test_prune_short_conv_protects_entire_tail(self, budget_compressor):
         """Regression guard for PR #17025.
