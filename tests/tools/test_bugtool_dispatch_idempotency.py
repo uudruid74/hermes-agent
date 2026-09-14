@@ -68,6 +68,35 @@ def mock_kanban(monkeypatch, bugtool, create_delay=0.0):
     return created
 
 
+def bug_text_with_task_reference():
+    return complete_bug_text().replace(
+        "## Kanban tasks\n\n\n",
+        "## Kanban tasks\n\n- t_related — running; this bug follows it\n\n",
+    )
+
+
+def test_dispatch_ignores_live_task_reference(monkeypatch, tmp_path):
+    bugtool, projects_root, _state_root = load_bugtool(monkeypatch, tmp_path)
+    path = write_pending_bug(projects_root, bug_text_with_task_reference())
+    created = mock_kanban(monkeypatch, bugtool)
+
+    with bugtool.locked_root():
+        result = bugtool.maybe_dispatch_locked(path, path.read_text(encoding="utf-8"))
+
+    assert result == "t_created1"
+    assert created == ["t_created1"]
+
+
+def test_check_ignores_live_task_reference(monkeypatch, tmp_path):
+    bugtool, projects_root, _state_root = load_bugtool(monkeypatch, tmp_path)
+    write_pending_bug(projects_root, bug_text_with_task_reference())
+    created = mock_kanban(monkeypatch, bugtool)
+
+    bugtool.cmd_check(argparse.Namespace())
+
+    assert created == ["t_created1"]
+
+
 def test_writeback_failure_records_task_and_prevents_duplicate(monkeypatch, tmp_path):
     bugtool, projects_root, state_root = load_bugtool(monkeypatch, tmp_path)
     path = write_pending_bug(projects_root)

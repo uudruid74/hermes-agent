@@ -375,8 +375,6 @@ def maybe_dispatch_locked(path: Path, text: str, directive: Optional[str] = None
         return None  # no valid Assignee: never dispatch
     if not approved_to_run(text):
         return None  # human approval checkbox unchecked: never dispatch
-    if live_task_ids(text):
-        return None
     if failure_count(text) >= 4 and not force:
         return None
     created = create_task(path, text, identity, directive)
@@ -601,7 +599,7 @@ def cmd_check(_args: argparse.Namespace) -> None:
             live = live_task_ids(fresh)
             state = f"live={','.join(live) if live else 'none'} failures={failure_count(fresh)}/4"
             print(f"{path}: {state}")
-            if required_complete(fresh) and not live and failure_count(fresh) < 4:
+            if required_complete(fresh) and failure_count(fresh) < 4:
                 maybe_dispatch_locked(path, fresh)
             elif failure_count(fresh) >= 4:
                 print(f"manual redispatch required: {path}")
