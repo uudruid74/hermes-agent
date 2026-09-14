@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 import gateway.platforms.base as base_platform
-from gateway.config import Platform, PlatformConfig, StreamingConfig
+from gateway.config import HomeChannel, Platform, PlatformConfig, StreamingConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 from gateway.session import SessionSource
 
@@ -57,6 +57,21 @@ class ProgressCaptureAdapter(BasePlatformAdapter):
 
     async def get_chat_info(self, chat_id: str):
         return {"id": chat_id}
+
+
+class MissingOriginProgressAdapter(ProgressCaptureAdapter):
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        self.sent.append(
+            {
+                "chat_id": chat_id,
+                "content": content,
+                "reply_to": reply_to,
+                "metadata": metadata,
+            }
+        )
+        if chat_id == "missing-user":
+            return SendResult(success=False, error="chat not found")
+        return SendResult(success=True, message_id="home-echo-1")
 
 
 class DiscordProgressCaptureAdapter(ProgressCaptureAdapter):
@@ -879,6 +894,7 @@ async def _run_with_agent(
     chat_type="group",
     thread_id="17585",
     adapter_cls=ProgressCaptureAdapter,
+    home_channel=None,
 ):
     if config_data:
         import yaml
@@ -895,6 +911,7 @@ async def _run_with_agent(
 
     adapter = adapter_cls(platform=platform)
     runner = _make_runner(adapter)
+    runner.config.get_home_channel = lambda _platform: home_channel
     gateway_run = importlib.import_module("gateway.run")
     if config_data and "streaming" in config_data:
         runner.config.streaming = StreamingConfig.from_dict(config_data["streaming"])
@@ -958,6 +975,36 @@ async def test_tell_echo_bypasses_interim_message_setting_and_targets_origin(mon
     assert [call["content"] for call in adapter.sent] == ["gopher: exact message body"]
     assert adapter.sent[0]["chat_id"] == "-1001"
     assert adapter.sent[0]["metadata"]["thread_id"] == "17585"
+
+
+@pytest.mark.asyncio
+async def test_tell_echo_falls_back_to_sethome_when_origin_is_missing(monkeypatch, tmp_path):
+    adapter, _result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        TellEchoAgent,
+        session_id="sess-tell-home-fallback",
+        config_data={"display": {"interim_assistant_messages": False}},
+        chat_id="missing-user",
+        thread_id="stale-topic",
+        adapter_cls=MissingOriginProgressAdapter,
+        home_channel=HomeChannel(
+            platform=Platform.TELEGRAM,
+            chat_id="8900123006",
+            name="Home",
+            thread_id="17585",
+        ),
+    )
+
+    assert [call["chat_id"] for call in adapter.sent] == [
+        "missing-user",
+        "8900123006",
+    ]
+    assert [call["content"] for call in adapter.sent] == [
+        "gopher: exact message body",
+        "gopher: exact message body",
+    ]
+    assert adapter.sent[1]["metadata"] == {"thread_id": "17585"}
 
 
 @pytest.mark.asyncio

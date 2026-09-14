@@ -4287,28 +4287,86 @@ class TurnRunner:
             _fut.add_done_callback(_track_status_id)
 
     def _tell_echo_callback_sync(self, message: str) -> None:
-        """Deliver a tell audit echo to the exact originating chat/thread."""
+        """Deliver a tell audit echo to its origin, then the configured home."""
         ctx = self._ctx
-        adapter = self._runner._adapter_for_source(ctx.source)
-        if adapter is None or not ctx._run_still_current():
-            raise RuntimeError("tell origin is no longer available")
+        source = ctx.source
+        origin_adapter = cast(
+            Optional[BasePlatformAdapter],
+            self._runner._adapter_for_source(source),
+        )
+
+        async def _deliver() -> None:
+            origin_error = "origin is no longer available"
+            origin_attempted = False
+            if origin_adapter is not None and ctx._run_still_current():
+                origin_attempted = True
+                try:
+                    result = await origin_adapter.send(
+                        source.chat_id,
+                        message,
+                        metadata=ctx._status_thread_metadata,
+                    )
+                except Exception as exc:
+                    origin_error = str(exc)
+                else:
+                    if getattr(result, "success", False):
+                        return
+                    origin_error = getattr(result, "error", None) or "unknown error"
+
+            home = self._runner.config.get_home_channel(source.platform)
+            if not home or not home.chat_id:
+                raise RuntimeError(
+                    f"tell echo delivery failed: {origin_error}; no /sethome channel configured"
+                )
+
+            home_platform = home.platform or source.platform
+            home_adapter = origin_adapter
+            if home_adapter is None or home_platform != source.platform:
+                home_adapter = self._runner._authorization_adapter(
+                    home_platform,
+                    getattr(source, "profile", None),
+                )
+            if home_adapter is None:
+                raise RuntimeError(
+                    f"tell echo delivery failed: {origin_error}; home adapter unavailable"
+                )
+
+            home_thread_id = str(home.thread_id) if home.thread_id else None
+            same_target = (
+                str(home.chat_id) == str(source.chat_id)
+                and home_thread_id == (str(source.thread_id) if source.thread_id else None)
+            )
+            if origin_attempted and same_target:
+                raise RuntimeError(f"tell echo delivery failed: {origin_error}")
+
+            logger.warning(
+                "Tell echo origin delivery failed (%s); retrying configured home channel",
+                origin_error,
+            )
+            home_metadata = {"thread_id": home_thread_id} if home_thread_id else {}
+            try:
+                result = await home_adapter.send(
+                    str(home.chat_id),
+                    message,
+                    metadata=home_metadata,
+                )
+            except Exception as exc:
+                raise RuntimeError(f"tell echo home delivery failed: {exc}") from exc
+            if not getattr(result, "success", False):
+                raise RuntimeError(
+                    "tell echo home delivery failed: "
+                    f"{getattr(result, 'error', None) or 'unknown error'}"
+                )
 
         future = safe_schedule_threadsafe(
-            adapter.send(
-                ctx.source.chat_id,
-                message,
-                metadata=ctx._status_thread_metadata,
-            ),
+            _deliver(),
             ctx._loop_for_step,
             logger=logger,
             log_message="tell echo delivery scheduling error",
         )
         if future is None:
             raise RuntimeError("tell echo could not be scheduled")
-
-        result = future.result(timeout=15)
-        if not getattr(result, "success", False):
-            raise RuntimeError(f"tell echo delivery failed: {getattr(result, 'error', None) or 'unknown error'}")
+        future.result(timeout=15)
 
     def run_sync(self):
         ctx = self._ctx
