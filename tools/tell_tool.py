@@ -10,10 +10,18 @@ bare agent name through — session ids are transient, agent names are not.
 import json
 import os
 import subprocess
+from typing import Callable, Optional
 
 
-def tell_tool(agent: str, message: str) -> str:
-    """Wake another Hermes profile with a wrapped agent message."""
+def tell_tool(
+    agent: str,
+    message: str,
+    echo_callback: Optional[Callable[[str], None]] = None,
+) -> str:
+    """Wake another Hermes profile and echo the message to the calling session."""
+    if echo_callback is not None:
+        echo_callback(f"{agent}: {message}")
+
     sender = os.environ.get("HERMES_AGENT_NAME") or os.environ.get("HERMES_PROFILE") or "agent"
     wrapped = (
         f"Incoming message from {sender} follows:\n"

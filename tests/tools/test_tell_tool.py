@@ -56,7 +56,20 @@ def test_tell_uses_profile_when_agent_name_is_absent(monkeypatch):
     assert result["returncode"] == 0
 
 
-def test_tell_preserves_send_failure_result(monkeypatch):
+def test_tell_echoes_target_and_message_to_origin(monkeypatch):
+    monkeypatch.setattr(tell_tool.subprocess, "run", lambda *_args, **_kwargs: _completed())
+    echoes = []
+
+    tell_tool.tell_tool(
+        agent="gopher",
+        message="Check the relay.",
+        echo_callback=echoes.append,
+    )
+
+    assert echoes == ["gopher: Check the relay."]
+
+
+def test_tell_preserves_send_failure_result_and_echoes_attempt(monkeypatch):
     monkeypatch.setenv("HERMES_AGENT_NAME", "Gopher")
     monkeypatch.setattr(
         tell_tool.subprocess,
@@ -67,14 +80,57 @@ def test_tell_preserves_send_failure_result(monkeypatch):
             stderr="hermes send: bridge socket missing\n",
         ),
     )
+    echoes = []
 
-    result = json.loads(tell_tool.tell_tool(agent="zephyr", message="Are you there?"))
+    result = json.loads(
+        tell_tool.tell_tool(
+            agent="zephyr",
+            message="Are you there?",
+            echo_callback=echoes.append,
+        )
+    )
 
+    assert echoes == ["zephyr: Are you there?"]
     assert result == {
         "returncode": 1,
         "stdout": "",
         "stderr": "hermes send: bridge socket missing\n",
     }
+
+
+def test_agent_runtime_routes_tell_to_origin_callback(monkeypatch):
+    from agent.agent_runtime_helpers import invoke_tool
+
+    monkeypatch.setattr(tell_tool.subprocess, "run", lambda *_args, **_kwargs: _completed())
+    echoes = []
+    agent = SimpleNamespace(
+        _memory_manager=None,
+        interim_assistant_callback=echoes.append,
+        session_id="session-1",
+    )
+
+    result = json.loads(
+        invoke_tool(
+            agent,
+            "tell",
+            {"agent": "wintermute", "message": "Trace this."},
+            "",
+            pre_tool_block_checked=True,
+            skip_tool_request_middleware=True,
+            skip_tool_execution_middleware=True,
+        )
+    )
+
+    assert echoes == ["wintermute: Trace this."]
+    assert result["returncode"] == 0
+
+
+def test_tell_is_owned_by_agent_runtime():
+    from agent.agent_runtime_helpers import AGENT_RUNTIME_POST_HOOK_TOOL_NAMES
+    from model_tools import _AGENT_LOOP_TOOLS
+
+    assert "tell" in AGENT_RUNTIME_POST_HOOK_TOOL_NAMES
+    assert "tell" in _AGENT_LOOP_TOOLS
 
 
 def test_tell_schema_requires_agent_and_message():
