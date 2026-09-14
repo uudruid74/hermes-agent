@@ -35,6 +35,7 @@ from agent.context_engine import ContextEngine, sanitize_memory_context
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.internal_compression_fallback import (
     INTERNAL_FALLBACK_PREFIX,
+    _verbatim_tail_start,
     build_internal_fallback,
 )
 from agent.model_metadata import (
@@ -103,6 +104,7 @@ HISTORICAL_TASK_HEADING = "## Historical Task Snapshot"
 # end marker, and merged-summary delimiters) after the fallback helper returns.
 # This is additional to the helper's own 24-token structural reserve.
 _INTERNAL_FALLBACK_POST_ASSEMBLY_RESERVE_TOKENS = 128
+_LAST_N_TAIL_COLLAPSE_RATIO = 0.68
 
 
 SUMMARY_PREFIX = (
@@ -6042,11 +6044,33 @@ This compaction should PRIORITISE preserving all information related to the focu
 
         display_tokens = current_tokens if current_tokens else self.last_prompt_tokens or estimate_messages_tokens_rough(messages)
 
+        # A visible-message last-N tail can include an arbitrarily large run of
+        # tool traffic. Collapse that traffic before the ordinary token-budget
+        # prune so the fallback can re-measure a tail that has room to fit.
+        last_n_tail_start = _verbatim_tail_start(
+            messages,
+            self._protect_head_size(messages),
+            self.protect_last_n,
+        )
+        last_n_tail_tokens = estimate_messages_tokens_rough(
+            messages[last_n_tail_start:]
+        )
+        pruned_count = 0
+        if last_n_tail_tokens > int(
+            self.tail_token_budget * _LAST_N_TAIL_COLLAPSE_RATIO
+        ):
+            messages, pruned_count = self._prune_old_tool_results(
+                messages,
+                protect_tail_count=1,
+                protect_tail_tokens=None,
+            )
+
         # Phase 1: Prune old tool results (cheap, no LLM call)
-        messages, pruned_count = self._prune_old_tool_results(
+        messages, ordinary_pruned_count = self._prune_old_tool_results(
             messages, protect_tail_count=self.protect_last_n,
             protect_tail_tokens=self.tail_token_budget,
         )
+        pruned_count += ordinary_pruned_count
         if pruned_count and not self.quiet_mode:
             logger.info("Pre-compression: pruned %d old tool result(s)", pruned_count)
 

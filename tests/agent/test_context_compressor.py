@@ -1583,6 +1583,58 @@ class TestTokenBudgetTailProtection:
         # Should have compressed (fewer messages than original)
         assert len(result) < len(messages)
 
+    def test_oversized_last_n_tail_collapses_tools_before_internal_fallback(self):
+        """Tool-heavy visible tails must leave room for the LexRank fallback."""
+        with patch(
+            "agent.context_compressor.get_model_context_length", return_value=100_000
+        ):
+            c = ContextCompressor(
+                model="test/model",
+                threshold_percent=0.85,
+                protect_first_n=0,
+                protect_last_n=8,
+                quiet_mode=True,
+                internal_only=True,
+            )
+        c.tail_token_budget = 1_400
+        old_first = "first output " + ("x" * 1_200)
+        old_second = "second output " + ("y" * 1_200)
+        newest = "newest output " + ("z" * 1_200)
+        messages = [
+            {"role": "system", "content": "system prompt"},
+            {"role": "user", "content": "opening request"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "c1", "function": {"name": "terminal", "arguments": "{}"}}],
+            },
+            {"role": "tool", "content": old_first, "tool_call_id": "c1"},
+            {"role": "assistant", "content": "first result reviewed"},
+            {"role": "user", "content": "continue"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "c2", "function": {"name": "terminal", "arguments": "{}"}}],
+            },
+            {"role": "tool", "content": old_second, "tool_call_id": "c2"},
+            {"role": "assistant", "content": "second result reviewed"},
+            {"role": "user", "content": "one more check"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "c3", "function": {"name": "terminal", "arguments": "{}"}}],
+            },
+            {"role": "tool", "content": newest, "tool_call_id": "c3"},
+        ]
+
+        result = c.compress(messages, current_tokens=90_000)
+
+        tool_contents = [msg["content"] for msg in result if msg.get("role") == "tool"]
+        assert c._last_compress_aborted is False
+        assert c._last_summary_fallback_used is True
+        assert old_first not in tool_contents
+        assert old_second not in tool_contents
+        assert newest in tool_contents
 
     def test_prune_short_conv_protects_entire_tail(self, budget_compressor):
         """Regression guard for PR #17025.
