@@ -2794,10 +2794,17 @@ class ContextCompressor(ContextEngine):
         latest_tool_call_idx = -1
         latest_tool_call_ids: set[str] = set()
         latest_assistant_idx = -1
+        # The newest assistant turn's index is used in two places: Pass 3's
+        # tool-call-args truncation and Pass 3b's reasoning strip. It must
+        # be computed unconditionally — Pass 3b runs even when the collapse
+        # flag is off (ordinary Phase-1 prune), so its "keep newest thinking
+        # verbatim" guard depends on it.
+        for i in range(len(result) - 1, -1, -1):
+            if latest_assistant_idx < 0 and result[i].get("role") == "assistant":
+                latest_assistant_idx = i
+                break
         if collapse_historical_tool_calls:
             for i in range(len(result) - 1, -1, -1):
-                if latest_assistant_idx < 0 and result[i].get("role") == "assistant":
-                    latest_assistant_idx = i
                 tool_calls = result[i].get("tool_calls") or []
                 if result[i].get("role") != "assistant" or not tool_calls:
                     continue
@@ -3015,9 +3022,13 @@ class ContextCompressor(ContextEngine):
         # measured 122K chars of reasoning_content in a 173-msg session).
         # Without this the collapse pass fits the tool-call half of the
         # tail but the fallback still aborts over the thinking half.
-        if collapse_historical_tool_calls:
-            for i in range(max(0, prune_boundary)):
-                _strip_historical_reasoning_at(i)
+        #
+        # Unconditional: reasoning blobs can sit inside the protected tail,
+        # and the ordinary Phase-1 prune (NO collapse flag) is the path that
+        # aborts when that tail exceeds budget. The strip itself preserves
+        # the newest assistant turn's thinking via `latest_assistant_idx`.
+        for i in range(len(result)):
+            _strip_historical_reasoning_at(i)
 
         # Pass 4 (issue #61932): protected-tail pressure demotion.
         # After multiple in-place compactions the transcript can be short
