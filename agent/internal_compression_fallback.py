@@ -38,6 +38,46 @@ _NOTE_SCORE_FLOOR = 1.25
 _MAX_UNIT_CHARS = 1_200
 _MAX_CANDIDATE_UNITS = 256
 _ASSEMBLY_RESERVE_TOKENS = 24
+# Minimum content tokens a unit must retain after boilerplate stripping to
+# stay rankable.  A unit made only of wrapper text carries no context.
+_MIN_UNIT_TOKENS = 2
+# Boilerplate carries no context but repeats in EVERY previous payload, so
+# LexRank's centrality term ranks it top — measured on a real 4,795-row
+# session, the two highest-scoring "units" were the compaction wrapper and
+# the verbatim marker (Evan, 2026-09-15).  Strip it before chunking.
+_BOILERPLATE_RES = (
+    re.compile(r"\[CONTEXT WINDOW COMPRESSED\]"),
+    # ``\s`` not ``\n``: an earlier compaction already collapsed newlines to
+    # spaces, so these wrappers arrive inline ("## Verbatim Recent Context
+    # The messages after...") and line-anchored patterns silently miss them.
+    re.compile(
+        r"-{2,}\s*END OF CONTEXT SUMMARY\b[\s—–-]*"
+        r"(?:respond to the message below, not the summary above)?[\s—–-]*",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"#{1,6}\s*(?:Active Plan|Relevant Earlier Context|"
+        r"Verbatim Recent Context|Session Notes|Context Summary)\b\s*:?",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"The messages after this summary marker are preserved verbatim\.?",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\[This response was interrupted by a user correction\.\]"),
+    re.compile(
+        r"The tool list for this conversation has been updated accordingly\.?",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\[System note:[^\]]*\]", re.IGNORECASE),
+    re.compile(r"\[OUT-OF-BAND USER MESSAGE[^\]]*\]", re.IGNORECASE),
+    re.compile(r"\[/OUT-OF-BAND USER MESSAGE\]", re.IGNORECASE),
+)
+# ``[ROLE]: `` prefixes stack ("[USER]: [USER]: [ASSISTANT]: ") when payloads
+# are re-ingested, and repeats can sit mid-text after newlines collapsed to
+# spaces.  Only the leading run on a *fresh* message is ours — every other
+# occurrence came from a previous payload and is wrapper noise.
+_ROLE_PREFIX_RE = re.compile(r"(?:\[[A-Z_]{2,12}\]:[ \t]*)+")
 
 
 @dataclass(frozen=True)
@@ -123,7 +163,71 @@ def _verbatim_tail_start(
     return tail_start
 
 
+def _strip_boilerplate(text: str) -> str:
+    """Remove compaction wrappers so they cannot be ranked as context.
+
+    A previous payload's ``[CONTEXT WINDOW COMPRESSED]`` prefix, section
+    headers and ``--- END OF CONTEXT SUMMARY`` rule recur in EVERY earlier
+    payload, so they score as maximally "central" under LexRank while
+    carrying no information at all.  Measured on a live session: 2 of the
+    top-5 ranked units were pure wrapper.  ``_TOKEN_RE`` also counts
+    underscore/bracket tokens like ``context_window_compressed`` as content
+    words, so the junk survives vectorization unless it is removed first.
+    """
+    cleaned = text
+    for pattern in _BOILERPLATE_RES:
+        cleaned = pattern.sub(" ", cleaned)
+    # Collapse the stacked ``[USER]: [USER]: [ASSISTANT]: `` prefixes that
+    # build up as payloads are re-ingested.
+    for _ in range(8):
+        stripped = _ROLE_PREFIX_RE.sub("", cleaned)
+        if stripped == cleaned:
+            break
+        cleaned = stripped
+    return re.sub(r"[ \t]+", " ", cleaned).strip()
+
+
+def _is_fragment(text: str) -> bool:
+    """True for units with no content beyond a list marker or punctuation.
+
+    Re-ingested payloads leave orphaned stubs behind once their wrapper and
+    role prefixes are removed — ``]``, ``**2.``, ``5.`` — which carry no
+    context but still consume budget and pollute the emitted block.
+    """
+    cleaned = _strip_boilerplate(text)
+    if len(_TOKEN_RE.findall(cleaned.casefold())) >= _MIN_UNIT_TOKENS:
+        return False
+    return len(re.sub(r"[\W\d_]+", "", cleaned)) == 0
+
+
+def _has_wrapper_marker(text: str) -> bool:
+    """True when text carries an actual compaction wrapper.
+
+    ``_message_units`` prefixes every unit with ``[ROLE]: ``, which the
+    role-prefix normalizer inside ``_strip_boilerplate`` also removes — so
+    comparing stripped-vs-original text cannot tell wrapper noise apart from
+    ordinary content.  Test the wrapper patterns directly instead, and leave
+    every unit that never matched one completely untouched.
+    """
+    return any(pattern.search(text) for pattern in _BOILERPLATE_RES)
+
+
+def _is_boilerplate_only(text: str) -> bool:
+    """True when a unit is *only* wrapper noise and nothing else.
+
+    Deliberately narrow: the unit must carry a wrapper marker AND lose all
+    content when it is removed.  Text that never matched a wrapper pattern
+    (a filler run, a repeated log line) is never dropped — doing so would
+    silently widen the budget and change which real units get selected.
+    """
+    if not _has_wrapper_marker(text):
+        return False
+    cleaned = _strip_boilerplate(text)
+    return len(_TOKEN_RE.findall(cleaned.casefold())) < _MIN_UNIT_TOKENS
+
+
 def _chunks(text: str) -> list[str]:
+    text = _strip_boilerplate(text)
     chunks: list[str] = []
     for sentence in _SENTENCE_SPLIT_RE.split(text.strip()):
         sentence = re.sub(r"\s+", " ", sentence).strip()
@@ -503,6 +607,29 @@ def _rank_units(
     the Plan must not make the LexRank area unreachable).
     """
     candidates = middle_units + note_units
+    if not candidates:
+        return []
+
+    # Drop wrapper-only units and collapse repeats.  Re-ingested payloads
+    # carry the same plan/summary lines forward verbatim, so without this
+    # the selector spends budget emitting the same line three times and
+    # LexRank rewards the duplication as centrality (Evan, 2026-09-15).
+    deduped: list[_Unit] = []
+    seen_text: set[str] = set()
+    for unit in candidates:
+        if _is_boilerplate_only(unit.text) or _is_fragment(unit.text):
+            continue
+        if not _has_wrapper_marker(unit.text):
+            # Not wrapper text: never dedupe it, or repeated-but-real lines
+            # (progress logs, step echoes) would silently disappear.
+            deduped.append(unit)
+            continue
+        key = re.sub(r"\W+", " ", _strip_boilerplate(unit.text).casefold()).strip()
+        if not key or key in seen_text:
+            continue
+        seen_text.add(key)
+        deduped.append(unit)
+    candidates = deduped
     if not candidates:
         return []
 
