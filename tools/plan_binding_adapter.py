@@ -438,6 +438,14 @@ def active_plan_compression_context(agent) -> Optional[tuple[str, str]]:
 
 
 def cmd_remind(agent, task_id: Optional[str] = None) -> str:
+    """Show the plan goal and the ACTIVE step only.
+
+    Deliberately does not list the other steps (2026-09-14, Evan): an agent that
+    sees every step loses track of which one it is on and starts working on the
+    wrong one. One step, then act — the closing line tells it to `advance`.
+    `cmd_continue` still prints the whole plan with summaries; that one is for
+    first-turn context restoration.
+    """
     conn = _legacy()._get_kanban_db()
     if task_id is None:
         _key, binding, error = _current(conn, agent)
@@ -449,7 +457,25 @@ def cmd_remind(agent, task_id: Optional[str] = None) -> str:
     task = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
     if task is None:
         return f"Task {task_id} not found"
-    return _format_plan(conn, task, include_summaries=False)
+
+    steps = json.loads(task["task_steps"] or "[]")
+    stepno = task["task_stepno"] or 1
+    lines = [
+        f"Task: {task['title'] or task['id']}",
+        f"Goal: {task['task_goal'] or ''}",
+    ]
+    if not steps:
+        lines.append("Active Step: (no steps defined)")
+    elif 0 < stepno <= len(steps):
+        lines.append(f"Active Step {stepno} of {len(steps)}: {steps[stepno - 1]}")
+    else:
+        lines.append(f"Active Step: (out of range: {stepno} of {len(steps)})")
+    lines.append("")
+    lines.append(
+        "If this step is complete, call `plan_tool advance` with a summary "
+        "to get the next step."
+    )
+    return "\n".join(lines)
 
 
 def cmd_continue(agent, task_id: str) -> str:

@@ -220,6 +220,59 @@ def test_remind_never_labels_an_explicit_task_historical(monkeypatch):
     assert "historical" not in result.casefold()
 
 
+def test_remind_shows_only_goal_and_active_step(monkeypatch):
+    """remind must not leak the other steps (Evan, 2026-09-14).
+
+    A small model that sees every step loses track of which one it is on and
+    starts working on the wrong one, so remind shows exactly one step and then
+    points at `advance`.
+    """
+    conn = _db()
+    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    monkeypatch.setattr(
+        plan_tool, "clarify_tool", lambda *_args, **_kwargs: '{"user_response":"Approve"}'
+    )
+    agent = _Agent()
+    plan_tool.plan_tool(
+        agent,
+        "new",
+        title="Two-step plan",
+        goal="ship it",
+        steps=["first do this", "then do that"],
+    )
+    task_id = conn.execute("SELECT task_id FROM execution_bindings").fetchone()[0]
+
+    result = plan_tool.plan_tool(agent, "remind", task_id=task_id)
+
+    assert "ship it" in result
+    assert "first do this" in result
+    assert "then do that" not in result
+    assert "advance" in result
+
+
+def test_continue_still_shows_every_step(monkeypatch):
+    """`continue` keeps the full listing — it restores first-turn context."""
+    conn = _db()
+    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    monkeypatch.setattr(
+        plan_tool, "clarify_tool", lambda *_args, **_kwargs: '{"user_response":"Approve"}'
+    )
+    agent = _Agent()
+    plan_tool.plan_tool(
+        agent,
+        "new",
+        title="Two-step plan",
+        goal="ship it",
+        steps=["first do this", "then do that"],
+    )
+    task_id = conn.execute("SELECT task_id FROM execution_bindings").fetchone()[0]
+
+    result = plan_tool.plan_tool(agent, "continue", task_id=task_id)
+
+    assert "first do this" in result
+    assert "then do that" in result
+
+
 def test_continue_rebinds_session_and_agent_and_returns_step_summaries(monkeypatch):
     conn = _db()
     monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
