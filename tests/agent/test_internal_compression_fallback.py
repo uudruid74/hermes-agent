@@ -223,7 +223,7 @@ def test_lexrank_fallback_keeps_relevant_middle_in_chronological_order():
         messages,
         protect_head_count=2,
         protect_last_n=2,
-        target_tokens=200,
+        target_tokens=180,
     )
 
     assert fallback is not None
@@ -250,7 +250,7 @@ def test_relevant_session_notes_receive_a_ranking_boost_but_are_budgeted():
         messages,
         protect_head_count=2,
         protect_last_n=2,
-        target_tokens=190,
+        target_tokens=160,
         memory_context="SQLite session note: preserve the schema rollback command.",
     )
 
@@ -478,7 +478,7 @@ def test_context_compressor_uses_plan_fallback_after_all_summary_providers_fail(
     )
 
     combined = "\n".join(str(message.get("content", "")) for message in result)
-    assert "CONTEXT WINDOW COMPRESSED — INTERNAL FALLBACK" in combined
+    assert "[CONTEXT WINDOW COMPRESSED]" in combined
     assert "Task: Recovery" in combined
     assert [message["content"] for message in result[-8:]] == [
         f"ornith recent message {index}" for index in range(8)
@@ -671,3 +671,42 @@ def test_emergency_rung_keeps_reasoning_contiguous_for_tail_refit(monkeypatch):
     if result is not None:
         assert result.mode in {"lexrank", "plan", "plan-minimal"}
 
+
+
+def test_prefix_shortening_does_not_widen_the_lexrank_budget():
+    """Guard for the 2026-09-15 prefix change.
+
+    INTERNAL_FALLBACK_PREFIX was shortened from a 151-char block (which spelled
+    out "All configured context-summary providers failed. This context was
+    reconstructed locally without an LLM.") to a 27-char marker
+    "[CONTEXT WINDOW COMPRESSED]". That reclaims ~31 tokens of headroom inside
+    every fallback summary, which shifts the tail-token budget the LexRank
+    selector can spend on the middle of the transcript.
+
+    This test pins the INVARIANT, not a byte count: at the budgets the
+    selection tests use, low-relevance filler must stay excluded while the
+    relevant middle is retained. It fails if a future prefix/format change
+    silently widens the selection budget again.
+    """
+    messages = [
+        _message("system", "system prompt"),
+        _message("user", "opening request"),
+        _message("assistant", "The garden weather is sunny and warm."),
+        _message("user", "SQLite migration needs a new sessions index."),
+        _message("assistant", "Add the sessions index before changing queries."),
+        _message("user", "A recipe needs flour and butter."),
+        _message("user", "How should we finish the SQLite sessions migration?"),
+        _message("assistant", "Keep the migration small and verify the index."),
+    ]
+
+    fallback = build_internal_fallback(
+        messages,
+        protect_head_count=2,
+        protect_last_n=2,
+        target_tokens=180,
+    )
+
+    assert fallback is not None
+    assert "SQLite migration needs" in fallback.summary
+    assert "sessions index before" in fallback.summary
+    assert "garden weather" not in fallback.summary

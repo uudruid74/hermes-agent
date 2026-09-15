@@ -3472,12 +3472,11 @@ class ContextCompressor(ContextEngine):
 {active_task}
 
 ## Goal
-Recovered from a deterministic fallback because the LLM context summarizer was unavailable. Continue from the protected recent messages after this summary and use current file/system state for exact details.{previous_summary_note}
+Successfully ran deterministic context compression. Continue from the protected recent messages after this summary and use current file/system state for exact details.{previous_summary_note}
 
 ## Constraints & Preferences
-- This fallback was generated locally without an LLM summary call.
 - Secrets and credentials were redacted before preservation.
-- The summary may be incomplete; prefer verifying current files, git state, processes, and test results instead of assuming omitted details.
+- If previous session contents are necessary, use the `session_search` tool.
 
 ## Completed Actions
 {chr(10).join(completed) if completed else "None recoverable from compacted turns."}

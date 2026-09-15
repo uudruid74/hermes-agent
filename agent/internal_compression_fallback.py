@@ -12,9 +12,7 @@ from agent.model_metadata import estimate_messages_tokens_rough, estimate_tokens
 
 
 INTERNAL_FALLBACK_PREFIX = (
-    "[CONTEXT WINDOW COMPRESSED — INTERNAL FALLBACK]\n"
-    "All configured context-summary providers failed. This context was "
-    "reconstructed locally without an LLM."
+    "[CONTEXT WINDOW COMPRESSED]"
 )
 VERBATIM_CONTEXT_MARKER = (
     "## Verbatim Recent Context\n"

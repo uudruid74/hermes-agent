@@ -991,7 +991,7 @@ class TestSummaryFailureTrackingForGatewayWarning:
         assert c._last_compress_aborted is False
         assert any(
             isinstance(m.get("content"), str)
-            and "CONTEXT WINDOW COMPRESSED — INTERNAL FALLBACK" in m["content"]
+            and "[CONTEXT WINDOW COMPRESSED]" in m["content"]
             for m in result
         )
 
@@ -1029,7 +1029,7 @@ class TestSummaryFailureTrackingForGatewayWarning:
         fallback = next(
             m["content"]
             for m in result
-            if "CONTEXT WINDOW COMPRESSED — INTERNAL FALLBACK" in m.get("content", "")
+            if "[CONTEXT WINDOW COMPRESSED]" in m.get("content", "")
         )
         assert "/tmp/project/app.py" in fallback
         assert secret not in fallback
@@ -1078,7 +1078,7 @@ class TestInternalFallbackPrecedesAbort:
         assert result != msgs
         assert any(
             isinstance(m.get("content"), str)
-            and "CONTEXT WINDOW COMPRESSED — INTERNAL FALLBACK" in m["content"]
+            and "[CONTEXT WINDOW COMPRESSED]" in m["content"]
             for m in result
         )
 
