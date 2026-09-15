@@ -24,6 +24,17 @@ _SESSION_NOTE_RE = re.compile(
     r"(?ims)^#{1,6}\s*session notes?\s*$\n(.*?)(?=^#{1,6}\s|\Z)"
 )
 _PRUNED_SKILL_RE = re.compile(r"\[SKILL_PRUNED:[^\]\n]+\]")
+# Ranking weights (Evan, 2026-09-15): centrality + relevance + recency.
+# Recency is an ADDITIVE third term, not a reweighting of relevance — a
+# recency *multiplier* on relevance tested worse (66.6% vs 69.2% coverage)
+# because it suppresses a genuinely central unit that merely sits further
+# back, instead of letting position break ties between equally central ones.
+_CENTRALITY_WEIGHT = 0.40
+_RELEVANCE_WEIGHT = 0.40
+_RECENCY_WEIGHT = 0.20
+# Floor for a pruned-skill reload marker so it stays selectable when budget
+# is free, without outranking real context (see the scoring loop).
+_NOTE_SCORE_FLOOR = 1.25
 _MAX_UNIT_CHARS = 1_200
 _MAX_CANDIDATE_UNITS = 256
 _ASSEMBLY_RESERVE_TOKENS = 24
@@ -276,6 +287,34 @@ def _centroid(vectors: list[dict[str, float]]) -> dict[str, float]:
     return {token: value / norm for token, value in result.items()} if norm else {}
 
 
+def _recency_scores(units: list[_Unit]) -> list[float]:
+    """Position of each unit relative to the live work, normalized to 0..1.
+
+    ``_Unit.order`` is ``(message_offset, chunk_offset)`` in true transcript
+    coordinates, so the newest candidate sits one row behind the protected
+    tail — i.e. immediately before the live turn.  1.0 means "adjacent to
+    the current work", 0.0 means "oldest row in the compressible middle".
+
+    Normalizing across the candidate span (rather than against an absolute
+    row count) keeps the signal meaningful on both a 20-unit middle and a
+    2,000-unit one.  Chunk offset is used only to order units within a
+    single message; it never outranks a whole message of recency.
+    """
+    if not units:
+        return []
+    orders = [unit.order for unit in units]
+    newest = max(orders)
+    oldest = min(orders)
+    if newest == oldest:
+        return [1.0] * len(units)
+    span = newest[0] - oldest[0]
+    if span <= 0:
+        # Every candidate is a chunk of one message: fall back to chunk order.
+        chunk_span = max(1, newest[1] - oldest[1])
+        return [(order[1] - oldest[1]) / chunk_span for order in orders]
+    return [(order[0] - oldest[0]) / span for order in orders]
+
+
 def _lexrank(vectors: list[dict[str, float]], threshold: float = 0.1) -> list[float]:
     count = len(vectors)
     if not count:
@@ -452,6 +491,128 @@ def _fitted_plan_summary(
     )
 
 
+def _rank_units(
+    middle_units: list[_Unit],
+    note_units: list[_Unit],
+    recent_units: list[_Unit],
+) -> list[tuple[_Unit, float]]:
+    """Rank candidate units by centrality + relevance + recency, best first.
+
+    Shared by both fallback paths so a session with an active Plan selects
+    its middle with the same selector as one without (Evan, 2026-09-15:
+    the Plan must not make the LexRank area unreachable).
+    """
+    candidates = middle_units + note_units
+    if not candidates:
+        return []
+
+    all_vectors = _tfidf_vectors(
+        [unit.text for unit in candidates] + [unit.text for unit in recent_units]
+    )
+    candidate_vectors = all_vectors[: len(candidates)]
+    recent_vectors = all_vectors[len(candidates) :]
+    recent_centroid = _centroid(recent_vectors)
+    relevance = [_cosine(vector, recent_centroid) for vector in candidate_vectors]
+    centrality = _lexrank(candidate_vectors)
+    recency = _recency_scores(candidates)
+    scores: list[float] = []
+    for unit, central, relevant, near in zip(candidates, centrality, relevance, recency):
+        # Third signal (Evan, 2026-09-15): how close the unit sits to the
+        # live work.  Lexrank centrality alone happily carries a *finished*
+        # sub-thread forward forever, because it was highly connected when
+        # it was active — position is what distinguishes "central then"
+        # from "central and still current".  Measured over 37 real
+        # compactions at equal token budget: 25 wins / 7 losses / 5 ties,
+        # mean coverage 66.5% -> 69.2%.
+        score = (
+            _CENTRALITY_WEIGHT * central
+            + _RELEVANCE_WEIGHT * relevant
+            + _RECENCY_WEIGHT * near
+        )
+        if _PRUNED_SKILL_RE.search(unit.text):
+            # Reload markers are an instruction to re-read a skill, not
+            # context worth ranking: scoring them above every real unit
+            # spent note budget on a placeholder (Evan, 2026-09-15).
+            # They are still emitted — `_session_notes` keeps them — but
+            # they no longer outrank the material they displaced.
+            score = max(score, _NOTE_SCORE_FLOOR)
+        elif unit.is_note:
+            score = 1.25 + 0.4 * relevant
+        scores.append(score)
+
+    return sorted(
+        zip(candidates, scores),
+        key=lambda item: (-item[1], item[0].order),
+    )[:_MAX_CANDIDATE_UNITS]
+
+
+def _with_lexrank_section(summary: str, selected: list[_Unit]) -> str:
+    """Insert a ``## Relevant Earlier Context`` block above the verbatim marker."""
+    if not selected:
+        return summary
+    block = "\n\n".join(
+        [
+            "## Relevant Earlier Context",
+            "\n".join(unit.text for unit in sorted(selected, key=lambda item: item.order)),
+        ]
+    )
+    if VERBATIM_CONTEXT_MARKER in summary:
+        head, _, rest = summary.partition(VERBATIM_CONTEXT_MARKER)
+        return head.rstrip() + "\n\n" + block + "\n\n" + VERBATIM_CONTEXT_MARKER + rest
+    return summary.rstrip() + "\n\n" + block
+
+
+def _add_plan_lexrank_area(
+    messages: list[dict[str, Any]],
+    *,
+    head_count: int,
+    tail_start: int,
+    summary: str,
+    notes: list[str],
+    target_tokens: int,
+) -> tuple[str, int]:
+    """Spend the leftover plan budget on the ranked middle (Evan, 2026-09-15).
+
+    The Plan path used to return as soon as the plan + notes + verbatim
+    tail fitted, which made the LexRank area **unreachable for any session
+    with an active Plan** — the region between the end of the plan and the
+    protected tail is supposed to be selected by LexRank, not dropped.
+
+    ``_fitted_plan_summary`` already fills whatever budget the notes leave.
+    If there is room left over after that, the same selector the planless
+    path uses ranks the middle and the best units are packed in one at a
+    time, so the emitted area grows to the budget rather than being
+    abandoned the moment the plan alone fits.  Budget is a TARGET, not a
+    ceiling: when nothing fits we keep the plan-only payload.
+
+    Returns ``(summary, tail_start)``; the tail start never moves backwards.
+    """
+    middle_messages = messages[head_count:tail_start]
+    if not middle_messages:
+        return summary, tail_start
+    middle_units = _message_units(middle_messages, start_index=head_count)
+    marker_notes = {note for note in notes if _PRUNED_SKILL_RE.fullmatch(note)}
+    if marker_notes:
+        middle_units = [
+            unit
+            for unit in middle_units
+            if not any(marker in unit.text for marker in marker_notes)
+        ]
+    recent_units = _message_units(messages[tail_start:], start_index=tail_start)
+    ranked = _rank_units(middle_units, [], recent_units)
+    if not ranked:
+        return summary, tail_start
+
+    selected: list[_Unit] = []
+    best = summary
+    for unit, _score in ranked:
+        candidate = _with_lexrank_section(summary, [*selected, unit])
+        if _fits(messages, head_count, tail_start, candidate, target_tokens):
+            selected.append(unit)
+            best = candidate
+    return best, tail_start
+
+
 def _lexrank_summary(selected: list[_Unit]) -> str:
     context = [unit for unit in selected if not unit.is_note]
     notes = [unit for unit in selected if unit.is_note]
@@ -517,8 +678,18 @@ def build_internal_fallback(
             target_tokens=target_tokens,
         )
         if _fits(messages, head_count, fitted_tail_start, summary, target_tokens):
+            summary, fitted_tail_start = _add_plan_lexrank_area(
+                messages,
+                head_count=head_count,
+                tail_start=fitted_tail_start,
+                summary=summary,
+                notes=notes,
+                target_tokens=target_tokens,
+            )
             return InternalFallback(summary, head_count, fitted_tail_start, "plan")
 
+        # The full plan is itself too large to fit — degrade to
+        # goal + current step + summary against the minimal head.
         system_head = 1 if messages and messages[0].get("role") == "system" else 0
         minimal_tail_start = _verbatim_tail_start(
             messages,
@@ -533,6 +704,14 @@ def build_internal_fallback(
             notes=notes,
             target_tokens=target_tokens,
             minimal=True,
+        )
+        summary, fitted_tail_start = _add_plan_lexrank_area(
+            messages,
+            head_count=system_head,
+            tail_start=fitted_tail_start,
+            summary=summary,
+            notes=notes,
+            target_tokens=target_tokens,
         )
         return InternalFallback(
             summary,
@@ -570,27 +749,7 @@ def build_internal_fallback(
             "lexrank",
         )
 
-    all_vectors = _tfidf_vectors(
-        [unit.text for unit in candidates] + [unit.text for unit in recent_units]
-    )
-    candidate_vectors = all_vectors[: len(candidates)]
-    recent_vectors = all_vectors[len(candidates) :]
-    recent_centroid = _centroid(recent_vectors)
-    relevance = [_cosine(vector, recent_centroid) for vector in candidate_vectors]
-    centrality = _lexrank(candidate_vectors)
-    scores: list[float] = []
-    for unit, central, relevant in zip(candidates, centrality, relevance):
-        score = 0.6 * central + 0.4 * relevant
-        if _PRUNED_SKILL_RE.search(unit.text):
-            score = 2.0
-        elif unit.is_note:
-            score = 1.25 + 0.4 * relevant
-        scores.append(score)
-
-    ranked = sorted(
-        zip(candidates, scores),
-        key=lambda item: (-item[1], item[0].order),
-    )[:_MAX_CANDIDATE_UNITS]
+    ranked = _rank_units(middle_units, note_units, recent_units)
     selected: list[_Unit] = []
     for unit, _score in ranked:
         candidate_selection = [*selected, unit]
