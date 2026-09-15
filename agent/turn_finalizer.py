@@ -23,6 +23,7 @@ keep the exact logger name (``"agent.conversation_loop"``).
 from __future__ import annotations
 
 import os
+from typing import Any, Callable
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.message_content import flatten_message_text
@@ -64,6 +65,132 @@ def _drop_verification_continuation_scaffolding(messages) -> None:
         m for m in messages
         if not (isinstance(m, dict) and any(m.get(f) for f in _VERIFICATION_CONTINUATION_FLAGS))
     ]
+
+
+def _reclaim_before_summary(agent, messages: list) -> list:
+    """Reclaim context at the tool-limit handoff, before anything ELSE grows it.
+
+    A tool/iteration limit being reached is a CLUE: the transcript is at its
+    largest exactly when the budget-exhaustion summary is about to fire, and
+    that summary call (``_handle_max_iterations``) builds its request straight
+    from the live transcript with no compression check at all.  On a small
+    window that is fatal -- a 200-iteration run asked LM Studio for 177,138
+    tokens against a 78,080 window and was rejected, so the user got no
+    summary and the turn died opaquely (2026-09-15).
+
+    Three deterministic rungs, cheapest first, stopping as soon as the request
+    fits under threshold:
+
+      1. Prune old tool results outside the ``protect_last_n`` tail -- no LLM,
+         keeps every turn, sheds only the bulky tool-output half.
+      2. Full deterministic compression (``_compress_context``), which on an
+         ``internal_only`` profile routes to the local selector.
+      3. Hard-drop the middle: protect the head and the last ``protect_last_n``
+         messages and discard everything between, re-aligning boundaries so no
+         tool-call / tool-result pair is orphaned.
+
+    Returns the (possibly new) message list.  Never raises: a failure in any
+    rung is logged and the caller proceeds with what it has, because the
+    original code path (summarise the raw transcript) is still no worse than
+    doing nothing.
+    """
+    from agent.conversation_loop import logger
+    from agent.model_metadata import estimate_request_tokens_rough
+
+    compressor = getattr(agent, "context_compressor", None)
+    if compressor is None or not getattr(agent, "compression_enabled", False):
+        return messages
+
+    system_prompt = ""
+    if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system":
+        system_prompt = messages[0].get("content") or ""
+
+    threshold = int(getattr(compressor, "threshold_tokens", 0) or 0)
+
+    def _measure() -> int:
+        return estimate_request_tokens_rough(
+            messages, system_prompt=system_prompt, tools=agent.tools or None
+        )
+
+    try:
+        tokens = _measure()
+        if tokens < threshold:
+            return messages
+        logger.info(
+            "tool-limit handoff: request ~%d tokens over threshold %d — reclaiming before summary",
+            tokens,
+            threshold,
+        )
+
+        protect_last_n = int(getattr(compressor, "protect_last_n", 0) or 0)
+
+        # Rung 1 -- deterministic tool-result prune.  Bypasses the
+        # proactive_prune_tokens trigger gate deliberately: reaching a tool
+        # limit IS the trigger here.
+        prune = getattr(compressor, "_prune_old_tool_results", None)
+        if callable(prune):
+            try:
+                pruned, count = prune(messages, protect_tail_count=protect_last_n)
+                if count and pruned is not messages:
+                    messages = pruned
+                    if _measure() < threshold:
+                        logger.info(
+                            "tool-limit handoff: prune reclaimed enough (%d pruned)", count
+                        )
+                        return messages
+            except Exception:
+                logger.debug("tool-limit handoff: prune rung failed", exc_info=True)
+
+        # Rung 2 -- full deterministic compression.
+        try:
+            compress = getattr(agent, "_compress_context", None)
+            if callable(compress):
+                compressed, _prompt = compress(messages, system_prompt, task_id="default")
+                if (
+                    compressed is not None
+                    and compressed is not messages
+                    and len(compressed) < len(messages)
+                ):
+                    messages = compressed
+                    if _measure() < threshold:
+                        logger.info("tool-limit handoff: compression reclaimed enough")
+                        return messages
+        except Exception:
+            logger.debug("tool-limit handoff: compression rung failed", exc_info=True)
+
+        # Rung 3 -- hard-drop the middle.  Keep head + last N, discard the rest.
+        try:
+            head = int(getattr(compressor, "_protect_head_size", lambda _m: 1)(messages))
+            align_fwd = getattr(compressor, "_align_boundary_forward", None)
+            drop_from = int(align_fwd(messages, head)) if callable(align_fwd) else head
+            drop_to = max(head, len(messages) - protect_last_n)
+            align_back = getattr(compressor, "_align_boundary_backward", None)
+            if callable(align_back):
+                drop_to = int(align_back(messages, drop_to))
+
+            if drop_to > drop_from:
+                messages = messages[:drop_from] + messages[drop_to:]
+                # The compressor's own pair sanitizer is authoritative here:
+                # it strips BOTH orphan directions (results with no surviving
+                # call, and calls whose results were dropped).  Hand-rolled
+                # boundary nudging alone left one orphan in testing.
+                sanitize: Callable[[list], Any] | None = getattr(
+                    compressor, "_sanitize_tool_pairs", None
+                )
+                if callable(sanitize):
+                    messages = list(sanitize(messages))
+                logger.info(
+                    "tool-limit handoff: hard-dropped middle (%d messages) to protect last %d",
+                    drop_to - drop_from,
+                    protect_last_n,
+                )
+        except Exception:
+            logger.debug("tool-limit handoff: hard-drop rung failed", exc_info=True)
+
+        return messages
+    except Exception:
+        logger.debug("tool-limit handoff: reclaim failed", exc_info=True)
+        return messages
 
 
 def finalize_turn(
@@ -129,6 +256,13 @@ def finalize_turn(
         # API call with tools stripped.  _handle_max_iterations injects a
         # user message and makes a single toolless request.
         _turn_exit_reason = f"max_iterations_reached({api_call_count}/{agent.max_iterations})"
+        # Reclaim context BEFORE the summary call grows the request.  A tool
+        # limit being reached is a clue: the transcript is at its largest
+        # exactly here, and _handle_max_iterations builds its request straight
+        # from the live transcript with no compression check — which on a small
+        # window means the summary itself overflows and the turn dies with no
+        # user-facing output (177,138 vs 78,080, 2026-09-15).
+        messages = _reclaim_before_summary(agent, messages)
         agent._emit_status(
             f"⚠️ Iteration budget exhausted ({api_call_count}/{agent.max_iterations}) "
             "— asking model to summarise"
