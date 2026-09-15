@@ -1129,16 +1129,24 @@ def kanban_command(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 def _profile_author() -> str:
-    """Best-effort author name for an interactive CLI call."""
-    for env in ("HERMES_PROFILE_NAME", "HERMES_PROFILE"):
-        v = os.environ.get(env)
-        if v:
-            return v
+    """Best-effort author name for an interactive CLI call.
+
+    Resolved from HERMES_HOME via the canonical accessor, so this agrees with
+    the worker/notify paths (``kanban_db`` and ``secret_sources.registry``)
+    instead of racing them on a stale env var. ``HERMES_PROFILE`` remains a
+    fallback for processes that carry the label without a resolvable HOME.
+    """
     try:
         from hermes_cli.profiles import get_active_profile_name
-        return get_active_profile_name() or "user"
+        name = get_active_profile_name()
+        if name and name != "default":
+            return name
     except Exception:
-        return "user"
+        pass
+    v = os.environ.get("HERMES_PROFILE")
+    if v:
+        return v
+    return "user"
 
 
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({

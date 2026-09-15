@@ -1778,3 +1778,89 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+# ── Session-bound task deletion (regression: archive --rm raised FK error) ──
+
+def test_delete_archived_task_clears_execution_binding(kanban_home):
+    """``execution_bindings.task_id`` is the only real FK to tasks(id).
+
+    Before the fix it was never cleared, so ``delete_archived_task`` raised
+    ``sqlite3.IntegrityError: FOREIGN KEY constraint failed`` for any task
+    that had ever been bound to a session — i.e. ``kanban archive --rm``
+    could never delete such a task.
+    """
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="bound task")
+        kb.complete_task(conn, tid, result="done")
+        assert kb.archive_task(conn, tid)
+        conn.execute(
+            "INSERT INTO execution_bindings"
+            "(profile, root_session_id, task_id, revision, bound_at, updated_at) "
+            "VALUES ('gopher', 'sess-1', ?, 1, 0, 0)",
+            (tid,),
+        )
+        conn.commit()
+        assert conn.execute(
+            "SELECT COUNT(*) FROM execution_bindings WHERE task_id = ?", (tid,)
+        ).fetchone()[0] == 1
+
+        # Must not raise IntegrityError.
+        assert kb.delete_archived_task(conn, tid) is True
+        assert kb.get_task(conn, tid) is None
+        assert conn.execute(
+            "SELECT COUNT(*) FROM execution_bindings WHERE task_id = ?", (tid,)
+        ).fetchone()[0] == 0
+
+
+def test_delete_task_clears_execution_binding(kanban_home):
+    """``delete_task`` deleted the task row BEFORE the FK child rows.
+
+    That ordering raised IntegrityError on any session-bound task. The task
+    row must go last.
+    """
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="bound task")
+        conn.execute(
+            "INSERT INTO execution_bindings"
+            "(profile, root_session_id, task_id, revision, bound_at, updated_at) "
+            "VALUES ('gopher', 'sess-1', ?, 1, 0, 0)",
+            (tid,),
+        )
+        conn.commit()
+        assert kb.delete_task(conn, tid) is True
+        assert kb.get_task(conn, tid) is None
+        assert conn.execute(
+            "SELECT COUNT(*) FROM execution_bindings WHERE task_id = ?", (tid,)
+        ).fetchone()[0] == 0
+
+
+def test_delete_archived_task_no_orphans_in_attachment_and_clarify(kanban_home):
+    """Tables carrying task_id with no FK must not be left orphaned."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="orphan check")
+        kb.complete_task(conn, tid, result="done")
+        assert kb.archive_task(conn, tid)
+        conn.execute(
+            "INSERT INTO task_attachments (task_id, filename, stored_path, size, created_at) "
+            "VALUES (?, 'f.txt', '/tmp/f.txt', 0, 0)", (tid,),
+        )
+        conn.execute(
+            "INSERT INTO clarify_queue (id, task_id, question, choices, created_at) "
+            "VALUES ('cq-1', ?, 'q?', '[]', 0)", (tid,),
+        )
+        conn.commit()
+        assert kb.delete_archived_task(conn, tid) is True
+        for table in ("task_attachments", "clarify_queue"):
+            n = conn.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE task_id = ?", (tid,)
+            ).fetchone()[0]
+            assert n == 0, f"{table} left {n} orphaned row(s)"
+
+
+def test_delete_archived_task_still_refuses_non_archived(kanban_home):
+    """Safety guard preserved: only archived tasks can be hard-deleted."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="live task")
+        assert kb.delete_archived_task(conn, tid) is False
+        assert kb.get_task(conn, tid) is not None

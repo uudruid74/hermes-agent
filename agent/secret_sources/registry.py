@@ -303,10 +303,12 @@ def _active_profile_name(home_path: Optional[Path]) -> str:
         resolved = Path(home_path)
         if resolved.parent.name == "profiles" and resolved.name:
             return resolved.name
-    for env_name in ("HERMES_PROFILE_NAME", "HERMES_PROFILE"):
-        value = os.environ.get(env_name, "").strip()
-        if value and value != "default":
-            return value
+    # HERMES_PROFILE is a label, not a selector — HERMES_HOME above is the
+    # single source of truth. Used only as a fallback for processes that carry
+    # the label without a resolvable home.
+    value = os.environ.get("HERMES_PROFILE", "").strip()
+    if value and value != "default":
+        return value
     return ""
 
 

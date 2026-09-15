@@ -6759,6 +6759,15 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
     Safety guard: only archived tasks can be deleted. Active / blocked / done
     tasks must be explicitly archived first so accidental data loss requires a
     second deliberate action.
+
+    Child rows are cleared before the task row. ``execution_bindings.task_id``
+    is the only column in the schema carrying a real
+    ``REFERENCES tasks(id)`` constraint, so it MUST be cleared first or the
+    final DELETE raises ``IntegrityError: FOREIGN KEY constraint failed``
+    whenever the task was ever bound to a session (issue: ``archive --rm``
+    could never delete such a task). The remaining tables declare no FK, so
+    they are cleared to avoid orphaned rows rather than to satisfy the
+    constraint.
     """
     with write_txn(conn):
         row = conn.execute(
@@ -6767,6 +6776,11 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         ).fetchone()
         if not row or row["status"] != "archived":
             return False
+        # Real FK — must go before the task row (see docstring).
+        conn.execute("DELETE FROM execution_bindings WHERE task_id = ?", (task_id,))
+        # No FK, but these carry task_id and would orphan otherwise.
+        conn.execute("DELETE FROM task_attachments WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM clarify_queue WHERE task_id = ?", (task_id,))
         conn.execute(
             "DELETE FROM task_links WHERE parent_id = ? OR child_id = ?",
             (task_id, task_id),
@@ -6786,18 +6800,33 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     we explicitly delete from child tables first, then the task row.
     This keeps the operation atomic (single ``write_txn``).
 
+    Ordering matters: ``execution_bindings.task_id`` carries a real
+    ``REFERENCES tasks(id)`` constraint, so the task row must be deleted
+    LAST. (This function previously deleted the task row first, which
+    raised ``IntegrityError`` on any session-bound task.)
+
     Returns ``True`` if the task existed and was deleted, ``False``
     if the task was not found.
     """
     with write_txn(conn):
-        cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-        if cur.rowcount != 1:
+        exists = conn.execute(
+            "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if not exists:
             return False
+        # Real FK first — must precede the task row.
+        conn.execute("DELETE FROM execution_bindings WHERE task_id = ?", (task_id,))
+        # No FK, but these carry task_id and would orphan otherwise.
+        conn.execute("DELETE FROM task_attachments WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM clarify_queue WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
         conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+        cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        if cur.rowcount != 1:
+            return False
     recompute_ready(conn)
     return True
 
