@@ -723,3 +723,105 @@ class TestMalformedYAMLConfigPreservation:
         assert "Cannot parse" in captured.out or "Cannot parse" in captured.err
         raw = _read_config(_isolated_hermes_home)
         assert raw == self.BROKEN_CONFIG
+
+
+# ---------------------------------------------------------------------------
+# JSON container coercion (list/dict literals)
+#
+# Regression: `hermes config set mcp_servers.foo.args '["cmd","serve"]'` wrote
+# the STRING '["cmd","serve"]'.  Downstream readers expecting a list either
+# iterated it character by character (spawning `uvx "["`, `u`, `v`, ...) or
+# raised AttributeError: 'str' object has no attribute 'get'.  Both symptom
+# classes were observed in the wild before this was fixed.
+# ---------------------------------------------------------------------------
+
+class TestJsonContainerCoercion:
+    def test_list_literal_stored_as_list(self, _isolated_hermes_home):
+        import yaml
+
+        set_config_value("mcp_servers.demo.args", '["code-review-graph", "serve"]')
+
+        cfg = yaml.safe_load(_read_config(_isolated_hermes_home))
+        value = cfg["mcp_servers"]["demo"]["args"]
+        assert isinstance(value, list), f"expected list, got {type(value).__name__}"
+        assert value == ["code-review-graph", "serve"]
+
+    def test_dict_literal_stored_as_dict(self, _isolated_hermes_home):
+        import yaml
+
+        set_config_value("mcp_servers.demo.headers", '{"X-Api-Key": "abc"}')
+
+        cfg = yaml.safe_load(_read_config(_isolated_hermes_home))
+        value = cfg["mcp_servers"]["demo"]["headers"]
+        assert isinstance(value, dict), f"expected dict, got {type(value).__name__}"
+        assert value == {"X-Api-Key": "abc"}
+
+    def test_leading_whitespace_still_coerces(self, _isolated_hermes_home):
+        import yaml
+
+        set_config_value("mcp_servers.demo.args", '  ["a"]')
+
+        cfg = yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert cfg["mcp_servers"]["demo"]["args"] == ["a"]
+
+    def test_plain_string_is_untouched(self, _isolated_hermes_home):
+        import yaml
+
+        set_config_value("mcp_servers.demo.command", "uvx")
+
+        cfg = yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert cfg["mcp_servers"]["demo"]["command"] == "uvx"
+
+    def test_bracket_inside_string_is_not_a_container(self, _isolated_hermes_home):
+        """Only a LEADING [ or { marks a container; 'a[0]' is a plain string."""
+        import yaml
+
+        set_config_value("mcp_servers.demo.note", "a[0]")
+
+        cfg = yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert cfg["mcp_servers"]["demo"]["note"] == "a[0]"
+
+    def test_malformed_literal_is_a_hard_error(self, _isolated_hermes_home, capsys):
+        """A broken JSON literal must fail loudly, not silently store a string."""
+        with pytest.raises(SystemExit) as exc:
+            set_config_value("mcp_servers.demo.args", "[not json")
+
+        assert exc.value.code == 1
+        captured = capsys.readouterr()
+        combined = captured.out + captured.err
+        assert "does not parse" in combined
+
+    def test_scalar_typed_default_still_wins_over_container(self, _isolated_hermes_home):
+        """String-typed settings keep their string even if the value looks JSON.
+
+        Guards the `if not isinstance(_default_value_for_key(key), str)` gate:
+        enum members like approvals.mode must never be coerced into bools or
+        containers.
+        """
+        import yaml
+
+        set_config_value("approvals.mode", "off")
+
+        cfg = yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert cfg["approvals"]["mode"] == "off"
+
+
+class TestJsonContainerHelpers:
+    def test_looks_like_json_container(self):
+        from hermes_cli.config import _looks_like_json_container as looks
+
+        assert looks('["a"]') is True
+        assert looks('{"a": 1}') is True
+        assert looks('   ["a"]') is True
+        assert looks("plain") is False
+        assert looks("a[0]") is False
+        assert looks("") is False
+
+    def test_parse_json_container(self):
+        from hermes_cli.config import _parse_json_container as parse
+
+        assert parse('["a","b"]') == ["a", "b"]
+        assert parse('{"k": "v"}') == {"k": "v"}
+        assert parse("[oops") is None
+        assert parse("{nope") is None
+

@@ -4647,6 +4647,34 @@ def _default_value_for_key(dotted_key: str):
     return node if not isinstance(node, dict) else None
 
 
+# Characters that introduce a JSON container.  A bare scalar never starts with
+# these, so the guard can be cheap and unambiguous.
+_JSON_CONTAINER_PREFIXES = ("[", "{")
+
+
+def _looks_like_json_container(value: str) -> bool:
+    """True if *value* is a JSON array/object literal (not a bare scalar).
+
+    A value that merely CONTAINS a bracket (e.g. ``a[0]``) is not a
+    container; only a leading ``[`` or ``{`` counts.
+    """
+    if not isinstance(value, str):
+        return False
+    return value.lstrip().startswith(_JSON_CONTAINER_PREFIXES)
+
+
+def _parse_json_container(value: str) -> Any:
+    """Parse *value* as a JSON array/object, or return ``None`` if invalid.
+
+    The return value is ``None`` for malformed input; callers treat that as a
+    hard error rather than silently keeping the raw string.
+    """
+    try:
+        return json.loads(value)
+    except (ValueError, TypeError):
+        return None
+
+
 # Known top-level config keys that intentionally accept arbitrary user-supplied
 # child keys ("dictionary-shaped" config: the schema declares the dict but the
 # user populates its keys). Schema validation accepts ANY path below these
@@ -4911,6 +4939,29 @@ def set_config_value(key: str, value: str, force: bool = False):
             coerced_value = int(value)
         elif value.replace('.', '', 1).isdigit():
             coerced_value = float(value)
+        elif _looks_like_json_container(value):
+            # List/dict literals (MCP `args`, header maps): without this, a
+            # documented `hermes config set mcp_servers.foo.args '["a","b"]'`
+            # wrote the STRING '["a","b"]'.  Downstream readers expecting a
+            # list then either iterated it CHARACTER BY CHARACTER (spawning
+            # `uvx "["`, `u`, `v`, ...) or, for a dict, hit
+            # `AttributeError: 'str' object has no attribute 'get'`.
+            # A malformed literal is a hard error rather than a silent string
+            # write -- silently storing the wrong TYPE is what made this
+            # expensive to find.
+            parsed = _parse_json_container(value)
+            if parsed is None:
+                print(
+                    f"✗ {value!r} looks like JSON but does not parse.",
+                    file=sys.stderr,
+                )
+                print(
+                    "  Fix the literal, or write a plain string (no leading "
+                    "[ / {) if you really want a string.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            coerced_value = parsed
 
     value = coerced_value
     # Normalize a scalar ``model`` key before writing sub-keys so that

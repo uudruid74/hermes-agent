@@ -251,6 +251,72 @@ def _apply_mcp_preset(
 
 # ─── Discovery (temporary connect) ───────────────────────────────────────────
 
+# How many trailing lines of a failed server's stderr to surface inline.  The
+# useful line is almost always last (argparse usage, traceback tail), but a
+# couple of context lines make a traceback readable.
+_MCP_FAILURE_STDERR_LINES = 12
+
+
+def _recent_mcp_stderr(server_name: str) -> str:
+    """Return the tail of this server's stderr log, or ``""`` if unavailable.
+
+    A stdio MCP server's own diagnostics (argparse usage, Python traceback)
+    go to ``<hermes_home>/logs/mcp-stderr.log``.  Without reading it back, an
+    immediate child exit surfaces to the user as a bare ``Connection closed``
+    with no hint of the cause -- the single biggest diagnostic gap in the
+    connect path.  Best-effort: never raises.
+    """
+    try:
+        from hermes_cli.config import get_hermes_home
+
+        log_path = get_hermes_home() / "logs" / "mcp-stderr.log"
+        if not log_path.exists():
+            return ""
+        # Bounded read: the log is append-only across every server and can
+        # grow to tens of MB, so never slurp the whole file.
+        with open(log_path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - 64_000))
+            tail = fh.read().decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+    marker = f"starting MCP server '{server_name}'"
+    # The LAST occurrence is this attempt; earlier ones are prior runs.
+    idx = tail.rfind(marker)
+    if idx < 0:
+        return ""
+    # Cut at the newline AFTER the marker line so the header itself is dropped.
+    nl = tail.find("\n", idx)
+    body = tail[nl + 1:] if nl >= 0 else ""
+    lines = [ln.rstrip() for ln in body.splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    return "\n".join(lines[-_MCP_FAILURE_STDERR_LINES:])
+
+
+def _describe_connect_failure(server_name: str, exc: Exception) -> None:
+    """Print a connect failure WITH the underlying server diagnostics."""
+    _error(f"Failed to connect: {exc}")
+
+    detail = _recent_mcp_stderr(server_name)
+    if detail:
+        print()
+        _info(f"What the server printed before exiting ({server_name}):")
+        for line in detail.splitlines():
+            print(f"    {color(line, Colors.DIM)}")
+        print()
+        _info(
+            "Common causes: an unrecognized flag in --args (everything after "
+            "--args is passed verbatim to the server), or a missing/incorrect "
+            "command."
+        )
+    else:
+        _info(
+            f"No output captured. Retry with: hermes mcp test {server_name}"
+        )
+
 def _resolve_mcp_server_config(config: dict) -> dict:
     """Resolve ``${ENV}`` placeholders in a server config before connecting.
 
@@ -423,6 +489,28 @@ def cmd_mcp_add(args):
     cmd_args = getattr(args, "args", None) or []
     if cmd_args and cmd_args[0] == "--":
         cmd_args = cmd_args[1:]
+    # `--args` uses argparse.REMAINDER, which is greedy by design: anything
+    # after it (including a trailing `-p <profile>`) is swallowed into the
+    # child command's argv and never parsed by Hermes.  That is CORRECT for
+    # child flags (Docker MCP Toolkit's own `--profile`), so we must not strip
+    # them -- but silently accepting a mistyped *global* flag produced a
+    # baffling bare "Connection closed" (the child rejects the flag and exits).
+    # Detect the known Hermes global selectors and tell the user to hoist them.
+    _swallowed_globals = [
+        tok for tok in cmd_args if tok in {"-p", "--profile", "-t", "--toolsets"}
+    ]
+    if _swallowed_globals:
+        _warning(
+            "These look like Hermes global options, but --args is greedy — "
+            "everything after it belongs to the server command: "
+            + ", ".join(_swallowed_globals)
+        )
+        _info(
+            "Put global options BEFORE the subcommand instead, e.g. "
+            f"hermes -p {getattr(args, 'profile', 'PROFILE') or 'PROFILE'} "
+            f"mcp add {name} --command <cmd> --args ..."
+        )
+        return
     auth_type = getattr(args, "auth", None)
     preset_name = getattr(args, "preset", None)
     raw_env = getattr(args, "env", None)
@@ -542,7 +630,7 @@ def cmd_mcp_add(args):
     try:
         tools = _probe_single_server(name, server_config)
     except Exception as exc:
-        _error(f"Failed to connect: {exc}")
+        _describe_connect_failure(name, exc)
         if _confirm("Save config anyway (you can test later)?", default=False):
             server_config["enabled"] = False
             if _save_mcp_server(name, server_config):
@@ -769,6 +857,18 @@ def cmd_mcp_test(args):
     except Exception as exc:
         elapsed_ms = (time.monotonic() - start) * 1000
         _error(f"Connection failed ({elapsed_ms:.0f}ms): {exc}")
+        detail = _recent_mcp_stderr(name)
+        if detail:
+            print()
+            _info(f"What the server printed before exiting ({name}):")
+            for line in detail.splitlines():
+                print(f"    {color(line, Colors.DIM)}")
+            print()
+            _info(
+                "Common causes: an unrecognized flag in args (everything in "
+                "args is passed verbatim to the server), or a missing/incorrect "
+                "command."
+            )
         return
 
     _success(f"Connected ({elapsed_ms:.0f}ms)")
@@ -986,7 +1086,7 @@ def cmd_mcp_configure(args):
     try:
         all_tools = _probe_single_server(name, cfg)
     except Exception as exc:
-        _error(f"Failed to connect: {exc}")
+        _describe_connect_failure(name, exc)
         return
 
     if not all_tools:

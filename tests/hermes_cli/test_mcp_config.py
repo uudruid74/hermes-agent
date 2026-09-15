@@ -747,3 +747,146 @@ class TestMcpReauth:
         cmd_mcp_reauth(_make_args(name="ghost", all=False))
         out = capsys.readouterr().out
         assert "not found" in out
+
+
+# ---------------------------------------------------------------------------
+# Swallowed global flags in `--args`
+#
+# `--args` is argparse.REMAINDER — greedy by design, because child MCP servers
+# legitimately take their own flags (Docker MCP Toolkit has `--profile`).  The
+# failure mode was SILENT: `hermes mcp add NAME --command uvx --args foo serve
+# -p gopher` passed ["foo","serve","-p","gopher"] to the child, which rejected
+# the flag and exited, surfacing only as a bare "Connection closed".
+# ---------------------------------------------------------------------------
+
+class TestSwallowedGlobalFlags:
+    @pytest.mark.parametrize("flag", ["-p", "--profile", "-t", "--toolsets"])
+    def test_swallowed_global_flag_is_reported(self, tmp_path, capsys, monkeypatch, flag):
+        """A trailing global selector must be detected, not silently forwarded."""
+        called = {"probe": False}
+
+        def mock_probe(name, config, **kw):
+            called["probe"] = True
+            return []
+
+        monkeypatch.setattr(
+            "hermes_cli.mcp_config._probe_single_server", mock_probe
+        )
+
+        from hermes_cli.mcp_config import cmd_mcp_add
+
+        cmd_mcp_add(_make_args(
+            name="demo",
+            mcp_command="uvx",
+            args=["demo-server", "serve", flag, "gopher"],
+        ))
+
+        out = capsys.readouterr().out
+        assert "--args is greedy" in out
+        assert flag in out
+        # Must NOT attempt a connect with the poisoned argv, and must not save.
+        assert called["probe"] is False
+        assert not (tmp_path / "config.yaml").exists()
+
+    def test_child_flags_are_not_flagged(self, tmp_path, capsys, monkeypatch):
+        """A legitimate child flag (e.g. `-y`) must pass through untouched."""
+        seen = {}
+
+        def mock_probe(name, config, **kw):
+            seen["args"] = config.get("args")
+            return [("t", "d")]
+
+        monkeypatch.setattr(
+            "hermes_cli.mcp_config._probe_single_server", mock_probe
+        )
+        monkeypatch.setattr("builtins.input", lambda _: "")
+
+        from hermes_cli.mcp_config import cmd_mcp_add
+
+        cmd_mcp_add(_make_args(
+            name="demo",
+            mcp_command="npx",
+            args=["-y", "@scope/server"],
+        ))
+
+        out = capsys.readouterr().out
+        assert "--args is greedy" not in out
+        assert seen["args"] == ["-y", "@scope/server"]
+
+
+# ---------------------------------------------------------------------------
+# Connect-failure diagnostics
+#
+# A stdio server that exits immediately surfaces as a bare McpError
+# "Connection closed".  Its own stderr (argparse usage, traceback) is written
+# to <hermes_home>/logs/mcp-stderr.log — reading it back into the error message
+# is the difference between "it's broken" and "the flag is wrong".
+# ---------------------------------------------------------------------------
+
+class TestConnectFailureDiagnostics:
+    def test_recent_stderr_reads_last_attempt_only(self, tmp_path, monkeypatch):
+        logs = tmp_path / "logs"
+        logs.mkdir(parents=True)
+        (logs / "mcp-stderr.log").write_text(
+            "===== [t0] starting MCP server 'demo' =====\nOLD FAILURE\n"
+            "===== [t1] starting MCP server 'demo' =====\n"
+            "usage: demo [-h]\ndemo: error: unrecognized arguments: -p gopher\n"
+        )
+        monkeypatch.setattr(
+            "hermes_cli.config.get_hermes_home", lambda: tmp_path
+        )
+
+        from hermes_cli.mcp_config import _recent_mcp_stderr
+
+        detail = _recent_mcp_stderr("demo")
+        assert "unrecognized arguments: -p gopher" in detail
+        assert "OLD FAILURE" not in detail
+
+    def test_recent_stderr_missing_log_is_empty(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.config.get_hermes_home", lambda: tmp_path
+        )
+        from hermes_cli.mcp_config import _recent_mcp_stderr
+
+        assert _recent_mcp_stderr("nope") == ""
+
+    def test_recent_stderr_unknown_server_is_empty(self, tmp_path, monkeypatch):
+        logs = tmp_path / "logs"
+        logs.mkdir(parents=True)
+        (logs / "mcp-stderr.log").write_text(
+            "===== [t0] starting MCP server 'other' =====\nsomething\n"
+        )
+        monkeypatch.setattr(
+            "hermes_cli.config.get_hermes_home", lambda: tmp_path
+        )
+        from hermes_cli.mcp_config import _recent_mcp_stderr
+
+        assert _recent_mcp_stderr("demo") == ""
+
+    def test_add_surfaces_child_stderr_on_failure(self, tmp_path, capsys, monkeypatch):
+        """The failure message must include what the child printed."""
+        logs = tmp_path / "logs"
+        logs.mkdir(parents=True)
+        (logs / "mcp-stderr.log").write_text(
+            "===== [t1] starting MCP server 'demo' =====\n"
+            "demo: error: unrecognized arguments: --badflag\n"
+        )
+        monkeypatch.setattr(
+            "hermes_cli.config.get_hermes_home", lambda: tmp_path
+        )
+
+        def mock_probe(name, config, **kw):
+            raise RuntimeError("Connection closed")
+
+        monkeypatch.setattr(
+            "hermes_cli.mcp_config._probe_single_server", mock_probe
+        )
+        monkeypatch.setattr("builtins.input", lambda _: "n")
+
+        from hermes_cli.mcp_config import cmd_mcp_add
+
+        cmd_mcp_add(_make_args(name="demo", mcp_command="uvx", args=["demo"]))
+
+        out = capsys.readouterr().out
+        assert "Connection closed" in out
+        assert "unrecognized arguments: --badflag" in out
