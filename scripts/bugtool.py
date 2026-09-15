@@ -373,6 +373,31 @@ def live_task_ids(text: str) -> list[str]:
     return [task_id for task_id in task_ids(text) if status_for_task(task_id) in LIVE_STATUSES]
 
 
+def owned_live_task_ids(text: str) -> list[str]:
+    """Live tasks this bug OWNS (created for it), not ones it merely references.
+
+    `## Kanban tasks` legitimately holds two different things:
+    - entries THIS bug's own dispatch created, written bare as ``- t_xxxx``
+      (see add_task_id), and
+    - hand-written *references* to related tasks, which carry an annotation
+      (e.g. ``- t_related — running; this bug follows it``) -- see
+      #3df9b2c04 "ignore referenced live tasks".
+
+    Only the bare form counts as "already dispatched"; a reference must never
+    block this bug from getting its own task. A task that is already done or
+    archived is not live, so a legitimate re-dispatch still works.
+    """
+    owned = []
+    for line in section_value(text, "Kanban tasks").splitlines():
+        match = re.match(r"^\s*[-*]\s*(\bt_[A-Za-z0-9]+\b)\s*$", line)
+        if not match:
+            continue
+        task_id = match.group(1)
+        if status_for_task(task_id) in LIVE_STATUSES:
+            owned.append(task_id)
+    return owned
+
+
 DISPATCHED_STATUS = "dispatched"
 
 
@@ -491,6 +516,18 @@ def maybe_dispatch_locked(path: Path, text: str, directive: Optional[str] = None
     if not approved_to_run(text):
         return None  # human approval checkbox unchecked: never dispatch
     if failure_count(text) >= 4 and not force:
+        return None
+    # The board is the second durable marker (with the file's own status):
+    # a bug that already OWNS a live task must never get a second one. This is
+    # the actual spew guard -- `is_dispatched_marker` below is status-only by
+    # design, so without this a file left at status=pending (hand-edited, or
+    # dispatched before the marker existed) re-creates its task every pass.
+    # Only BARE entries count (bare = this bug's own task, written by
+    # add_task_id); annotated hand-written references to related tasks do not
+    # block dispatch (#3df9b2c04), and done/archived tasks are not live, so a
+    # legitimate re-dispatch still works.
+    if not force and owned_live_task_ids(text):
+        print(f"nothing to dispatch for {path.name}: live task exists")
         return None
     # AUTHORITATIVE idempotency gate (2026-09-14, Evan): "just change the
     # meta-data from 'pending' to 'dispatched' and do not dispatch a dispatched
