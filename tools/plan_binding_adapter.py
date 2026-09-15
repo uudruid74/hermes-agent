@@ -132,6 +132,33 @@ def cmd_new(
     parent_task_id: Optional[str] = None,
 ) -> str:
     """Create a Plan without implicit nesting or legacy task identity reads."""
+    return _create_plan(
+        agent,
+        title=title,
+        goal=goal,
+        steps=steps,
+        temp=temp,
+        board=board,
+        kind=kind,
+        debug_plan_id=debug_plan_id,
+        pre_approved=pre_approved,
+        parent_task_id=parent_task_id,
+    )
+
+
+def _create_plan(
+    agent, *, title: str, goal: str, steps: list[str], temp: Optional[str] = None,
+    board: Optional[str] = None, kind: str = "normal",
+    debug_plan_id: Optional[str] = None, pre_approved: bool = False,
+    parent_task_id: Optional[str] = None,
+    repeat_of: Optional[tuple[str, int]] = None,
+) -> str:
+    """Create, approve and activate a Plan.
+
+    ``repeat_of`` marks the Plan as a CORRECTIVE child of ``(parent, step)``:
+    the parent's step summary is cleared now (the claim it held was wrong) and
+    restored from this child's completion summary when the child closes.
+    """
     from hermes_cli import execution_bindings as bindings
     from hermes_cli.kanban_db import write_txn
 
@@ -248,9 +275,36 @@ def cmd_new(
         if not approved:
             return f"Plan denied ({task_id}): {response}."
 
+    if repeat_of is not None:
+        parent_id, parent_step = repeat_of
+        with write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    task_id,
+                    _legacy()._get_agent_name(agent),
+                    f"REPEAT-OF:{parent_id}:{parent_step}",
+                    int(time.time()),
+                ),
+            )
+            # The claim the parent held for this step was wrong — drop it so the
+            # step stands open until this child's summary replaces it.
+            bindings._clear_step_summary(conn, parent_id, parent_step)
+
     resolved_temp = _legacy()._resolve_temp(temp, agent)
     if resolved_temp is not None:
         agent._session_temperature = resolved_temp
+    if repeat_of is not None:
+        parent_id, parent_step = repeat_of
+        return (
+            f"CORRECTIVE PLAN APPROVED ({task_id}): {title}\n\n"
+            f">>> STEP {parent_step} of {parent_id} re-opened as a child plan.\n"
+            f"STEP {parent_step} OF THIS PLAN: {steps[0]} <<<\n\n"
+            f"Work the corrective plan. When its final step completes, the "
+            f"parent reopens at step {parent_step} carrying this plan's "
+            f"completion summary."
+        )
     return f"TASK APPROVED ({task_id}): {title}\n\n>>> STEP 1: {steps[0]} <<<"
 
 
@@ -303,8 +357,7 @@ def cmd_advance(
             session_db = getattr(agent, "_session_db", None)
             if source is not None and session_db is not None:
                 session_db.update_agent_rating(source["assignee"], 0.5)
-        note = " (no receipt submitted)" if result.unverified else ""
-        return f"The task goal was: {task['task_goal'] or ''}{note}"
+        return f"The task goal was: {task['task_goal'] or ''}"
     if result.binding_revision == binding.revision:
         # The step did NOT move — this is the verify-first response.
         return (
@@ -314,22 +367,33 @@ def cmd_advance(
             f"actually met. If it is, submit checkable proof by calling `advance` "
             f"again for step {result.step_no} with `proof` — a git commit hash, a "
             f"test result, a file path, or the command you ran and its output. A "
-            f"summary alone is a claim, not evidence. If the step is NOT done, fix "
-            f"it now, then submit the proof. To drop this claim instead, call `repeat`."
+            f"summary alone is a claim, not evidence.\n\n"
+            f"If the step is NOT done and needs real work, call `repeat` with "
+            f"step={result.step_no} plus a corrective plan (title, goal, steps) — "
+            f"that opens a child plan, and the parent resumes here when it "
+            f"completes."
         )
-    unverified = " (no receipt — recorded as unverified)" if result.unverified else ""
-    return f"Complete Step {result.step_no}: {result.next_step}{unverified}"
+    return f"Complete Step {result.step_no}: {result.next_step}"
 
 
-def cmd_repeat(agent, reason: str = "") -> str:
-    """Drop the current step's pending claim and re-state the step.
+def cmd_repeat(
+    agent,
+    reason: str = "",
+    step: Optional[int] = None,
+    title: Optional[str] = None,
+    goal: Optional[str] = None,
+    steps: Optional[list] = None,
+) -> str:
+    """Re-open a step as a CORRECTIVE CHILD PLAN.
 
-    Pairs with the two-phase `advance`: a claim that is wrong does not have to
-    be walked back by hand, and the step is restated from the task row so the
-    agent cannot drift onto whatever it last had in context.
+    `repeat` does not just clear a claim — it demands a fix.  The caller passes
+    the step it is re-opening plus a plan for correcting it (title, goal,
+    steps).  The step text becomes the child plan's goal by default; the child
+    gets its own steps and its own log.  When the child completes, the parent
+    reopens at that step carrying the child's completion summary, and resumes
+    where it left off.
     """
     from hermes_cli import execution_bindings as bindings
-    from hermes_cli.kanban_db import write_txn
 
     conn = _legacy()._get_kanban_db()
     key, binding, error = _current(conn, agent)
@@ -337,33 +401,51 @@ def cmd_repeat(agent, reason: str = "") -> str:
         return error
     if key is None or binding is None:
         return "ERROR: No active task"
+
     task = conn.execute("SELECT * FROM tasks WHERE id=?", (binding.task_id,)).fetchone()
     if task is None:
         return f"ERROR: Task {binding.task_id} not found"
-    rows = conn.execute(
-        "SELECT id FROM task_comments WHERE task_id = ? AND body LIKE ?",
-        (binding.task_id, f"Step {task['task_stepno']} complete — %"),
-    ).fetchall()
-    with write_txn(conn):
-        for row in rows:
-            conn.execute(
-                "DELETE FROM task_comments WHERE id = ?",
-                (row["id"] if isinstance(row, sqlite3.Row) else row[0],),
-            )
-    steps, step_no = bindings._steps_for_task(task)
-    lines = [
-        f"Step {step_no} of {len(steps)} re-opened — the pending claim was dropped.",
-    ]
-    if reason.strip():
-        lines.append(f"Note: {reason.strip()}")
-    lines.append("")
-    lines.append(f">>> STEP {step_no}: {steps[step_no - 1]} <<<")
-    lines.append("")
-    lines.append(
-        "Do this step from the ground-truth source, then call `advance` with a "
-        "summary AND `proof`."
+    try:
+        all_steps, active_step = bindings._steps_for_task(task)
+    except bindings.ExecutionBindingError as exc:
+        return f"ERROR: {exc}"
+
+    # Explicit step: the caller names which step it is re-opening.  Omitting it
+    # targets the active step (a bare `repeat` still works).
+    target = step if step is not None else active_step
+    if not isinstance(target, int) or not 1 <= target <= len(all_steps):
+        return (
+            f"ERROR: step {target} is outside 1..{len(all_steps)} for plan "
+            f"{binding.task_id}"
+        )
+    step_title = all_steps[target - 1]
+
+    # Think before you act: a corrective plan is REQUIRED, not optional.
+    if not steps:
+        return (
+            f"STEP {target} RE-OPEN REQUIRES A CORRECTIVE PLAN — think first.\n\n"
+            f">>> The step to fix (its text becomes the new plan's goal):\n"
+            f"{step_title} <<<\n\n"
+            f"Call `repeat` again with `step={target}` plus `title`, `goal` and "
+            f"`steps` describing how you will actually complete it. That becomes "
+            f"a child plan with its own steps and its own log."
+            + (f"\n\nReason given: {reason.strip()}" if reason.strip() else "")
+        )
+
+    if not title or not goal:
+        return (
+            f"ERROR: 'repeat' with steps requires title and goal "
+            f"(step {target}: {step_title})"
+        )
+
+    return _create_plan(
+        agent,
+        title=title,
+        goal=goal,
+        steps=list(steps),
+        parent_task_id=binding.task_id,
+        repeat_of=(binding.task_id, target),
     )
-    return "\n".join(lines)
 
 
 def cmd_handoff(agent, summary: str) -> str:

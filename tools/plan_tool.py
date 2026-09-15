@@ -1201,7 +1201,7 @@ def plan_tool(
     Commands:
       new           — present a plan for approval
       advance       — record completed work and advance one step
-      repeat        — drop the pending step claim and re-state the step
+      repeat        — re-open a step as a corrective child plan (needs a plan)
       handoff       — replace the current step's in-progress summary
       continue      — resume a task in the caller's current session
       dispatch      — create + dispatch a kanban task
@@ -1237,7 +1237,14 @@ def plan_tool(
         )
 
     elif command == "repeat":
-        return _cmd_repeat(agent, reason or "")
+        return _cmd_repeat(
+            agent,
+            reason or "",
+            step if isinstance(step, int) else None,
+            title,
+            goal,
+            steps,
+        )
 
     elif command == "handoff":
         if not summary or not summary.strip():
@@ -1289,7 +1296,7 @@ PLAN_TOOL_SCHEMA = {
     "description": (
         "Mandatory Action Protocol — create and manage multistep plans. "
         "Commands: new (present plan for approval), advance (record completed work and advance), "
-        "repeat (drop a pending step claim), "
+        "repeat (re-open a step as a corrective child plan), "
         "handoff (record in-progress work), continue (resume a task in this session), "
         "dispatch (create kanban task), remind (show current plan), "
         "fail (mark task failed), test-complete (neutral test outcome), approve (unblock plan task), block (emergency block), "
@@ -1312,12 +1319,12 @@ PLAN_TOOL_SCHEMA = {
             },
             "goal": {
                 "type": "string",
-                "description": "Success criteria / intended outcome (required for new, dispatch)",
+                "description": "Success criteria / intended outcome (required for new, dispatch). For 'repeat', the goal of the corrective child plan — the re-opened step's text is the natural goal.",
             },
             "steps": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Ordered step list (required for new; optional for dispatch)",
+                "description": "Ordered step list (required for new; optional for dispatch). For 'repeat': the corrective child plan's steps — `repeat` without steps only tells you what to fix, it does not re-open the step.",
             },
             "temp": {
                 "type": "string",
@@ -1333,7 +1340,7 @@ PLAN_TOOL_SCHEMA = {
             },
             "step": {
                 "type": "integer",
-                "description": "For 'advance': the step number you believe you are completing. A mismatch is refused rather than advancing, so a lost agent is told to re-read `remind` instead of moving the plan forward. This is what catches a duplicate or drifted advance call.",
+                "description": "The step number you are acting on. For 'advance': the step you believe you are completing — a mismatch is refused rather than advancing, so a lost agent is told to re-read `remind` instead of moving the plan forward. This is what catches a duplicate or drifted advance call. For 'repeat': the step to re-open (defaults to the active step).",
             },
             "project": {
                 "type": "string",
@@ -1416,6 +1423,8 @@ registry.register(
         debug_plan_id=args.get("debug_plan_id"),
         pre_approved=args.get("pre_approved", False),
         parent_task_id=args.get("parent_task_id"),
+        proof=args.get("proof"),
+        step=args.get("step"),
     ),
     emoji="📋",
 )

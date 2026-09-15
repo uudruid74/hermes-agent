@@ -11,7 +11,7 @@ with a manual Plan lifecycle transition.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 import json
 import sqlite3
 import time
@@ -90,11 +90,6 @@ class PlanStepResult:
     closed: bool
     restored_task_id: Optional[str]
     binding_revision: Optional[int]
-    # True when this step was advanced WITHOUT proof because the caller had
-    # already claimed it once (`repeat`).  A caller that re-claims a step it
-    # never completed gets the step back instead of the next one; the second
-    # claim is the only way past a missing receipt.
-    unverified: bool = False
 
 
 PlanOutcome = Literal["done", "failed", "test-complete"]
@@ -593,6 +588,25 @@ def _close_plan_in_txn(
         ).rowcount
         if rebound != 1:
             raise BindingRevisionConflict("execution binding changed during closure")
+
+        # `repeat` hand-off (Evan, 2026-09-15): a corrective child carries
+        # REPEAT-OF:<parent>:<step>.  Its completion summary becomes the parent
+        # step's summary — the reason the step was re-opened is now on record,
+        # and the parent resumes from the step it was on.
+        repeat = _repeat_target(conn, current.task_id)
+        if repeat is not None and outcome == "done":
+            repeat_parent, repeat_step = repeat
+            if repeat_parent == previous_task_id:
+                _set_step_summary(
+                    conn,
+                    repeat_parent,
+                    repeat_step,
+                    f"Re-opened and corrected via {current.task_id}: "
+                    f"{status_note or step_title}",
+                    actor=actor,
+                    now=now,
+                )
+
         _append_event(
             conn,
             previous_task_id,
@@ -636,6 +650,44 @@ def _close_plan_in_txn(
     )
 
 
+def _clear_step_summary(
+    conn: sqlite3.Connection, task_id: str, step_no: int
+) -> None:
+    """Drop the stored summary for one Plan step.
+
+    Used by `repeat`: the claim the parent held for that step was wrong, so the
+    step stands open until the corrective child's completion summary replaces it.
+    """
+    marker = f"[plan-step-summary:{step_no}] "
+    conn.execute(
+        "DELETE FROM task_comments WHERE task_id = ? AND body LIKE ?",
+        (task_id, f"{marker}%"),
+    )
+
+
+def _repeat_target(conn: sqlite3.Connection, task_id: str) -> Optional[tuple[str, int]]:
+    """Return ``(parent_task_id, step_no)`` when this Plan is a `repeat` child.
+
+    Written at creation as ``REPEAT-OF:<parent>:<step>``; the child's
+    completion summary is handed back to that parent step.
+    """
+    row = conn.execute(
+        "SELECT body FROM task_comments WHERE task_id = ? AND body LIKE 'REPEAT-OF:%' "
+        "ORDER BY id LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    body = row["body"] if isinstance(row, sqlite3.Row) else row[0]
+    parts = str(body).split(":")
+    if len(parts) < 3:
+        return None
+    try:
+        return parts[1], int(parts[2])
+    except ValueError:
+        return None
+
+
 def _step_receipts(conn: sqlite3.Connection, task_id: str) -> set[int]:
     """Return the step numbers that carry a completion receipt.
 
@@ -655,25 +707,6 @@ def _step_receipts(conn: sqlite3.Connection, task_id: str) -> set[int]:
         except (IndexError, ValueError):
             continue
     return steps
-
-
-def _claimed_without_receipt(
-    conn: sqlite3.Connection, task_id: str, step_no: int, summary: str
-) -> bool:
-    """True when this exact step was already claimed once with no receipt.
-
-    This is deliberately narrow: only a prior *advance claim* for the SAME
-    step counts (``Step {n} complete`` — `handoff` writes a different
-    ``Step {n}:`` form and must not trip it).  So the first claim returns the
-    step, and a second claim advances with ``unverified=True``: we ask for
-    proof but never jail the session.
-    """
-    marker = f"Step {step_no} complete — {summary.strip()}"
-    row = conn.execute(
-        "SELECT COUNT(*) FROM task_comments WHERE task_id = ? AND body = ?",
-        (task_id, marker),
-    ).fetchone()
-    return bool(row and (row[0] if not isinstance(row, sqlite3.Row) else row[0]))
 
 
 def advance_plan(
@@ -719,31 +752,25 @@ def advance_plan(
             )
         now = int(time.time())
 
-        unverified = False
+        # Two-phase completion (Evan, 2026-09-15).  A bare claim never moves the
+        # step: it is recorded as a summary and the SAME step comes back with an
+        # instruction to verify and resubmit WITH `proof`.  Only `proof` — or a
+        # receipt already on file — advances.  Repeating the claim no longer
+        # sneaks past the gate; the explicit escape hatch is `repeat`, which
+        # opens a corrective child plan.
         if not proof:
             if step_no not in _step_receipts(conn, current.task_id):
-                if not _claimed_without_receipt(conn, current.task_id, step_no, summary):
-                    # First claim for this step: record it, hold the step.
-                    conn.execute(
-                        "INSERT INTO task_comments (task_id, author, body, created_at) "
-                        "VALUES (?, ?, ?, ?)",
-                        (
-                            current.task_id,
-                            actor,
-                            f"Step {step_no} complete — {summary}",
-                            now,
-                        ),
-                    )
-                    return PlanStepResult(
-                        task_id=current.task_id,
-                        step_no=step_no,
-                        next_step=steps[step_no - 1],
-                        closed=False,
-                        restored_task_id=None,
-                        binding_revision=current.revision,
-                    )
-                # Second claim with still no receipt: honor it, flag it.
-                unverified = True
+                _set_step_summary(
+                    conn, current.task_id, step_no, summary, actor=actor, now=now
+                )
+                return PlanStepResult(
+                    task_id=current.task_id,
+                    step_no=step_no,
+                    next_step=steps[step_no - 1],
+                    closed=False,
+                    restored_task_id=None,
+                    binding_revision=current.revision,
+                )
 
         if step_no == len(steps):
             closed = _close_plan_in_txn(
@@ -755,7 +782,13 @@ def advance_plan(
                 actor=actor,
                 status_note=summary,
             )
-            return replace(closed, unverified=unverified)
+            if proof:
+                conn.execute(
+                    "INSERT INTO task_comments (task_id, author, body, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (current.task_id, actor, f"RECEIPT:{step_no}:{proof}", now),
+                )
+            return closed
 
         if proof:
             conn.execute(
@@ -812,7 +845,6 @@ def advance_plan(
             closed=False,
             restored_task_id=None,
             binding_revision=new_revision,
-            unverified=unverified,
         )
 
 
