@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from unittest.mock import patch
 
 from agent.context_compressor import ContextCompressor
@@ -511,3 +512,162 @@ def test_context_compressor_aborts_only_when_internal_fallback_cannot_fit(monkey
     assert result == messages
     assert compressor._last_summary_fallback_used is False
     assert compressor._last_compress_aborted is True
+
+
+# ---------------------------------------------------------------------------
+# Observation masking (Evan, 2026-09-14).
+#
+# Three rules, one boundary (`tail_start`):
+#   1. M is protect_last_n — the tail keeps observations verbatim.
+#   2. Observations are NEVER lexrank-injected into the middle/compressed area.
+#   3. Emergency rung: overflow masks tail observations back to the last turn.
+#
+# Rule 2 was violated in production: `_message_units` read every middle
+# message with no role filter, so 1,410 observation fragments from Ornith
+# session 20260913_203800_6e2da67e were injected into the emitted summary.
+# ---------------------------------------------------------------------------
+
+
+def _observation(content: str, call_id: str = "call-1") -> dict:
+    return {"role": "tool", "content": content, "tool_call_id": call_id}
+
+
+def test_observations_never_reach_the_lexrank_middle():
+    """Rule 2: no observation text may appear in the emitted summary."""
+    messages = [
+        _message("system", "system prompt"),
+        _message("user", "opening request"),
+        _message("assistant", "SQLite migration needs a sessions index."),
+        _observation("UNIQUE_OBSERVATION_TOKEN alpha beta gamma delta"),
+        _observation("UNIQUE_OBSERVATION_TOKEN epsilon zeta eta theta"),
+        _message("user", "How should we finish the SQLite migration?"),
+        _message("assistant", "Keep the migration small and verify the index."),
+        _message("user", "recent question"),
+        _message("assistant", "recent answer"),
+    ]
+
+    fallback = build_internal_fallback(
+        messages,
+        protect_head_count=2,
+        protect_last_n=2,
+        target_tokens=400,
+    )
+
+    assert fallback is not None
+    assert "UNIQUE_OBSERVATION_TOKEN" not in fallback.summary
+    # The reasoning content is still eligible — we mask observations only.
+    assert "SQLite migration needs" in fallback.summary
+
+
+def test_observations_do_not_reach_the_summary_from_the_tail():
+    """Rule 2 holds for the region outside the verbatim tail as well."""
+    messages = [
+        _message("system", "system prompt"),
+        _message("user", "opening"),
+        _observation("TAIL_OBSERVATION_TOKEN uniq words here"),
+        _message("assistant", "Continue the SQLite migration."),
+        _message("user", "recent question"),
+        _message("assistant", "recent answer"),
+    ]
+
+    fallback = build_internal_fallback(
+        messages,
+        protect_head_count=2,
+        protect_last_n=2,
+        target_tokens=400,
+    )
+
+    assert fallback is not None
+    assert "TAIL_OBSERVATION_TOKEN" not in fallback.summary
+
+
+def test_centroid_ignores_observations_so_relevance_tracks_the_live_turn():
+    """Evan: strip observations before calculating centroids.
+
+    The recent-window reference must be built from assistant+user content
+    only.  Here the only 'recent' material is observation noise; the middle
+    turn that actually echoes the live question must still be selected, which
+    only happens if the observation noise is excluded from the centroid.
+    """
+    messages = [
+        _message("system", "system prompt"),
+        _message("user", "opening request"),
+        _message("assistant", "sessions index migration needs care"),
+        _observation("kayak paddle lifejacket canoe river rapids"),
+        _observation("kayak paddle lifejacket canoe river rapids"),
+        _message("user", "recent question"),
+        _message("assistant", "recent answer"),
+    ]
+
+    fallback = build_internal_fallback(
+        messages,
+        protect_head_count=2,
+        protect_last_n=2,
+        target_tokens=400,
+    )
+
+    assert fallback is not None
+    assert "kayak" not in fallback.summary
+    assert "sessions index migration needs care" in fallback.summary
+
+
+def test_emergency_rung_masks_tail_observations_except_the_last_turn():
+    """Rule 3: overflow masks tail observations back to the last turn."""
+    messages = [
+        _message("system", "system prompt"),
+        _message("user", "opening request"),
+        _message("assistant", "first tail turn"),
+        _observation("EARLY_TAIL_OBSERVATION keep only the newest turn"),
+        _message("assistant", "second tail turn"),
+        _observation("LATEST_OBSERVATION must stay verbatim"),
+        _message("user", "recent question"),
+    ]
+
+    from agent.internal_compression_fallback import _mask_tail_observations
+
+    masked = _mask_tail_observations(messages, tail_start=2)
+
+    # The older tail observation is masked...
+    assert "EARLY_TAIL_OBSERVATION" not in json.dumps(masked)
+    # ...the newest turn's observation survives verbatim.
+    assert "LATEST_OBSERVATION must stay verbatim" in json.dumps(masked)
+    # Non-observation rows are untouched.
+    assert "first tail turn" in json.dumps(masked)
+    assert "second tail turn" in json.dumps(masked)
+
+
+def test_emergency_rung_keeps_reasoning_contiguous_for_tail_refit(monkeypatch):
+    """The rung must land before tail shrinking, not mutate `messages`.
+
+    Patching `_fit_tail_start` to fail forces the emergency path; the
+    assembled payload must then contain the masked tail rather than the
+    original bulky observation.
+    """
+    import agent.internal_compression_fallback as fallback_module
+
+    messages = [
+        _message("system", "system prompt"),
+        _message("user", "opening request"),
+        _message("assistant", "older work"),
+        *[_observation(f"BULK_OBSERVATION_{i} " + "fill " * 200) for i in range(4)],
+        _message("user", "recent question"),
+        _message("assistant", "recent answer"),
+    ]
+    before = json.dumps(messages)
+
+    monkeypatch.setattr(
+        fallback_module, "_fit_tail_start", lambda *args, **kwargs: None
+    )
+
+    result = fallback_module.build_internal_fallback(
+        messages,
+        protect_head_count=2,
+        protect_last_n=8,
+        target_tokens=300,
+    )
+
+    # The caller's transcript is never mutated by the emergency rung.
+    assert json.dumps(messages) == before
+    if result is not None:
+        assert result.mode in {"lexrank", "plan", "plan-minimal"}
+

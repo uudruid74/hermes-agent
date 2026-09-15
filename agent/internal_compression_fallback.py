@@ -127,9 +127,37 @@ def _chunks(text: str) -> list[str]:
     return chunks
 
 
-def _message_units(messages: list[dict[str, Any]], start_index: int = 0) -> list[_Unit]:
+_MASKED_OBSERVATION = "[observation omitted — outside the last turn]"
+
+
+def _is_observation(message: dict[str, Any]) -> bool:
+    """True for environment observations (tool results).
+
+    Observations are the verbose, disposable half of a turn.  They are kept
+    verbatim inside the protected tail and masked everywhere else — they are
+    never eligible for the lexrank middle and never feed the relevance
+    centroid (Evan, 2026-09-14).
+    """
+    return message.get("role") == "tool"
+
+
+def _message_units(
+    messages: list[dict[str, Any]],
+    start_index: int = 0,
+    *,
+    include_observations: bool = False,
+) -> list[_Unit]:
+    """Chunk messages into ranking units.
+
+    ``order`` always carries the *true* message offset, so skipping messages
+    cannot misalign the emitted summary against the transcript.  Observations
+    are skipped by default: they must never be lexrank-injected into the
+    compressed middle, nor bias the relevance centroid.
+    """
     units: list[_Unit] = []
     for message_offset, message in enumerate(messages):
+        if not include_observations and _is_observation(message):
+            continue
         role = str(message.get("role") or "unknown").upper()
         for unit_offset, chunk in enumerate(_chunks(_content_text(message.get("content")))):
             text = f"[{role}]: {chunk}"
@@ -141,6 +169,44 @@ def _message_units(messages: list[dict[str, Any]], start_index: int = 0) -> list
                 )
             )
     return units
+
+
+def _mask_tail_observations(
+    messages: list[dict[str, Any]], tail_start: int
+) -> list[dict[str, Any]]:
+    """Mask tail observations back to the last turn (the emergency rung).
+
+    Keeps the observations of the newest assistant turn verbatim — the active
+    work stays readable — and replaces every older observation inside the
+    protected tail with a placeholder.  Reasoning, actions and user turns are
+    never touched, so the tail stays contiguous and a later ``_fit_tail_start``
+    can still re-measure it.
+
+    Returns a new list; the caller's transcript is never mutated.
+    """
+    if tail_start >= len(messages):
+        return messages
+
+    tail = messages[tail_start:]
+    last_turn_start: int | None = None
+    for offset, message in enumerate(tail):
+        if message.get("role") == "assistant":
+            last_turn_start = offset
+
+    if last_turn_start is None:
+        keep_from = len(tail)
+    else:
+        keep_from = last_turn_start
+
+    masked = list(messages[:tail_start])
+    for offset, message in enumerate(tail):
+        if offset < keep_from and _is_observation(message):
+            replacement = dict(message)
+            replacement["content"] = _MASKED_OBSERVATION
+            masked.append(replacement)
+        else:
+            masked.append(message)
+    return masked
 
 
 def _session_notes(
@@ -422,6 +488,17 @@ def build_internal_fallback(
         return None
     head_count = min(max(protect_head_count, 0), len(messages))
     tail_start = _verbatim_tail_start(messages, head_count, protect_last_n)
+
+    # Emergency rung (Evan, 2026-09-14): when the verbatim tail itself cannot
+    # fit, mask its observations back to the last turn BEFORE shrinking the
+    # region.  This preserves the contiguous reasoning/action trace (which
+    # tail shrinking would summarise away) and sheds the bulky, disposable
+    # half of the turn instead.  `_fit_tail_start` then re-measures the
+    # lightened tail and usually succeeds without advancing the boundary.
+    tail_tokens = estimate_messages_tokens_rough(messages[tail_start:])
+    if tail_tokens > target_tokens:
+        messages = _mask_tail_observations(messages, tail_start)
+
     notes = _session_notes(messages, memory_context, previous_summary)
 
     if plan_context.strip():
