@@ -393,11 +393,13 @@ def is_dispatched_marker(text: str, path: Path) -> bool:
     status = bug_status(text)
     if status == DISPATCHED_STATUS:
         return True
-    # Transitional: files dispatched before the marker existed carry their task
-    # id under `## Kanban tasks` while still reading status: pending, and the
-    # first dispatch predating DISPATCH_LOG (2026-09-05) created 28 duplicates
-    # in 76 seconds this way. A task id already recorded here means dispatched.
-    return bool(task_ids(text))
+    # NOTE: deliberately NOT falling back to "a task id appears under
+    # `## Kanban tasks`". That section also legitimately holds *references* to
+    # other tasks (see live_task_ids / #3df9b2c04, "ignore referenced live
+    # tasks"), and treating any reference as "already dispatched" would block
+    # dispatch for a bug that only mentions a related task. Evan's rule is
+    # status-only: flip `pending` -> `dispatched` and refuse a dispatched bug.
+    return False
 
 
 def set_bug_status(text: str, status: str) -> str:

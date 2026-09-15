@@ -23,7 +23,7 @@ def load_bugtool(monkeypatch, tmp_path):
 def bug_text(assignee=None, approved=False, sections=True):
     parts = ["# Gate test\n"]
     if sections:
-        parts += ["## Symptom\n\nS\n\n", "## Repro\n\nR\n\n", "## Suspected cause\n\nC\n\n"]
+        parts += ["## Description\n\nS\n\n", "## How To Reproduce\n\nR\n\n", "## Actual Behavior\n\nC\n\n"]
     if assignee:
         parts.append(f"## Assignee\n\n{assignee}\n\n")
     if approved is not None:

@@ -31,9 +31,9 @@ def complete_bug_text(approved=True):
     checkbox = "- [x] approved by Evan" if approved else "- [ ] approved by Evan"
     return (
         "# Repeated dispatch\n\n"
-        "## Symptom\n\nDuplicates\n\n"
-        "## Repro\n\nRun reconciliation\n\n"
-        "## Suspected cause\n\nMissing durable state\n\n"
+        "## Description\n\nDuplicates\n\n"
+        "## How To Reproduce\n\nRun reconciliation\n\n"
+        "## Actual Behavior\n\nDuplicates created\n\n"
         "## Assignee\n\nneo\n\n"
         f"## Approved to run\n\n{checkbox}\n\n"
         "## Kanban tasks\n\n\n"
