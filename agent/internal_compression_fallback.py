@@ -349,7 +349,7 @@ def _fit_tail_start(
     tail_start: int,
     summary: str,
     target_tokens: int,
-) -> int | None:
+) -> int:
     """Advance *tail_start* forward until the assembled payload fits.
 
     ``_verbatim_tail_start`` answers "which messages does the template
@@ -367,8 +367,11 @@ def _fit_tail_start(
     contiguous (the compressor emits ``messages[tail_start:]`` verbatim)
     and never leaving an orphaned tool result at the boundary.
 
-    Returns the fitted start, or ``None`` when even the newest message
-    plus the summary cannot fit under the target.
+    Always returns a usable start.  ``target_tokens`` is a TARGET, not a
+    ceiling (Evan, 2026-09-15): landing above it is expected and is not a
+    failure to compress, so when nothing fits this falls through to the
+    tightest region it can produce rather than returning ``None`` and
+    stranding the session.  Deterministic compression has no failure rung.
     """
     total = len(messages)
     start = max(0, min(tail_start, total))
@@ -383,8 +386,13 @@ def _fit_tail_start(
             start += 1
         if _fits(messages, head_count, start, summary, target_tokens):
             return start
+        if start == limit:
+            break
         start += 1
-    return None
+    # Nothing fit under the target.  Return the tightest region (the newest
+    # message, or the whole head when everything is protected) instead of
+    # aborting.
+    return min(limit, total)
 
 
 def _plan_summary(plan_context: str, notes: list[str]) -> str:
@@ -412,7 +420,7 @@ def _fitted_plan_summary(
     notes: list[str],
     target_tokens: int,
     minimal: bool = False,
-) -> tuple[str, int] | None:
+) -> tuple[str, int]:
     """Keep each priority-ordered note that fits beside the required Plan.
 
     Returns ``(summary, fitted_tail_start)``.  The tail start is a
@@ -439,12 +447,9 @@ def _fitted_plan_summary(
     # Last resort: the requested tail cannot fit beside the plan at all.
     # Shrink the verbatim region (summarising its scaffolding) rather than
     # aborting — an abort here is terminal for the session.
-    fitted_start = _fit_tail_start(
+    return summary, _fit_tail_start(
         messages, head_count, tail_start, summary, target_tokens
     )
-    if fitted_start is None:
-        return None
-    return summary, fitted_start
 
 
 def _lexrank_summary(selected: list[_Unit]) -> str:
@@ -479,11 +484,14 @@ def build_internal_fallback(
     minimal_plan_context: str = "",
     memory_context: str = "",
     previous_summary: str = "",
-) -> InternalFallback | None:
-    """Build the last-resort local compression payload within ``target_tokens``."""
+) -> InternalFallback:
+    """Build the last-resort local compression payload within ``target_tokens``.
 
-    if target_tokens <= 0:
-        return None
+    Never returns ``None``.  ``target_tokens`` is a TARGET, not a ceiling
+    (Evan, 2026-09-15): deterministic compression has no failure rung, so an
+    over-target or degenerate budget yields the tightest payload this
+    selector can assemble rather than stranding the session.
+    """
     head_count = min(max(protect_head_count, 0), len(messages))
     tail_start = _verbatim_tail_start(messages, head_count, protect_last_n)
 
@@ -500,7 +508,7 @@ def build_internal_fallback(
     notes = _session_notes(messages, memory_context, previous_summary)
 
     if plan_context.strip():
-        fitted = _fitted_plan_summary(
+        summary, fitted_tail_start = _fitted_plan_summary(
             messages,
             head_count=head_count,
             tail_start=tail_start,
@@ -508,8 +516,7 @@ def build_internal_fallback(
             notes=notes,
             target_tokens=target_tokens,
         )
-        if fitted is not None:
-            summary, fitted_tail_start = fitted
+        if _fits(messages, head_count, fitted_tail_start, summary, target_tokens):
             return InternalFallback(summary, head_count, fitted_tail_start, "plan")
 
         system_head = 1 if messages and messages[0].get("role") == "system" else 0
@@ -518,7 +525,7 @@ def build_internal_fallback(
             system_head,
             protect_last_n,
         )
-        minimal = _fitted_plan_summary(
+        summary, fitted_tail_start = _fitted_plan_summary(
             messages,
             head_count=system_head,
             tail_start=minimal_tail_start,
@@ -527,15 +534,12 @@ def build_internal_fallback(
             target_tokens=target_tokens,
             minimal=True,
         )
-        if minimal is not None:
-            summary, fitted_tail_start = minimal
-            return InternalFallback(
-                summary,
-                system_head,
-                fitted_tail_start,
-                "plan-minimal",
-            )
-        return None
+        return InternalFallback(
+            summary,
+            system_head,
+            fitted_tail_start,
+            "plan-minimal",
+        )
 
     middle_messages = messages[head_count:tail_start]
     middle_units = _message_units(middle_messages, start_index=head_count)
@@ -559,12 +563,12 @@ def build_internal_fallback(
     candidates = middle_units + note_units
     if not candidates:
         summary = _lexrank_summary([])
-        fitted_start = _fit_tail_start(
-            messages, head_count, tail_start, summary, target_tokens
+        return InternalFallback(
+            summary,
+            head_count,
+            _fit_tail_start(messages, head_count, tail_start, summary, target_tokens),
+            "lexrank",
         )
-        if fitted_start is not None:
-            return InternalFallback(summary, head_count, fitted_start, "lexrank")
-        return None
 
     all_vectors = _tfidf_vectors(
         [unit.text for unit in candidates] + [unit.text for unit in recent_units]
@@ -601,9 +605,9 @@ def build_internal_fallback(
     # the region (summarising its tool scaffolding) instead of aborting —
     # an abort here is terminal for the session, and the scaffolding rows
     # were never asked to be protected verbatim.
-    fitted_start = _fit_tail_start(
-        messages, head_count, tail_start, summary, target_tokens
+    return InternalFallback(
+        summary,
+        head_count,
+        _fit_tail_start(messages, head_count, tail_start, summary, target_tokens),
+        "lexrank",
     )
-    if fitted_start is None:
-        return None
-    return InternalFallback(summary, head_count, fitted_start, "lexrank")

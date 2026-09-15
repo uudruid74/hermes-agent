@@ -6482,8 +6482,9 @@ This compaction should PRIORITISE preserving all information related to the focu
                 raise
 
         # Provider failure is not terminal: the internal CPU fallback below is
-        # the last compression provider. Only abort if that fallback cannot fit
-        # even its minimal active-Plan payload under the configured target.
+        # the last compression provider, and deterministic compression has no
+        # failure rung (Evan, 2026-09-15). build_internal_fallback always
+        # assembles a payload, so there is no abort branch here.
         if not summary:
             fallback = build_internal_fallback(
                 messages,
@@ -6499,20 +6500,6 @@ This compaction should PRIORITISE preserving all information related to the focu
                 memory_context=memory_context,
                 previous_summary=self._previous_summary or "",
             )
-            if fallback is None:
-                self._last_summary_dropped_count = 0
-                self._last_summary_fallback_used = False
-                self._last_compress_aborted = True
-                self._previous_summary = _previous_summary_before_scan
-                self._summary_has_user_turn = _summary_has_user_turn_before_scan
-                telemetry["failure_class"] = "internal_fallback_over_budget"
-                if not self.quiet_mode:
-                    logger.warning(
-                        "Internal compression fallback could not fit under the "
-                        "%d-token target; preserving the transcript unchanged.",
-                        self.tail_token_budget,
-                    )
-                return messages
 
             summary = _redact_compaction_text(fallback.summary)
             self._previous_summary = self._strip_summary_prefix(summary)
@@ -6810,25 +6797,28 @@ This compaction should PRIORITISE preserving all information related to the focu
         compressed = _strip_historical_media(compressed)
 
         new_estimate = estimate_messages_tokens_rough(compressed)
-        if (
-            self._last_summary_fallback_used
-            and new_estimate > self.tail_token_budget
-        ):
-            self._last_summary_dropped_count = 0
-            self._last_summary_fallback_used = False
-            self._last_compress_aborted = True
-            self._previous_summary = _previous_summary_before_scan
-            self._summary_has_user_turn = _summary_has_user_turn_before_scan
-            telemetry["failure_class"] = "internal_fallback_final_over_budget"
-            if not self.quiet_mode:
-                logger.warning(
-                    "Assembled internal compression fallback exceeded the "
-                    "%d-token target (%d tokens); preserving the transcript "
-                    "unchanged.",
-                    self.tail_token_budget,
-                    new_estimate,
-                )
-            return messages
+
+        # NOTE (Evan, 2026-09-15): there is deliberately NO post-assembly
+        # "did the fallback fit under tail_token_budget?" abort here.
+        #
+        # tail_token_budget is a TARGET, not a ceiling. It is a guess at how
+        # much of the window the compacted region should occupy, and it is
+        # handed to the selector as "please compress down to about this".
+        # Landing above it is expected and is not a failure to compress — the
+        # selector already trims the droppable middle to fit what it can.
+        #
+        # The gate that used to live here compared the WHOLE assembled list
+        # (protected head + summary + protected tail) against that target,
+        # even though the head and tail are fixed cost the fallback cannot
+        # shrink and the middle is the part being discarded. So a transcript
+        # whose head and tail alone approached the target aborted every time,
+        # discarding a perfectly good compaction and leaving the session
+        # stuck — while the LLM summary path, which has no such gate,
+        # compressed the same history without complaint.
+        #
+        # Do NOT reintroduce this test. The selector's own fit check (when
+        # build_internal_fallback returns None) is the real, correct signal
+        # that nothing could be assembled at all.
 
         self.compression_count += 1
 

@@ -88,21 +88,6 @@ def test_active_plan_fallback_degrades_to_goal_current_step_and_summary():
     assert "verbatim" in fallback.summary.lower()
 
 
-def test_active_plan_fallback_fails_when_minimal_context_cannot_fit():
-    messages = [_message("system", "system prompt")]
-
-    fallback = build_internal_fallback(
-        messages,
-        protect_head_count=1,
-        protect_last_n=0,
-        target_tokens=1,
-        plan_context="Goal: work",
-        minimal_plan_context="Goal: work\nCurrent step: impossible to fit",
-    )
-
-    assert fallback is None
-
-
 def test_tail_protection_counts_template_visible_messages():
     latest = {
         "role": "user",
@@ -393,46 +378,6 @@ def test_internal_only_never_calls_summary_provider():
     assert compressor._last_summary_fallback_used is True
 
 
-def test_fallback_never_returns_a_transcript_over_its_target():
-    compressor = ContextCompressor(
-        model="test/model",
-        config_context_length=64_000,
-        protect_first_n=1,
-        protect_last_n=1,
-        summary_target_ratio=0.2,
-        quiet_mode=True,
-    )
-    compressor.tail_token_budget = 142
-    messages = [
-        _message("system", "system prompt"),
-        _message("user", "opening"),
-        *[
-            _message("assistant", f"old details {index} " + ("x " * 100))
-            for index in range(4)
-        ],
-        _message("user", "current request"),
-        _message("assistant", "recent result"),
-    ]
-    oversized = InternalFallback(
-        summary="locally reconstructed context " * 30,
-        head_count=1,
-        tail_start=7,
-        mode="lexrank",
-    )
-
-    with (
-        patch.object(compressor, "_generate_summary", return_value=None),
-        patch(
-            "agent.context_compressor.build_internal_fallback",
-            return_value=oversized,
-        ),
-    ):
-        result = compressor.compress(messages, force=True)
-
-    assert result == messages
-    assert compressor._last_compress_aborted is True
-
-
 def _compressor_messages() -> list[dict]:
     return [
         _message("system", "system prompt"),
@@ -486,46 +431,6 @@ def test_context_compressor_uses_plan_fallback_after_all_summary_providers_fail(
     assert "old middle 4" not in combined
     assert compressor._last_summary_fallback_used is True
     assert compressor._last_compress_aborted is False
-
-
-def test_context_compressor_aborts_only_when_internal_fallback_cannot_fit(monkeypatch):
-    compressor = ContextCompressor(
-        model="ornith-1.5-9b-uncensored",
-        config_context_length=78_080,
-        threshold_percent=0.80,
-        summary_target_ratio=0.15,
-        quiet_mode=True,
-        protect_first_n=1,
-        protect_last_n=8,
-        abort_on_summary_failure=True,
-    )
-    compressor.tail_token_budget = 1
-    monkeypatch.setattr(compressor, "_generate_summary", lambda *_args, **_kwargs: None)
-    messages = _compressor_messages()
-
-    result = compressor.compress(
-        messages,
-        plan_context="Task: Recovery\nGoal: keep going",
-        minimal_plan_context="Goal: keep going\nCurrent step 2/3: implement",
-    )
-
-    assert result == messages
-    assert compressor._last_summary_fallback_used is False
-    assert compressor._last_compress_aborted is True
-
-
-# ---------------------------------------------------------------------------
-# Observation masking (Evan, 2026-09-14).
-#
-# Three rules, one boundary (`tail_start`):
-#   1. M is protect_last_n — the tail keeps observations verbatim.
-#   2. Observations are NEVER lexrank-injected into the middle/compressed area.
-#   3. Emergency rung: overflow masks tail observations back to the last turn.
-#
-# Rule 2 was violated in production: `_message_units` read every middle
-# message with no role filter, so 1,410 observation fragments from Ornith
-# session 20260913_203800_6e2da67e were injected into the emitted summary.
-# ---------------------------------------------------------------------------
 
 
 def _observation(content: str, call_id: str = "call-1") -> dict:
@@ -636,10 +541,11 @@ def test_emergency_rung_masks_tail_observations_except_the_last_turn():
     assert "second tail turn" in json.dumps(masked)
 
 
-def test_emergency_rung_keeps_reasoning_contiguous_for_tail_refit(monkeypatch):
+def test_emergency_rung_keeps_reasoning_contiguous_for_tail_refit():
     """The rung must land before tail shrinking, not mutate `messages`.
 
-    Patching `_fit_tail_start` to fail forces the emergency path; the
+    The rung fires on the tail's own token count (not on a tail-refit
+    failure), so with a budget this small it lands automatically; the
     assembled payload must then contain the masked tail rather than the
     original bulky observation.
     """
@@ -655,10 +561,6 @@ def test_emergency_rung_keeps_reasoning_contiguous_for_tail_refit(monkeypatch):
     ]
     before = json.dumps(messages)
 
-    monkeypatch.setattr(
-        fallback_module, "_fit_tail_start", lambda *args, **kwargs: None
-    )
-
     result = fallback_module.build_internal_fallback(
         messages,
         protect_head_count=2,
@@ -668,9 +570,10 @@ def test_emergency_rung_keeps_reasoning_contiguous_for_tail_refit(monkeypatch):
 
     # The caller's transcript is never mutated by the emergency rung.
     assert json.dumps(messages) == before
-    if result is not None:
-        assert result.mode in {"lexrank", "plan", "plan-minimal"}
-
+    # Deterministic compression has no failure rung: a payload is always
+    # produced (Evan, 2026-09-15).
+    assert result is not None
+    assert result.mode in {"lexrank", "plan", "plan-minimal"}
 
 
 def test_prefix_shortening_does_not_widen_the_lexrank_budget():
