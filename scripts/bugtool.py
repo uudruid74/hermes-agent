@@ -373,51 +373,36 @@ def live_task_ids(text: str) -> list[str]:
     return [task_id for task_id in task_ids(text) if status_for_task(task_id) in LIVE_STATUSES]
 
 
-def live_tasks_for_bug(path: Path) -> list[dict]:
-    """Return live kanban tasks that already reference *path* as their bug file.
+DISPATCHED_STATUS = "dispatched"
 
-    THE AUTHORITATIVE "already dispatched?" CHECK (2026-09-14, Evan).
 
-    The dispatch log alone is NOT a sufficient guard: on 2026-09-05 the log did
-    not exist yet, so `dispatch_is_recorded()` was permanently False and 28
-    duplicate tasks accumulated in 76 seconds (all titled
-    `BUG: bugtool-central-bug-tracking`, all still blocked). The board is the
-    durable, shareable source of truth — the log lives in ~/.local/state and is
-    per-machine, not in the vault and not in git.
+def bug_status(text: str) -> str:
+    """Return the bug file's own frontmatter status ('' when absent)."""
+    return frontmatter(text).get("status", "").strip().lower()
 
-    Matching is on the bug file path, which every bugtool-created task body
-    carries as its first line ("Bug file: <abs path>"). Title fallback
-    (`BUG: <slug>`) covers tasks whose body was trimmed.
+
+def is_dispatched_marker(text: str, path: Path) -> bool:
+    """True when this bug file's metadata says a task was already created.
+
+    THE "already dispatched?" CHECK (2026-09-14, Evan): "just change the
+    meta-data from 'pending' to 'dispatched' and do not dispatch a dispatched
+    bug." Status lives in the file itself (vault, git-tracked, survives across
+    machines and DB rebuilds) instead of being inferred by string-matching task
+    bodies against a board listing.
     """
-    result = subprocess.run(
-        [HERMES, "kanban", "list", "--json"],
-        text=True, capture_output=True, check=False,
-    )
-    if result.returncode:
-        # Fail closed: if we cannot read the board we cannot prove the bug is
-        # undispatched, and a duplicate task is worse than a deferred dispatch.
-        return []
-    try:
-        tasks = json.loads(result.stdout)
-    except json.JSONDecodeError:
-        return []
-    if not isinstance(tasks, list):
-        return []
+    status = bug_status(text)
+    if status == DISPATCHED_STATUS:
+        return True
+    # Transitional: files dispatched before the marker existed carry their task
+    # id under `## Kanban tasks` while still reading status: pending, and the
+    # first dispatch predating DISPATCH_LOG (2026-09-05) created 28 duplicates
+    # in 76 seconds this way. A task id already recorded here means dispatched.
+    return bool(task_ids(text))
 
-    resolved = str(path.resolve())
-    slug = path.stem.split("-", 3)[-1]
-    wanted_title = f"BUG: {slug}".lower()
-    found: list[dict] = []
-    for task in tasks:
-        if not isinstance(task, dict):
-            continue
-        if task.get("status") not in LIVE_STATUSES:
-            continue
-        body = task.get("body") or ""
-        title = (task.get("title") or "").strip().lower()
-        if resolved in body or title == wanted_title:
-            found.append(task)
-    return found
+
+def set_bug_status(text: str, status: str) -> str:
+    """Rewrite the frontmatter `status:` line, leaving the rest untouched."""
+    return re.sub(r"(?m)^status:.*$", f"status: {status}", text, count=1)
 
 
 def task_body(path: Path, text: str, directive: Optional[str] = None) -> str:
@@ -478,7 +463,9 @@ def create_task(
         print(f"dispatch failed for {path}: {output.strip()}", file=sys.stderr)
         return None
     append_dispatch_record(identity, "created", created)
-    atomic_write_text(path, add_task_id(text, created))
+    # Flip the bug's own metadata to `dispatched` in the SAME locked write that
+    # records the task id, so the marker can never lag behind the task.
+    atomic_write_text(path, set_bug_status(add_task_id(text, created), DISPATCHED_STATUS))
     return created
 
 
@@ -503,24 +490,20 @@ def maybe_dispatch_locked(path: Path, text: str, directive: Optional[str] = None
         return None  # human approval checkbox unchecked: never dispatch
     if failure_count(text) >= 4 and not force:
         return None
-    # AUTHORITATIVE idempotency gate (2026-09-14, Evan): the dispatch log is
-    # per-machine state that may be absent (it did not exist before 2026-09-07,
-    # which is how 28 duplicates were created on 2026-09-05). The live board is
-    # the durable source of truth — if a task already exists for this bug file,
-    # creating another is the bug, not the fix.
+    # AUTHORITATIVE idempotency gate (2026-09-14, Evan): "just change the
+    # meta-data from 'pending' to 'dispatched' and do not dispatch a dispatched
+    # bug." The dispatch log is per-machine state that may be absent (it did not
+    # exist before 2026-09-07, which is how 28 duplicates were created on
+    # 2026-09-05). The file's own status is the durable marker — vault-tracked,
+    # git-tracked, machine-independent, no board string matching.
     #
     # `force=True` is `bugtool redispatch`, the DELIBERATE revive path (see the
     # kanban skill: re-dispatching an archived/revoked bug). It bypasses this
     # gate on purpose and is the only way to intentionally re-create a task for
-    # a bug that still has a live board entry.
-    if not force:
-        existing = live_tasks_for_bug(path)
-        if existing:
-            print(
-                f"nothing to dispatch for {path.name}: already live as "
-                f"{', '.join(t.get('id', '?') for t in existing)}"
-            )
-            return None
+    # a bug that is already marked dispatched.
+    if not force and is_dispatched_marker(text, path):
+        print(f"nothing to dispatch for {path.name}: already dispatched")
+        return None
     created = create_task(path, text, identity, directive)
     if created:
         print(f"dispatched {created}: {path}")
@@ -752,12 +735,15 @@ def cmd_dispatch(args: argparse.Namespace) -> None:
 def cmd_check(args: argparse.Namespace) -> None:
     filename = getattr(args, "file", "") or ""
     if filename:
-        path = bug_path(filename)
+        path = bug_path(args.file)
         with locked_root():
             text = path.read_text(encoding="utf-8")
             updated = replace_section(text, APPROVED_SECTION, "- [x] approved by Evan\n")
             path.write_text(updated, encoding="utf-8")
+            created = maybe_dispatch_locked(path, updated)
         print(f"approved {path}")
+        if not created and not is_dispatched_marker(updated, path):
+            print("dispatch deferred: a live task exists or four failures require manual redispatch")
     for path in all_bug_files():
         if path.parent.name != "pending":
             continue
