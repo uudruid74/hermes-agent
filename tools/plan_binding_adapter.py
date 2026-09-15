@@ -267,7 +267,9 @@ def _current(conn, agent):
     return key, binding, None
 
 
-def cmd_advance(agent, summary: str) -> str:
+def cmd_advance(
+    agent, summary: str, proof: Optional[str] = None, step: Optional[int] = None
+) -> str:
     from hermes_cli import execution_bindings as bindings
 
     conn = _legacy()._get_kanban_db()
@@ -284,6 +286,8 @@ def cmd_advance(agent, summary: str) -> str:
             expected_revision=binding.revision,
             summary=summary,
             actor=_legacy()._get_agent_name(agent),
+            proof=proof,
+            step=step,
         )
     except bindings.ExecutionBindingError as exc:
         return f"ERROR: {exc}"
@@ -299,8 +303,67 @@ def cmd_advance(agent, summary: str) -> str:
             session_db = getattr(agent, "_session_db", None)
             if source is not None and session_db is not None:
                 session_db.update_agent_rating(source["assignee"], 0.5)
-        return f"The task goal was: {task['task_goal'] or ''}"
-    return f"Complete Step {result.step_no}: {result.next_step}"
+        note = " (no receipt submitted)" if result.unverified else ""
+        return f"The task goal was: {task['task_goal'] or ''}{note}"
+    if result.binding_revision == binding.revision:
+        # The step did NOT move — this is the verify-first response.
+        return (
+            f"STEP {result.step_no} NOT ADVANCED — verify before claiming.\n\n"
+            f">>> STEP {result.step_no}: {result.next_step} <<<\n\n"
+            f"Return to the ground-truth source and confirm this step's goal is "
+            f"actually met. If it is, submit checkable proof by calling `advance` "
+            f"again for step {result.step_no} with `proof` — a git commit hash, a "
+            f"test result, a file path, or the command you ran and its output. A "
+            f"summary alone is a claim, not evidence. If the step is NOT done, fix "
+            f"it now, then submit the proof. To drop this claim instead, call `repeat`."
+        )
+    unverified = " (no receipt — recorded as unverified)" if result.unverified else ""
+    return f"Complete Step {result.step_no}: {result.next_step}{unverified}"
+
+
+def cmd_repeat(agent, reason: str = "") -> str:
+    """Drop the current step's pending claim and re-state the step.
+
+    Pairs with the two-phase `advance`: a claim that is wrong does not have to
+    be walked back by hand, and the step is restated from the task row so the
+    agent cannot drift onto whatever it last had in context.
+    """
+    from hermes_cli import execution_bindings as bindings
+    from hermes_cli.kanban_db import write_txn
+
+    conn = _legacy()._get_kanban_db()
+    key, binding, error = _current(conn, agent)
+    if error:
+        return error
+    if key is None or binding is None:
+        return "ERROR: No active task"
+    task = conn.execute("SELECT * FROM tasks WHERE id=?", (binding.task_id,)).fetchone()
+    if task is None:
+        return f"ERROR: Task {binding.task_id} not found"
+    rows = conn.execute(
+        "SELECT id FROM task_comments WHERE task_id = ? AND body LIKE ?",
+        (binding.task_id, f"Step {task['task_stepno']} complete — %"),
+    ).fetchall()
+    with write_txn(conn):
+        for row in rows:
+            conn.execute(
+                "DELETE FROM task_comments WHERE id = ?",
+                (row["id"] if isinstance(row, sqlite3.Row) else row[0],),
+            )
+    steps, step_no = bindings._steps_for_task(task)
+    lines = [
+        f"Step {step_no} of {len(steps)} re-opened — the pending claim was dropped.",
+    ]
+    if reason.strip():
+        lines.append(f"Note: {reason.strip()}")
+    lines.append("")
+    lines.append(f">>> STEP {step_no}: {steps[step_no - 1]} <<<")
+    lines.append("")
+    lines.append(
+        "Do this step from the ground-truth source, then call `advance` with a "
+        "summary AND `proof`."
+    )
+    return "\n".join(lines)
 
 
 def cmd_handoff(agent, summary: str) -> str:

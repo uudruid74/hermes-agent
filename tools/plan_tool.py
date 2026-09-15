@@ -1168,6 +1168,7 @@ from tools.plan_binding_adapter import (
     cmd_handoff as _cmd_handoff,
     cmd_new as _cmd_new,
     cmd_remind as _cmd_remind,
+    cmd_repeat as _cmd_repeat,
     cmd_test_complete as _cmd_test_complete,
 )
 
@@ -1192,12 +1193,15 @@ def plan_tool(
     debug_plan_id: Optional[str] = None,
     pre_approved: bool = False,
     parent_task_id: Optional[str] = None,
+    proof: Optional[str] = None,
+    step: Optional[int] = None,
 ) -> str:
     """Mandatory Action Protocol — multistep plan management.
 
     Commands:
       new           — present a plan for approval
       advance       — record completed work and advance one step
+      repeat        — drop the pending step claim and re-state the step
       handoff       — replace the current step's in-progress summary
       continue      — resume a task in the caller's current session
       dispatch      — create + dispatch a kanban task
@@ -1225,7 +1229,15 @@ def plan_tool(
     elif command == "advance":
         if not summary or not summary.strip():
             return "ERROR: 'advance' requires summary"
-        return _cmd_advance(agent, summary.strip())
+        return _cmd_advance(
+            agent,
+            summary.strip(),
+            (proof or "").strip() or None,
+            step if isinstance(step, int) else None,
+        )
+
+    elif command == "repeat":
+        return _cmd_repeat(agent, reason or "")
 
     elif command == "handoff":
         if not summary or not summary.strip():
@@ -1277,6 +1289,7 @@ PLAN_TOOL_SCHEMA = {
     "description": (
         "Mandatory Action Protocol — create and manage multistep plans. "
         "Commands: new (present plan for approval), advance (record completed work and advance), "
+        "repeat (drop a pending step claim), "
         "handoff (record in-progress work), continue (resume a task in this session), "
         "dispatch (create kanban task), remind (show current plan), "
         "fail (mark task failed), test-complete (neutral test outcome), approve (unblock plan task), block (emergency block), "
@@ -1290,8 +1303,8 @@ PLAN_TOOL_SCHEMA = {
         "properties": {
             "command": {
                 "type": "string",
-                "description": "Command: new, advance, handoff, continue, dispatch, remind, fail, test-complete, approve, block, archive, or cron",
-                "enum": ["new", "advance", "handoff", "continue", "dispatch", "remind", "fail", "test-complete", "approve", "block", "archive", "cron"],
+                "description": "Command: new, advance, repeat, handoff, continue, dispatch, remind, fail, test-complete, approve, block, archive, or cron",
+                "enum": ["new", "advance", "repeat", "handoff", "continue", "dispatch", "remind", "fail", "test-complete", "approve", "block", "archive", "cron"],
             },
             "title": {
                 "type": "string",
@@ -1313,6 +1326,14 @@ PLAN_TOOL_SCHEMA = {
             "summary": {
                 "type": "string",
                 "description": "Required for 'advance' and 'handoff'. For 'advance', summarize the work completed in this step, including any files changed. For 'handoff', summarize what has been done and what remains to complete the current step.",
+            },
+            "proof": {
+                "type": "string",
+                "description": "For 'advance': checkable evidence the step is actually complete — a git commit hash, a test result, a file path, or the command you ran and its output. Without proof the step is NOT advanced the first time you claim it: you get the step back with an instruction to verify against ground truth. A summary alone is a claim, not evidence.",
+            },
+            "step": {
+                "type": "integer",
+                "description": "For 'advance': the step number you believe you are completing. A mismatch is refused rather than advancing, so a lost agent is told to re-read `remind` instead of moving the plan forward. This is what catches a duplicate or drifted advance call.",
             },
             "project": {
                 "type": "string",

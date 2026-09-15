@@ -189,6 +189,7 @@ def test_intermediate_advance_changes_step_and_binding_revision(tmp_path):
             expected_revision=current.revision,
             summary="verified first",
             actor="Wintermute",
+            proof="pytest: 3 passed",
         )
 
         assert result.closed is False
@@ -259,6 +260,7 @@ def test_final_advance_closes_root_and_removes_binding(tmp_path):
             expected_revision=current.revision,
             summary="verified final step",
             actor="Wintermute",
+            proof="commit deadbeef",
         )
 
         assert result.closed is True
@@ -309,6 +311,7 @@ def test_event_failure_rolls_back_task_binding_comment_and_event(tmp_path, monke
                 expected_revision=current.revision,
                 summary="must roll back",
                 actor="Wintermute",
+                proof="commit deadbeef",
             )
 
         assert conn.execute(
@@ -318,3 +321,47 @@ def test_event_failure_rolls_back_task_binding_comment_and_event(tmp_path, monke
         assert conn.execute(
             "SELECT COUNT(*) FROM task_comments WHERE task_id='t_plan'"
         ).fetchone()[0] == 0
+
+
+def test_continue_archived_plan_reactivates_and_logs_event(tmp_path):
+    """Evan 2026-09-13: `continue` must revive a fail/test-complete-archived
+    plan into the caller's current session as status manual, and log a
+    plan-continued event so the resurrection is visible in the audit trail."""
+    with kb.connect(tmp_path / "kanban.db") as conn:
+        _insert_task(conn, "t_archived", status="archived",
+                     steps=("first", "second"), step_no=2)
+
+        result = bindings.continue_plan(
+            conn, _key(), "t_archived",
+            actor="Ornith", session_id="session-2",
+        )
+
+        assert result.task_id == "t_archived"
+        row = conn.execute(
+            "SELECT status, assignee, session_id, task_stepno FROM tasks WHERE id='t_archived'"
+        ).fetchone()
+        assert row["status"] == "manual"
+        assert row["assignee"] == "Ornith"
+        assert row["session_id"] == "session-2"
+        assert row["task_stepno"] == 2  # resumes at the failed step
+
+        event = conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id='t_archived' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        assert event["kind"] == "plan-continued"
+        payload = json.loads(event["payload"])
+        assert payload["from_status"] == "archived"
+        assert payload["actor"] == "Ornith"
+        assert payload["session_id"] == "session-2"
+
+
+def test_continue_rejects_terminal_done_status(tmp_path):
+    """Done plans stay closed — continue must not resurrect completed work."""
+    with kb.connect(tmp_path / "kanban.db") as conn:
+        _insert_task(conn, "t_done", status="done", step_no=None)
+
+        with pytest.raises(bindings.InvalidTaskState, match="cannot continue"):
+            bindings.continue_plan(
+                conn, _key(), "t_done",
+                actor="Ornith", session_id="session-2",
+            )

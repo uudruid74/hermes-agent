@@ -183,9 +183,13 @@ def test_advance_closes_binding_and_records_required_summary(monkeypatch):
     task_id = conn.execute("SELECT task_id FROM execution_bindings").fetchone()[0]
 
     missing = plan_tool.plan_tool(agent, "advance")
-    advanced = plan_tool.plan_tool(agent, "advance", summary="Finished the only step")
+    held = plan_tool.plan_tool(agent, "advance", summary="Finished the only step")
+    advanced = plan_tool.plan_tool(
+        agent, "advance", summary="Finished the only step", proof="pytest: 6 passed"
+    )
 
     assert missing == "ERROR: 'advance' requires summary"
+    assert "NOT ADVANCED" in held, "a bare claim must not close the plan"
     assert "goal was: finish" in advanced
     assert conn.execute("SELECT status FROM tasks WHERE id=?", (task_id,)).fetchone()[0] == "done"
     assert conn.execute("SELECT COUNT(*) FROM execution_bindings").fetchone()[0] == 0
@@ -310,7 +314,12 @@ def test_continue_rebinds_session_and_agent_and_returns_step_summaries(monkeypat
     )
     task_id = conn.execute("SELECT task_id FROM execution_bindings").fetchone()[0]
     plan_tool.plan_tool(original, "handoff", summary="Partial first step")
-    plan_tool.plan_tool(original, "advance", summary="Completed first step in tools/a.py")
+    plan_tool.plan_tool(
+        original,
+        "advance",
+        summary="Completed first step in tools/a.py",
+        proof="commit 17258c7",
+    )
     plan_tool.plan_tool(original, "handoff", summary="Started second step in tests/test_a.py")
     resumed = SimpleNamespace(
         profile_name="Ornith",

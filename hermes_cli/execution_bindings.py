@@ -11,7 +11,7 @@ with a manual Plan lifecycle transition.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import sqlite3
 import time
@@ -90,6 +90,11 @@ class PlanStepResult:
     closed: bool
     restored_task_id: Optional[str]
     binding_revision: Optional[int]
+    # True when this step was advanced WITHOUT proof because the caller had
+    # already claimed it once (`repeat`).  A caller that re-claims a step it
+    # never completed gets the step back instead of the next one; the second
+    # claim is the only way past a missing receipt.
+    unverified: bool = False
 
 
 PlanOutcome = Literal["done", "failed", "test-complete"]
@@ -631,6 +636,46 @@ def _close_plan_in_txn(
     )
 
 
+def _step_receipts(conn: sqlite3.Connection, task_id: str) -> set[int]:
+    """Return the step numbers that carry a completion receipt.
+
+    A receipt is an `advance` that supplied ``proof`` (a commit, a test
+    result, a file path — anything checkable).  A summary alone is a CLAIM;
+    this set is what separates a claim from evidence.
+    """
+    rows = conn.execute(
+        "SELECT body FROM task_comments WHERE task_id = ? AND body LIKE 'RECEIPT:%'",
+        (task_id,),
+    ).fetchall()
+    steps: set[int] = set()
+    for row in rows:
+        body = row["body"] if isinstance(row, sqlite3.Row) else row[0]
+        try:
+            steps.add(int(str(body).split(":", 2)[1]))
+        except (IndexError, ValueError):
+            continue
+    return steps
+
+
+def _claimed_without_receipt(
+    conn: sqlite3.Connection, task_id: str, step_no: int, summary: str
+) -> bool:
+    """True when this exact step was already claimed once with no receipt.
+
+    This is deliberately narrow: only a prior *advance claim* for the SAME
+    step counts (``Step {n} complete`` — `handoff` writes a different
+    ``Step {n}:`` form and must not trip it).  So the first claim returns the
+    step, and a second claim advances with ``unverified=True``: we ask for
+    proof but never jail the session.
+    """
+    marker = f"Step {step_no} complete — {summary.strip()}"
+    row = conn.execute(
+        "SELECT COUNT(*) FROM task_comments WHERE task_id = ? AND body = ?",
+        (task_id, marker),
+    ).fetchone()
+    return bool(row and (row[0] if not isinstance(row, sqlite3.Row) else row[0]))
+
+
 def advance_plan(
     conn: sqlite3.Connection,
     key: ExecutionKey,
@@ -639,8 +684,23 @@ def advance_plan(
     expected_revision: int,
     summary: str,
     actor: str,
+    proof: Optional[str] = None,
+    step: Optional[int] = None,
 ) -> PlanStepResult:
-    """Complete one step, atomically advancing or closing the active Plan."""
+    """Complete one step, atomically advancing or closing the active Plan.
+
+    Two-phase completion (Evan, 2026-09-15): a plan step may not advance on a
+    bare claim.  ``advance`` without ``proof`` for a step that has no receipt
+    RECORDS the claim and returns the SAME step with an instruction to verify
+    against ground truth and resubmit.  Supplying ``proof`` (or re-claiming an
+    already-recorded claim) completes the step.  This catches the failure that
+    actually happened — Ornith advanced four steps in four minutes, then said
+    "I did not actually fix Step 1."
+
+    ``step`` is the caller stating which step it believes it is completing.
+    A mismatch is refused instead of advancing: an agent that has lost its
+    place must re-read ``remind``, not silently move the plan forward.
+    """
     _validate_key(key)
     with write_txn(conn):
         current = _assert_expected_binding(
@@ -652,8 +712,41 @@ def advance_plan(
                 f"plan {current.task_id} is not active (status: {task['status']})"
             )
         steps, step_no = _steps_for_task(task)
+        if step is not None and step != step_no:
+            raise InvalidTaskState(
+                f"step {step} is not the active step of plan {current.task_id} "
+                f"(active: {step_no}) — call `remind` before advancing"
+            )
+        now = int(time.time())
+
+        unverified = False
+        if not proof:
+            if step_no not in _step_receipts(conn, current.task_id):
+                if not _claimed_without_receipt(conn, current.task_id, step_no, summary):
+                    # First claim for this step: record it, hold the step.
+                    conn.execute(
+                        "INSERT INTO task_comments (task_id, author, body, created_at) "
+                        "VALUES (?, ?, ?, ?)",
+                        (
+                            current.task_id,
+                            actor,
+                            f"Step {step_no} complete — {summary}",
+                            now,
+                        ),
+                    )
+                    return PlanStepResult(
+                        task_id=current.task_id,
+                        step_no=step_no,
+                        next_step=steps[step_no - 1],
+                        closed=False,
+                        restored_task_id=None,
+                        binding_revision=current.revision,
+                    )
+                # Second claim with still no receipt: honor it, flag it.
+                unverified = True
+
         if step_no == len(steps):
-            return _close_plan_in_txn(
+            closed = _close_plan_in_txn(
                 conn,
                 key,
                 current,
@@ -662,8 +755,14 @@ def advance_plan(
                 actor=actor,
                 status_note=summary,
             )
+            return replace(closed, unverified=unverified)
 
-        now = int(time.time())
+        if proof:
+            conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (current.task_id, actor, f"RECEIPT:{step_no}:{proof}", now),
+            )
         _set_step_summary(
             conn,
             current.task_id,
@@ -713,6 +812,7 @@ def advance_plan(
             closed=False,
             restored_task_id=None,
             binding_revision=new_revision,
+            unverified=unverified,
         )
 
 
@@ -773,10 +873,11 @@ def continue_plan(
     now = int(time.time())
     with write_txn(conn):
         task = _task_row(conn, plan_id)
-        if task["status"] != "manual":
+        if task["status"] not in ("manual", "archived"):
             raise InvalidTaskState(
                 f"plan {plan_id} cannot continue from status {task['status']}"
             )
+        from_status: str = task["status"]
         _steps_for_task(task)
         prior = conn.execute(
             "SELECT revision FROM execution_bindings "
@@ -796,12 +897,20 @@ def continue_plan(
             (key.profile, key.root_session_id, plan_id, revision, now, now),
         )
         changed = conn.execute(
-            "UPDATE tasks SET assignee = ?, session_id = ? "
-            "WHERE id = ? AND status = 'manual'",
+            "UPDATE tasks SET assignee = ?, session_id = ?, status = 'manual' "
+            "WHERE id = ? AND status IN ('manual', 'archived')",
             (actor, session_id, plan_id),
         ).rowcount
         if changed != 1:
             raise InvalidTaskState(f"plan {plan_id} changed during continuation")
+        if from_status != "manual":
+            _append_event(
+                conn,
+                plan_id,
+                "plan-continued",
+                payload={"actor": actor, "from_status": from_status, "session_id": session_id},
+                now=now,
+            )
         stored = _get_binding_row(conn, key)
         if stored is None:
             raise ExecutionBindingError("plan binding disappeared during continuation")
