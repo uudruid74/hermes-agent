@@ -1050,3 +1050,69 @@ class TestExpandedOverflowPatterns:
 
 
 
+
+
+# ── Message-only overload must reach the provider fallback chain ───────
+# Regression for the 2026-09-14 gopher compression failures (22:33 and
+# 23:15): the primary was OpenRouter with a configured
+# auxiliary.compression.fallback_chain pointing at ollama-cloud. The error
+# ``Upstream error from Nvidia: Service temporarily overloaded`` arrived
+# with no dependable status_code, matched NONE of the predicates in the
+# auxiliary fallback gates, so should_fallback stayed False and the
+# configured chain was never consulted.
+
+class TestMessageOnlyOverloadFallsBack:
+    """``_is_overload_error`` must catch overloads that carry no status code."""
+
+    def _real_error(self, status=None):
+        e = Exception("Upstream error from Nvidia: Service temporarily overloaded")
+        e.status_code = status
+        return e
+
+    def test_message_only_overload_is_overload(self):
+        from agent.auxiliary_client import _is_overload_error
+
+        assert _is_overload_error(self._real_error(None)) is True
+
+    def test_status_503_overload_is_overload(self):
+        from agent.auxiliary_client import _is_overload_error
+
+        assert _is_overload_error(self._real_error(503)) is True
+
+    def test_classifier_agrees_without_status(self):
+        """Canonical classifier must call the message-only overload 'overloaded'."""
+        result = classify_api_error(self._real_error(None))
+        assert result.reason == FailoverReason.overloaded
+
+    def test_old_predicate_set_would_have_missed_it(self):
+        """Guard: the pre-fix predicate set returns False for this error.
+
+        If this ever starts returning True the arm is redundant — which is
+        fine, but means the regression case changed and this test should be
+        revisited rather than silently passing.
+        """
+        from agent.auxiliary_client import (
+            _is_auth_error, _is_connection_error, _is_invalid_aux_response_error,
+            _is_model_incompatible_error, _is_payment_error, _is_rate_limit_error,
+            _is_transient_transport_error,
+        )
+
+        e = self._real_error(None)
+        old = any(fn(e) for fn in (
+            _is_auth_error, _is_payment_error, _is_connection_error,
+            _is_rate_limit_error, _is_model_incompatible_error,
+            _is_invalid_aux_response_error, _is_transient_transport_error,
+        ))
+        assert old is False
+
+    def test_unrelated_error_is_not_overload(self):
+        """Negative case — the arm must not fire on ordinary failures."""
+        from agent.auxiliary_client import _is_overload_error
+
+        for msg in (
+            "some unrelated bug",
+            "Context compression LLM returned empty content",
+            "no provider",
+            "invalid literal for int()",
+        ):
+            assert _is_overload_error(Exception(msg)) is False, msg

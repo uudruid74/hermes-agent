@@ -3871,6 +3871,39 @@ def _is_transient_transport_error(exc: Exception) -> bool:
     return isinstance(status, int) and (status == 408 or 500 <= status < 600)
 
 
+def _is_overload_error(exc: Exception) -> bool:
+    """Return True for an overloaded/busy-server error.
+
+    Catches BOTH shapes:
+
+    * a real 5xx/408 status (handled by ``_is_transient_transport_error``), and
+    * a **message-only** overload with no usable status code — e.g.
+      ``Upstream error from Nvidia: Service temporarily overloaded`` arriving
+      from a proxied/streamed route (OpenRouter upstream errors surface the
+      provider's overload text without a dependable ``status_code``).
+
+    Why this exists: ``_is_transient_transport_error`` is status-based, so a
+    message-only overload returns False. Without this arm that error matched
+    NO predicate in the fallback gates, ``should_fallback`` stayed False, the
+    whole fallback block was skipped, and a configured
+    ``auxiliary.<task>.fallback_chain`` (here: ollama-cloud) was never
+    consulted — the call dropped straight to the deterministic internal path.
+    Observed 2026-09-14 22:33 and 23:15 on gopher compression.
+
+    Delegates the phrase matching to the canonical classifier so the two
+    cannot drift.
+    """
+    if _is_transient_transport_error(exc):
+        return True
+    try:
+        from agent.error_classifier import FailoverReason, classify_api_error
+
+        reason = classify_api_error(exc).reason
+        return reason in (FailoverReason.overloaded, FailoverReason.server_error)
+    except Exception:
+        return False
+
+
 _DEFAULT_TRANSIENT_RETRIES = 2
 # Base for exponential backoff between transient retries (seconds). Overridable
 # so tests can zero it out and not sleep real wall-clock time.
@@ -9159,6 +9192,18 @@ def _call_llm_impl(
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
+            # 5xx / 408 / 503-overload, plus message-only overloads with no
+            # usable status code. The provider answered (so this is not a
+            # connection error) but cannot serve the request right now. Without
+            # this arm a 503 — or an overload whose status never survives the
+            # proxied route — matches NO predicate above, `should_fallback` is
+            # False, the whole fallback block below is skipped, and a configured
+            # ``auxiliary.<task>.fallback_chain`` never runs — the call drops
+            # straight to the main-agent-model safety net (or, on compression,
+            # to the deterministic internal provider). Observed 2026-09-14:
+            # ``Upstream error from Nvidia: Service temporarily overloaded``
+            # skipped the ollama-cloud chain entry at 22:33 and 23:15.
+            or _is_overload_error(first_err)
         )
         # Respect explicit provider choice for transient errors (auth, request
         # validation, etc.) but allow fallback when the provider clearly cannot
@@ -9182,6 +9227,15 @@ def _call_llm_impl(
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
+            # 5xx/408 capacity failure, plus message-only overloads. A provider
+            # that answers 503 "temporarily overloaded" — or relays that text
+            # without a dependable status — cannot serve ANY request right now,
+            # regardless of the user's explicit provider choice; same class as a
+            # connection failure or an exhausted quota. Without this the chain
+            # is honoured only in auto mode, so a pinned provider that starts
+            # 503ing never walks to its configured fallback. Paired with the
+            # _is_overload_error arm in should_fallback above.
+            or _is_overload_error(first_err)
         )
         if should_fallback and (is_auto or is_capacity_error):
             if _is_auth_error(first_err):
@@ -9201,6 +9255,11 @@ def _call_llm_impl(
                 reason = "model incompatible with route"
             elif _is_invalid_aux_response_error(first_err):
                 reason = "invalid provider response"
+            elif _is_overload_error(first_err):
+                # 5xx / message-only overload. Labelled distinctly so the log
+                # doesn't claim a connection failure for a provider that
+                # answered and is merely busy.
+                reason = "provider overloaded"
             else:
                 reason = "connection error"
             logger.info("Auxiliary %s: %s on %s (%s), trying fallback",
@@ -9808,6 +9867,18 @@ async def _async_call_llm_impl(
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
+            # 5xx / 408 / 503-overload, plus message-only overloads with no
+            # usable status code. The provider answered (so this is not a
+            # connection error) but cannot serve the request right now. Without
+            # this arm a 503 — or an overload whose status never survives the
+            # proxied route — matches NO predicate above, `should_fallback` is
+            # False, the whole fallback block below is skipped, and a configured
+            # ``auxiliary.<task>.fallback_chain`` never runs — the call drops
+            # straight to the main-agent-model safety net (or, on compression,
+            # to the deterministic internal provider). Observed 2026-09-14:
+            # ``Upstream error from Nvidia: Service temporarily overloaded``
+            # skipped the ollama-cloud chain entry at 22:33 and 23:15.
+            or _is_overload_error(first_err)
         )
         # Capacity errors (payment/quota/connection/rate-limit) bypass the
         # explicit-provider gate — the provider cannot serve the request
@@ -9823,6 +9894,15 @@ async def _async_call_llm_impl(
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
+            # 5xx/408 capacity failure, plus message-only overloads. A provider
+            # that answers 503 "temporarily overloaded" — or relays that text
+            # without a dependable status — cannot serve ANY request right now,
+            # regardless of the user's explicit provider choice; same class as a
+            # connection failure or an exhausted quota. Without this the chain
+            # is honoured only in auto mode, so a pinned provider that starts
+            # 503ing never walks to its configured fallback. Paired with the
+            # _is_overload_error arm in should_fallback above.
+            or _is_overload_error(first_err)
         )
         if should_fallback and (is_auto or is_capacity_error):
             if _is_auth_error(first_err):
@@ -9838,6 +9918,11 @@ async def _async_call_llm_impl(
                 reason = "model incompatible with route"
             elif _is_invalid_aux_response_error(first_err):
                 reason = "invalid provider response"
+            elif _is_overload_error(first_err):
+                # 5xx / message-only overload. Labelled distinctly so the log
+                # doesn't claim a connection failure for a provider that
+                # answered and is merely busy.
+                reason = "provider overloaded"
             else:
                 reason = "connection error"
             logger.info("Auxiliary %s (async): %s on %s (%s), trying fallback",
