@@ -117,7 +117,42 @@ def test_approve_question_contains_full_plan(monkeypatch):
     assert "2. Load all steps" in seen["question"]
 
 
-def test_new_requires_explicit_matching_parent(monkeypatch):
+def test_new_nests_implicitly_under_the_active_plan(monkeypatch):
+    """`new` while a Plan is active nests instead of refusing (Evan, 2026-09-15).
+
+    The refusal was the bug: an active binding is the normal state, and the
+    spec is that every Plan stores the previous Plan's task id in
+    `previous_task` so closing the child restores the parent — nesting to
+    any depth, no explicit parent_task_id required.
+    """
+    conn = _db()
+    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    monkeypatch.setattr(
+        plan_tool, "clarify_tool", lambda *_args, **_kwargs: '{"user_response":"Approve"}'
+    )
+    agent = _Agent()
+
+    first = plan_tool.plan_tool(agent, "new", title="Parent", goal="parent", steps=["one"])
+    assert first.startswith("TASK APPROVED")
+    parent_id = conn.execute("SELECT task_id FROM execution_bindings").fetchone()[0]
+
+    child = plan_tool.plan_tool(
+        agent, "new", title="Implicit child", goal="no parent arg", steps=["one"]
+    )
+    assert child.startswith("TASK APPROVED"), child
+    child_id = conn.execute("SELECT task_id FROM execution_bindings").fetchone()[0]
+    assert child_id != parent_id
+    assert conn.execute(
+        "SELECT previous_task FROM tasks WHERE id=?", (child_id,)
+    ).fetchone()[0] == parent_id
+
+    # the parent is suspended, not closed, so the chain can be walked back
+    assert conn.execute(
+        "SELECT status FROM tasks WHERE id=?", (parent_id,)
+    ).fetchone()[0] == "manual"
+
+
+def test_new_rejects_a_parent_that_is_not_the_active_plan(monkeypatch):
     conn = _db()
     monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
     monkeypatch.setattr(
@@ -129,22 +164,12 @@ def test_new_requires_explicit_matching_parent(monkeypatch):
     assert first.startswith("TASK APPROVED")
     before = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
 
-    blocked = plan_tool.plan_tool(agent, "new", title="Implicit child", goal="no", steps=["one"])
-    assert blocked.startswith("ACTIVE_PLAN")
-    assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == before
-
-    parent_id = conn.execute("SELECT task_id FROM execution_bindings").fetchone()[0]
-    nested = plan_tool.plan_tool(
-        agent,
-        "new",
-        title="Explicit child",
-        goal="yes",
-        steps=["one"],
-        parent_task_id=parent_id,
+    blocked = plan_tool.plan_tool(
+        agent, "new", title="Wrong parent", goal="no", steps=["one"],
+        parent_task_id="t_doesnotexist",
     )
-    assert nested.startswith("TASK APPROVED")
-    child = conn.execute("SELECT task_id FROM execution_bindings").fetchone()[0]
-    assert conn.execute("SELECT previous_task FROM tasks WHERE id=?", (child,)).fetchone()[0] == parent_id
+    assert blocked.startswith("PLAN_CONFLICT"), blocked
+    assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == before
 
 
 def test_advance_closes_binding_and_records_required_summary(monkeypatch):

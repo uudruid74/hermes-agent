@@ -148,13 +148,22 @@ def cmd_new(
     conn = _legacy()._get_kanban_db(board)
     try:
         current = bindings.get_binding(conn, key)
-        if current is not None and parent_task_id != current.task_id:
-            return (
-                f"ACTIVE_PLAN: {current.task_id} is active at binding revision "
-                f"{current.revision}; supply parent_task_id={current.task_id!r} to nest."
-            )
+        # Plans nest implicitly (Evan, 2026-09-15).  `new` while a Plan is
+        # active creates a CHILD of that Plan: the new row stores the active
+        # task id in `previous_task`, and closing the child restores the
+        # parent binding (`_close_plan_in_txn`), so nesting works to any
+        # depth.  Refusing instead of nesting was the bug — an active
+        # binding is the normal, expected state, not a lock.
+        if current is not None and parent_task_id is None:
+            parent_task_id = current.task_id
         if current is None and parent_task_id is not None:
             return f"PLAN_CONFLICT: expected parent {parent_task_id}, but no Plan is active"
+        if (
+            current is not None
+            and parent_task_id is not None
+            and parent_task_id != current.task_id
+        ):
+            return f"PLAN_CONFLICT: active Plan is {current.task_id}, not {parent_task_id!r}"
 
         task_id = f"t_{uuid.uuid4().hex[:8]}"
         with write_txn(conn):
