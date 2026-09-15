@@ -3059,19 +3059,27 @@ class ContextCompressor(ContextEngine):
         for i in range(len(result)):
             _strip_historical_reasoning_at(i)
 
-        # Pass 4 (issue #61932): protected-tail pressure demotion.
+        # Pass 4 (issue #61932): protected-tail observation cascade.
         # After multiple in-place compactions the transcript can be short
         # enough that nearly every remaining message sits inside the
         # protected floor, yet those messages are huge completed tool /
         # file outputs.  Summarizing the (empty) middle does nothing and
-        # preflight ends in "Cannot compress further".  Demote bulky tool
-        # bodies *inside* the protected region until the protected tail
-        # fits the soft budget, always keeping a short recent floor
-        # verbatim so the active ask stays readable.
+        # preflight ends in "Cannot compress further".
+        #
+        # Evan's rule (2026-09-14): shed observations (tool outputs) in three
+        # tightening rungs, stopping as soon as the protected region fits the
+        # soft budget (``protect_tail_tokens * 1.5``):
+        #   1. mask region observations older than the newest
+        #      ``protect_last_n`` rows — the protected tail keeps its own;
+        #   2. additionally mask every region observation before the current
+        #      turn (the newest user message), so only the active turn's
+        #      observations survive;
+        #   3. mask the active turn's observations too, and truncate oversized
+        #      tool-call args — nothing is spared.
+        # Only tool *results* are demoted, never the model's reasoning or its
+        # tool-call rows, so tool_call/tool_result pairing always survives.
         if protect_tail_tokens is not None and protect_tail_tokens > 0 and result:
             soft_ceiling = int(protect_tail_tokens * 1.5)
-            keep_recent = min(_PRESSURE_KEEP_RECENT_MESSAGES, len(result))
-            demote_end = len(result) - keep_recent
 
             def _protected_region_tokens() -> int:
                 start = max(0, prune_boundary)
@@ -3080,56 +3088,42 @@ class ContextCompressor(ContextEngine):
                     for i in range(start, len(result))
                 )
 
-            if demote_end > prune_boundary and _protected_region_tokens() > soft_ceiling:
-                pressure_hits = 0
-                for i in range(max(0, prune_boundary), demote_end):
+            if _protected_region_tokens() > soft_ceiling:
+                region_start = max(0, prune_boundary)
+                latest_user_idx = -1
+                for i in range(len(result) - 1, -1, -1):
+                    if result[i].get("role") == "user":
+                        latest_user_idx = i
+                        break
+                tail_floor = len(result) - min(protect_tail_count, len(result))
+                masked_hits = 0
+                # keep_from is the start of the newest suffix that survives
+                # this rung; it only ever moves later, so the rungs tighten.
+                for keep_from in (
+                    tail_floor,
+                    max(tail_floor, latest_user_idx),
+                    len(result),
+                ):
                     # Pressure passes override the just-loaded-skill guard:
                     # when the protected region itself blows the soft budget,
                     # sparing skill bodies would recreate the #61932 dead-end.
-                    if _demote_tool_result_at(i, spare_protected_skills=False):
-                        pressure_hits += 1
-                    if _truncate_tool_call_args_at(i):
-                        pressure_hits += 1
+                    for i in range(region_start, keep_from):
+                        if _demote_tool_result_at(i, spare_protected_skills=False):
+                            masked_hits += 1
+                    if keep_from >= len(result):
+                        # Final rung: no observation is left to shed, so the
+                        # model's own oversized action payloads go too.  One
+                        # write_file call can alone exceed the soft budget.
+                        for i in range(region_start, len(result)):
+                            if _truncate_tool_call_args_at(i):
+                                masked_hits += 1
                     if _protected_region_tokens() <= soft_ceiling:
                         break
-                # If the short recent floor itself is still dominated by a
-                # stack of huge tool bodies, demote every protected tool
-                # result except the single most recent one.  The active
-                # user message (usually the last row) stays untouched.
-                if _protected_region_tokens() > soft_ceiling:
-                    last_tool_idx = None
-                    for i in range(len(result) - 1, -1, -1):
-                        if result[i].get("role") == "tool":
-                            last_tool_idx = i
-                            break
-                    for i in range(max(0, prune_boundary), len(result)):
-                        if last_tool_idx is not None and i == last_tool_idx:
-                            continue
-                        if result[i].get("role") == "tool":
-                            if _demote_tool_result_at(i, spare_protected_skills=False):
-                                pressure_hits += 1
-                        elif result[i].get("role") == "assistant":
-                            if _truncate_tool_call_args_at(i):
-                                pressure_hits += 1
-                    # Absolute last resort: even the newest tool body can
-                    # be larger than the soft budget alone (one 200KB file
-                    # read).  Summarize it so compression can still reclaim
-                    # enough headroom to continue the session.
-                    if (
-                        last_tool_idx is not None
-                        and last_tool_idx >= prune_boundary
-                        and _protected_region_tokens() > soft_ceiling
-                    ):
-                        if _demote_tool_result_at(
-                            last_tool_idx, spare_protected_skills=False
-                        ):
-                            pressure_hits += 1
-                if pressure_hits and not self.quiet_mode:
+                if masked_hits and not self.quiet_mode:
                     logger.info(
-                        "Pre-compression pressure demotion: reclaimed protected-tail "
-                        "tool output (%d change(s); protected region now ~%s tokens, "
-                        "soft ceiling %s)",
-                        pressure_hits,
+                        "Pre-compression tail observation masking: %d change(s); "
+                        "protected region now ~%s tokens, soft ceiling %s",
+                        masked_hits,
                         f"{_protected_region_tokens():,}",
                         f"{soft_ceiling:,}",
                     )
