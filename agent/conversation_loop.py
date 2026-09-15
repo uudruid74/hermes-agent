@@ -40,6 +40,7 @@ from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.turn_context import (
     _compression_warrants_another_preflight_pass,
+    _retry_after_compression,
     build_turn_context,
     compose_user_api_content,
     reanchor_current_turn_user_idx,
@@ -4955,22 +4956,75 @@ def run_conversation(
                     new_tokens = estimate_messages_tokens_rough(messages)
                     approx_tokens = new_tokens  # update for downstream logging
 
-                    if len(messages) < original_len or (new_tokens > 0 and new_tokens < original_tokens * 0.95) or (new_ctx and new_ctx < old_ctx):
+                    # Decide on the REQUEST size, not the message-only size.
+                    # The request (messages + system prompt + tool schemas) is
+                    # what the provider actually rejected, and the overhead is
+                    # routinely the majority of it: on a real overflow the
+                    # message-only estimate read 9,177 while the request that
+                    # failed was 35,031.  Reporting the message-only number made
+                    # the failure message self-refuting ("9,177 tokens. Cannot
+                    # compress further" against a 78,080 window).
+                    _post_request_tokens = estimate_request_tokens_rough(
+                        messages,
+                        system_prompt=active_system_prompt or "",
+                        tools=agent.tools or None,
+                    )
+
+                    # A request that now fits needs no further compression: the
+                    # premise of this handler ("the request does not fit") is
+                    # gone, so retry even when compression could not shrink
+                    # anything further.  Without this check the branch below
+                    # decides purely on "did compaction remove something?", and
+                    # a session whose compressible region is already minimal —
+                    # every pass returns the same transcript — is declared
+                    # "Cannot compress further" and the turn dies while still
+                    # comfortably inside the window (observed 2026-09-15: a
+                    # 35,031-token request against a 78,080 window, well under
+                    # the 64,000 threshold, aborted the turn).  Retries remain
+                    # bounded by max_compression_attempts below.
+                    _request_fits_now = _retry_after_compression(
+                        request_tokens=_post_request_tokens,
+                        context_length=old_ctx,
+                        orig_len=original_len,
+                        new_len=len(messages),
+                        orig_tokens=original_tokens,
+                        new_tokens=new_tokens,
+                        context_limit_shrank=bool(new_ctx and new_ctx < old_ctx),
+                    )
+
+                    if _request_fits_now:
                         if len(messages) < original_len:
                             agent._buffer_status(COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE.format(before=original_len, after=len(messages)))
                         elif new_tokens > 0 and new_tokens < original_tokens * 0.95:
                             agent._buffer_status(COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE.format(before=original_tokens, after=new_tokens))
+                        else:
+                            # Nothing was removed, but the request now fits —
+                            # say so explicitly rather than silently retrying.
+                            agent._buffer_status(
+                                f"Request fits after compression "
+                                f"(~{_post_request_tokens:,} < {old_ctx:,}); continuing"
+                            )
                         time.sleep(2)  # Brief pause between compression retries
                         _retry.restart_with_compressed_messages = True
                         break
                     else:
-                        # Can't compress further and already at minimum tier
+                        # Can't compress further and already at minimum tier.
+                        # Report the REQUEST size (what the provider rejected)
+                        # alongside the window so the numbers are reconcilable.
                         agent._flush_status_buffer()
                         agent._vprint(f"{agent.log_prefix}❌ Context length exceeded and cannot compress further.", force=True)
                         agent._vprint(f"{agent.log_prefix}   💡 The conversation has accumulated too much content. Try /new to start fresh, or /compress to manually trigger compression.", force=True)
-                        logger.error("%sContext length exceeded: %s tokens. Cannot compress further.", agent.log_prefix, f"{new_tokens:,}")
+                        logger.error(
+                            "%sContext length exceeded: request ~%s tokens "
+                            "(messages ~%s) vs window %s. Cannot compress further.",
+                            agent.log_prefix, f"{_post_request_tokens:,}",
+                            f"{new_tokens:,}", f"{old_ctx:,}",
+                        )
                         agent._persist_session(messages, conversation_history)
-                        _final_response = f"Context length exceeded ({new_tokens:,} tokens). Cannot compress further."
+                        _final_response = (
+                            f"Context length exceeded (request ~{_post_request_tokens:,} "
+                            f"tokens vs window {old_ctx:,}). Cannot compress further."
+                        )
                         return {
                             "final_response": _final_response,
                             "messages": messages,

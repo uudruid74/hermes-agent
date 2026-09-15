@@ -254,6 +254,45 @@ def _compression_warrants_another_preflight_pass(
     )
 
 
+def _retry_after_compression(
+    *,
+    request_tokens: int,
+    context_length: int,
+    orig_len: int,
+    new_len: int,
+    orig_tokens: int,
+    new_tokens: int,
+    context_limit_shrank: bool = False,
+) -> bool:
+    """Whether the overflow handler should retry after a compression pass.
+
+    ``True`` means "the provider rejection can be retried"; ``False`` means
+    the transcript is exhausted and the turn must fail.
+
+    The critical arm is ``request_tokens < context_length``: the handler was
+    entered because *the request* did not fit, so if it fits now, the premise
+    is gone and retrying is correct **even when compaction removed nothing**.
+    Without that arm this reduces to "did compaction delete rows or cut tokens
+    by >5%?", which declares a healthy session unsalvageable whenever its
+    compressible region is already minimal — every pass returns the same
+    transcript, so no row/token signal can ever fire.
+
+    Observed 2026-09-15 (ornith): a 35,031-token request against a 78,080
+    window, well under the 64,000 compression threshold, aborted the turn with
+    "Context length exceeded: 9,177 tokens. Cannot compress further." — where
+    9,177 was the message-ONLY estimate while the request that actually failed
+    was 35,031. Two defects in one branch: the wrong number decided it, and
+    the fitting-request case had no arm.
+    """
+    if 0 < request_tokens < context_length:
+        return True
+    if new_len < orig_len:
+        return True
+    if new_tokens > 0 and new_tokens < orig_tokens * 0.95:
+        return True
+    return bool(context_limit_shrank)
+
+
 def _should_run_preflight_estimate(
     messages: List[Dict[str, Any]],
     protect_first_n: int,
