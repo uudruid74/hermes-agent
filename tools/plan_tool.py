@@ -607,9 +607,27 @@ def _cmd_advance(agent, summary: str) -> str:
 def _cmd_dispatch(agent, title: str, goal: str, project: str, assignee: str,
                   steps: Optional[List[str]] = None,
                   resume: Optional[str] = None) -> str:
-    """Create and dispatch a regular kanban task."""
+    """Create and dispatch a regular kanban task.
+
+    ``goal`` and ``steps`` are capped here too (Evan, 2026-09-16).  A
+    dispatched task carries the same ``task_goal`` / ``task_steps`` columns
+    that ``_format_plan`` renders into the Protected region, so it grows the
+    context window exactly like a manual Plan does.  Measured on the live
+    board when only ``new`` was capped: 141 tasks over the 240-char limit,
+    including a ``ready`` one at 505 chars — i.e. work waiting to be picked
+    up that was already over budget.  Capping only ``new`` left the hole
+    that dispatch is the most common way work enters the board.
+    """
     if not project:
         return "ERROR: 'project' (board) is required for dispatch"
+
+    from hermes_cli.plan_limits import cap_steps, cap_text, step_count_error
+
+    over_limit = step_count_error(steps)
+    if over_limit:
+        return over_limit
+    goal = cap_text(goal)
+    steps = cap_steps(steps) if steps else steps
 
     kdb = _get_kanban_db(project)
     import uuid
@@ -688,8 +706,23 @@ def _cmd_cron(agent, cron: str, root: str, title: str, goal: str,
               steps: List[str], temp: Optional[str] = None,
               board: Optional[str] = None) -> str:
     """Schedule a recurring plan. Creates a cron template task (cron + root)
-    and registers a cron job that copies + dispatches it on each fire."""
+    and registers a cron job that copies + dispatches it on each fire.
+
+    ``goal`` and ``steps`` are capped at creation (Evan, 2026-09-16) for the
+    same reason as ``dispatch``: the template's text is copied into every
+    task the job fires, so an over-cap goal here is an over-cap goal repeated
+    on every tick.
+    """
     import uuid
+
+    from hermes_cli.plan_limits import cap_steps, cap_text, step_count_error
+
+    over_limit = step_count_error(steps)
+    if over_limit:
+        return over_limit
+    goal = cap_text(goal)
+    steps = cap_steps(steps)
+
     agent_name = _get_agent_name(agent)
     session_id = _get_session_id(agent)
     board_slug = _resolve_board(board)
