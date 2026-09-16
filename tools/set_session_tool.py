@@ -260,7 +260,9 @@ SET_SESSION_SCHEMA = {
         "Pass 'subject' to note a topic change (resets temperature to default "
         "if no explicit temperature given). "
         "Pass 'note' to persist a memorable observation to fabric. "
-        "Pass 'ego' to set your emotional state: one of [poor, low, normal, happy, loved]. "
+        "Pass 'ego' to set your emotional state: one of "
+        "[poor, low, normal, happy, loved], or a numeric delta in "
+        "[-1.0, 1.0] (clamped and rounded to the nearest 0.5). "
         "System computes deltas automatically."
     ),
     "parameters": {
