@@ -41,8 +41,19 @@ def _insert_request(
     board: Optional[str], kind: str, parent_task_id: Optional[str], pre_approved: bool,
     debug_plan_id: Optional[str],
 ) -> str:
-    """Create a blocked Plan and its pending durable authorization atomically."""
+    """Create a blocked Plan and its pending durable authorization atomically.
+
+    ``goal`` and ``steps`` are whitespace-compressed and head-capped here as
+    well as in the adapter (Evan, 2026-09-16): this is the durable write, so
+    a caller reaching the kernel directly gets the same bounded Plan rather
+    than only callers that entered through ``plan_tool``.  ``cap_text`` is
+    idempotent, so applying it twice is a no-op.
+    """
     from hermes_cli import plan_authorizations
+    from hermes_cli.plan_limits import cap_steps, cap_text
+
+    goal = cap_text(goal)
+    steps = cap_steps(steps)
 
     legacy = _legacy()
     now = int(time.time())
@@ -161,12 +172,22 @@ def _create_plan(
     """
     from hermes_cli import execution_bindings as bindings
     from hermes_cli.kanban_db import write_txn
+    from hermes_cli.plan_limits import cap_steps, cap_text, step_count_error
 
     if not title or not goal or not steps:
         return "ERROR: 'new' requires title, goal, and steps[]"
     kind = (kind or "normal").strip().lower()
     if kind not in {"normal", "debug"}:
         return "ERROR: 'kind' must be 'normal' or 'debug'"
+    over_limit = step_count_error(steps)
+    if over_limit:
+        return over_limit
+    # Bound the Plan at submission (Evan, 2026-09-16).  The Plan is the
+    # Protected region of the context window, so its size is a permanent
+    # per-turn cost; nothing previously capped it and a live goal reached
+    # 6,907 chars.  `_insert_request` re-applies these idempotently.
+    goal = cap_text(goal)
+    steps = cap_steps(steps)
     try:
         key = _identity(agent)
     except bindings.PlanStateUnavailable as exc:

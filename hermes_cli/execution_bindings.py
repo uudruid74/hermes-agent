@@ -207,7 +207,19 @@ def _set_step_summary(
     actor: str,
     now: int,
 ) -> None:
-    """Replace the stored summary for one Plan step."""
+    """Replace the stored summary for one Plan step.
+
+    The summary is whitespace-compressed and cut to its LAST
+    ``PLAN_TEXT_MAX_CHARS`` characters (Evan, 2026-09-16): the conclusion is
+    at the end of a summary, and the Plan is the Protected region, so an
+    uncapped summary grows the context window permanently.  This one function
+    is the choke point for every summary write — ``advance`` (claim and
+    proof paths), ``handoff``, and plan closure all route through it — so the
+    cap cannot be bypassed by taking a different command.
+    """
+    from hermes_cli.plan_limits import cap_summary
+
+    summary = cap_summary(summary)
     marker = f"[plan-step-summary:{step_no}] "
     row = conn.execute(
         "SELECT id FROM task_comments WHERE task_id = ? AND body LIKE ?",

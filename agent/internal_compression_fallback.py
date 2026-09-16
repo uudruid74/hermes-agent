@@ -14,6 +14,17 @@ from agent.model_metadata import estimate_messages_tokens_rough, estimate_tokens
 INTERNAL_FALLBACK_PREFIX = (
     "[CONTEXT WINDOW COMPRESSED]"
 )
+# The payload marker doubles as the "this is a compaction payload" test used
+# to prune re-ingested payloads out of the ranking region (Evan, 2026-09-16).
+_PAYLOAD_MARKER = INTERNAL_FALLBACK_PREFIX
+# Wrapper prefixes that identify a persisted compaction payload.  Both forms
+# are present on the live Ornith transcript; the LLM-summarizer variant is a
+# PREFIX constant, not one of the line-anchored ``_BOILERPLATE_RES`` patterns,
+# precisely so it can be tested at position 0.
+_PAYLOAD_MARKERS = (
+    _PAYLOAD_MARKER,
+    "[PRIOR CONTEXT",
+)
 VERBATIM_CONTEXT_MARKER = (
     "## Verbatim Recent Context\n"
     "The messages after this summary marker are preserved verbatim."
@@ -157,6 +168,19 @@ _BOILERPLATE_RES = (
     re.compile(r"\[System note:[^\]]*\]", re.IGNORECASE),
     re.compile(r"\[OUT-OF-BAND USER MESSAGE[^\]]*\]", re.IGNORECASE),
     re.compile(r"\[/OUT-OF-BAND USER MESSAGE\]", re.IGNORECASE),
+)
+# The Plan tool's own result markers (Evan, 2026-09-16).  The newest one in
+# the compressed region is the Heap boundary: everything before it belongs to
+# a step that is already complete, so ranking it spends the budget on noise
+# for the step the agent is actually working.  Verified against a live Ornith
+# session (24,926 rows): ``Complete Step`` 80 hits, ``>>> STEP n`` 9,
+# ``Active Step n of m`` 16.
+_PLAN_STEP_CHANGE_RE = re.compile(
+    r"(?:"
+    r"Complete Step \d+"
+    r"|>>>\s*STEP\s+\d+"
+    r"|Active Step \d+ of \d+"
+    r")"
 )
 # ``[ROLE]: `` prefixes stack ("[USER]: [USER]: [ASSISTANT]: ") when payloads
 # are re-ingested, and repeats can sit mid-text after newlines collapsed to
@@ -421,6 +445,52 @@ def _is_observation(message: dict[str, Any]) -> bool:
     return message.get("role") == "tool"
 
 
+def _prune_reingested_payload(text: str, *, is_newest: bool = False) -> str:
+    """Reduce a re-ingested compaction payload to nothing worth ranking.
+
+    Evan, 2026-09-16: *"that is a hermes compression output format. That isn't
+    supposed to be there. That is for LLMs"* … *"we need to regex prune those
+    results when they hit mid-window."*
+
+    A payload is the API wire format for one compaction, but it is persisted
+    as a real transcript message, so on the next cycle it sits in the middle
+    and is ranked like history.  Measured on the live Ornith session: 37 such
+    rows, the newest 18,720 chars (~4,680 tokens, 5.8% of an 80,128 window),
+    with 14 consecutive payload pairs re-selecting 98–99% of the previous one
+    into the next.
+
+    Every section of a payload is regenerated each cycle rather than
+    accumulated — the Plan from the kanban DB, the heap by LexRank, the
+    verbatim tail by ``protect_last_n`` — so ranking it spends budget on a
+    copy of what the window already holds.  The body is therefore dropped
+    whole; ``_strip_boilerplate`` remains responsible for the wrapper lines on
+    genuine content.
+
+    ``is_newest`` is retained for callers that know a text is the payload being
+    assembled right now; ``_message_units`` does NOT use it, because that
+    payload is appended after compression and so is never inside the ranked
+    region.
+
+    Detection is a PREFIX test, not a substring search.  A payload is emitted
+    with the marker at position 0; a ``session_search`` result that merely
+    *quotes* a payload carries the marker mid-string and is ordinary content
+    that must still rank.  A substring test pruned that result to nothing —
+    caught by ``test_ordinary_content_is_untouched`` before it shipped.
+
+    Two wrapper forms exist on the live transcript and both are machinery:
+
+    * ``[CONTEXT WINDOW COMPRESSED]`` — the internal fallback payload (35 rows)
+    * ``[PRIOR CONTEXT — for reference only; not a new message]`` — the
+      LLM-summarizer payload (2 rows, role=assistant)
+    """
+    if is_newest:
+        return text
+    stripped = text.lstrip()
+    if any(stripped.startswith(marker) for marker in _PAYLOAD_MARKERS):
+        return ""
+    return text
+
+
 def _message_units(
     messages: list[dict[str, Any]],
     start_index: int = 0,
@@ -433,13 +503,23 @@ def _message_units(
     cannot misalign the emitted summary against the transcript.  Observations
     are skipped by default: they must never be lexrank-injected into the
     compressed middle, nor bias the relevance centroid.
+
+    Re-ingested compaction payloads are pruned here (Evan, 2026-09-16).
+
+    There is deliberately NO positional exemption.  An earlier version exempted
+    the newest message on the theory that it might be the payload under
+    construction — but that payload is appended AFTER compression, so it is
+    never inside the region being ranked, and the exemption was slice-relative
+    (a payload was wrongly exempted whenever it happened to land last in the
+    slice passed in).  Every payload inside the transcript is historical.
     """
     units: list[_Unit] = []
     for message_offset, message in enumerate(messages):
         if not include_observations and _is_observation(message):
             continue
         role = str(message.get("role") or "unknown").upper()
-        for unit_offset, chunk in enumerate(_chunks(_content_text(message.get("content")))):
+        content = _prune_reingested_payload(_content_text(message.get("content")))
+        for unit_offset, chunk in enumerate(_chunks(content)):
             text = f"[{role}]: {chunk}"
             units.append(
                 _Unit(
@@ -934,7 +1014,14 @@ def _mmr_order(
 
 
 def _with_lexrank_section(summary: str, selected: list[_Unit]) -> str:
-    """Insert a ``## Relevant Earlier Context`` block above the verbatim marker."""
+    """Append the heap block below the Plan, above the verbatim marker.
+
+    Plan first, heap second (Evan, 2026-09-16) — *"Plan should be first"*.  The
+    Plan holds the long-term goals and the step list and is byte-stable
+    between step changes, so it rides the prompt cache; the heap is
+    re-selected every cycle and has no such claim.  Ordering is therefore
+    load-bearing, not cosmetic.
+    """
     if not selected:
         return summary
     block = "\n\n".join(
@@ -947,6 +1034,37 @@ def _with_lexrank_section(summary: str, selected: list[_Unit]) -> str:
         head, _, rest = summary.partition(VERBATIM_CONTEXT_MARKER)
         return head.rstrip() + "\n\n" + block + "\n\n" + VERBATIM_CONTEXT_MARKER + rest
     return summary.rstrip() + "\n\n" + block
+
+
+def _plan_step_change_index(
+    messages: list[dict[str, Any]], start: int, end: int
+) -> int:
+    """Index of the newest Plan step-change marker in ``messages[start:end]``.
+
+    Evan, 2026-09-16: *"If there is an active plan, scan for those markers it
+    leaves and only rank from that point forward. Everything before the step
+    change is noise."*  Content belonging to completed steps is not context
+    for the current step, and ranking it is what let a payload re-select
+    itself into the next cycle.
+
+    The three markers are the plan tool's own results — they are already in
+    the transcript and nothing new is written to produce them:
+
+    * ``Complete Step 3: <next step>``  — ``advance`` moving the step
+    * ``>>> STEP 3: <step> <<<``        — ``remind`` / approval output
+    * ``Active Step 3 of 9: ...``       — ``remind`` on a resumed Plan
+
+    Returns ``start`` when no marker is present (nothing to bound — rank the
+    whole region, which is the pre-existing behaviour).
+    """
+    boundary = start
+    for index in range(start, end):
+        content = messages[index].get("content")
+        if not isinstance(content, str) or not content:
+            continue
+        if _PLAN_STEP_CHANGE_RE.search(content):
+            boundary = index
+    return boundary
 
 
 def _add_plan_lexrank_area(
@@ -974,10 +1092,15 @@ def _add_plan_lexrank_area(
 
     Returns ``(summary, tail_start)``; the tail start never moves backwards.
     """
-    middle_messages = messages[head_count:tail_start]
+    # Heap boundary (Evan, 2026-09-16): rank only from the newest Plan
+    # step-change marker forward.  Content before it belongs to completed
+    # steps and is noise for the step being worked.  With no marker the
+    # boundary is ``head_count`` and the whole middle ranks, as before.
+    rank_start = _plan_step_change_index(messages, head_count, tail_start)
+    middle_messages = messages[rank_start:tail_start]
     if not middle_messages:
         return summary, tail_start
-    middle_units = _message_units(middle_messages, start_index=head_count)
+    middle_units = _message_units(middle_messages, start_index=rank_start)
     marker_notes = {note for note in notes if _PRUNED_SKILL_RE.fullmatch(note)}
     if marker_notes:
         middle_units = [
@@ -1119,8 +1242,15 @@ def build_internal_fallback(
             "plan-minimal",
         )
 
-    middle_messages = messages[head_count:tail_start]
-    middle_units = _message_units(middle_messages, start_index=head_count)
+    # Same Heap boundary as the Plan path (Evan, 2026-09-16).  The rule is
+    # "IF there is an active plan" — but a Plan that has just closed still
+    # leaves its markers in the transcript, and content belonging to completed
+    # steps is noise for the current step either way.  Applying it on both
+    # paths also keeps the two selectors interchangeable, which the shared
+    # `_rank_units` contract already assumes.
+    rank_start = _plan_step_change_index(messages, head_count, tail_start)
+    middle_messages = messages[rank_start:tail_start]
+    middle_units = _message_units(middle_messages, start_index=rank_start)
     marker_notes = {note for note in notes if _PRUNED_SKILL_RE.fullmatch(note)}
     if marker_notes:
         middle_units = [

@@ -243,14 +243,47 @@ def test_findings_are_not_mistaken_for_narration() -> None:
     assert any("what I found" in t for t in texts)
 
 
-def test_message_units_emits_stripped_text() -> None:
+def test_message_units_prunes_a_real_payload_whole() -> None:
+    """A payload whose marker is at position 0 is machinery, not content.
+
+    SUPERSEDES the previous assertion that "[CONTEXT WINDOW COMPRESSED] keep
+    this line" yields a rankable unit.  Evan, 2026-09-16: *"that is a hermes
+    compression output format. That isn't supposed to be there"* … *"we need
+    to regex prune those results when they hit mid-window."*  Every section of
+    a payload is regenerated each cycle (Plan from the kanban DB, heap by
+    LexRank, tail by protect_last_n), so ranking its body spends the budget on
+    a copy of what the window already holds — measured at 98-99% self-copy
+    across 14 consecutive payload pairs on the live Ornith session.
+    """
     messages = [
-        {"role": "user", "content": "[CONTEXT WINDOW COMPRESSED] keep this line"},
+        {"role": "user", "content": "[CONTEXT WINDOW COMPRESSED]  ## Relevant Earlier Context"},
+        {"role": "assistant", "content": "## Verbatim Recent Context"},
+    ]
+    units = _message_units(messages)
+    assert not any("CONTEXT WINDOW COMPRESSED" in u.text for u in units)
+    # The non-payload second message still strips its wrapper heading.
+    assert not any("Verbatim Recent Context" in u.text for u in units)
+
+
+def test_message_units_still_emits_content_that_merely_quotes_a_marker() -> None:
+    """The body of genuine content survives; only payload PREFIXES are pruned.
+
+    A session_search result that quotes a payload carries the marker
+    mid-string.  That is ordinary content and must still rank — this is the
+    case a naive substring test got wrong.  Note the role: a ``tool`` message
+    is already excluded as an observation, so the quoting case only matters
+    for roles that DO reach the ranker.
+    """
+    messages = [
+        {
+            "role": "user",
+            "content": 'Quoted from an earlier session: "[CONTEXT WINDOW COMPRESSED] ..." and keep this line',
+        },
         {"role": "assistant", "content": "## Verbatim Recent Context"},
     ]
     units = _message_units(messages)
     assert any("keep this line" in u.text for u in units)
-    assert all("CONTEXT WINDOW COMPRESSED" not in u.text for u in units)
+    assert not any("Verbatim Recent Context" in u.text for u in units)
 
 
 # --- Repeat gate (Evan, 2026-09-15) --------------------------------------
