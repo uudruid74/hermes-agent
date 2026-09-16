@@ -7,13 +7,16 @@ the section headers, the ``--- END OF CONTEXT SUMMARY ---`` rule, and the
 in EVERY earlier payload.  Measured on a live 4,795-row session, the top two
 ranked "units" were pure wrapper.
 
-These tests pin the two properties that matter:
+These tests pin the properties that matter:
 
 1. Wrapper noise is stripped before chunking, and units that are *only*
    wrapper are dropped from the ranking entirely.
-2. Real content is never touched — the filter is narrow by construction,
-   so ordinary text (including repeated-but-real lines and contentless
-   filler that carries no wrapper) is left exactly as it was.
+2. Near-duplicate units collapse on their content-word canonical form, and
+   units too short to carry context never reach the ranking (Evan,
+   2026-09-15 — the emitted area was 59% fragments under 10 content tokens).
+3. Real content survives: a unit that clears the floor is left exactly as it
+   was, and a transcript made only of short lines still ranks something
+   rather than emptying the block.
 """
 
 from __future__ import annotations
@@ -147,20 +150,97 @@ def test_boilerplate_units_never_reach_the_ranking() -> None:
 def test_duplicate_wrapper_units_are_collapsed() -> None:
     # The same plan line arrives twice because two payloads were re-ingested.
     dup = "[USER]: ## Active Plan Step 3: Rewrite the tell path around play."
-    middle = [_unit(dup, 0), _unit(dup, 1), _unit("[ASSISTANT]: unrelated note", 2)]
+    middle = [
+        _unit(dup, 0),
+        _unit(dup, 1),
+        _unit("[ASSISTANT]: unrelated note about the sessions index", 2),
+    ]
     ranked = _rank_units(middle, [], [])
     texts = [unit.text for unit, _ in ranked]
     assert sum(1 for t in texts if "Rewrite the tell path" in t) == 1
     assert any("unrelated note" in t for t in texts)
 
 
-def test_repeated_real_lines_are_not_deduped() -> None:
-    # Repeated-but-real lines carry no wrapper, so they must all survive:
-    # dedupe is scoped to re-ingested wrapper text only.
-    line = "[USER]: Retrying the same failing command"
+def test_repeated_real_lines_are_deduped() -> None:
+    # Evan, 2026-09-15: dedupe is NOT scoped to wrapper text.  Near-duplicate
+    # real lines were filling the emitted area — the top of the ranking was a
+    # clique of step echoes that reinforced each other's centrality — so the
+    # canonical form (content words, function words dropped) collapses them.
+    line = "[USER]: Retrying the same failing migration command now"
     middle = [_unit(line, 0), _unit(line, 1)]
     ranked = _rank_units(middle, [], [])
-    assert len([u for u, _ in ranked if "Retrying" in u.text]) == 2
+    assert len([u for u, _ in ranked if "Retrying" in u.text]) == 1
+
+
+def test_canonical_form_ignores_word_order_and_function_words() -> None:
+    # Two re-quoted wordings of one line carry the same information, so the
+    # canonical form compares content words as a set.
+    first = "[USER]: The delete of create/join must not happen in production"
+    second = "[USER]: in production must not happen the delete of create/join"
+    ranked = _rank_units([_unit(first, 0), _unit(second, 1)], [], [])
+    assert len([u for u, _ in ranked if "delete" in u.text]) == 1
+
+
+def test_short_stub_units_are_not_ranked() -> None:
+    # Measured: 59% of the emitted area was under 10 content tokens, and
+    # "Step 5/9" (1 content token) was occupying the top of the ranking.
+    middle = [
+        _unit("[USER]: Step 5/9", 0),
+        _unit("[USER]: pente_games has exactly eleven columns defined", 1),
+    ]
+    ranked = _rank_units(middle, [], [])
+    texts = [unit.text for unit, _ in ranked]
+    assert any("eleven columns" in t for t in texts)
+    assert not any("Step 5/9" in t for t in texts)
+
+
+def test_all_short_transcript_still_ranks_something() -> None:
+    # A floor must not be able to empty the area: an empty block is worse than
+    # a weak one, since the caller has no other middle context to fall back on.
+    middle = [_unit("[USER]: step one", 0), _unit("[USER]: step two", 1)]
+    ranked = _rank_units(middle, [], [])
+    assert len(ranked) == 2
+
+
+def test_agent_narration_is_dropped() -> None:
+    # Evan, 2026-09-15: narration chatter was 59.7% of the emitted area in
+    # 17/17 payloads.  Throw it out rather than rank it.
+    middle = [
+        _unit("[ASSISTANT]: Let me check the real current state of the code:", 0),
+        _unit("[ASSISTANT]: Now let me see the `create()` tell branch", 1),
+        _unit("[ASSISTANT]: The DB schema has 11 columns in pente_games", 2),
+    ]
+    ranked = _rank_units(middle, [], [])
+    texts = [unit.text for unit, _ in ranked]
+    assert not any("Let me check" in t for t in texts)
+    assert not any("let me see" in t.lower() for t in texts)
+    assert any("11 columns" in t for t in texts)
+
+
+def test_user_requests_are_never_treated_as_narration() -> None:
+    # "Let me know when it's done" is the user asking for something; only the
+    # assistant's own "let me do X" lines are chatter.  Role decides it.
+    middle = [
+        _unit("[USER]: Let me know when the migration is done and verified", 0),
+        _unit("[USER]: Implement the fixes, in order, then work on step 6", 1),
+    ]
+    ranked = _rank_units(middle, [], [])
+    texts = [unit.text for unit, _ in ranked]
+    assert any("Let me know" in t for t in texts)
+    assert any("Implement the fixes" in t for t in texts)
+
+
+def test_findings_are_not_mistaken_for_narration() -> None:
+    # A finding that happens to start with a narration-ish word must survive.
+    middle = [
+        _unit("[ASSISTANT]: Looking at the traceback, line 42 raises KeyError", 0),
+        _unit("[ASSISTANT]: Here is what I found: the sessions schema is wrong", 1),
+        _unit("[ASSISTANT]: The leaderboard table stores agents, wins and losses", 2),
+    ]
+    ranked = _rank_units(middle, [], [])
+    texts = [unit.text for unit, _ in ranked]
+    assert any("Looking at the traceback" in t for t in texts)
+    assert any("what I found" in t for t in texts)
 
 
 def test_message_units_emits_stripped_text() -> None:

@@ -41,6 +41,87 @@ _ASSEMBLY_RESERVE_TOKENS = 24
 # Minimum content tokens a unit must retain after boilerplate stripping to
 # stay rankable.  A unit made only of wrapper text carries no context.
 _MIN_UNIT_TOKENS = 2
+# Minimum content tokens for a unit to be worth ranking at all (Evan,
+# 2026-09-15).  Measured on 22 real payloads: the emitted area's median unit
+# was 8 content tokens and 59% were under 10, so the budget was spent on
+# eight-word stubs.  Cosine also saturates on degenerate short units — a
+# 2-token unit whose tokens both appear in the recent tail scores a perfect
+# relevance — which filled the top of the ranking with trivia.
+#
+# Swept 0..12 on the real payloads: the lexical proxy keeps rising with the
+# floor, but that is partly the same length bias the metric has, so this is
+# set by principle instead — low enough to keep a genuinely short but real
+# line ("SQLite migration needs a sessions index", 5 content tokens), high
+# enough to drop the stubs that were occupying the top of the ranking
+# ("Step 5/9" 1 token, "Do NOT delete create/join" 3).
+# Notes and pruned-skill markers are exempt (see _rank_units).
+_MIN_RANKABLE_TOKENS = 5
+# MMR redundancy penalty (Evan, 2026-09-15).  Selection was pure greedy
+# top-N, so the budget collapsed onto a near-duplicate clique: the emitted
+# set was more internally redundant than a random pick in 21/21 payloads and
+# covered half the distinct content tokens (394 vs 751).  Each unit is now
+# penalised by its similarity to what is already chosen, so the budget buys
+# distinct ground instead of the same line eight times.
+_MMR_LAMBDA = 0.7
+# Self-narration / planning chatter ("Let me check…", "I'll start by…",
+# "Okay, so…") — Evan, 2026-09-15: throw these out with a regex.
+#
+# Measured after dedupe+floor+MMR: these templates were 59.7% of the emitted
+# area in 17/17 payloads, the same recurring-template failure as the
+# compaction wrapper.  They could not be deduped against each other, because
+# the tail differs every time ("let me check the code" vs "let me read the
+# bodies").
+#
+# Coverage check before deleting (Evan asked): across 8,043 narration units,
+# 52.2% were 100% covered by surviving units + the verbatim tail + plan text,
+# 85.4% were >=80% covered, median 100%.  The words unique to dropped lines
+# are verbs of intent — examine, inventory, assess, locate, systematically —
+# never facts.  Nothing durable is lost.
+#
+# Deliberately broad across model dialects: Claude ("Let me start by", "My
+# plan is"), GPT ("To do this,", "First, I'll"), DeepSeek ("Now I'll"),
+# assistant small talk ("Okay so", "Sure,", "Great,", "Hmm").  All openers
+# are role-gated in `_is_narration`, so a USER line is never dropped — "Let
+# me know when it's done" is a request, not narration.
+_NARRATION_OPENER_RE = re.compile(
+    r"(?i)^\s*"
+    # optional filler/small-talk lead-in
+    r"(?:(?:now|next|then|first|second|third|finally|so|ok|okay|good|great|"
+    r"perfect|right|alright|sure|certainly|yes|no|hmm+|wait|actually|"
+    r"and|but|also|well|let's\s+see)\b[\s,.:;-]*)*"
+    r"(?:"
+    # intent / self-narration.  Only phrasings that announce a NEXT ACTION
+    # are listed.  Bare "looking at…" / "checking…" / "here's what I found"
+    # are deliberately absent: they usually carry the finding itself
+    # ("Looking at the traceback, line 42 raises KeyError"), and dropping a
+    # real finding costs far more than keeping a line of chatter.
+    r"let\s+me|let\s+us|let's|"
+    r"i'?ll|i\s+will|i'?m\s+(?:going|gonna)\s+to|i\s+am\s+going\s+to|"
+    r"i\s+(?:need|should|want|have|must|can|could)\s+to|"
+    r"i'?m\s+(?:now\s+)?(?:checking|looking|reading|running|going|starting|"
+    r"applying|verifying|inspecting|examining|investigating)|"
+    r"my\s+(?:plan|approach|next\s+step)\s+is|"
+    r"(?:now\s+)?(?:i'?ll\s+)?(?:start|begin|proceed)\s+by|"
+    r"(?:to\s+do\s+this|for\s+this|to\s+start|to\s+begin)\s*[,:]"
+    r")"
+    r"(?:\b|$)"
+)
+_ROLE_ONLY_RE = re.compile(r"^\[([A-Z_]{2,12})\]:")
+
+
+def _is_narration(text: str) -> bool:
+    """True for an agent's own "let me do X" line — never for a user request.
+
+    "Let me check the real current state of the code" is the assistant
+    narrating its next tool call; "Let me know when it's done" is the user
+    asking for something.  Both start with "let me", so the opener alone
+    cannot decide it — the role has to.  Only assistant/system lines are
+    demoted; anything said by the user is context and ranks normally.
+    """
+    role_match = _ROLE_ONLY_RE.match(text)
+    if role_match and role_match.group(1) != "ASSISTANT":
+        return False
+    return bool(_NARRATION_OPENER_RE.match(_strip_boilerplate(text)))
 # Boilerplate carries no context but repeats in EVERY previous payload, so
 # LexRank's centrality term ranks it top — measured on a real 4,795-row
 # session, the two highest-scoring "units" were the compaction wrapper and
@@ -224,6 +305,61 @@ def _is_boilerplate_only(text: str) -> bool:
         return False
     cleaned = _strip_boilerplate(text)
     return len(_TOKEN_RE.findall(cleaned.casefold())) < _MIN_UNIT_TOKENS
+
+
+# Canonical-form stopwords (Evan, 2026-09-15).  Two units that differ only in
+# function words carry the same information, so dedupe must compare them on
+# content words alone.
+_STOPWORDS = frozenset(
+    """
+    a an and are as at be been but by can could did do does for from had has
+    have he her him his how i if in into is it its me my no nor not of on or
+    our out over own should so some such than that the their them then there
+    these they this those to too us was we were what when where which who
+    whom why will with would you your yours
+    """.split()
+)
+
+
+def _canonical_form(text: str) -> str:
+    """Content-word canonical form of a unit, for near-duplicate detection.
+
+    Drops boilerplate and function words and orders the surviving content
+    words, so ``Step 6: implement undo`` and ``6. Step — undo, implement it``
+    collapse to the same key.  Word *order* is discarded on purpose: the
+    near-duplicates this is built for are re-quoted re-wordings of one line,
+    not re-orderings that change meaning.
+    """
+    cleaned = _strip_boilerplate(text).casefold()
+    tokens = [
+        token
+        for token in _TOKEN_RE.findall(cleaned)
+        if token not in _STOPWORDS and not token.isdigit()
+    ]
+    if len(tokens) < 2:
+        # Too little survives to distinguish anything: fall back to the exact
+        # token sequence so genuinely different stubs do not collide.
+        return " ".join(_TOKEN_RE.findall(cleaned))
+    return " ".join(sorted(set(tokens)))
+
+
+def _content_token_count(text: str) -> int:
+    """How many content tokens a unit carries (its real information mass)."""
+    return len(_content_tokens(text))
+
+
+def _content_tokens(text: str) -> frozenset[str]:
+    """Content-word token set of a unit, for similarity comparisons.
+
+    Function words are dropped; digits are KEPT.  A bare number is often the
+    whole payload of a line ("11 columns", "v2", "step 5"), so discarding
+    digits under-counts real content and over-triggers the length floor.
+    """
+    return frozenset(
+        token
+        for token in _TOKEN_RE.findall(_strip_boilerplate(text).casefold())
+        if token not in _STOPWORDS
+    )
 
 
 def _chunks(text: str) -> list[str]:
@@ -610,25 +746,63 @@ def _rank_units(
     if not candidates:
         return []
 
-    # Drop wrapper-only units and collapse repeats.  Re-ingested payloads
-    # carry the same plan/summary lines forward verbatim, so without this
-    # the selector spends budget emitting the same line three times and
-    # LexRank rewards the duplication as centrality (Evan, 2026-09-15).
+    # Drop unusable units and collapse near-duplicates (Evan, 2026-09-15).
+    #
+    # Dedupe runs on the CONTENT-WORD canonical form, not on raw text: the
+    # emitted area was filling with re-quoted re-wordings of one line
+    # ("Step 8: Leaderboard via `list`" appearing twice, "Do NOT delete
+    # create/join" and "Do NOT delete create/join/move/watch" side by side),
+    # each of which scored high on all three signals because near-identical
+    # units reinforce each other's centrality.  Comparing function-word-
+    # stripped, order-normalised forms catches those; comparing raw text did
+    # not.
+    #
+    # An earlier version gated this on `_has_wrapper_marker`, so plain
+    # duplicates that never carried a wrapper were kept and only wrapper text
+    # was ever collapsed.  That was the bug.
     deduped: list[_Unit] = []
     seen_text: set[str] = set()
+    short: list[_Unit] = []
+    narration: list[_Unit] = []
     for unit in candidates:
         if _is_boilerplate_only(unit.text) or _is_fragment(unit.text):
             continue
-        if not _has_wrapper_marker(unit.text):
-            # Not wrapper text: never dedupe it, or repeated-but-real lines
-            # (progress logs, step echoes) would silently disappear.
-            deduped.append(unit)
-            continue
-        key = re.sub(r"\W+", " ", _strip_boilerplate(unit.text).casefold()).strip()
-        if not key or key in seen_text:
-            continue
-        seen_text.add(key)
+        # Notes and pruned-skill reload markers are protected content: they
+        # are short by nature ("Critical deployment note: never restart the
+        # database automatically.") and were never the junk this filter
+        # targets.  A length floor applied to them empties the emitted block
+        # and takes the whole fallback down with it.
+        protected = unit.is_note or bool(_PRUNED_SKILL_RE.search(unit.text))
+        if not protected:
+            if _is_narration(unit.text):
+                # "Let me check the code" / "Now let me see the bodies".
+                # Evan, 2026-09-15: throw these out, do not just demote them.
+                # They were 59.7% of the emitted area in 17/17 payloads — the
+                # same recurring-template failure as the compaction wrapper,
+                # and the reason the area scored like a random draw.  Held
+                # back rather than discarded outright so a transcript made
+                # only of narration still emits something (see below).
+                narration.append(unit)
+                continue
+            if _content_token_count(unit.text) < _MIN_RANKABLE_TOKENS:
+                # Too short to carry context, and short units inflate cosine.
+                # Held back rather than discarded: see the fallback below.
+                short.append(unit)
+                continue
+            key = _canonical_form(unit.text)
+            if not key or key in seen_text:
+                continue
+            seen_text.add(key)
         deduped.append(unit)
+    if not deduped and short:
+        # Every candidate was below the floor.  An empty area is worse than a
+        # weak one — the caller has no other middle context to fall back on —
+        # so on a transcript that is nothing but short lines, keep them.
+        deduped = short
+    if not deduped and narration:
+        # Same reasoning for a transcript that is nothing but agent
+        # narration: narration is poor context, but it beats an empty block.
+        deduped = narration
     candidates = deduped
     if not candidates:
         return []
@@ -667,10 +841,65 @@ def _rank_units(
             score = 1.25 + 0.4 * relevant
         scores.append(score)
 
-    return sorted(
+    ordered = sorted(
         zip(candidates, scores),
         key=lambda item: (-item[1], item[0].order),
     )[:_MAX_CANDIDATE_UNITS]
+    return _mmr_order(ordered)
+
+
+def _mmr_order(
+    ranked: list[tuple[_Unit, float]],
+    *,
+    lam: float = _MMR_LAMBDA,
+) -> list[tuple[_Unit, float]]:
+    """Re-order a ranked list so redundant near-duplicates are pushed down.
+
+    Maximal Marginal Relevance over the ranked candidates.  Both call sites
+    select greedily from the top of this list until the token budget is
+    spent, so the ORDER *is* the selection policy — pure score order spent
+    the budget on a near-duplicate clique (measured: more internally
+    redundant than a random pick in 21/21 payloads, half the distinct
+    content tokens).
+
+    Each step picks the candidate maximising ``score - lam * max_similarity``
+    against everything already picked, where similarity is the Jaccard
+    overlap of content-word sets.  O(n^2) on <=256 candidates.
+
+    The returned scores are the original ranking scores, unchanged: this
+    decides order, not value, so callers that only read the score are
+    unaffected.
+    """
+    if len(ranked) < 2 or lam <= 0:
+        return ranked
+
+    remaining = list(ranked)
+    token_sets = {id(unit): _content_tokens(unit.text) for unit, _score in remaining}
+    chosen: list[tuple[_Unit, float]] = []
+    picked_tokens: list[frozenset[str]] = []
+
+    while remaining:
+        best_index = 0
+        best_value = float("-inf")
+        for index, (unit, score) in enumerate(remaining):
+            tokens = token_sets[id(unit)]
+            overlap = 0.0
+            if tokens and picked_tokens:
+                for previous in picked_tokens:
+                    union = len(tokens | previous)
+                    if union:
+                        similarity = len(tokens & previous) / union
+                        if similarity > overlap:
+                            overlap = similarity
+            value = score - lam * overlap
+            if value > best_value:
+                best_value = value
+                best_index = index
+        unit, score = remaining.pop(best_index)
+        chosen.append((unit, score))
+        picked_tokens.append(token_sets[id(unit)])
+
+    return chosen
 
 
 def _with_lexrank_section(summary: str, selected: list[_Unit]) -> str:

@@ -282,7 +282,11 @@ def test_restart_fossil_is_folded_into_internal_fallback_state():
     msgs += [
         {
             "role": "user" if idx % 2 else "assistant",
-            "content": f"filler {idx}",
+            # Long enough to clear the rankable-content floor (Evan,
+            # 2026-09-15): the assertion below checks that middle content is
+            # carried into the fallback, so the fixture must be real content,
+            # not two-token filler that the floor now drops by design.
+            "content": f"filler {idx}: migrating the sessions table needs care",
         }
         for idx in range(1, 6)
     ]
