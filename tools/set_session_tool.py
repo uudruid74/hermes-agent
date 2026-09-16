@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""
-Session Metadata Tool — set session-level state.
+"""Session Metadata Tool — set session-level state.
 
 Arguments (all optional):
     subject: str       — topic change; resets temperature to default if no temp arg
     note: str          — memorable observation → fabric_write
     temperature: float — set session temperature (0.0–2.0)
-    ego: str           — one of [poor, low, normal, happy, loved]
+    ego: str|float     — one of [poor, low, normal, happy, loved] or a numeric delta in [-1.0, 1.0]
                          (deltas computed by system, reason goes to note)
 """
 
@@ -29,14 +28,34 @@ _EGO_DELTA = {
 _EGO_PARSE_RE = re.compile(r"^\s*(poor|low|normal|happy|loved)\s*$", re.IGNORECASE)
 
 
-def _parse_ego(raw: str) -> Optional[tuple[str, float]]:
-    """Parse an ego tagword into (word_lower, delta). Returns None if no match."""
-    m = _EGO_PARSE_RE.match(raw.strip())
-    if not m:
-        return None
-    word = m.group(1).lower()
-    delta = _EGO_DELTA.get(word, 0.0)
-    return word, delta
+def _parse_ego(raw) -> Optional[tuple[str, float]]:
+    """Parse an ego tagword or numeric delta into (word_lower, delta).
+    If raw is a string, it must be one of the ego words.
+    If raw is a number, it is clamped to [-1.0, 1.0] and rounded to the nearest 0.5,
+    then mapped to the corresponding ego word.
+    Returns None if the string is not a recognized ego word.
+    """
+    # Handle numeric input: treat as delta
+    if isinstance(raw, (int, float)):
+        # Clamp to [-1.0, 1.0]
+        delta = max(-1.0, min(1.0, float(raw)))
+        # Round to nearest 0.5
+        delta = round(delta * 2) / 2
+        # Map to word
+        for word, d in _EGO_DELTA.items():
+            if d == delta:
+                return word, delta
+        # Fallback (should not happen)
+        return "normal", 0.0
+    # Handle string input
+    if isinstance(raw, str):
+        m = _EGO_PARSE_RE.match(raw.strip())
+        if not m:
+            return None
+        word = m.group(1).lower()
+        delta = _EGO_DELTA.get(word, 0.0)
+        return word, delta
+    return None
 
 
 def _is_kimi_provider(agent) -> bool:
@@ -191,7 +210,7 @@ def set_session_tool(
                         agent_name_rating = "neo"
 
                 new_rating = db.update_agent_rating(agent_name_rating, delta)
-                db.set_agent_last_ego(agent_name_rating, ego)
+                db.set_agent_last_ego(agent_name_rating, word)
                 changes.append(f"rating: {new_rating:.1f} ({delta:+.1f})")
 
                 # Tag session for Telegram ego-tagging
@@ -262,8 +281,11 @@ SET_SESSION_SCHEMA = {
                 "description": "Set sampling temperature (0.0=deterministic, 1.0=balanced, 2.0=creative)."
             },
             "ego": {
-                "type": "string",
-                "description": "Emotional state: one of [poor, low, normal, happy, loved]. System computes deltas."
+                "oneOf": [
+                    {"type": "string"},
+                    {"type": "number"}
+                ],
+                "description": "Emotional state: one of [poor, low, normal, happy, loved] or a numeric delta in [-1.0, 1.0]. System computes deltas."
             },
         },
     },
