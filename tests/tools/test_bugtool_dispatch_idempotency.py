@@ -87,12 +87,21 @@ def test_dispatch_ignores_live_task_reference(monkeypatch, tmp_path):
     assert created == ["t_created1"]
 
 
-def test_check_ignores_live_task_reference(monkeypatch, tmp_path):
+def test_check_and_dispatch_ignores_live_task_reference(monkeypatch, tmp_path):
+    """SUPERSEDES test_check_ignores_live_task_reference (bare `check` sweep).
+
+    Intent is unchanged and still worth guarding: a hand-written *reference* to
+    a live task must not block this bug from getting its own task
+    (#3df9b2c04). Only the entry point moved -- the sweep is gone, approval is
+    now Evan-only and scoped to one file.
+    """
     bugtool, projects_root, _state_root = load_bugtool(monkeypatch, tmp_path)
-    write_pending_bug(projects_root, bug_text_with_task_reference())
+    path = write_pending_bug(projects_root, bug_text_with_task_reference())
     created = mock_kanban(monkeypatch, bugtool)
 
-    bugtool.cmd_check(argparse.Namespace())
+    bugtool.cmd_check_and_dispatch(
+        argparse.Namespace(file=str(path), i_am_evan=True)
+    )
 
     assert created == ["t_created1"]
 
@@ -178,15 +187,18 @@ def test_create_task_uses_json_id_instead_of_body_task_id(monkeypatch, tmp_path)
     assert records[-1]["task_id"] == "t_created1"
 
 
-def test_concurrent_check_calls_create_one_task(monkeypatch, tmp_path):
+def test_concurrent_check_and_dispatch_calls_create_one_task(monkeypatch, tmp_path):
+    """SUPERSEDES test_concurrent_check_calls_create_one_task (bare `check`)."""
     bugtool, projects_root, _state_root = load_bugtool(monkeypatch, tmp_path)
-    write_pending_bug(projects_root)
+    path = write_pending_bug(projects_root)
     created = mock_kanban(monkeypatch, bugtool, create_delay=0.05)
     start = threading.Barrier(2)
 
     def check_once():
         start.wait()
-        bugtool.cmd_check(argparse.Namespace())
+        bugtool.cmd_check_and_dispatch(
+            argparse.Namespace(file=str(path), i_am_evan=True)
+        )
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         futures = [pool.submit(check_once) for _ in range(2)]
@@ -197,12 +209,14 @@ def test_concurrent_check_calls_create_one_task(monkeypatch, tmp_path):
 
 
 def test_markdown_revert_uses_dispatch_log_before_markdown_state(monkeypatch, tmp_path):
+    """SUPERSEDES test_markdown_revert_uses_dispatch_log_before_markdown_state."""
     bugtool, projects_root, state_root = load_bugtool(monkeypatch, tmp_path)
     original = complete_bug_text()
     path = write_pending_bug(projects_root, original)
     created = mock_kanban(monkeypatch, bugtool)
+    args = argparse.Namespace(file=str(path), i_am_evan=True)
 
-    bugtool.cmd_check(argparse.Namespace())
+    bugtool.cmd_check_and_dispatch(args)
     assert created == ["t_created1"]
     path.write_text(original, encoding="utf-8")
 
@@ -210,7 +224,7 @@ def test_markdown_revert_uses_dispatch_log_before_markdown_state(monkeypatch, tm
         raise AssertionError("dispatch log must be consulted before markdown task state")
 
     monkeypatch.setattr(bugtool, "live_task_ids", markdown_live_state_must_not_be_consulted)
-    bugtool.cmd_check(argparse.Namespace())
+    bugtool.cmd_check_and_dispatch(args)
 
     assert created == ["t_created1"]
     assert (state_root / "bugs-dispatched.log").is_file()

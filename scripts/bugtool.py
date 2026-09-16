@@ -43,7 +43,14 @@ SECTION_ALIASES = {
     "failure-reports": "Failure Reports",
     "failure reports": "Failure Reports",
     "resolution": "Resolution",
+    # Optional grouping metadata (2026-09-16, Evan): ONE task, MANY bugs. The
+    # primary bug gets its own task; its `## Related bugs` section lists the
+    # other bug files to fold into the SAME piece of work. This replaces the old
+    # multi-file `check` sweep, which created one task per bug.
+    "related-bugs": "Related bugs",
+    "related bugs": "Related bugs",
 }
+RELATED_SECTION = "Related bugs"
 
 
 @contextmanager
@@ -434,8 +441,12 @@ def set_bug_status(text: str, status: str) -> str:
 
 def task_body(path: Path, text: str, directive: Optional[str] = None) -> str:
     parts = [f"Bug file: {path}"]
-    for section in (*REQUIRED_SECTIONS, ASSIGNEE_SECTION, APPROVED_SECTION, "Failure Reports"):
+    for section in (*REQUIRED_SECTIONS, ASSIGNEE_SECTION, APPROVED_SECTION, RELATED_SECTION, "Failure Reports"):
         value = section_value(text, section)
+        if section == RELATED_SECTION and not value:
+            # Optional grouping metadata: omit the heading entirely when absent
+            # so every pre-existing bug body keeps its exact old shape.
+            continue
         parts.extend((f"## {section}", value or "(none)"))
     if directive:
         parts.extend(("## Redispatch directive", directive))
@@ -771,36 +782,60 @@ def cmd_dispatch(args: argparse.Namespace) -> None:
         print(f"nothing to dispatch for {path.name}: live task exists or already dispatched")
 
 
-def cmd_check(args: argparse.Namespace) -> None:
-    filename = getattr(args, "file", "") or ""
-    if filename:
-        path = bug_path(args.file)
-        with locked_root():
-            text = path.read_text(encoding="utf-8")
-            updated = replace_section(text, APPROVED_SECTION, "- [x] approved by Evan\n")
-            path.write_text(updated, encoding="utf-8")
-            created = maybe_dispatch_locked(path, updated)
-        print(f"approved {path}")
-        if not created and not is_dispatched_marker(updated, path):
+def cmd_check_and_dispatch(args: argparse.Namespace) -> None:
+    """Approve ONE bug (check its box) and dispatch it -- in a single step.
+
+    WRITES: this stamps the `## Approved to run` checkbox and creates a kanban
+    task. It is the deliberate approval action, not a status query. Reading bug
+    state is `bugtool list` / `bugtool search`, or just read the file; directory
+    (`pending/` vs `resolved/`) is the status.
+
+    Scoped to the ONE file named on the command line. The previous `check`
+    command additionally swept every pending bug and dispatched each
+    gate-complete one, so a single invocation could spawn several paid workers;
+    that sweep is gone. Grouping multiple bugs into one piece of work is now
+    expressed as data -- the primary bug's `## Related bugs` section -- and
+    travels as one task body.
+    """
+    if not getattr(args, "i_am_evan", False):
+        die(
+            "check-and-dispatch refuses to run without --i-am-evan.\n"
+            "This command writes an APPROVAL on Evan's behalf and dispatches a\n"
+            "worker. Agents: do not pass this flag. If a bug needs approval, ask\n"
+            "Evan -- he checks the box or runs this himself."
+        )
+    if not getattr(args, "file", ""):
+        die("check-and-dispatch requires a bug file (one bug per invocation)")
+
+    path = bug_path(args.file)
+    if path.parent.name != "pending":
+        print(f"nothing to dispatch for {path.name}: only pending/ bugs dispatch "
+              f"(this file is in {path.parent.name}/ — already resolved or archived)")
+        raise SystemExit(0)
+
+    with locked_root():
+        text = path.read_text(encoding="utf-8")
+        updated = replace_section(text, APPROVED_SECTION, "- [x] approved by Evan\n")
+        atomic_write_text(path, updated)
+        created = maybe_dispatch_locked(path, updated)
+
+    print(f"approved {path}")
+    if created:
+        print(f"dispatched {created} -> {path.name}")
+        related = section_value(updated, RELATED_SECTION)
+        if related:
+            print(f"related bugs folded into {created}:")
+            for line in related.splitlines():
+                if line.strip():
+                    print(f"  {line.strip()}")
+    else:
+        missing = missing_dispatch_fields(updated)
+        if missing:
+            print("dispatch blocked: missing/incomplete: " + "; ".join(missing))
+        elif is_dispatched_marker(updated, path):
+            print("nothing to dispatch: already dispatched")
+        else:
             print("dispatch deferred: a live task exists or four failures require manual redispatch")
-    for path in all_bug_files():
-        if path.parent.name != "pending":
-            continue
-        with locked_root():
-            fresh = path.read_text(encoding="utf-8")
-            identity = dispatch_identity(path, fresh, None)
-            if dispatch_is_recorded(identity):
-                record = latest_dispatch_record(identity)
-                task_id = record.get("task_id") if record else None
-                print(f"{path}: dispatched={task_id or 'reserved'} failures={failure_count(fresh)}/4")
-                continue
-            live = live_task_ids(fresh)
-            state = f"live={','.join(live) if live else 'none'} failures={failure_count(fresh)}/4"
-            print(f"{path}: {state}")
-            if required_complete(fresh) and failure_count(fresh) < 4:
-                maybe_dispatch_locked(path, fresh)
-            elif failure_count(fresh) >= 4:
-                print(f"manual redispatch required: {path}")
 
 
 def cmd_list(args: argparse.Namespace) -> None:
@@ -860,16 +895,33 @@ def parser() -> argparse.ArgumentParser:
     redispatch.add_argument("file")
     redispatch.add_argument("--directive", required=True)
     redispatch.set_defaults(func=cmd_redispatch)
-    dispatch = commands.add_parser("dispatch", help="gate-check one bug file and dispatch if approved")
+    dispatch = commands.add_parser(
+        "dispatch",
+        help="gate-check ONE bug file and dispatch it if Evan already approved it (read-only on approval state)",
+    )
     dispatch.add_argument("file")
     dispatch.set_defaults(func=cmd_dispatch)
-    check = commands.add_parser("check")
-    check.add_argument("file", nargs="?", default="")
-    check.set_defaults(func=cmd_check)
-    listing = commands.add_parser("list")
+    check = commands.add_parser(
+        "check-and-dispatch",
+        help=(
+            "WRITES: Evan-only. Checks the approval box on ONE bug AND dispatches it "
+            "(requires --i-am-evan). Agents must not run this — use `dispatch`, "
+            "`list`, `search`, or read the file."
+        ),
+    )
+    check.add_argument("file", nargs="?", default="",
+                       help="the ONE bug file to approve and dispatch")
+    check.add_argument("--i-am-evan", dest="i_am_evan", action="store_true",
+                       help="required confirmation that Evan is performing this approval himself")
+    check.set_defaults(func=cmd_check_and_dispatch)
+    listing = commands.add_parser(
+        "list", help="READ-ONLY: per-file status + failure counts (use this to inspect bug state)"
+    )
     listing.add_argument("project", nargs="?")
     listing.set_defaults(func=cmd_list)
-    search = commands.add_parser("search")
+    search = commands.add_parser(
+        "search", help="READ-ONLY: find bugs by content"
+    )
     search.add_argument("keywords", nargs="+")
     search.set_defaults(func=cmd_search)
     return root

@@ -96,7 +96,7 @@ def main() -> int:
                         print(f"  ERR  {path.name}: {exc}")
                     continue
                 # maybe_dispatch_locked is the single gate everything funnels
-                # through (cmd_check and cmd_dispatch both call it).
+                # through (the Evan-only cmd_check_and_dispatch and cmd_dispatch both call it).
                 before = len(created_attempts)
                 buf = io.StringIO()
                 try:
