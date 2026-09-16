@@ -55,6 +55,40 @@ def board(monkeypatch):
     conn.close()
 
 
+@pytest.fixture()
+def hermetic_cron(monkeypatch):
+    """Stop ``_cmd_cron`` from writing outside the test.
+
+    ``_cmd_cron`` has TWO real side effects beyond the board, and the first
+    version of these tests leaked both (4 orphaned 107-byte scripts in
+    ``~/.hermes/scripts/``, found by auditing the directory afterwards):
+
+    1. It writes a fire script to ``os.path.expanduser("~/.hermes/scripts")``
+       — a HARDCODED path with no injection point, so it cannot be redirected
+       by arguments.  This shims only ``expanduser`` back to the real
+       implementation for any other path.
+    2. It registers a real cron job via ``cron.jobs.create_job`` — which a test
+       must never do (a stray daily job silently dispatches work forever).
+    """
+    import cron.jobs as cron_jobs
+
+    tmp_scripts = tempfile.mkdtemp()
+    real_expanduser = os.path.expanduser
+
+    def _expanduser(path):
+        if str(path).startswith("~/.hermes/scripts"):
+            return os.path.join(tmp_scripts, os.path.basename(str(path)))
+        return real_expanduser(path)
+
+    monkeypatch.setattr(os.path, "expanduser", _expanduser)
+    monkeypatch.setattr(
+        cron_jobs,
+        "create_job",
+        lambda **kwargs: {"job_id": "test_job", "id": "test_job", **kwargs},
+    )
+    return tmp_scripts
+
+
 def _row(conn, title):
     return conn.execute(
         "SELECT task_goal, task_steps FROM tasks WHERE title = ? ORDER BY created_at DESC LIMIT 1",
@@ -92,7 +126,7 @@ def test_dispatch_refuses_more_than_twelve_steps(board):
     assert _row(conn, "too many") is None, "refused plan must not be created"
 
 
-def test_cron_caps_the_template(board):
+def test_cron_caps_the_template(board, hermetic_cron):
     """A cron template's text is copied into every task the job fires."""
     conn, plan_tool = board
     plan_tool._cmd_cron(
@@ -103,9 +137,13 @@ def test_cron_caps_the_template(board):
         pytest.skip("cron path unavailable in this environment")
     assert len(row["task_goal"]) == 240
     assert [len(s) for s in json.loads(row["task_steps"])] == [240]
+    # Proof the fixture held: the fire script went to the temp dir, not ~/.hermes
+    leaked = os.path.join(os.path.expanduser("~/.hermes/scripts"),
+                          "plan_cron_cron cap.py")
+    assert not os.path.exists(leaked)
 
 
-def test_cron_refuses_more_than_twelve_steps(board):
+def test_cron_refuses_more_than_twelve_steps(board, hermetic_cron):
     conn, plan_tool = board
     result = plan_tool._cmd_cron(
         None, "0 9 * * *", "/tmp", "cron too many", "g", ["s"] * 13
