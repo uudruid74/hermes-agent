@@ -251,3 +251,45 @@ def test_message_units_emits_stripped_text() -> None:
     units = _message_units(messages)
     assert any("keep this line" in u.text for u in units)
     assert all("CONTEXT WINDOW COMPRESSED" not in u.text for u in units)
+
+
+# --- Dax no-repeat rule (Evan, 2026-09-15) -------------------------------
+# Items scored over the whole session live at the very start of the window for
+# long-term caching; the heap area must not spend budget re-stating them (or
+# the verbatim tail, which is in the window already).
+
+
+def test_unit_covered_by_head_tier_is_a_repeat() -> None:
+    head = "the parser raises on empty input and the cache key is stale"
+    unit = "the parser raises on empty input"
+    assert fallback._heap_repeat_covered(unit, [fallback._content_tokens(head)]) is True
+
+
+def test_unit_carrying_new_information_is_not_a_repeat() -> None:
+    head = "the parser raises on empty input and the cache key is stale"
+    unit = "leaderboard reads through list and pente_leaderboard"
+    assert fallback._heap_repeat_covered(unit, [fallback._content_tokens(head)]) is False
+
+
+def test_unit_repeated_against_the_tail_tier_is_also_dropped() -> None:
+    head = fallback._content_tokens("unrelated head text")
+    tail = fallback._content_tokens("leaderboard reads through list")
+    assert fallback._heap_repeat_covered("leaderboard reads through list", [head, tail]) is True
+
+
+def test_empty_or_missing_tier_never_marks_a_repeat() -> None:
+    assert fallback._heap_repeat_covered("anything at all", [frozenset()]) is False
+    assert fallback._heap_repeat_covered("anything at all", []) is False
+
+
+def test_empty_unit_is_never_a_repeat() -> None:
+    assert fallback._heap_repeat_covered("", [fallback._content_tokens("some head text")]) is False
+
+
+def test_notes_are_exempt_from_the_no_repeat_gate() -> None:
+    # Session notes go through the plan path's separate note handling; the
+    # planless path must not swallow them as "repeats".
+    import inspect
+
+    src = inspect.getsource(fallback.build_internal_fallback)
+    assert "not unit.is_note" in src

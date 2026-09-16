@@ -56,6 +56,11 @@ _MIN_UNIT_TOKENS = 2
 # ("Step 5/9" 1 token, "Do NOT delete create/join" 3).
 # Notes and pruned-skill markers are exempt (see _rank_units).
 _MIN_RANKABLE_TOKENS = 5
+# Fraction of a heap candidate's content words that may already be carried by
+# a tier outside the heap area (the head/summary and the verbatim tail) before
+# the candidate is skipped as a repeat (Evan, 2026-09-15 — the Dax no-repeat
+# rule; see _heap_repeat_covered).  0.8 means "effectively a duplicate".
+_HEAP_REPEAT_COVERAGE = 0.8
 # MMR redundancy penalty (Evan, 2026-09-15).  Selection was pure greedy
 # top-N, so the budget collapsed onto a near-duplicate clique: the emitted
 # set was more internally redundant than a random pick in 21/21 payloads and
@@ -360,6 +365,34 @@ def _content_tokens(text: str) -> frozenset[str]:
         for token in _TOKEN_RE.findall(_strip_boilerplate(text).casefold())
         if token not in _STOPWORDS
     )
+
+
+def _heap_repeat_covered(
+    unit_text: str,
+    tier_tokens: list[frozenset[str]],
+) -> bool:
+    """True when a heap candidate is already carried by the window around it.
+
+    Dax rule (Evan, 2026-09-15): whole-session-scored items live at the very
+    start of the context window for long-term caching, "then we don't repeat
+    those for the shorter heap area of LexRank inserts."  The same argument
+    holds for the verbatim tail — it is literally in the window already.
+    Spending heap budget on a fragment the window already carries buys
+    nothing, so a candidate whose content words are mostly covered by a tier
+    outside the heap area is skipped.
+
+    Measured before this gate (17 real payloads): mean coverage of an emitted
+    heap unit by the surrounding tiers was 0.66 (head) / 0.76 (tail), 29.8%
+    of units were >=80% head-covered, and only 24.5% of emitted heap tokens
+    were information the window did not already hold.
+    """
+    tokens = _content_tokens(unit_text)
+    if not tokens:
+        return False
+    for tier in tier_tokens:
+        if tier and len(tokens & tier) / len(tokens) >= _HEAP_REPEAT_COVERAGE:
+            return True
+    return False
 
 
 def _chunks(text: str) -> list[str]:
@@ -959,9 +992,21 @@ def _add_plan_lexrank_area(
     if not ranked:
         return summary, tail_start
 
+    # Dax no-repeat rule: do not spend heap budget re-stating the head tier
+    # (the plan/summary text) or the verbatim tail — both are already in the
+    # window.  See _heap_repeat_covered for the measurement that motivated it.
+    outside_tiers = [
+        _content_tokens(summary),
+        _content_tokens(
+            "\n".join(m.get("content") or "" for m in messages[tail_start:])
+        ),
+    ]
+
     selected: list[_Unit] = []
     best = summary
     for unit, _score in ranked:
+        if _heap_repeat_covered(unit.text, outside_tiers):
+            continue
         candidate = _with_lexrank_section(summary, [*selected, unit])
         if _fits(messages, head_count, tail_start, candidate, target_tokens):
             selected.append(unit)
@@ -1106,8 +1151,18 @@ def build_internal_fallback(
         )
 
     ranked = _rank_units(middle_units, note_units, recent_units)
+    # Same no-repeat gate as the plan path: the head here is the fresh
+    # lexrank summary being built (notes + prefix), and the tail is verbatim.
+    outside_tiers = [
+        _content_tokens("\n".join(notes)),
+        _content_tokens(
+            "\n".join(m.get("content") or "" for m in messages[tail_start:])
+        ),
+    ]
     selected: list[_Unit] = []
     for unit, _score in ranked:
+        if not unit.is_note and _heap_repeat_covered(unit.text, outside_tiers):
+            continue
         candidate_selection = [*selected, unit]
         summary = _lexrank_summary(candidate_selection)
         if _fits(messages, head_count, tail_start, summary, target_tokens):
