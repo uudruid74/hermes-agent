@@ -1117,9 +1117,11 @@ def _add_plan_lexrank_area(
     # the window.  The plan/summary text is deliberately NOT a tier: it stands
     # in for the session-wide LexRank score (the Dax half), so it is not a
     # separate class of content to dedupe against (Evan, 2026-09-15).
+    # _content_text, not a raw join: multimodal messages carry `content` as a
+    # list of parts, and a raw join raises TypeError mid-compression.
     outside_tiers = [
         _content_tokens(
-            "\n".join(m.get("content") or "" for m in messages[tail_start:])
+            "\n".join(_content_text(m.get("content")) for m in messages[tail_start:])
         ),
     ]
 
@@ -1281,9 +1283,11 @@ def build_internal_fallback(
     ranked = _rank_units(middle_units, note_units, recent_units)
     # Same gate as the plan path: only the verbatim tail counts as a repeat
     # source.  Notes are exempt (they route separately below).
+    # _content_text, not a raw join: multimodal messages carry `content` as a
+    # list of parts, and a raw join raises TypeError mid-compression.
     outside_tiers = [
         _content_tokens(
-            "\n".join(m.get("content") or "" for m in messages[tail_start:])
+            "\n".join(_content_text(m.get("content")) for m in messages[tail_start:])
         ),
     ]
     selected: list[_Unit] = []
