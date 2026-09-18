@@ -63,6 +63,13 @@ _PROTECTED_MIN_TERM_CHARS = 4
 # corpus cannot Protect most of its own vocabulary and leave the Heap with
 # nothing to rank on.
 _PROTECTED_MAX_SHARE = 0.05
+# Protected AREA size and persistence (Evan, 2026-09-18: "we'll go 2 of 3 for
+# now and can widen later as needed").  The area is deliberately small — it
+# is the byte-stable prefix that rides the prompt cache, so churn in it is
+# what costs a full re-prefill.
+_PROTECTED_TOP_K = 12
+_PROTECTED_PERSIST_RUNS = 3
+_PROTECTED_PERSIST_MIN = 2
 # Minimum content tokens a unit must retain after boilerplate stripping to
 # stay rankable.  A unit made only of wrapper text carries no context.
 _MIN_UNIT_TOKENS = 2
@@ -211,6 +218,9 @@ class InternalFallback:
     head_count: int
     tail_start: int
     mode: str
+    # Between-compaction Protected state, handed back so the caller can
+    # persist it on the compressor instance (2026-09-18).
+    protected_memory: "ProtectedMemory | None" = None
 
 
 @dataclass(frozen=True)
@@ -451,6 +461,103 @@ def _protected_terms(
     limit = max(1, int(_PROTECTED_MAX_SHARE * len(frequency)))
     qualifying.sort(key=lambda item: (-item[1], item[0]))
     return frozenset(token for token, _ in qualifying[:limit])
+
+
+@dataclass(frozen=True)
+class ProtectedMemory:
+    """Between-compaction state for the Protected area (2026-09-18).
+
+    Immutable so a compaction cannot mutate the caller's copy by accident —
+    the compressor replaces its reference with the returned value, which is
+    the same discipline the rest of this module follows.
+
+    ``recent`` holds the last ``_PROTECTED_PERSIST_RUNS`` runs' top-K
+    canonical keys, oldest first.  A unit reaches the Protected area when it
+    appears in ``_PROTECTED_PERSIST_MIN`` of them, so a single-compaction
+    spike never gets Protected — measured on Ornith's window, 28.4% of
+    top-20 appearances last exactly one snapshot.
+
+    ``subject`` is the session subject these keys were selected under.  A
+    change to it discards the history (Evan, 2026-09-18: a subject change is
+    what turns a heap compaction into a full one).
+
+    Lives on ``ContextCompressor`` (one instance per agent, created once at
+    agent_init.py:2507), so it survives between compactions without any new
+    store.
+    """
+
+    recent: tuple[tuple[str, ...], ...] = ()
+    subject: str = ""
+
+
+def _persistent_protected(
+    units: list[_Unit],
+    memory: ProtectedMemory,
+    *,
+    top_k: int = _PROTECTED_TOP_K,
+) -> tuple[list[_Unit], ProtectedMemory]:
+    """Select the globally-central units worth carrying in Protected.
+
+    Ranked over the WHOLE window, not against the hot area (Evan,
+    2026-09-18): *"we're going to rank the entire context window, not
+    against the hot area, all of it.  We want to look for long term global
+    things to keep."*  The window is its own reference for the relevance
+    term, so "relevant" here means "close to the centre of the session"
+    rather than "close to the newest work".
+
+    Returns ``(chosen_units, updated_memory)``.  Chosen units are drawn from
+    the current top-K only — a unit that has dropped out of the top-K is no
+    longer globally central, so its history is not a claim on the area.
+
+    Bootstrap: with no history the threshold is 1, so the first compaction
+    accepts the whole top-K.  Without that the area would be empty until the
+    third compaction, and a full compaction with no Protected area is
+    exactly the case that must not happen (Evan, 2026-09-18: *"you can't
+    full compact without a protected area"*).
+    """
+    if not units:
+        return [], memory
+
+    # Nothing is "global" on a window too small to have a centre.  Below the
+    # Heap's own candidate cap the selector already sees every unit, so a
+    # Protected area adds nothing but can crowd out notes on a tight budget
+    # (caught by test_relevant_session_notes_receive_a_ranking_boost: on a
+    # 5-message window the only candidate was protected and the Session Note
+    # no longer fitted).  Inert here = exactly the pre-2026-09-18 behaviour.
+    if len(units) <= _MAX_CANDIDATE_UNITS:
+        return [], memory
+
+    # `recent` = the whole window: relevance becomes proximity to the
+    # session's own centre instead of proximity to the newest turn.
+    ranked = _rank_units(units, [], units)
+    if not ranked:
+        return [], memory
+
+    top = [unit for unit, _score in ranked[:top_k]]
+    keys = tuple(_canonical_form(unit.text) for unit in top)
+    recent = (*memory.recent, keys)[-_PROTECTED_PERSIST_RUNS:]
+    needed = _PROTECTED_PERSIST_MIN if len(recent) >= _PROTECTED_PERSIST_MIN else 1
+    counts: Counter[str] = Counter(key for run in recent for key in run)
+    chosen = [
+        unit for unit in top if counts[_canonical_form(unit.text)] >= needed
+    ]
+    return chosen, ProtectedMemory(recent=recent, subject=memory.subject)
+
+
+def _protected_summary_block(units: list[_Unit]) -> str:
+    """The Protected area's own section, emitted above the Heap."""
+    if not units:
+        return ""
+    return "\n\n".join(
+        [
+            "## Protected Context",
+            "\n".join(unit.text for unit in sorted(units, key=lambda item: item.order)),
+        ]
+    )
+
+
+# Kept last so the two helpers above read in dependency order.
+_HEAP_REPEAT_IS_NOTE_EXEMPT = True
 
 
 def _heap_repeat_covered(
@@ -945,16 +1052,26 @@ def _rank_units(
     middle_units: list[_Unit],
     note_units: list[_Unit],
     recent_units: list[_Unit],
+    *,
+    reference_units: list[_Unit] | None = None,
+    protected_units: list[_Unit] | None = None,
 ) -> list[tuple[_Unit, float]]:
     """Rank candidate units by centrality + relevance + recency, best first.
 
     Shared by both fallback paths so a session with an active Plan selects
     its middle with the same selector as one without (Evan, 2026-09-15:
     the Plan must not make the LexRank area unreachable).
+
+    ``reference_units`` overrides the relevance reference.  Default is the
+    newest work, which is what the Heap wants ("close to the live turn").
+    The Protected selector passes the whole window instead, so relevance
+    becomes "close to the centre of the session" (Evan, 2026-09-18).
     """
     candidates = middle_units + note_units
     if not candidates:
         return []
+
+    reference_units = recent_units if reference_units is None else reference_units
 
     # Drop unusable units and collapse near-duplicates (Evan, 2026-09-15).
     #
@@ -1026,8 +1143,26 @@ def _rank_units(
         [unit.text for unit in candidates] + [unit.text for unit in recent_units]
     )
 
+    # The Protected AREA is scored out of the Heap's candidate pool when the
+    # caller supplies one (Evan, 2026-09-18: its hits are removed as scoring
+    # terms for the Heap, and no duplication is allowed across regions).
+    if protected_units:
+        protected_keys = {_canonical_form(unit.text) for unit in protected_units}
+        removed = [
+            unit for unit in candidates if _canonical_form(unit.text) in protected_keys
+        ]
+        if removed:
+            candidates = [
+                unit for unit in candidates if _canonical_form(unit.text) not in protected_keys
+            ]
+            if not candidates:
+                return []
+            protected_terms = protected_terms | frozenset(
+                token for unit in removed for token in _content_tokens(unit.text)
+            )
+
     all_vectors = _tfidf_vectors(
-        [unit.text for unit in candidates] + [unit.text for unit in recent_units],
+        [unit.text for unit in candidates] + [unit.text for unit in reference_units],
         drop=protected_terms,
     )
     candidate_vectors = all_vectors[: len(candidates)]
@@ -1122,23 +1257,37 @@ def _mmr_order(
     return chosen
 
 
-def _with_lexrank_section(summary: str, selected: list[_Unit]) -> str:
-    """Append the heap block below the Plan, above the verbatim marker.
+def _with_lexrank_section(
+    summary: str, selected: list[_Unit], protected: list[_Unit] | None = None
+) -> str:
+    """Append the heap block below the Plan and Protected, above the marker.
 
-    Plan first, heap second (Evan, 2026-09-16) — *"Plan should be first"*.  The
-    Plan holds the long-term goals and the step list and is byte-stable
-    between step changes, so it rides the prompt cache; the heap is
-    re-selected every cycle and has no such claim.  Ordering is therefore
-    load-bearing, not cosmetic.
+    Order is Plan, Protected, Heap, verbatim tail (Evan, 2026-09-18):
+    *"separate messages for plan, protected, and heap."*  Plan holds the
+    long-term goals and is byte-stable between step changes; Protected holds
+    the globally-central units, which are byte-stable between subject
+    changes; the heap is re-selected every cycle and has no such claim.
+    Ordering is therefore load-bearing, not cosmetic — the two stable
+    sections ride the prompt cache and only the heap churns.
     """
-    if not selected:
+    blocks: list[str] = []
+    protected_block = _protected_summary_block(protected or [])
+    if protected_block:
+        blocks.append(protected_block)
+    if selected:
+        blocks.append(
+            "\n\n".join(
+                [
+                    "## Relevant Earlier Context",
+                    "\n".join(
+                        unit.text for unit in sorted(selected, key=lambda item: item.order)
+                    ),
+                ]
+            )
+        )
+    if not blocks:
         return summary
-    block = "\n\n".join(
-        [
-            "## Relevant Earlier Context",
-            "\n".join(unit.text for unit in sorted(selected, key=lambda item: item.order)),
-        ]
-    )
+    block = "\n\n".join(blocks)
     if VERBATIM_CONTEXT_MARKER in summary:
         head, _, rest = summary.partition(VERBATIM_CONTEXT_MARKER)
         return head.rstrip() + "\n\n" + block + "\n\n" + VERBATIM_CONTEXT_MARKER + rest
@@ -1184,6 +1333,7 @@ def _add_plan_lexrank_area(
     summary: str,
     notes: list[str],
     target_tokens: int,
+    protected: list[_Unit] | None = None,
 ) -> tuple[str, int]:
     """Spend the leftover plan budget on the ranked middle (Evan, 2026-09-15).
 
@@ -1218,7 +1368,7 @@ def _add_plan_lexrank_area(
             if not any(marker in unit.text for marker in marker_notes)
         ]
     recent_units = _message_units(messages[tail_start:], start_index=tail_start)
-    ranked = _rank_units(middle_units, [], recent_units)
+    ranked = _rank_units(middle_units, [], recent_units, protected_units=protected)
     if not ranked:
         return summary, tail_start
 
@@ -1239,17 +1389,22 @@ def _add_plan_lexrank_area(
     for unit, _score in ranked:
         if _heap_repeat_covered(unit.text, outside_tiers):
             continue
-        candidate = _with_lexrank_section(summary, [*selected, unit])
+        candidate = _with_lexrank_section(summary, [*selected, unit], protected)
         if _fits(messages, head_count, tail_start, candidate, target_tokens):
             selected.append(unit)
             best = candidate
     return best, tail_start
 
 
-def _lexrank_summary(selected: list[_Unit]) -> str:
+def _lexrank_summary(
+    selected: list[_Unit], protected: list[_Unit] | None = None
+) -> str:
     context = [unit for unit in selected if not unit.is_note]
     notes = [unit for unit in selected if unit.is_note]
     parts = [INTERNAL_FALLBACK_PREFIX]
+    protected_block = _protected_summary_block(protected or [])
+    if protected_block:
+        parts.append(protected_block)
     if context:
         parts.extend(
             [
@@ -1278,6 +1433,8 @@ def build_internal_fallback(
     minimal_plan_context: str = "",
     memory_context: str = "",
     previous_summary: str = "",
+    protected_memory: "ProtectedMemory | None" = None,
+    session_subject: str = "",
 ) -> InternalFallback:
     """Build the last-resort local compression payload within ``target_tokens``.
 
@@ -1285,9 +1442,23 @@ def build_internal_fallback(
     (Evan, 2026-09-15): deterministic compression has no failure rung, so an
     over-target or degenerate budget yields the tightest payload this
     selector can assemble rather than stranding the session.
+
+    ``protected_memory`` carries the Protected area's state between
+    compactions, and ``session_subject`` is the subject those keys were
+    selected under.  When the subject changes the history is discarded and
+    the area is rebuilt from scratch — that is the *full* compaction; with
+    the subject unchanged only the Heap is rebuilt, which is the *heap*
+    compaction that leaves the cacheable prefix byte-stable (Evan,
+    2026-09-18).
     """
     head_count = min(max(protect_head_count, 0), len(messages))
     tail_start = _verbatim_tail_start(messages, head_count, protect_last_n)
+
+    memory = protected_memory or ProtectedMemory()
+    if session_subject and memory.subject and memory.subject != session_subject:
+        memory = ProtectedMemory(subject=session_subject)
+    elif session_subject:
+        memory = ProtectedMemory(recent=memory.recent, subject=session_subject)
 
     # Emergency rung (Evan, 2026-09-14): when the verbatim tail itself cannot
     # fit, mask its observations back to the last turn BEFORE shrinking the
@@ -1300,6 +1471,15 @@ def build_internal_fallback(
         messages = _mask_tail_observations(messages, tail_start)
 
     notes = _session_notes(messages, memory_context, previous_summary)
+
+    # Protected is selected from the whole window, once, so every path below
+    # emits the same area (Evan, 2026-09-18: "you can't full compact without
+    # a protected area").  Ranking the entire window is the intent; this
+    # bounds the per-iteration cost the same way `_MAX_CANDIDATE_UNITS`
+    # already does for the Heap, with `_rank_units` selecting the top-K of
+    # however many units the window holds.
+    window_units = _message_units(messages[head_count:tail_start], start_index=head_count)
+    protected, memory = _persistent_protected(window_units, memory)
 
     if plan_context.strip():
         summary, fitted_tail_start = _fitted_plan_summary(
@@ -1318,8 +1498,11 @@ def build_internal_fallback(
                 summary=summary,
                 notes=notes,
                 target_tokens=target_tokens,
+                protected=protected,
             )
-            return InternalFallback(summary, head_count, fitted_tail_start, "plan")
+            return InternalFallback(
+                summary, head_count, fitted_tail_start, "plan", memory
+            )
 
         # The full plan is itself too large to fit — degrade to
         # goal + current step + summary against the minimal head.
@@ -1345,12 +1528,14 @@ def build_internal_fallback(
             summary=summary,
             notes=notes,
             target_tokens=target_tokens,
+            protected=protected,
         )
         return InternalFallback(
             summary,
             system_head,
             fitted_tail_start,
             "plan-minimal",
+            memory,
         )
 
     # Same Heap boundary as the Plan path (Evan, 2026-09-16).  The rule is
@@ -1381,15 +1566,16 @@ def build_internal_fallback(
     ]
     candidates = middle_units + note_units
     if not candidates:
-        summary = _lexrank_summary([])
+        summary = _lexrank_summary([], protected)
         return InternalFallback(
             summary,
             head_count,
             _fit_tail_start(messages, head_count, tail_start, summary, target_tokens),
             "lexrank",
+            memory,
         )
 
-    ranked = _rank_units(middle_units, note_units, recent_units)
+    ranked = _rank_units(middle_units, note_units, recent_units, protected_units=protected)
     # Same gate as the plan path: only the verbatim tail counts as a repeat
     # source.  Notes are exempt (they route separately below).
     # _content_text, not a raw join: multimodal messages carry `content` as a
@@ -1404,13 +1590,13 @@ def build_internal_fallback(
         if not unit.is_note and _heap_repeat_covered(unit.text, outside_tiers):
             continue
         candidate_selection = [*selected, unit]
-        summary = _lexrank_summary(candidate_selection)
+        summary = _lexrank_summary(candidate_selection, protected)
         if _fits(messages, head_count, tail_start, summary, target_tokens):
             selected = candidate_selection
 
-    summary = _lexrank_summary(selected)
+    summary = _lexrank_summary(selected, protected)
     if _fits(messages, head_count, tail_start, summary, target_tokens):
-        return InternalFallback(summary, head_count, tail_start, "lexrank")
+        return InternalFallback(summary, head_count, tail_start, "lexrank", memory)
     # Last resort: the requested verbatim tail cannot fit at all.  Shrink
     # the region (summarising its tool scaffolding) instead of aborting —
     # an abort here is terminal for the session, and the scaffolding rows
@@ -1420,4 +1606,5 @@ def build_internal_fallback(
         head_count,
         _fit_tail_start(messages, head_count, tail_start, summary, target_tokens),
         "lexrank",
+        memory,
     )

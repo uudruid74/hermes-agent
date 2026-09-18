@@ -1643,6 +1643,35 @@ class ContextCompressor(ContextEngine):
         self._active_compression_telemetry = None
         self._compression_telemetry_seed = None
 
+    def _session_subject(self) -> str:
+        """The session's current subject string, or "" when unavailable.
+
+        Read from the bound session row (`bind_session_state`).  Never
+        raises: a missing DB, a missing row, or any driver error degrades to
+        "" and the caller simply keeps its existing Protected history, which
+        is the pre-2026-09-18 behaviour.
+
+        This is the full/heap compaction gate (Evan, 2026-09-18): the
+        subject string is written by `set_session`, so the entity that
+        already knows the subject is the one that records the change.  No
+        detector is involved — a similarity trigger was measured against
+        hand-labeled within-session transitions and caught 0 of 9 while
+        firing on 80% of all positions.
+        """
+        if not (self._session_db and self._session_id):
+            return ""
+        try:
+            row = self._session_db.get_session(self._session_id)
+        except Exception:
+            return ""
+        if not row:
+            return ""
+        try:
+            subject = row["subject"]
+        except Exception:
+            subject = getattr(row, "subject", "")
+        return subject or ""
+
     def bind_session_state(self, session_db: Any = None, session_id: str = "") -> None:
         """Bind the current session row so durable cooldowns can round-trip."""
         self._session_db = session_db
@@ -2377,7 +2406,14 @@ class ContextCompressor(ContextEngine):
         self.summary_model = summary_model_override or ""
         self._session_db: Any = None
         self._session_id: str = ""
-
+        # Protected area state, carried BETWEEN compactions (Evan,
+        # 2026-09-18).  One compressor instance per agent (created once at
+        # agent_init.py:2507), so this survives the cycles that a
+        # module-level function cannot.  Holds the last runs' top-K keys so
+        # 2-of-3 persistence has history, plus the subject those keys were
+        # selected under — a subject change discards it, which is what makes
+        # the next compaction a FULL one rather than a heap one.
+        self._protected_memory: Any = None
         # Stores the previous compaction summary for iterative updates
         self._previous_summary: Optional[str] = None
         # Provenance for the rolling summary. A compaction handoff can carry
@@ -6499,7 +6535,14 @@ This compaction should PRIORITISE preserving all information related to the focu
                 minimal_plan_context=minimal_plan_context,
                 memory_context=memory_context,
                 previous_summary=self._previous_summary or "",
+                protected_memory=self._protected_memory,
+                session_subject=self._session_subject(),
             )
+            # Carry the Protected area's state to the next compaction.  The
+            # returned value is immutable; we only ever replace the
+            # reference (Evan, 2026-09-18).
+            if fallback.protected_memory is not None:
+                self._protected_memory = fallback.protected_memory
 
             summary = _redact_compaction_text(fallback.summary)
             self._previous_summary = self._strip_summary_prefix(summary)
