@@ -680,8 +680,34 @@ def _lexrank(vectors: list[dict[str, float]], threshold: float = 0.1) -> list[fl
             threshold=threshold,
         )
         scores = [0.0] * count
-        for index, score in zip(sampled_indices, sampled_scores):
-            scores[index] = score
+        for position, index in enumerate(sampled_indices):
+            scores[index] = sampled_scores[position]
+        # Fill the gaps between samples with the nearer neighbour's score
+        # rather than leaving them at 0.0 (Evan, 2026-09-18).  Centrality is
+        # 40% of the unit score, so zeroing the unsampled units scores
+        # (1 - 256/count) of the window on relevance and recency alone — at
+        # count = 10,248 that is 97.5% of the window unable to compete on
+        # centrality, which is what made the selector behave like a random
+        # draw.  Measured: at 1,024 units the number of exactly-zero scores
+        # (768) equals the number of unsampled units, i.e. every zero was
+        # this artifact, not a property of the graph.
+        #
+        # ponytail: nearest-neighbour fill, not interpolation.  The sampled
+        # indices are evenly spaced by construction, so the two are nearly
+        # identical here, and nearest-neighbour cannot invent a score between
+        # two neighbours that were both low.  Upgrading to a real dynamic
+        # PageRank (warm-started turn-by-turn) is the Dax path if this stops
+        # being good enough.
+        for position in range(len(sampled_indices) - 1):
+            start = sampled_indices[position]
+            end = sampled_indices[position + 1]
+            if end - start <= 1:
+                continue
+            left_score = sampled_scores[position]
+            right_score = sampled_scores[position + 1]
+            midpoint = (start + end) / 2
+            for index in range(start + 1, end):
+                scores[index] = left_score if index <= midpoint else right_score
         return scores
 
     graph: list[list[float]] = [[0.0] * count for _ in range(count)]
