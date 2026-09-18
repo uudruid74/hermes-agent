@@ -49,6 +49,20 @@ _NOTE_SCORE_FLOOR = 1.25
 _MAX_UNIT_CHARS = 1_200
 _MAX_CANDIDATE_UNITS = 256
 _ASSEMBLY_RESERVE_TOKENS = 24
+# Protected terms: the corpus's OWN filler, as opposed to the English filler
+# in _STOPWORDS.  A term seen in this fraction of units is global to the
+# session and saturates every vector, so it is carried in the Protected area
+# and removed from Heap scoring (Evan, 2026-09-18).  Measured: the saturation
+# culprits sat at 5.9-12.2% document frequency on Ornith's live window.
+_PROTECTED_DF_FLOOR = 0.06
+# A short token cannot carry a filename or an identifier, so excluding them
+# keeps common English words ("this", "that") out of a set whose whole job is
+# filenames and domain nouns.
+_PROTECTED_MIN_TERM_CHARS = 4
+# Ceiling on the Protected set as a share of the vocabulary, so a degenerate
+# corpus cannot Protect most of its own vocabulary and leave the Heap with
+# nothing to rank on.
+_PROTECTED_MAX_SHARE = 0.05
 # Minimum content tokens a unit must retain after boilerplate stripping to
 # stay rankable.  A unit made only of wrapper text carries no context.
 _MIN_UNIT_TOKENS = 2
@@ -390,6 +404,55 @@ def _content_tokens(text: str) -> frozenset[str]:
     )
 
 
+def _protected_terms(
+    texts: list[str],
+    *,
+    min_document_frequency: float = _PROTECTED_DF_FLOOR,
+) -> frozenset[str]:
+    """Corpus-global terms that saturate ranking and belong in Protected.
+
+    Evan, 2026-09-18: *"things like filenames that appear everywhere get
+    thrown in the protected area and that filename should no longer be
+    relevant to how other stuff scores when we build the heap area."*
+
+    This is the measured fix for the saturation that made the emitted area
+    "no better than random picks": the stopword list removes *English*
+    filler but nothing knows that `config`, `model`, `key`, `hermes` and
+    `compression` are *this corpus's* filler.  Weight is ``count * idf``, so
+    a global term appearing three times in a unit outweighs a rare term
+    appearing once — every vector leans the same way, every cosine is
+    similar, and centrality degenerates.
+
+    Threshold is a document-frequency fraction, not a count, so it holds on
+    both a 200-unit middle and a 10,000-unit window.  Guards against
+    stripping genuinely discriminative vocabulary: only terms longer than
+    ``_PROTECTED_MIN_TERM_CHARS`` qualify (a short token cannot carry a
+    filename or an identifier), and the set is capped so a degenerate
+    corpus cannot Protect most of its own vocabulary and leave the Heap
+    nothing to rank on.
+
+    Returns an empty set when nothing clears the floor — the caller then
+    behaves exactly as before, so this can only ever add selectivity.
+    """
+    if not texts:
+        return frozenset()
+    document_count = len(texts)
+    minimum = max(2.0, min_document_frequency * document_count)
+    frequency: Counter[str] = Counter()
+    for text in texts:
+        frequency.update(_content_tokens(text))
+    qualifying = [
+        (token, count)
+        for token, count in frequency.items()
+        if count >= minimum and len(token) > _PROTECTED_MIN_TERM_CHARS
+    ]
+    if not qualifying:
+        return frozenset()
+    limit = max(1, int(_PROTECTED_MAX_SHARE * len(frequency)))
+    qualifying.sort(key=lambda item: (-item[1], item[0]))
+    return frozenset(token for token, _ in qualifying[:limit])
+
+
 def _heap_repeat_covered(
     unit_text: str,
     tier_tokens: list[frozenset[str]],
@@ -601,7 +664,16 @@ def _session_notes(
     return notes
 
 
-def _tfidf_vectors(texts: list[str]) -> list[dict[str, float]]:
+def _tfidf_vectors(
+    texts: list[str], *, drop: frozenset[str] = frozenset()
+) -> list[dict[str, float]]:
+    """TF-IDF vectors for ``texts``.
+
+    ``drop`` removes corpus-global Protected terms from every vector before
+    weighting (Evan, 2026-09-18).  They are still counted for document
+    frequency so the remaining weights are unchanged — they simply carry no
+    weight in the Heap's scoring after being Protected.
+    """
     token_counts = [Counter(_TOKEN_RE.findall(text.casefold())) for text in texts]
     document_frequency: Counter[str] = Counter()
     for counts in token_counts:
@@ -613,6 +685,7 @@ def _tfidf_vectors(texts: list[str]) -> list[dict[str, float]]:
         vector = {
             token: count * (math.log((1 + document_count) / (1 + document_frequency[token])) + 1)
             for token, count in counts.items()
+            if token not in drop
         }
         norm = math.sqrt(sum(value * value for value in vector.values()))
         vectors.append(
@@ -944,8 +1017,18 @@ def _rank_units(
     if not candidates:
         return []
 
-    all_vectors = _tfidf_vectors(
+    # Protected terms are detected over the WHOLE window (Evan, 2026-09-18):
+    # *"we're going to rank the entire context window, not against the hot
+    # area, all of it.  We want to look for long term global things to
+    # keep."*  Detecting them over the middle alone would miss a term that
+    # is globally common because the recent tail keeps using it.
+    protected_terms = _protected_terms(
         [unit.text for unit in candidates] + [unit.text for unit in recent_units]
+    )
+
+    all_vectors = _tfidf_vectors(
+        [unit.text for unit in candidates] + [unit.text for unit in recent_units],
+        drop=protected_terms,
     )
     candidate_vectors = all_vectors[: len(candidates)]
     recent_vectors = all_vectors[len(candidates) :]
