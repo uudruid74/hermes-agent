@@ -36,6 +36,55 @@ def _actor(agent):
     )
 
 
+def _sync_subject_from_binding(agent) -> None:
+    """Re-point the session subject at the active Plan's current step.
+
+    Called after every command that can change *what the active step is*:
+    activate (new / approve / continue / corrective child), advance, and
+    close (which restores a parent Plan or leaves none).
+
+    The subject string is the full/heap compaction gate (Evan, 2026-09-18):
+    a change discards the Protected area and rebuilds it — a *full*
+    compaction — while an unchanged subject only rebuilds the Heap and
+    leaves the cacheable prefix byte-stable.  Tying it to the active step
+    makes a step change the trigger, and gives every compaction a
+    searchable subject string.
+
+    No binding means no active Plan, so the subject is **cleared** rather
+    than left on a finished step.  A stale subject would never change
+    again, so the Protected area would accumulate globals forever and
+    never take a full compaction — the opposite of the intent.
+
+    Never raises.  An unbound session or any read error leaves the
+    subject untouched, which is the pre-2026-09-18 behaviour.
+    """
+    session_id = getattr(agent, "session_id", None)
+    session_db = getattr(agent, "_session_db", None)
+    if not session_id or session_db is None:
+        return
+    try:
+        from hermes_cli import execution_bindings as bindings
+
+        conn = _legacy()._get_kanban_db()
+        _key, binding, error = _current(conn, agent)
+        subject = ""
+        if not error and binding is not None:
+            task = conn.execute(
+                "SELECT * FROM tasks WHERE id = ?", (binding.task_id,)
+            ).fetchone()
+            if task is not None:
+                steps, step_no = bindings._steps_for_task(task)
+                title = task["title"] or ""
+                step_text = " ".join((steps[step_no - 1] or "").split())
+                subject = f"{title}: {step_text}" if title else step_text
+    except Exception:
+        return
+    try:
+        session_db.set_session_subject(session_id, subject)
+    except Exception:
+        pass
+
+
 def _insert_request(
     conn, *, task_id: str, title: str, goal: str, steps: list[str], agent,
     board: Optional[str], kind: str, parent_task_id: Optional[str], pre_approved: bool,
@@ -295,6 +344,9 @@ def _create_plan(
             return f"ERROR: Failed to resolve Plan approval: {exc}"
         if not approved:
             return f"Plan denied ({task_id}): {response}."
+    # Active step changed (new step-1) — re-point the subject so the change
+    # triggers a FULL compaction.  See _sync_subject_from_binding.
+    _sync_subject_from_binding(agent)
 
     if repeat_of is not None:
         parent_id, parent_step = repeat_of
@@ -378,6 +430,11 @@ def cmd_advance(
             session_db = getattr(agent, "_session_db", None)
             if source is not None and session_db is not None:
                 session_db.update_agent_rating(source["assignee"], 0.5)
+        # Closing restores a parent Plan or leaves none — either way the
+        # active step is a different step (or there is no Plan).  Re-point the
+        # subject so the transition takes a FULL compaction; with no Plan the
+        # subject is CLEARED.  See _sync_subject_from_binding.
+        _sync_subject_from_binding(agent)
         return f"The task goal was: {task['task_goal'] or ''}"
     if result.binding_revision == binding.revision:
         # The step did NOT move — this is the verify-first response.
@@ -394,6 +451,10 @@ def cmd_advance(
             f"that opens a child plan, and the parent resumes here when it "
             f"completes."
         )
+    # The active step moved — re-point the subject.  The verify-first branch
+    # above returns before this line and writes nothing, so a step that did
+    # not advance leaves the Protected area in place.
+    _sync_subject_from_binding(agent)
     return f"Complete Step {result.step_no}: {result.next_step}"
 
 
@@ -551,6 +612,11 @@ def _terminal(agent, outcome: str, reason: Optional[str]) -> str:
             conn.commit()
     elif outcome == "failed" and session_db is not None:
         session_db.set_session_mood(getattr(agent, "session_id", None), -1.0)
+    # Closing restores a parent Plan or leaves none — either way the active
+    # step is a different step (or there is no Plan).  Re-point the subject so
+    # the transition takes a FULL compaction; with no Plan the subject is
+    # cleared.  See _sync_subject_from_binding.
+    _sync_subject_from_binding(agent)
     return f"Plan {result.task_id} {outcome}; restored {result.restored_task_id or 'no parent'}"
 
 
@@ -671,6 +737,9 @@ def cmd_continue(agent, task_id: str) -> str:
         )
     except (bindings.ExecutionBindingError, ValueError) as exc:
         return f"ERROR: {exc}"
+    # The Plan was transferred to this session — point the subject at its
+    # active step.  See _sync_subject_from_binding.
+    _sync_subject_from_binding(agent)
     task = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
     return _format_plan(conn, task, include_summaries=True)
 
@@ -703,6 +772,10 @@ def cmd_approve(agent, task_id: str) -> str:
                 parent_task_id=task["previous_task"],
                 revision=current.revision if current is not None else None,
             )
-    except (bindings.ExecutionBindingError, sqlite3.Error, ValueError) as exc:
-        return f"ERROR: Failed to activate task: {exc}"
+    except bindings.ExecutionBindingError as exc:
+        return f"ERROR: {exc}"
+    # Activating a blocked Plan changes the active step — re-point the subject
+    # so the transition triggers a FULL compaction.  See
+    # _sync_subject_from_binding.
+    _sync_subject_from_binding(agent)
     return f"Task {task_id} approved: {task['title']}"

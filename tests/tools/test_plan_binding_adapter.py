@@ -392,3 +392,104 @@ def test_schema_replaces_done_and_status_with_advance_summary_handoff_continue()
     assert "advance" in properties["summary"]["description"]
     assert "handoff" in properties["summary"]["description"]
     assert "Unknown plan command 'done'" in plan_tool.plan_tool(_Agent(), "done")
+
+
+# ---------------------------------------------------------------------------
+# subject = full/heap compaction gate (Evan, 2026-09-18)
+#
+# The compressor reads `sessions.subject`; a change discards the Protected
+# area (FULL compaction), an identical value keeps it (HEAP compaction, which
+# leaves the cacheable prefix byte-stable).  So the subject has to track the
+# Plan's ACTIVE STEP.  Before this, the four legacy writes lived only in the
+# shadowed plan_tool helpers, so the live adapter path never set a subject at
+# all and the gate could never fire.
+# ---------------------------------------------------------------------------
+
+
+class _SubjectAgent(_Agent):
+    """_Agent with a subject-recording session DB."""
+
+    def __init__(self):
+        self.subjects: list = []
+        outer = self
+
+        class _DB:
+            def get_compression_root(self, session_id: str) -> str:
+                return f"root:{session_id}"
+
+            def set_session_subject(self, session_id, subject) -> None:
+                outer.subjects.append(subject)
+
+        self._session_db = _DB()
+        self.session_id = "subject-session"
+        self.profile_name = "neo"
+        self.agent_name = "neo"
+        self.canonical_session_id = "subject-session"
+        self._session_temperature = None
+        self._plan_approval_timed_out = None
+
+    def clarify_callback(self, *_args, **_kwargs) -> str:
+        return "Approve"
+
+
+def _start_plan(monkeypatch, agent, steps):
+    conn = _db()
+    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    monkeypatch.setattr(
+        plan_tool, "clarify_tool", lambda *_a, **_k: '{"user_response":"Approve"}'
+    )
+    result = plan_tool.plan_tool(
+        agent, "new", title="Subject plan", goal="gate the compaction", steps=steps
+    )
+    assert result.startswith("TASK APPROVED (t_")
+    return conn
+
+
+def test_subject_tracks_the_active_step_and_changes_on_advance(monkeypatch):
+    agent = _SubjectAgent()
+    _start_plan(monkeypatch, agent, ["inspect", "implement", "verify"])
+
+    # Activation named step 1.
+    assert agent.subjects[-1] == "Subject plan: inspect"
+
+    plan_tool.plan_tool(agent, "advance", summary="inspected", proof="ran it")
+    assert agent.subjects[-1] == "Subject plan: implement"
+
+    plan_tool.plan_tool(agent, "advance", summary="implemented", proof="ran it")
+    assert agent.subjects[-1] == "Subject plan: verify"
+
+    # Every transition wrote a DIFFERENT value: each is a full compaction.
+    assert len(set(agent.subjects)) == len(agent.subjects)
+
+
+def test_step_that_did_not_advance_leaves_the_subject_alone(monkeypatch):
+    """Verify-first: a summary without proof must not fake a subject change.
+
+    A no-op write would be harmless (same value = cache preserved), but a
+    wrong value would trigger a needless full compaction, so nothing is
+    written at all.
+    """
+    agent = _SubjectAgent()
+    _start_plan(monkeypatch, agent, ["inspect", "implement"])
+    assert agent.subjects[-1] == "Subject plan: inspect"
+
+    result = plan_tool.plan_tool(agent, "advance", summary="claim only")
+
+    assert "NOT ADVANCED" in result
+    assert agent.subjects[-1] == "Subject plan: inspect"
+    assert agent.subjects.count("Subject plan: implement") == 0
+
+
+def test_closing_the_plan_clears_the_subject(monkeypatch):
+    """No active Plan means no subject.
+
+    A stale subject never changes again, so the Protected area would
+    accumulate globals forever and never take a full compaction.
+    """
+    agent = _SubjectAgent()
+    _start_plan(monkeypatch, agent, ["only step"])
+    assert agent.subjects[-1] == "Subject plan: only step"
+
+    plan_tool.plan_tool(agent, "advance", summary="finished", proof="ran it")
+
+    assert agent.subjects[-1] == ""
