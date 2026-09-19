@@ -96,24 +96,40 @@ def _row(conn, title):
     ).fetchone()
 
 
-def test_dispatch_caps_the_goal(board):
+def test_dispatch_refuses_a_goal_over_the_cap(board):
+    """An over-cap goal is REFUSED, not silently truncated (Evan, 2026-09-18).
+
+    Truncation destroyed a real brief: a 7,038-char dispatch goal was stored as
+    246 chars and the worker spent 53 tool calls hunting for text that was never
+    stored.  A refusal surfaces at the caller, which still holds the full text.
+    """
     conn, plan_tool = board
-    plan_tool._cmd_dispatch(None, "cap test", LONG_GOAL, "default", "neo")
-    row = _row(conn, "cap test")
-    assert row is not None, "dispatch did not create the task"
-    assert len(row["task_goal"]) == 240
-    # Head, not tail: a goal states its objective up front.
-    assert row["task_goal"].startswith("Dispatch goal")
+    result = plan_tool._cmd_dispatch(None, "cap test", LONG_GOAL, "default", "neo")
+    assert "ERROR" in result
+    assert "goal" in result and "240" in result
+    assert "FILE" in result, "the error must point at the supported long-form path"
+    assert _row(conn, "cap test") is None, "a refused dispatch must create NOTHING"
 
 
-def test_dispatch_caps_each_step(board):
+def test_dispatch_refuses_a_step_over_the_cap(board):
     conn, plan_tool = board
-    plan_tool._cmd_dispatch(
+    result = plan_tool._cmd_dispatch(
         None, "step cap test", "goal", "default", "neo", steps=[LONG_STEP, "short"]
     )
-    row = _row(conn, "step cap test")
-    steps = json.loads(row["task_steps"])
-    assert [len(s) for s in steps] == [240, 5]
+    assert "ERROR" in result
+    assert "step 1" in result, "the error must name WHICH step is over"
+    assert _row(conn, "step cap test") is None
+
+
+def test_dispatch_accepts_text_exactly_at_the_cap(board):
+    """Boundary: exactly 240 chars (after whitespace compression) must pass."""
+    conn, plan_tool = board
+    goal = "G" * 240
+    result = plan_tool._cmd_dispatch(None, "at cap", goal, "default", "neo", steps=["s"])
+    assert "ERROR" not in result, result
+    row = _row(conn, "at cap")
+    assert row is not None
+    assert len(row["task_goal"]) == 240
 
 
 def test_dispatch_refuses_more_than_twelve_steps(board):
@@ -126,18 +142,17 @@ def test_dispatch_refuses_more_than_twelve_steps(board):
     assert _row(conn, "too many") is None, "refused plan must not be created"
 
 
-def test_cron_caps_the_template(board, hermetic_cron):
+def test_cron_refuses_an_over_cap_template(board, hermetic_cron):
     """A cron template's text is copied into every task the job fires."""
     conn, plan_tool = board
-    plan_tool._cmd_cron(
+    result = plan_tool._cmd_cron(
         None, "0 9 * * *", "/tmp", "cron cap", LONG_GOAL, [LONG_STEP]
     )
-    row = _row(conn, "cron cap")
-    if row is None:
+    if "cron path unavailable" in result:
         pytest.skip("cron path unavailable in this environment")
-    assert len(row["task_goal"]) == 240
-    assert [len(s) for s in json.loads(row["task_steps"])] == [240]
-    # Proof the fixture held: the fire script went to the temp dir, not ~/.hermes
+    assert "ERROR" in result
+    assert _row(conn, "cron cap") is None
+    # Proof the fixture held: nothing leaked into ~/.hermes/scripts
     leaked = os.path.join(os.path.expanduser("~/.hermes/scripts"),
                           "plan_cron_cron cap.py")
     assert not os.path.exists(leaked)

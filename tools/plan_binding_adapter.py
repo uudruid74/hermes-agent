@@ -221,7 +221,9 @@ def _create_plan(
     """
     from hermes_cli import execution_bindings as bindings
     from hermes_cli.kanban_db import write_txn
-    from hermes_cli.plan_limits import cap_steps, cap_text, step_count_error
+    from hermes_cli.plan_limits import (
+        cap_steps, cap_text, goal_text_error, step_count_error, steps_text_error,
+    )
 
     if not title or not goal or not steps:
         return "ERROR: 'new' requires title, goal, and steps[]"
@@ -229,6 +231,13 @@ def _create_plan(
     if kind not in {"normal", "debug"}:
         return "ERROR: 'kind' must be 'normal' or 'debug'"
     over_limit = step_count_error(steps)
+    if over_limit:
+        return over_limit
+    # Refuse rather than truncate (Evan, 2026-09-18) — see text_limit_error.
+    over_limit = goal_text_error(goal)
+    if over_limit:
+        return over_limit
+    over_limit = steps_text_error(steps)
     if over_limit:
         return over_limit
     # Bound the Plan at submission (Evan, 2026-09-16).  The Plan is the

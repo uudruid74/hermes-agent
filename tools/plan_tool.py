@@ -621,9 +621,20 @@ def _cmd_dispatch(agent, title: str, goal: str, project: str, assignee: str,
     if not project:
         return "ERROR: 'project' (board) is required for dispatch"
 
-    from hermes_cli.plan_limits import cap_steps, cap_text, step_count_error
+    from hermes_cli.plan_limits import (
+        cap_steps, cap_text, goal_text_error, step_count_error, steps_text_error,
+    )
 
     over_limit = step_count_error(steps)
+    if over_limit:
+        return over_limit
+    # Refuse rather than truncate (Evan, 2026-09-18).  A truncated goal is
+    # silently destroyed instructions: a 7,038-char brief was stored as 246
+    # chars and the worker spent 53 calls hunting for the rest.
+    over_limit = goal_text_error(goal)
+    if over_limit:
+        return over_limit
+    over_limit = steps_text_error(steps)
     if over_limit:
         return over_limit
     goal = cap_text(goal)
@@ -715,9 +726,17 @@ def _cmd_cron(agent, cron: str, root: str, title: str, goal: str,
     """
     import uuid
 
-    from hermes_cli.plan_limits import cap_steps, cap_text, step_count_error
+    from hermes_cli.plan_limits import (
+        cap_steps, cap_text, goal_text_error, step_count_error, steps_text_error,
+    )
 
     over_limit = step_count_error(steps)
+    if over_limit:
+        return over_limit
+    over_limit = goal_text_error(goal)
+    if over_limit:
+        return over_limit
+    over_limit = steps_text_error(steps)
     if over_limit:
         return over_limit
     goal = cap_text(goal)

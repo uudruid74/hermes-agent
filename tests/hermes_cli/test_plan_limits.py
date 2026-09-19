@@ -18,7 +18,9 @@ from hermes_cli.plan_limits import (  # noqa: E402
     cap_summary,
     cap_text,
     compress_whitespace,
+    goal_text_error,
     step_count_error,
+    steps_text_error,
 )
 
 
@@ -64,6 +66,30 @@ def test_cap_steps_applies_to_every_step():
     capped = cap_steps(steps)
     assert [len(item) for item in capped] == [PLAN_TEXT_MAX_CHARS, 5, 11]
     assert capped[2] == "spaced step"
+
+
+def test_goal_text_error_refuses_over_the_cap():
+    """Truncation is silent data loss — submission must REFUSE (Evan, 2026-09-18)."""
+    assert goal_text_error("G" * PLAN_TEXT_MAX_CHARS) is None
+    error = goal_text_error("G" * (PLAN_TEXT_MAX_CHARS + 1))
+    assert error is not None
+    assert "241" in error and str(PLAN_TEXT_MAX_CHARS) in error
+    assert "FILE" in error
+
+
+def test_goal_text_error_measures_after_whitespace_compression():
+    """Whitespace collapses first, so a padded-but-short goal still passes."""
+    padded = "  G  " * 50 + "\n\n"  # 300 raw chars -> 100 compressed
+    assert len(padded) > PLAN_TEXT_MAX_CHARS
+    assert goal_text_error(padded) is None
+
+
+def test_steps_text_error_names_the_offending_step():
+    assert steps_text_error(["fine", "also fine"]) is None
+    assert steps_text_error(None) is None
+    error = steps_text_error(["fine", "s" * 400])
+    assert error is not None
+    assert "step 2" in error, "must name WHICH step is over the cap"
 
 
 def test_cap_steps_handles_none_and_empty():
