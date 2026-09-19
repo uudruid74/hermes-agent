@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 import math
 import re
 from collections import Counter
-from typing import Any
+from typing import Any, Callable
 
 from agent.model_metadata import estimate_messages_tokens_rough, estimate_tokens_rough
+
+logger = logging.getLogger(__name__)
 
 
 INTERNAL_FALLBACK_PREFIX = (
@@ -560,9 +563,278 @@ def _protected_summary_block(units: list[_Unit]) -> str:
 _HEAP_REPEAT_IS_NOTE_EXEMPT = True
 
 
+# --------------------------------------------------------- inviolable identifiers
+# The Protected selector above answers "what is too COMMON to score?" (corpus
+# filler, by document frequency).  This answers the opposite question: "what is
+# too SPECIFIC to lose?"  A file path, a PID, an error code or a port scores
+# near-zero on every signal we have — it is rare, short, and shares no
+# vocabulary with anything — so a budget squeeze drops exactly the details a
+# coding session cannot continue without (the "artifact trail" failure: an agent
+# that forgets which file it modified produces inconsistent work).
+#
+# Transferable from LLMSlim's Tier 3 and TopoCompress's evidence-preservation
+# argument; both lock these by REGEX, with no model call.  Design constraints
+# that keep it cheap and honest:
+#   * A unit qualifies only if it carries an identifier AND is short enough to
+#     afford (`_INVIOLABLE_MAX_TOKENS`).  Without the length gate a long prose
+#     turn that happens to mention one path would be locked whole and would
+#     crowd out better units.
+#   * Every locked unit must earn its place in the emitted text; nothing is
+#     exempt from the budget (see the survival check in the selection loops).
+#   * Paths and identifiers only — NOT numbers.  Bare numerals are the common
+#     case in tool output and locking them all would be noise, not signal.
+_PATH_RE = re.compile(
+    r"(?:"
+    r"(?:\.{0,2}/|/)[\w.@+-]+(?:/[\w.@+-]+)+"      # ./a/b, /home/ekl/x, ../a/b
+    r"|[\w@+-]+/[\w.@+-]+\.(?:py|md|db|json|yaml|yml|txt|sh|sql|log|toml|cfg)"
+    r"|\b[\w@+-]+\.(?:py|md|db|sql|json|yaml|yml|sh|log|toml|cfg)\b"
+    r")"
+)
+_IDENTIFIER_RE = re.compile(
+    r"(?:"
+    r"\b(?:pid|exit[ _]?code|errno|https?[_ ]?status|signal)\b[^.\n]{0,12}?\d+"
+    r"|\bE[A-Z]{2,}\b"                              # ENOENT, EACCES
+    r"|\b\d{1,5}/(?:tcp|udp)\b"                     # 1234/tcp
+    r"|\b0x[0-9a-fA-F]{4,}\b"                       # 0xdeadbeef
+    # SCREAMING_SNAKE constants, with or without a leading underscore.  A
+    # suffix allow-list (`_MAX`, `_RE`, ...) looked tidy and missed
+    # `_MAX_CANDIDATE_UNITS` — a name our own compressor uses.  Multi-word
+    # capitals are rare in prose, so the general form is safe; single words
+    # (BLACK, EMPTY) are deliberately excluded, which is what the `+` requires.
+    r"|\b_?[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b"
+    r")"
+)
+_INVIOLABLE_MAX_TOKENS = 60
+
+
+def _carries_inviolable(text: str) -> bool:
+    """True when a unit carries a path or an identifier worth preserving.
+
+    Both patterns are anchored on word boundaries and are deliberately narrow;
+    widening them is the way this degrades into "keep everything", which is the
+    failure the length gate exists to prevent.
+    """
+    return bool(_PATH_RE.search(text) or _IDENTIFIER_RE.search(text))
+
+
+def _is_inviolable(unit: "_Unit") -> bool:
+    """Lock a unit against budget-squeeze dropping — if it is small enough.
+
+    Length is the price of the lock.  A short unit carrying a path is the
+    cheapest possible way to keep the artifact trail, so it is always worth its
+    tokens; a long one is not, and locking it would let a single mention of
+    `context_compressor.py` protect three paragraphs of prose.
+
+    Measures ``unit.token_count`` (``estimate_tokens_rough`` of the full text),
+    NOT ``_content_token_count``.  That helper returns the size of a *set* of
+    distinct content words, so 148 words of repetitive filler "count" as 13 —
+    it answers "how much information does this carry", not "how much budget
+    will this cost".  Using it here made the gate pass long units through.
+    """
+    if unit.token_count > _INVIOLABLE_MAX_TOKENS:
+        return False
+    return _carries_inviolable(unit.text)
+
+
+def _inviolable_missing(summary: str, locked: list["_Unit"]) -> list[str]:
+    """Artifacts the lock asked for that the emitted text does not carry.
+
+    The counterpart to ``_is_inviolable``: locking sets the *priority*, this
+    verifies the priority was actually honoured.  The selection loops stop at
+    the budget, so a lock can still lose — and a silently dropped artifact is
+    worse than one that was never locked, because the caller believes it is
+    there.  Callers log these, so a squeeze is visible instead of invisible.
+    """
+    return [u.text for u in locked if u.text not in summary]
+
+
+def _log_inviolable_dropout(
+    summary: str, ranked: list[tuple["_Unit", float]]
+) -> None:
+    """Warn when a locked artifact lost to the budget.
+
+    Called at the end of a selection loop so the outcome is observable.  A lock
+    that silently loses is the same defect class as a test that asserts on a
+    return value instead of the database: the caller believes the artifact is
+    present and it is not.
+    """
+    locked = [u for u, _s in ranked if _is_inviolable(u)]
+    if not locked:
+        return
+    missing = _inviolable_missing(summary, locked)
+    if missing:
+        logger.warning(
+            "compression: %d/%d locked artifact(s) dropped by budget: %s",
+            len(missing),
+            len(locked),
+            "; ".join(text.strip()[:80] for text in missing[:3]),
+        )
+
+
+# Cap on how much artifact budget can claim.  A transcript that is nothing but
+# paths and error codes must not spend the whole payload on them.
+_MAX_INVIOLABLE_UNITS = 12
+
+
+def _lock_first(
+    ranked: list[tuple["_Unit", float]],
+) -> list[tuple["_Unit", float]]:
+    """Move artifact-bearing units to the front of the selection order.
+
+    Both selection loops pack greedily from the top of this list until the
+    budget is spent, so position **is** priority.  An artifact-bearing unit is
+    ranked low by construction — a file path is rare, short, and shares no
+    vocabulary with anything, which is exactly what centrality and relevance
+    penalise — so without this it never gets reached when the budget binds, and
+    the session loses the record of what it touched.
+
+    Promoting them costs at most ``_MAX_INVIOLABLE_UNITS`` short units and makes
+    the artifact trail survive a squeeze.  The cap keeps the highest-ranked
+    ones, so the order *within* both groups is untouched.
+    """
+    locked: list[tuple[_Unit, float]] = []
+    rest: list[tuple[_Unit, float]] = []
+    for pair in ranked:
+        if len(locked) < _MAX_INVIOLABLE_UNITS and _is_inviolable(pair[0]):
+            locked.append(pair)
+        else:
+            rest.append(pair)
+    return locked + rest
+
+
+# Two-pass budget allocation (merged 2026-09-19 from LLMSlim's documented
+# failure mode; Evan: "everything but the LLM").
+#
+# The packer was single-pass: walk the ranked list, add every unit that fits.
+# Order is global, but a *region* that produces many units still wins by
+# volume.  One tool dump splits into a dozen sentence chunks, all sharing
+# vocabulary, all scoring high on centrality — and it spends the budget before
+# the packer ever reaches a region that produces one or two.  LLMSlim names
+# this exactly: "Single-pass budget allocation ... fails badly on documents
+# with mixed density: technical specs mixed with background narrative."  An
+# agent transcript is that mixture, maximally.
+#
+# Pass 1 caps each source region at a share of the budget proportional to the
+# tokens it contributes to the ranked list, so volume cannot preempt priority.
+# Pass 2 hands every unspent remainder back to strict global priority order —
+# a region that cannot use its share (duplicates, or content already carried
+# by the verbatim tail) does not hoard it.
+#
+# The cap is a CEILING, never a reservation: nothing is held back, so a tight
+# budget still spends everything it can.
+_TWO_PASS_ALLOCATION = True
+# Floor on a region's share.  Without it a region contributing two units out
+# of five hundred gets a cap of a few tokens and is effectively excluded,
+# which is the opposite of the point.
+_ALLOC_REGION_MIN_TOKENS = 32
+
+
+def _region_key(unit: "_Unit") -> tuple[int, ...]:
+    """Region a unit belongs to for budget allocation.
+
+    Normally the source message (``order[0]``).  Notes are each their own
+    region: they are synthesized rather than chunked from the transcript, so
+    they all share one ``order[0]`` by construction and grouping them would
+    cap the entire notes block at a single share.
+    """
+    region = unit.order[0]
+    return (region, unit.order[1]) if unit.is_note else (region,)
+
+
+def _region_allocation(
+    units: list["_Unit"], target_tokens: int
+) -> dict[tuple[int, ...], int]:
+    """Per-region token ceiling for pass 1, proportional to contributed tokens.
+
+    A region is the source message (``unit.order[0]``); a unit's region is
+    where it came from in the transcript, not where it landed in the ranking.
+    """
+    weights: dict[tuple[int, ...], int] = {}
+    for unit in units:
+        region = _region_key(unit)
+        weights[region] = weights.get(region, 0) + unit.token_count
+    total = sum(weights.values())
+    if not total:
+        return {}
+    return {
+        region: max(_ALLOC_REGION_MIN_TOKENS, int(target_tokens * weight / total))
+        for region, weight in weights.items()
+    }
+
+
+def _allocate_two_pass(
+    ranked: list[tuple["_Unit", float]],
+    *,
+    target_tokens: int,
+    initial: str,
+    render: Callable[[list["_Unit"]], str],
+    fits: Callable[[str], bool],
+    accept: Callable[["_Unit"], bool] | None = None,
+) -> tuple[list["_Unit"], str]:
+    """Pack ``ranked`` into the budget in two passes (see the note above).
+
+    ``render`` builds the payload text for a candidate selection and ``fits``
+    tests it, so both callers share this even though they emit different
+    blocks (the Plan path appends a LexRank area under a plan summary, the
+    planless path builds the whole payload).  ``accept`` is the caller's
+    repeat filter.
+
+    Returns ``(selected, text)``.  ``text`` is ``initial`` when nothing was
+    accepted, so a caller can pass the payload it already holds and get it
+    back unchanged on a transcript where nothing fits.
+
+    A unit that fails ``fits`` is dropped rather than reconsidered: the
+    rendered text only grows as units are added, so the same unit cannot fit
+    later.  A unit that is merely *capped* is deferred to pass 2, and that
+    distinction is the whole mechanism.
+    """
+    selected: list[_Unit] = []
+    best = initial
+
+    def try_add(unit: _Unit) -> bool:
+        nonlocal best
+        text = render([*selected, unit])
+        if not fits(text):
+            return False
+        selected.append(unit)
+        best = text
+        return True
+
+    usable = [unit for unit, _score in ranked if accept is None or accept(unit)]
+    if len(usable) < 2:
+        for unit in usable:
+            try_add(unit)
+        return selected, best
+
+    if not _TWO_PASS_ALLOCATION:
+        for unit in usable:
+            try_add(unit)
+        return selected, best
+
+    quota = _region_allocation(usable, target_tokens)
+    spent: dict[tuple[int, ...], int] = {}
+    deferred: list[_Unit] = []
+    for unit in usable:
+        region = _region_key(unit)
+        used = spent.get(region, 0)
+        if used and used + unit.token_count > quota.get(region, 0):
+            # Over its share for this pass.  Not rejected — held for pass 2,
+            # where the regions that could not use their share have already
+            # had their pick.
+            deferred.append(unit)
+            continue
+        if try_add(unit):
+            spent[region] = used + unit.token_count
+
+    for unit in deferred:
+        try_add(unit)
+
+    return selected, best
+
+
 def _heap_repeat_covered(
     unit_text: str,
-    tier_tokens: list[frozenset[str]],
+    outside_tiers: list[frozenset[str]],
 ) -> bool:
     """True when a heap candidate is already carried by text outside the heap.
 
@@ -581,7 +853,7 @@ def _heap_repeat_covered(
     tokens = _content_tokens(unit_text)
     if not tokens:
         return False
-    for tier in tier_tokens:
+    for tier in outside_tiers:
         if tier and len(tokens & tier) / len(tokens) >= _HEAP_REPEAT_COVERAGE:
             return True
     return False
@@ -1114,8 +1386,23 @@ def _rank_units(
             if _content_token_count(unit.text) < _MIN_RANKABLE_TOKENS:
                 # Too short to carry context, and short units inflate cosine.
                 # Held back rather than discarded: see the fallback below.
-                short.append(unit)
-                continue
+                #
+                # EXCEPT when the unit is inviolable.  A line carrying a path,
+                # a pid or an error code is short BY NATURE — the token count
+                # that makes it "too short to rank" is the same property that
+                # makes it cheap to keep and impossible to recover.  Measured
+                # 2026-09-19: `edited agent/system_prompt.py` is 4 content
+                # tokens and `killed pid 1476953` is 3, against a floor of 5,
+                # so both were dropped BEFORE ranking and the artifact lock
+                # never saw them.  Without this exemption the lock is dead code
+                # for the very units it exists to protect.
+                #
+                # Only the length floor is waived.  Boilerplate, fragments and
+                # narration are still excluded above, so this cannot pull back
+                # the junk those filters exist for.
+                if not _is_inviolable(unit):
+                    short.append(unit)
+                    continue
             key = _canonical_form(unit.text)
             if not key or key in seen_text:
                 continue
@@ -1200,7 +1487,11 @@ def _rank_units(
         zip(candidates, scores),
         key=lambda item: (-item[1], item[0].order),
     )[:_MAX_CANDIDATE_UNITS]
-    return _mmr_order(ordered)
+    # Artifact lock LAST, after MMR has had its say: MMR reorders to push
+    # near-duplicates down, and it would happily demote a file path for sharing
+    # vocabulary with another path.  Locking here — immediately before the
+    # callers pack the budget — is what actually decides priority.
+    return _lock_first(_mmr_order(ordered))
 
 
 def _mmr_order(
@@ -1384,15 +1675,21 @@ def _add_plan_lexrank_area(
         ),
     ]
 
-    selected: list[_Unit] = []
-    best = summary
-    for unit, _score in ranked:
-        if _heap_repeat_covered(unit.text, outside_tiers):
-            continue
-        candidate = _with_lexrank_section(summary, [*selected, unit], protected)
-        if _fits(messages, head_count, tail_start, candidate, target_tokens):
-            selected.append(unit)
-            best = candidate
+    # Two-pass packing (2026-09-19).  Single-pass let one many-unit region
+    # spend the budget before the packer reached a one-unit region, which is
+    # the mixed-density failure LLMSlim documents; the allocator caps each
+    # region's pass-1 share and hands the remainder back in priority order.
+    # Budget is still a TARGET: when nothing fits we keep the plan-only
+    # payload, which is what ``initial`` returns unchanged.
+    selected, best = _allocate_two_pass(
+        ranked,
+        target_tokens=target_tokens,
+        initial=summary,
+        render=lambda chosen: _with_lexrank_section(summary, chosen, protected),
+        fits=lambda text: _fits(messages, head_count, tail_start, text, target_tokens),
+        accept=lambda unit: not _heap_repeat_covered(unit.text, outside_tiers),
+    )
+    _log_inviolable_dropout(best, ranked)
     return best, tail_start
 
 
@@ -1585,16 +1882,19 @@ def build_internal_fallback(
             "\n".join(_content_text(m.get("content")) for m in messages[tail_start:])
         ),
     ]
-    selected: list[_Unit] = []
-    for unit, _score in ranked:
-        if not unit.is_note and _heap_repeat_covered(unit.text, outside_tiers):
-            continue
-        candidate_selection = [*selected, unit]
-        summary = _lexrank_summary(candidate_selection, protected)
-        if _fits(messages, head_count, tail_start, summary, target_tokens):
-            selected = candidate_selection
-
-    summary = _lexrank_summary(selected, protected)
+    # Same two-pass packing as the Plan path, and the same reasoning: the
+    # budget is a TARGET, and `initial` is the empty-heap payload that comes
+    # back unchanged when nothing fits.
+    selected, summary = _allocate_two_pass(
+        ranked,
+        target_tokens=target_tokens,
+        initial=_lexrank_summary([], protected),
+        render=lambda chosen: _lexrank_summary(chosen, protected),
+        fits=lambda text: _fits(messages, head_count, tail_start, text, target_tokens),
+        accept=lambda unit: unit.is_note
+        or not _heap_repeat_covered(unit.text, outside_tiers),
+    )
+    _log_inviolable_dropout(summary, ranked)
     if _fits(messages, head_count, tail_start, summary, target_tokens):
         return InternalFallback(summary, head_count, tail_start, "lexrank", memory)
     # Last resort: the requested verbatim tail cannot fit at all.  Shrink

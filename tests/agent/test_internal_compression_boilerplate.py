@@ -21,6 +21,8 @@ These tests pin the properties that matter:
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from agent import internal_compression_fallback as fallback
@@ -332,7 +334,43 @@ def test_plan_summary_is_not_treated_as_a_repeat_source() -> None:
 
 
 def test_notes_are_exempt_from_the_repeat_gate() -> None:
-    import inspect
+    """A note fully covered by the verbatim tail still reaches the payload.
 
-    src = inspect.getsource(fallback.build_internal_fallback)
-    assert "not unit.is_note" in src
+    Behaviour, not source text.  This test used to grep the function source for
+    ``"not unit.is_note"`` — which broke the moment the repeat gate moved into
+    the two-pass packer's ``accept`` callable, even though the exemption was
+    intact.  A source-text assertion cannot tell "the rule is gone" from "the
+    rule moved", which is the same defect class as a test that asserts on a
+    function's return value instead of the database it was supposed to write.
+
+    The property under test: notes route separately from the heap's repeat
+    gate, so a note whose content words are all present in the verbatim tail is
+    still emitted as a note.
+    """
+    note = "Critical deployment note: never restart the database automatically."
+    # Tail carries every content word of the note, so the repeat gate would
+    # mark it a duplicate if it were applied to notes.
+    msgs: list[dict[str, Any]] = [
+        {"role": "system", "content": "sys"},
+        {
+            "role": "assistant",
+            "content": (
+                "Critical deployment note: never restart the database "
+                "automatically. " + "padding prose about the ledger and the "
+                "harbour and the almanac. "
+            ),
+        },
+        {"role": "user", "content": "carry on with the work please"},
+    ]
+    res = fallback.build_internal_fallback(
+        msgs,
+        protect_head_count=1,
+        protect_last_n=1,
+        target_tokens=4000,
+        memory_context=note,
+    )
+    assert "never restart the database automatically" in res.summary, (
+        "the note was treated as a repeat of the verbatim tail"
+    )
+    # And it is emitted in the notes section, not mixed into the heap.
+    assert "## Session Notes" in res.summary
