@@ -406,6 +406,20 @@ def _current(conn, agent):
 def cmd_advance(
     agent, summary: str, proof: Optional[str] = None, step: Optional[int] = None
 ) -> str:
+    """Complete the active plan step.
+
+    This adapter SHADOWS ``plan_tool._cmd_advance`` — live ``advance`` calls
+    resolve here, not to the legacy helper — so when the two-phase completion
+    gate (``execution_bindings.advance_plan``, Evan 2026-09-15) was added, it
+    became this function's job to forward ``proof``.  It does.
+
+    Two-phase completion: without ``proof`` the step is recorded as a bare
+    claim and returned unchanged ("STEP n NOT ADVANCED — verify before
+    claiming"); with ``proof`` a ``RECEIPT:n:<proof>`` comment is written and
+    the step advances.  Both ``proof`` and ``step`` are load-bearing here —
+    ``step`` is what makes a drifted or duplicate advance refuse instead of
+    moving the plan forward.  Do not drop either when refactoring.
+    """
     from hermes_cli import execution_bindings as bindings
 
     conn = _legacy()._get_kanban_db()

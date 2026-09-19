@@ -11,6 +11,20 @@ Protected region.
 These tests exist so that gap cannot reopen: they exercise each creation path
 against a temp copy of a real board and assert on the STORED row, not on the
 function's return value.
+
+2026-09-19 addition — the two-phase ADVANCE gate
+------------------------------------------------
+``execution_bindings.advance_plan`` (Evan, 2026-09-15) refuses to move a step on
+a bare claim: without ``proof`` the step is recorded and returned unchanged, and
+a ``RECEIPT:n:<proof>`` comment is what actually advances it.
+
+Live ``advance`` calls do NOT resolve to ``plan_tool._cmd_advance`` — the
+adapter in :mod:`tools.plan_binding_adapter` SHADOWS it, so that module's
+forwarding of ``proof``/``step`` is the only thing standing between a correct
+call and a silently-recorded claim.  That is a one-line refactor away from being
+dropped, with no visible symptom except "my proven step won't advance".  The
+tests below drive the REAL ``advance_plan`` against a real binding row and pin
+the forwarding contract on the adapter, not on the legacy helper.
 """
 
 from __future__ import annotations
@@ -224,3 +238,124 @@ def test_insert_request_cap_is_idempotent(board):
         "SELECT task_goal FROM tasks WHERE id = 't_insertcap2'"
     ).fetchone()["task_goal"]
     assert cap_text(stored) == stored
+
+
+# --------------------------------------------------------------------------
+# Two-phase ADVANCE gate — the adapter must forward `proof` and `step`.
+#
+# These drive the REAL ``advance_plan`` against a real binding row on a temp
+# board rather than monkeypatching it away: the failure mode here is a
+# FORWARDING contract, and a mocked callee cannot observe what was forwarded.
+# --------------------------------------------------------------------------
+
+STEP_TEXT = "make the end() regression read the DB"
+
+
+@pytest.fixture()
+def bound_plan(board):
+    """A copy of the real board carrying an active one-step Plan + binding.
+
+    Reuses a real binding row so the identity/resolution path is the
+    production one; only ``status``/``task_steps`` are forced into a clean,
+    claimable state.
+    """
+    conn, _plan_tool = board
+    from hermes_cli import execution_bindings as B
+
+    task_id = conn.execute(
+        "SELECT task_id FROM execution_bindings "
+        "ORDER BY updated_at DESC LIMIT 1"
+    ).fetchone()
+    if task_id is None:
+        pytest.skip("no binding row in the board copy")
+    task_id = task_id["task_id"]
+
+    conn.execute(
+        "UPDATE tasks SET status='manual', task_steps=?, task_stepno=1, "
+        "task_goal='advance gate fixture', plan_kind='normal' WHERE id=?",
+        (json.dumps([STEP_TEXT]), task_id),
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT * FROM execution_bindings WHERE task_id=?", (task_id,)
+    ).fetchone()
+    key = B.ExecutionKey(profile=row["profile"], root_session_id=row["root_session_id"])
+    return conn, B, key, task_id, row["revision"]
+
+
+def test_bare_claim_does_not_advance(bound_plan):
+    """No proof => the step is recorded as a claim and comes back unchanged."""
+    conn, B, key, task_id, revision = bound_plan
+    result = B.advance_plan(
+        conn, key, expected_task_id=task_id, expected_revision=revision,
+        summary="claim only", actor="gopher", proof=None, step=1,
+    )
+    assert result.binding_revision == revision, "a bare claim must not move the step"
+    assert not result.closed
+    assert B._step_receipts(conn, task_id) == set()
+
+
+def test_proof_advances_and_writes_a_receipt(bound_plan):
+    """Proof => the step closes and a RECEIPT comment lands on the task row."""
+    conn, B, key, task_id, revision = bound_plan
+    result = B.advance_plan(
+        conn, key, expected_task_id=task_id, expected_revision=revision,
+        summary="verified", actor="gopher", proof="git commit 09f34a1", step=1,
+    )
+    assert result.closed, "the last step of a one-step plan closes it"
+    receipts = B._step_receipts(conn, task_id)
+    assert receipts == {1}, "advancing with proof must record a receipt"
+    stored = conn.execute(
+        "SELECT body FROM task_comments WHERE task_id=? "
+        "AND body LIKE 'RECEIPT:%'",
+        (task_id,),
+    ).fetchone()["body"]
+    assert "09f34a1" in stored
+
+
+def test_adapter_forwards_proof_and_step(bound_plan, monkeypatch):
+    """The SHADOWING adapter must pass `proof` and `step` through.
+
+    This contract has no other guard: if a refactor calls the legacy helper
+    with ``summary`` alone, every proven advance degrades into a recorded
+    claim and the only symptom is a step that will not move.
+    """
+    conn, B, key, task_id, _revision = bound_plan
+    from tools import plan_binding_adapter as adapter
+
+    class _Agent:
+        session_id = "sess"
+        profile_name = key.profile
+        _session_db = None
+        _session_temperature = None
+
+    seen = {}
+    real = B.advance_plan
+
+    def _spy(*args, **kwargs):
+        seen.update(kwargs)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(B, "advance_plan", _spy)
+    # The adapter reaches the board via `_legacy()._get_kanban_db()` WITHOUT a
+    # `with`, so it needs the connection itself — the `board` fixture's
+    # nullcontext (correct for `plan_tool`'s `with` sites) would blow up here.
+    monkeypatch.setattr(adapter._legacy(), "_get_kanban_db", lambda board=None: conn)
+    monkeypatch.setattr(
+        adapter, "_current", lambda c, a: (key, B.require_binding(c, key), None)
+    )
+    monkeypatch.setattr(adapter, "_sync_subject_from_binding", lambda agent: None)
+
+    adapter.cmd_advance(_Agent(), "verified step", proof="git commit 09f34a1", step=1)
+    assert seen.get("proof") == "git commit 09f34a1", "adapter dropped `proof`"
+    assert seen.get("step") == 1, "adapter dropped `step`"
+
+
+def test_step_guard_refuses_a_drifted_step(bound_plan):
+    """A wrong step number is refused instead of silently advancing."""
+    conn, B, key, task_id, revision = bound_plan
+    with pytest.raises(B.InvalidTaskState):
+        B.advance_plan(
+            conn, key, expected_task_id=task_id, expected_revision=revision,
+            summary="lost agent", actor="gopher", proof="x", step=7,
+        )
