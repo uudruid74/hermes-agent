@@ -16881,6 +16881,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         exc_info=True,
                                     )
                                 _hyg_session_db = getattr(self._session_db, "_db", self._session_db)
+                                # Structural absence of a session DB is the
+                                # only case where neither rotation nor
+                                # in-place compaction can run. Track it so the
+                                # no-change warning below can name the REAL
+                                # reason instead of the old catch-all text
+                                # (#21301).
+                                _hyg_had_session_db = _hyg_session_db is not None
                                 _hyg_agent = AIAgent(
                                     **_hyg_runtime,
                                     model=_hyg_model,
@@ -16928,11 +16935,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                                     loop = asyncio.get_running_loop()
                                     _hyg_commit_fence = CompressionCommitFence()
+                                    # Gateway hygiene is a PRE-AGENT safety net:
+                                    # it fires at 85% threshold (or the hard
+                                    # message limit) to rescue exactly the
+                                    # pathologically large sessions the agent
+                                    # loop can no longer shrink.  Pass
+                                    # force=True so the anti-thrash breaker
+                                    # (compression_fallback_streak /
+                                    # compression_ineffective_count >= 2,
+                                    # #14694) does NOT block it — the breaker
+                                    # is preserved for the agent loop's own
+                                    # compression, but a tripped breaker must
+                                    # not turn the hygiene safety net into a
+                                    # log-spamming no-op (#21301).  force only
+                                    # clears the in-process summary-failure
+                                    # cooldown; the DURABLE failure cooldown
+                                    # re-check above (get_compression_failure_
+                                    # cooldown) still rate-limits a provider
+                                    # that keeps failing, so force cannot
+                                    # thrash a genuinely broken aux model.
                                     _hyg_future = loop.run_in_executor(
                                         None,
                                         lambda: _hyg_agent._compress_context(
                                             _hyg_msgs, "",
                                             approx_tokens=_approx_tokens,
+                                            force=True,
                                             commit_fence=_hyg_commit_fence,
                                         ),
                                     )
@@ -17186,13 +17213,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         # the pre-compression ones.
                                         _new_count = _msg_count
                                         _new_tokens = _approx_tokens
+                                        _hyg_noop_cause = (
+                                            "structural session_db: none"
+                                            if not _hyg_had_session_db
+                                            else "skipped: compression lock held by another path"
+                                            if getattr(
+                                                _hyg_agent,
+                                                "_compression_skipped_due_to_lock",
+                                                False,
+                                            )
+                                            else "aborted: summary could not be produced"
+                                            if getattr(
+                                                getattr(_hyg_agent, "context_compressor", None),
+                                                "_last_compress_aborted",
+                                                False,
+                                            )
+                                            else "no change: compressor returned the transcript untouched"
+                                        )
                                         logger.warning(
                                             "Gateway hygiene compression for session %s "
-                                            "did not rotate or compact in place "
-                                            "(no session_db on the hygiene agent) — "
+                                            "did not rotate or compact in place (%s) — "
                                             "preserving the original transcript instead "
                                             "of overwriting it with the summary (#21301).",
                                             session_entry.session_id,
+                                            _hyg_noop_cause,
                                         )
 
                                     logger.info(

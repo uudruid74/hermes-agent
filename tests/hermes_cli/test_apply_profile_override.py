@@ -20,11 +20,16 @@ from types import SimpleNamespace
 def _run_apply_profile_override(
     tmp_path, monkeypatch, *, hermes_home: str | None, active_profile: str | None,
     argv: list[str] | None = None,
+    preset_profile: str | None = None,
+    preset_agent_name: str | None = None,
 ):
     """Run _apply_profile_override in isolation.
 
     Returns the value of os.environ["HERMES_HOME"] after the call,
     or None if unset.
+
+    ``preset_profile`` / ``preset_agent_name`` pre-set the identity env vars so
+    a test can assert that an explicit value is never clobbered by the export.
     """
     hermes_root = tmp_path / ".hermes"
     hermes_root.mkdir(parents=True, exist_ok=True)
@@ -32,14 +37,31 @@ def _run_apply_profile_override(
     if active_profile is not None:
         (hermes_root / "active_profile").write_text(active_profile)
 
-    if active_profile and active_profile != "default":
-        (hermes_root / "profiles" / active_profile).mkdir(parents=True, exist_ok=True)
+    # resolve_profile_env() raises FileNotFoundError for a profile that has no
+    # directory, so every name the run can resolve needs one: the sticky
+    # active_profile and any explicit -p in argv.
+    names = {n for n in [active_profile] if n and n != "default"}
+    _argv = argv or ["hermes", "gateway", "start"]
+    for _i, _a in enumerate(_argv):
+        if _a in {"--profile", "-p"} and _i + 1 < len(_argv):
+            names.add(_argv[_i + 1])
+        elif _a.startswith("--profile="):
+            names.add(_a.split("=", 1)[1])
+    for _n in names:
+        (hermes_root / "profiles" / _n).mkdir(parents=True, exist_ok=True)
 
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     if hermes_home is not None:
         monkeypatch.setenv("HERMES_HOME", hermes_home)
     else:
         monkeypatch.delenv("HERMES_HOME", raising=False)
+
+    for var, val in (("HERMES_PROFILE", preset_profile),
+                     ("HERMES_AGENT_NAME", preset_agent_name)):
+        if val is None:
+            monkeypatch.delenv(var, raising=False)
+        else:
+            monkeypatch.setenv(var, val)
 
     monkeypatch.setattr(sys, "argv", argv or ["hermes", "gateway", "start"])
 
@@ -163,4 +185,83 @@ class TestSupervisedChildIgnoresStickyProfile:
         result = os.environ.get("HERMES_HOME")
         assert result is not None
         assert result.endswith("coder")
+
+
+class TestProfileIdentityExport:
+    """``-p``/HERMES_HOME must also export HERMES_PROFILE + HERMES_AGENT_NAME.
+
+    Regression for the empty-profile origin stamp: ``-p`` used to set ONLY
+    HERMES_HOME, so ``os.environ.get("HERMES_PROFILE", "")`` returned empty in
+    a gateway process. Anything using it as a fallback (plan_tool dispatch
+    origin stamping) then recorded ``profile: ""``, and a completion wake
+    resolved to an unqualified ``platform:chat_id`` target — delivered by
+    whichever gateway owned the bridge socket rather than the dispatcher's.
+    See bugs/pending/2026-09-14-notify-wake-profile-less-origin.md.
+    """
+
+    def _reset(self, monkeypatch):
+        for var in ("HERMES_PROFILE", "HERMES_AGENT_NAME"):
+            monkeypatch.delenv(var, raising=False)
+
+    def test_explicit_profile_flag_exports_identity(self, tmp_path, monkeypatch):
+        """`hermes -p coder ...` exports both vars as the profile slug."""
+        self._reset(monkeypatch)
+        _run_apply_profile_override(
+            tmp_path, monkeypatch, hermes_home=None, active_profile=None,
+            argv=["hermes", "-p", "coder", "gateway", "run"],
+        )
+
+        assert os.environ.get("HERMES_HOME", "").endswith("coder")
+        assert os.environ.get("HERMES_PROFILE") == "coder"
+        assert os.environ.get("HERMES_AGENT_NAME") == "coder"
+
+    def test_preexisting_hermes_home_early_return_still_exports(self, tmp_path, monkeypatch):
+        """The systemd contract: HERMES_HOME already points into profiles/.
+
+        This is the path that produced the empty profile — the early-return
+        exited before any identity was exported.
+        """
+        self._reset(monkeypatch)
+        profile_dir = tmp_path / ".hermes" / "profiles" / "gopher"
+        profile_dir.mkdir(parents=True, exist_ok=True)
+
+        _run_apply_profile_override(
+            tmp_path, monkeypatch, hermes_home=str(profile_dir), active_profile=None,
+        )
+
+        assert os.environ.get("HERMES_PROFILE") == "gopher"
+        assert os.environ.get("HERMES_AGENT_NAME") == "gopher"
+
+    def test_identity_never_overrides_an_explicit_value(self, tmp_path, monkeypatch):
+        """A deliberate value wins.
+
+        ``HERMES_AGENT_NAME`` is a display identity ("Gopher") that legitimately
+        differs from the slug ("gopher"); a profile's .env load right after this
+        must be able to supply the human casing, and a tool subprocess may carry
+        HERMES_PROFILE on purpose.
+        """
+        _run_apply_profile_override(
+            tmp_path, monkeypatch, hermes_home=None, active_profile=None,
+            argv=["hermes", "-p", "coder", "gateway", "run"],
+            preset_profile="explicit-slug",
+            preset_agent_name="Gopher",
+        )
+
+        assert os.environ.get("HERMES_PROFILE") == "explicit-slug"
+        assert os.environ.get("HERMES_AGENT_NAME") == "Gopher"
+
+    def test_default_profile_exports_literal_default(self, tmp_path, monkeypatch):
+        """The root profile exports "default" — a concrete value, not blank.
+
+        Consumers strip it with an explicit ``!= "default"`` test, so exporting
+        it is strictly better than the previous empty string.
+        """
+        self._reset(monkeypatch)
+        _run_apply_profile_override(
+            tmp_path, monkeypatch, hermes_home=None, active_profile="default",
+            argv=["hermes", "gateway", "run"],
+        )
+
+        assert os.environ.get("HERMES_PROFILE") == "default"
+        assert os.environ.get("HERMES_AGENT_NAME") == "default"
 

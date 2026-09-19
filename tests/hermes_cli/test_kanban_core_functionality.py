@@ -562,6 +562,44 @@ def test_claim_task_recovers_from_invariant_leak(kanban_home):
         conn.close()
 
 
+def test_claim_task_rejects_unassigned(kanban_home):
+    """An unassigned task must never promote ready -> running.
+
+    Evan 2026-09-13: a kanban task with no Assignee should not spawn a
+    nameless worker. claim_task demotes it to 'todo' and records a
+    claim_rejected event with reason='unassigned', mirroring the
+    parents_not_done guard above.
+    """
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="unassigned claim guard",
+        )
+        # Simulate the observed footgun: an unassigned task ends up 'ready'
+        # (create_task supports running/blocked only; ready arrives via
+        # later promotion/release paths).
+        conn.execute(
+            "UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,),
+        )
+        conn.commit()
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is None
+        task = kb.get_task(conn, tid)
+        assert task.status == "todo"
+        events = kb._events_since(conn, tid, 0) if hasattr(kb, "_events_since") else []
+        # Fallback: read events through the public API when available.
+        if not events:
+            events = kb.list_events(conn, tid) if hasattr(kb, "list_events") else []
+        assert any(
+            ev.kind == "claim_rejected"
+            and (ev.payload or {}).get("reason") == "unassigned"
+            for ev in events
+        )
+    finally:
+        conn.close()
+
+
 # -------------------------------------------------------------------------
 # Live-test findings (Apr 2026 third pass: auto-init, show --json carries runs)
 # -------------------------------------------------------------------------
