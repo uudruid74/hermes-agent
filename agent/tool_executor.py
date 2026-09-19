@@ -1525,6 +1525,13 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     around_message_id=next_args.get("around_message_id"),
                     window=next_args.get("window", 5),
                     sort=next_args.get("sort"),
+                    # `profile` is declared in the schema (read another profile's
+                    # session DB, read-only) and accepted by session_search(),
+                    # but was missing from this whitelist — so cross-profile
+                    # recall silently read the CURRENT profile instead. Same
+                    # class as the plan_tool proof/step drop: present at both
+                    # ends, dropped in the middle.
+                    profile=next_args.get("profile"),
                     db=session_db,
                     current_session_id=agent.session_id,
                 )
@@ -1624,6 +1631,22 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     kind=next_args.get("kind") or "normal",
                     debug_plan_id=next_args.get("debug_plan_id"),
                     pre_approved=next_args.get("pre_approved", False),
+                    # `proof` and `step` are declared in the tool schema and
+                    # accepted by plan_tool(), but were missing from this
+                    # explicit argument whitelist — so every live `advance`
+                    # reached the two-phase gate with proof=None. The step was
+                    # recorded as a bare claim and returned unchanged
+                    # ("STEP n NOT ADVANCED — verify before claiming") no matter
+                    # what proof the caller supplied, and no RECEIPT was ever
+                    # written. Same class as the cap_text truncation bug: a
+                    # parameter present at both ends and dropped in the middle.
+                    proof=next_args.get("proof"),
+                    step=next_args.get("step"),
+                    # Same whitelist gap: `new` accepts a parent_task_id to nest
+                    # a sub-plan, and the schema declares it — but it was not
+                    # forwarded here, so a nested plan silently became a root
+                    # plan.
+                    parent_task_id=next_args.get("parent_task_id"),
                 )
             function_result, function_args, middleware_trace, _execution_blocked = _managed_values(_run_agent_tool_execution_middleware(
                 agent,
