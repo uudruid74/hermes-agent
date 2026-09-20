@@ -336,7 +336,25 @@ class OpenAIRateLimitThrottle:
                 # status code but no structured body.
                 _quota_reset = None
                 try:
-                    _body = getattr(response, "content", b"") or b""
+                    # The response body is NOT buffered when a `response`
+                    # event hook fires on a streamed request (httpx raises
+                    # ResponseNotRead on `.content`).  The codex path streams
+                    # (agent_init.py: raw_codex=True -> responses.stream()), so
+                    # reading `.content` here always raised and the bare
+                    # `except` below swallowed it — `quota_reset_at` was never
+                    # persisted and the kanban respawn guard had no deadline to
+                    # read.  Force the body with read(); this does not steal it
+                    # from the caller, which still receives the full body.
+                    _is_stream = bool(getattr(response, "_content", None) is None)
+                    if _is_stream:
+                        try:
+                            response.read()
+                        except Exception:
+                            pass  # non-replayable stream — fall through to no body
+                    try:
+                        _body = response.content or b""
+                    except Exception:
+                        _body = b""
                     if isinstance(_body, bytes):
                         _parsed = json.loads(_body.decode("utf-8", "replace"))
                     else:
