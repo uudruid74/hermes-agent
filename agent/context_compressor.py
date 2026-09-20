@@ -6554,6 +6554,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             self._last_summary_fallback_used = True
             telemetry["fallback_used"] = True
             telemetry["fallback_mode"] = fallback.mode
+            telemetry["fallback_selection"] = dict(fallback.selection_telemetry)
             if internal_only:
                 telemetry["failure_class"] = "internal_only"
             elif feasibility_skip:

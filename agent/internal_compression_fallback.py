@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import logging
 import math
 import re
 from collections import Counter
 from typing import Any, Callable
 
+from agent.llmslim_selector import (
+    SelectionUnit,
+    entity_score,
+    instruction_score,
+    score_semantic_chunks,
+    semantic_chunks,
+    split_sentences,
+)
 from agent.model_metadata import estimate_messages_tokens_rough, estimate_tokens_rough
 
 logger = logging.getLogger(__name__)
@@ -224,14 +232,17 @@ class InternalFallback:
     # Between-compaction Protected state, handed back so the caller can
     # persist it on the compressor instance (2026-09-18).
     protected_memory: "ProtectedMemory | None" = None
+    selection_telemetry: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
 class _Unit:
     text: str
-    order: tuple[int, int]
+    order: tuple[int, ...]
     token_count: int
     is_note: bool = False
+    role: str = "unknown"
+    semantic_chunk: int | None = None
 
 
 def _content_text(content: Any) -> str:
@@ -732,13 +743,16 @@ _ALLOC_REGION_MIN_TOKENS = 32
 def _region_key(unit: "_Unit") -> tuple[int, ...]:
     """Region a unit belongs to for budget allocation.
 
-    Normally the source message (``order[0]``).  Notes are each their own
-    region: they are synthesized rather than chunked from the transcript, so
-    they all share one ``order[0]`` by construction and grouping them would
-    cap the entire notes block at a single share.
+    Semantic middle candidates use their coherent chunk as the region. Legacy
+    candidates retain source-message regions. Notes remain individually
+    budgeted because they are synthesized rather than transcript chunks.
     """
     region = unit.order[0]
-    return (region, unit.order[1]) if unit.is_note else (region,)
+    if unit.is_note:
+        return (region, unit.order[1])
+    if unit.semantic_chunk is not None:
+        return (-1, unit.semantic_chunk)
+    return (region,)
 
 
 def _region_allocation(
@@ -862,7 +876,7 @@ def _heap_repeat_covered(
 def _chunks(text: str) -> list[str]:
     text = _strip_boilerplate(text)
     chunks: list[str] = []
-    for sentence in _SENTENCE_SPLIT_RE.split(text.strip()):
+    for sentence in split_sentences(text):
         sentence = re.sub(r"\s+", " ", sentence).strip()
         if not sentence:
             continue
@@ -959,15 +973,17 @@ def _message_units(
     for message_offset, message in enumerate(messages):
         if not include_observations and _is_observation(message):
             continue
-        role = str(message.get("role") or "unknown").upper()
+        role = str(message.get("role") or "unknown")
+        role_label = role.upper()
         content = _prune_reingested_payload(_content_text(message.get("content")))
         for unit_offset, chunk in enumerate(_chunks(content)):
-            text = f"[{role}]: {chunk}"
+            text = f"[{role_label}]: {chunk}"
             units.append(
                 _Unit(
                     text=text,
                     order=(start_index + message_offset, unit_offset),
                     token_count=estimate_tokens_rough(text),
+                    role=role.casefold(),
                 )
             )
     return units
@@ -1320,6 +1336,125 @@ def _fitted_plan_summary(
     )
 
 
+def _blank_selection_telemetry() -> dict[str, Any]:
+    return {
+        "selector": "semantic",
+        "instruction_units_found": 0,
+        "instruction_units_kept": 0,
+        "entity_units_found": 0,
+        "entity_units_kept": 0,
+        "chunk_count": 0,
+        "candidate_count": 0,
+        "candidate_tokens": 0,
+        "selected_count": 0,
+        "selected_tokens": 0,
+        "achieved_ratio": 0.0,
+        "selection_state": "no-op",
+        "no_op_reason": None,
+        "assembled_tokens": 0,
+        "over_budget": False,
+    }
+
+
+def _record_selected_units(
+    telemetry: dict[str, Any], selected: list[_Unit]
+) -> None:
+    telemetry["selected_count"] = len(selected)
+    telemetry["selected_tokens"] = sum(unit.token_count for unit in selected)
+    telemetry["instruction_units_kept"] = sum(
+        instruction_score(unit.text, role=unit.role) > 0 for unit in selected
+    )
+    telemetry["entity_units_kept"] = sum(
+        entity_score(unit.text) > 0 for unit in selected
+    )
+    candidate_tokens = int(telemetry.get("candidate_tokens") or 0)
+    telemetry["achieved_ratio"] = (
+        round(telemetry["selected_tokens"] / candidate_tokens, 6)
+        if candidate_tokens
+        else 0.0
+    )
+    if not selected:
+        telemetry["selection_state"] = "no-op"
+        telemetry["no_op_reason"] = telemetry.get("no_op_reason") or (
+            "no_candidates"
+            if not telemetry.get("candidate_count")
+            else "no_selected_candidates"
+        )
+    elif len(selected) == telemetry.get("candidate_count"):
+        telemetry["selection_state"] = "unchanged"
+        telemetry["no_op_reason"] = None
+    else:
+        telemetry["selection_state"] = "selected"
+        telemetry["no_op_reason"] = None
+
+
+def _semantic_rank_candidates(
+    candidates: list[_Unit],
+    reference_units: list[_Unit],
+    telemetry: dict[str, Any] | None = None,
+) -> list[tuple[_Unit, float]]:
+    """Rank a prepared middle with dependency-free LLMSlim semantics."""
+
+    selection_units = [
+        SelectionUnit(
+            text=unit.text,
+            order=unit.order,
+            token_count=unit.token_count,
+            role=unit.role,
+            is_note=unit.is_note,
+        )
+        for unit in candidates
+    ]
+    recent_units = [
+        SelectionUnit(
+            text=unit.text,
+            order=unit.order,
+            token_count=unit.token_count,
+            role=unit.role,
+            is_note=unit.is_note,
+        )
+        for unit in reference_units
+    ]
+    chunks = semantic_chunks(selection_units)
+    scored = score_semantic_chunks(chunks, recent_units=recent_units)
+    if telemetry is not None:
+        telemetry["chunk_count"] = len(chunks)
+        telemetry["candidate_count"] = len(scored)
+        telemetry["candidate_tokens"] = sum(
+            item.unit.token_count for item in scored
+        )
+        telemetry["instruction_units_found"] = sum(
+            item.instruction > 0 for item in scored
+        )
+        telemetry["entity_units_found"] = sum(item.entity > 0 for item in scored)
+    ranked: list[tuple[_Unit, float]] = []
+    for item in scored:
+        unit = _Unit(
+            text=item.unit.text,
+            order=item.unit.order,
+            token_count=item.unit.token_count,
+            is_note=item.unit.is_note,
+            role=item.unit.role,
+            semantic_chunk=item.chunk_index,
+        )
+        score = item.score
+        if _PRUNED_SKILL_RE.search(unit.text):
+            score = max(score, _NOTE_SCORE_FLOOR)
+        elif unit.is_note:
+            score = max(score, 1.25 + 0.4 * item.relevance)
+        ranked.append((unit, score))
+
+    ordered = sorted(
+        ranked,
+        key=lambda pair: (-pair[1], pair[0].order),
+    )[:_MAX_CANDIDATE_UNITS]
+    # Semantic chunk coverage is the new diversity mechanism. Applying legacy
+    # sentence-level MMR again can promote an otherwise low-value isolated
+    # identifier solely because it is lexically unique, making the artifact
+    # lock impossible to verify. Keep the lock as the explicit mechanism.
+    return _lock_first(ordered)
+
+
 def _rank_units(
     middle_units: list[_Unit],
     note_units: list[_Unit],
@@ -1327,6 +1462,8 @@ def _rank_units(
     *,
     reference_units: list[_Unit] | None = None,
     protected_units: list[_Unit] | None = None,
+    semantic: bool = False,
+    selection_telemetry: dict[str, Any] | None = None,
 ) -> list[tuple[_Unit, float]]:
     """Rank candidate units by centrality + relevance + recency, best first.
 
@@ -1447,6 +1584,13 @@ def _rank_units(
             protected_terms = protected_terms | frozenset(
                 token for unit in removed for token in _content_tokens(unit.text)
             )
+
+    if semantic:
+        return _semantic_rank_candidates(
+            candidates,
+            reference_units,
+            telemetry=selection_telemetry,
+        )
 
     all_vectors = _tfidf_vectors(
         [unit.text for unit in candidates] + [unit.text for unit in reference_units],
@@ -1625,6 +1769,7 @@ def _add_plan_lexrank_area(
     notes: list[str],
     target_tokens: int,
     protected: list[_Unit] | None = None,
+    selection_telemetry: dict[str, Any] | None = None,
 ) -> tuple[str, int]:
     """Spend the leftover plan budget on the ranked middle (Evan, 2026-09-15).
 
@@ -1649,6 +1794,8 @@ def _add_plan_lexrank_area(
     rank_start = _plan_step_change_index(messages, head_count, tail_start)
     middle_messages = messages[rank_start:tail_start]
     if not middle_messages:
+        if selection_telemetry is not None:
+            selection_telemetry["no_op_reason"] = "no_candidates"
         return summary, tail_start
     middle_units = _message_units(middle_messages, start_index=rank_start)
     marker_notes = {note for note in notes if _PRUNED_SKILL_RE.fullmatch(note)}
@@ -1659,8 +1806,19 @@ def _add_plan_lexrank_area(
             if not any(marker in unit.text for marker in marker_notes)
         ]
     recent_units = _message_units(messages[tail_start:], start_index=tail_start)
-    ranked = _rank_units(middle_units, [], recent_units, protected_units=protected)
+    ranked = _rank_units(
+        middle_units,
+        [],
+        recent_units,
+        protected_units=protected,
+        semantic=True,
+        selection_telemetry=selection_telemetry,
+    )
     if not ranked:
+        if selection_telemetry is not None:
+            selection_telemetry["no_op_reason"] = (
+                selection_telemetry.get("no_op_reason") or "no_ranked_candidates"
+            )
         return summary, tail_start
 
     # Do not spend heap budget re-stating the verbatim tail — it is already in
@@ -1689,6 +1847,8 @@ def _add_plan_lexrank_area(
         fits=lambda text: _fits(messages, head_count, tail_start, text, target_tokens),
         accept=lambda unit: not _heap_repeat_covered(unit.text, outside_tiers),
     )
+    if selection_telemetry is not None:
+        _record_selected_units(selection_telemetry, selected)
     _log_inviolable_dropout(best, ranked)
     return best, tail_start
 
@@ -1750,6 +1910,7 @@ def build_internal_fallback(
     """
     head_count = min(max(protect_head_count, 0), len(messages))
     tail_start = _verbatim_tail_start(messages, head_count, protect_last_n)
+    selection_telemetry = _blank_selection_telemetry()
 
     memory = protected_memory or ProtectedMemory()
     if session_subject and memory.subject and memory.subject != session_subject:
@@ -1778,6 +1939,38 @@ def build_internal_fallback(
     window_units = _message_units(messages[head_count:tail_start], start_index=head_count)
     protected, memory = _persistent_protected(window_units, memory)
 
+    def make_result(
+        summary: str,
+        result_head_count: int,
+        result_tail_start: int,
+        mode: str,
+    ) -> InternalFallback:
+        assembled_tokens = (
+            estimate_messages_tokens_rough(
+                [
+                    *messages[:result_head_count],
+                    {"role": "assistant", "content": summary},
+                    *messages[result_tail_start:],
+                ]
+            )
+            + _ASSEMBLY_RESERVE_TOKENS
+        )
+        selection_telemetry["assembled_tokens"] = assembled_tokens
+        selection_telemetry["over_budget"] = assembled_tokens > target_tokens
+        if (
+            selection_telemetry["selected_count"] == 0
+            and selection_telemetry["no_op_reason"] is None
+        ):
+            selection_telemetry["no_op_reason"] = "no_candidates"
+        return InternalFallback(
+            summary,
+            result_head_count,
+            result_tail_start,
+            mode,
+            memory,
+            dict(selection_telemetry),
+        )
+
     if plan_context.strip():
         summary, fitted_tail_start = _fitted_plan_summary(
             messages,
@@ -1796,10 +1989,9 @@ def build_internal_fallback(
                 notes=notes,
                 target_tokens=target_tokens,
                 protected=protected,
+                selection_telemetry=selection_telemetry,
             )
-            return InternalFallback(
-                summary, head_count, fitted_tail_start, "plan", memory
-            )
+            return make_result(summary, head_count, fitted_tail_start, "plan")
 
         # The full plan is itself too large to fit — degrade to
         # goal + current step + summary against the minimal head.
@@ -1826,13 +2018,13 @@ def build_internal_fallback(
             notes=notes,
             target_tokens=target_tokens,
             protected=protected,
+            selection_telemetry=selection_telemetry,
         )
-        return InternalFallback(
+        return make_result(
             summary,
             system_head,
             fitted_tail_start,
             "plan-minimal",
-            memory,
         )
 
     # Same Heap boundary as the Plan path (Evan, 2026-09-16).  The rule is
@@ -1858,21 +2050,29 @@ def build_internal_fallback(
             order=(len(messages), index),
             token_count=estimate_tokens_rough(note),
             is_note=True,
+            role="memory",
         )
         for index, note in enumerate(notes)
     ]
     candidates = middle_units + note_units
     if not candidates:
+        selection_telemetry["no_op_reason"] = "no_candidates"
         summary = _lexrank_summary([], protected)
-        return InternalFallback(
+        return make_result(
             summary,
             head_count,
             _fit_tail_start(messages, head_count, tail_start, summary, target_tokens),
             "lexrank",
-            memory,
         )
 
-    ranked = _rank_units(middle_units, note_units, recent_units, protected_units=protected)
+    ranked = _rank_units(
+        middle_units,
+        note_units,
+        recent_units,
+        protected_units=protected,
+        semantic=True,
+        selection_telemetry=selection_telemetry,
+    )
     # Same gate as the plan path: only the verbatim tail counts as a repeat
     # source.  Notes are exempt (they route separately below).
     # _content_text, not a raw join: multimodal messages carry `content` as a
@@ -1894,17 +2094,17 @@ def build_internal_fallback(
         accept=lambda unit: unit.is_note
         or not _heap_repeat_covered(unit.text, outside_tiers),
     )
+    _record_selected_units(selection_telemetry, selected)
     _log_inviolable_dropout(summary, ranked)
     if _fits(messages, head_count, tail_start, summary, target_tokens):
-        return InternalFallback(summary, head_count, tail_start, "lexrank", memory)
+        return make_result(summary, head_count, tail_start, "lexrank")
     # Last resort: the requested verbatim tail cannot fit at all.  Shrink
     # the region (summarising its tool scaffolding) instead of aborting —
     # an abort here is terminal for the session, and the scaffolding rows
     # were never asked to be protected verbatim.
-    return InternalFallback(
+    return make_result(
         summary,
         head_count,
         _fit_tail_start(messages, head_count, tail_start, summary, target_tokens),
         "lexrank",
-        memory,
     )

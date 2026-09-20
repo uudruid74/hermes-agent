@@ -1,0 +1,73 @@
+{
+  "cases": {
+    "active_plan": {
+      "assembled_tokens": 221,
+      "dropped_messages": 4,
+      "entity_found": 1,
+      "entity_kept": 1,
+      "fallback_mode": "plan",
+      "instruction_found": 1,
+      "instruction_kept": 1,
+      "original_tokens": 183,
+      "summary_tokens": 108
+    },
+    "artifact_and_reingested_payload": {
+      "assembled_tokens": 167,
+      "dropped_messages": 4,
+      "entity_found": 4,
+      "entity_kept": 4,
+      "fallback_mode": "lexrank",
+      "instruction_found": 1,
+      "instruction_kept": 1,
+      "original_tokens": 183,
+      "summary_tokens": 60
+    },
+    "lowercase_machine_output": {
+      "assembled_tokens": 563,
+      "dropped_messages": 18,
+      "entity_found": 2,
+      "entity_kept": 0,
+      "fallback_mode": "lexrank",
+      "instruction_found": 1,
+      "instruction_kept": 1,
+      "original_tokens": 1167,
+      "summary_tokens": 30
+    },
+    "mixed_density": {
+      "assembled_tokens": 222,
+      "dropped_messages": 4,
+      "entity_found": 2,
+      "entity_kept": 2,
+      "fallback_mode": "lexrank",
+      "instruction_found": 2,
+      "instruction_kept": 2,
+      "original_tokens": 1933,
+      "summary_tokens": 108
+    },
+    "multilingual": {
+      "assembled_tokens": 192,
+      "dropped_messages": 2,
+      "entity_found": 2,
+      "entity_kept": 2,
+      "fallback_mode": "lexrank",
+      "instruction_found": 3,
+      "instruction_kept": 3,
+      "original_tokens": 170,
+      "summary_tokens": 59
+    },
+    "real_session_shape": {
+      "assembled_tokens": 547,
+      "dropped_messages": 34,
+      "entity_found": 3,
+      "entity_kept": 1,
+      "fallback_mode": "lexrank",
+      "instruction_found": 1,
+      "instruction_kept": 1,
+      "original_tokens": 1634,
+      "summary_tokens": 51
+    }
+  },
+  "notes": "Sanitized fixed-budget baseline captured before the LLMSlim selector port.",
+  "selector": "legacy_lexrank",
+  "source_commit": "389673210461cbf56fe279dbe733aa8424dc6b45"
+}
