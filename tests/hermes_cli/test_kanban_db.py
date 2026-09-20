@@ -140,7 +140,7 @@ def test_complete_task_resolves_bug_file_from_body_or_legacy_title(
         text=True,
     )
     monkeypatch.setattr(kb, "_BUG_VAULT", vault)
-    monkeypatch.setenv("HERMES_AGENT_NAME", "Neo")
+    monkeypatch.setenv("USERNAME", "neo")
 
     with kb.connect() as conn:
         task_id = kb.create_task(
@@ -156,7 +156,7 @@ def test_complete_task_resolves_bug_file_from_body_or_legacy_title(
     assert resolved.exists()
     text = resolved.read_text(encoding="utf-8")
     assert 'status: "resolved"' in text
-    assert 'resolved_by: "Neo"' in text
+    assert 'resolved_by: "neo"' in text
     assert "Resolved canonical bug" in text
     commit_subject = subprocess.run(
         ["git", "-C", str(vault), "log", "-1", "--format=%s"],

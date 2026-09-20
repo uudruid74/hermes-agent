@@ -5181,7 +5181,7 @@ def _bug_autoremove_resolve(
             return
         text = src_file.read_text(encoding="utf-8")
         today = _dt.date.today().isoformat()
-        agent = os.environ.get("HERMES_AGENT_NAME") or "unknown"
+        agent = (os.environ.get("USERNAME") or "").strip() or "unknown"
         # frontmatter status + resolution stamps
         text = _re.sub(r'(?m)^status: "pending"$', 'status: "resolved"', text, count=1)
         text = _re.sub(r'(?m)^date: "(\d{4}-\d{2}-\d{2})"$',
@@ -9605,10 +9605,8 @@ def _default_spawn(
     # board slug still forces it to the right directory.
     resolved_board = _normalize_board_slug(board) or get_current_board()
     env["HERMES_KANBAN_BOARD"] = resolved_board
-    # HERMES_PROFILE is the author the kanban_comment tool defaults to.
-    # `hermes -p <assignee>` activates the profile, but the env var is
-    # what the tool reads — set it explicitly here so comments are
-    # attributed correctly regardless of how the child loads config.
+    # HERMES_PROFILE selects the worker profile. `hermes -p <assignee>` also
+    # loads that profile's .env, whose USERNAME value owns attribution.
     env["HERMES_PROFILE"] = profile_arg
 
     # A worker must NEVER boot the interactive TUI: an inherited HERMES_TUI=1
@@ -10000,7 +9998,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             age = _relative_age(c.created_at, _now)
             ts_disp = f"{ts}, {age}" if age else ts
             # Render author with explicit "comment from worker" framing so
-            # operator-controlled HERMES_PROFILE values like "hermes-system"
+            # operator-controlled USERNAME values like "hermes-system"
             # or "operator" can't be misread by the next worker as a system
             # directive above the (attacker-influenceable) comment body.
             # Defense-in-depth — the LLM-controlled author-forgery surface

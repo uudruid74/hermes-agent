@@ -433,7 +433,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_list.add_argument("--board", default=None, metavar="<slug|all>",
                         help="Board slug, or 'all' to search across all boards")
     p_list.add_argument("--mine", action="store_true",
-                        help="Filter by $HERMES_PROFILE as assignee")
+                        help="Filter by $USERNAME as assignee")
     p_list.add_argument("--assignee", default=None)
     p_list.add_argument("--status", default=None, metavar="<status>",
                         help="Filter by task status. Accepts comma-separated "
@@ -580,7 +580,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_comment.add_argument("task_id")
     p_comment.add_argument("text", nargs="+", help="Comment body")
     p_comment.add_argument("--author", default=None,
-                           help="Author name (default: $HERMES_PROFILE or 'user')")
+                           help="Author name (default: $USERNAME or 'user')")
     p_comment.add_argument("--max-len", type=int, default=None,
                            help="Trim the stored comment body to this many characters")
 
@@ -593,7 +593,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_attach.add_argument("--name", default=None,
                           help="Stored filename (default: the source file's basename)")
     p_attach.add_argument("--author", default=None,
-                          help="uploaded_by label (default: $HERMES_PROFILE or 'user')")
+                          help="uploaded_by label (default: $USERNAME or 'user')")
 
     p_attachments = sub.add_parser("attachments", help="List a task's attachments")
     p_attachments.add_argument("task_id")
@@ -889,7 +889,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--author",
         default=None,
         help="Author name recorded on the audit comment "
-             "(default: $HERMES_PROFILE or 'specifier')",
+             "(default: $USERNAME or 'specifier')",
     )
     p_specify.add_argument(
         "--json",
@@ -926,7 +926,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--author",
         default=None,
         help="Author name recorded on the audit comment "
-             "(default: $HERMES_PROFILE or 'decomposer')",
+             "(default: $USERNAME or 'decomposer')",
     )
     p_decompose.add_argument(
         "--json",
@@ -1129,24 +1129,8 @@ def kanban_command(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 def _profile_author() -> str:
-    """Best-effort author name for an interactive CLI call.
-
-    Resolved from HERMES_HOME via the canonical accessor, so this agrees with
-    the worker/notify paths (``kanban_db`` and ``secret_sources.registry``)
-    instead of racing them on a stale env var. ``HERMES_PROFILE`` remains a
-    fallback for processes that carry the label without a resolvable HOME.
-    """
-    try:
-        from hermes_cli.profiles import get_active_profile_name
-        name = get_active_profile_name()
-        if name and name != "default":
-            return name
-    except Exception:
-        pass
-    v = os.environ.get("HERMES_PROFILE")
-    if v:
-        return v
-    return "user"
+    """Return the fleet identity for an interactive CLI call."""
+    return (os.environ.get("USERNAME") or "").strip() or "user"
 
 
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
@@ -1864,7 +1848,7 @@ def _store_cli_origin_routing(conn, task_id: str, channel_flag: str) -> None:
             platform=platform, chat_id=chat_id,
             thread_id=thread_id or "",
             chat_type=chat_type or "",
-            profile=os.environ.get("HERMES_PROFILE", ""),
+            profile=(os.environ.get("USERNAME") or "").strip(),
         )
     except Exception as exc:
         print(f"kanban: failed to store origin routing: {exc}", file=sys.stderr)
@@ -1936,10 +1920,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                         platform=_platform, chat_id=_chat_id,
                         thread_id=_thread_id or "",
                         chat_type=_chat_type or "",
-                        profile=(
-                            os.environ.get("HERMES_SESSION_PROFILE", "").strip()
-                            or os.environ.get("HERMES_PROFILE", "").strip()
-                        ),
+                        profile=(os.environ.get("USERNAME") or "").strip(),
                     )
                 except Exception as exc:
                     print(f"kanban: failed to store origin routing from env: {exc}", file=sys.stderr)

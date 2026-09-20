@@ -38,9 +38,9 @@ def _run_hook(msg_file: Path, agent: str | None, source_kind: str = "message") -
     """Invoke the hook the way git does; return the resulting message text."""
     env = dict(os.environ)
     if agent is None:
-        env.pop("HERMES_AGENT_NAME", None)
+        env.pop("USERNAME", None)
     else:
-        env["HERMES_AGENT_NAME"] = agent
+        env["USERNAME"] = agent
 
     proc = subprocess.run(
         ["bash", str(HOOK_SRC), str(msg_file), source_kind],
@@ -68,7 +68,7 @@ def test_agent_commit_gets_trailer(tmp_path: Path) -> None:
 
 
 def test_agent_name_used_verbatim(tmp_path: Path) -> None:
-    """HERMES_AGENT_NAME is the identity — whatever it says, verbatim."""
+    """USERNAME is the identity — whatever it says, verbatim."""
     for agent in ("Neo", "Wintermute", "ornith"):
         f = tmp_path / f"msg-{agent}"
         f.write_text("feat: x")
@@ -110,7 +110,7 @@ def test_multiline_body_preserved(tmp_path: Path) -> None:
 
 def test_missing_arguments_exit_zero() -> None:
     """A hook that aborts a commit is worse than a missing trailer."""
-    env = dict(os.environ, HERMES_AGENT_NAME="Gopher")
+    env = dict(os.environ, USERNAME="Gopher")
     proc = subprocess.run(
         ["bash", str(HOOK_SRC)],
         env=env,
@@ -122,7 +122,7 @@ def test_missing_arguments_exit_zero() -> None:
 
 
 def test_nonexistent_message_file_exits_zero(tmp_path: Path) -> None:
-    env = dict(os.environ, HERMES_AGENT_NAME="Gopher")
+    env = dict(os.environ, USERNAME="Gopher")
     proc = subprocess.run(
         ["bash", str(HOOK_SRC), str(tmp_path / "nope"), "message"],
         env=env,
@@ -142,6 +142,9 @@ def test_never_calls_git_global_username() -> None:
     assert "user.name" not in code, "must never fall back to git's global user.name"
     assert "HERMES_PROFILE" not in code, (
         "HERMES_PROFILE is route state, not identity — never read it as an author"
+    )
+    assert "HERMES_AGENT_NAME" not in code, (
+        "HERMES_AGENT_NAME is superseded — never read it as an author"
     )
 
 
@@ -179,9 +182,9 @@ def repo(tmp_path: Path) -> Path:
 def _commit(repo_dir: Path, message: str, agent: str | None) -> None:
     env = dict(os.environ)
     if agent is None:
-        env.pop("HERMES_AGENT_NAME", None)
+        env.pop("USERNAME", None)
     else:
-        env["HERMES_AGENT_NAME"] = agent
+        env["USERNAME"] = agent
     subprocess.run(
         ["git", "-C", str(repo_dir), "commit", "-q", "--allow-empty", "-m", message],
         env=env,
@@ -234,7 +237,7 @@ def test_real_amend_does_not_stack_trailers(repo: Path) -> None:
             "git", "-C", str(repo), "commit", "-q", "--amend", "--allow-empty",
             "-m", "feat: amended (t_abc)",
         ],
-        env=dict(os.environ, HERMES_AGENT_NAME="Gopher"),
+        env=dict(os.environ, USERNAME="Gopher"),
         check=True,
         stdin=subprocess.DEVNULL,
     )
@@ -264,7 +267,7 @@ def test_real_merge_commit_not_attributed(repo: Path) -> None:
     subprocess.run(["git", "-C", str(repo), "checkout", "-q", main], check=True)
     subprocess.run(
         ["git", "-C", str(repo), "merge", "-q", "--no-ff", "side", "-m", "Merge branch 'side'"],
-        env=dict(os.environ, HERMES_AGENT_NAME="Gopher"),
+        env=dict(os.environ, USERNAME="Gopher"),
         check=True,
         stdin=subprocess.DEVNULL,
     )

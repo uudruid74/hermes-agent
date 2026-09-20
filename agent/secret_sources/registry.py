@@ -293,20 +293,9 @@ def _ordered_enabled_sources(secrets_cfg: dict) -> List[SecretSource]:
     return enabled
 
 
-def _active_profile_name(home_path: Optional[Path]) -> str:
-    """Best-effort active profile name for profile-scoped secret aliases.
-
-    A named profile's HERMES_HOME is ``~/.hermes/profiles/<name>``; the
-    default profile (``~/.hermes``) returns "".
-    """
-    if home_path is not None:
-        resolved = Path(home_path)
-        if resolved.parent.name == "profiles" and resolved.name:
-            return resolved.name
-    # HERMES_PROFILE is a label, not a selector — HERMES_HOME above is the
-    # single source of truth. Used only as a fallback for processes that carry
-    # the label without a resolvable home.
-    value = os.environ.get("HERMES_PROFILE", "").strip()
+def _active_profile_name(environ: MutableMapping[str, str]) -> str:
+    """Return the USERNAME scope for profile-specific secret aliases."""
+    value = environ.get("USERNAME", "").strip()
     if value and value != "default":
         return value
     return ""
@@ -375,7 +364,7 @@ def apply_all(secrets_cfg: dict, home_path: Path,
     ) if isinstance(preserve_raw, list) else frozenset()
 
     alias_enabled = bool(secrets_cfg.get("profile_alias", True))
-    profile = _active_profile_name(home_path) if alias_enabled else ""
+    profile = _active_profile_name(env) if alias_enabled else ""
 
     # Mapped sources outrank bulk sources regardless of list order:
     # an explicit VAR→ref binding is stronger intent than a project dump.

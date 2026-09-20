@@ -26,7 +26,7 @@ def tell_tool(
     echo_callback: Callable[[str], object],
 ) -> str:
     """Wake another Hermes profile after exposing the exact message to the caller."""
-    sender = os.environ.get("HERMES_AGENT_NAME") or os.environ.get("HERMES_PROFILE") or "agent"
+    sender = (os.environ.get("USERNAME") or "").strip() or "agent"
     wrapped = (
         f"Incoming message from {sender} follows:\n"
         "---\n"

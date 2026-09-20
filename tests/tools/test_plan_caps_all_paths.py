@@ -146,6 +146,31 @@ def test_dispatch_accepts_text_exactly_at_the_cap(board):
     assert len(row["task_goal"]) == 240
 
 
+def test_dispatch_origin_routing_uses_username_only(board, monkeypatch):
+    _conn, plan_tool = board
+    captured = {}
+    monkeypatch.setenv("USERNAME", "neo")
+    monkeypatch.setenv("HERMES_PROFILE", "wrong-route")
+    monkeypatch.setenv("HERMES_SESSION_PROFILE", "wrong-session-route")
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "123")
+
+    from hermes_cli import kanban_db
+
+    monkeypatch.setattr(
+        kanban_db,
+        "store_origin_routing",
+        lambda _conn, _task_id, **kwargs: captured.update(kwargs),
+    )
+
+    result = plan_tool._cmd_dispatch(
+        None, "username origin", "route correctly", "default", "neo"
+    )
+
+    assert "ERROR" not in result, result
+    assert captured["profile"] == "neo"
+
+
 def test_dispatch_refuses_more_than_twelve_steps(board):
     conn, plan_tool = board
     result = plan_tool._cmd_dispatch(

@@ -46,7 +46,7 @@ def test_no_task_write_file_dispatches_for_current_agent_journal(monkeypatch, tm
     monkeypatch.setattr(file_safety, "is_write_denied_by_task_gate", lambda: True)
     monkeypatch.setattr(file_safety, "_is_temp_path", lambda path: False)
     monkeypatch.setenv("VAULT_ROOT", str(journal.parent))
-    monkeypatch.setenv("HERMES_AGENT_NAME", "Neo")
+    monkeypatch.setenv("USERNAME", "neo")
 
     result = _dispatch_write_file(captured, str(journal / "today.md"))
 

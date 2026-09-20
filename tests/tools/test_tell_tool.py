@@ -13,7 +13,8 @@ def _completed(*, returncode=0, stdout="sent\n", stderr=""):
 
 
 def test_tell_wraps_message_and_targets_agent_profile(monkeypatch):
-    monkeypatch.setenv("HERMES_AGENT_NAME", "Zephyr")
+    monkeypatch.setenv("USERNAME", "zephyr")
+    monkeypatch.setenv("HERMES_AGENT_NAME", "WrongAgent")
     monkeypatch.setenv("HERMES_PROFILE", "ignored-profile")
     calls = []
     echoes = []
@@ -39,7 +40,7 @@ def test_tell_wraps_message_and_targets_agent_profile(monkeypatch):
                 "send",
                 "-u",
                 "gopher",
-                "Incoming message from Zephyr follows:\n"
+                "Incoming message from zephyr follows:\n"
                 "---\n"
                 "Check the relay.\n"
                 "---\n"
@@ -52,14 +53,17 @@ def test_tell_wraps_message_and_targets_agent_profile(monkeypatch):
     assert result == {"returncode": 0, "stdout": "sent\n", "stderr": ""}
 
 
-def test_tell_uses_profile_when_agent_name_is_absent(monkeypatch):
-    monkeypatch.delenv("HERMES_AGENT_NAME", raising=False)
-    monkeypatch.setenv("HERMES_PROFILE", "neo")
-    monkeypatch.setattr(
-        tell_tool.subprocess,
-        "run",
-        lambda *_args, **_kwargs: _completed(),
-    )
+def test_tell_does_not_fall_back_to_superseded_identity_vars(monkeypatch):
+    monkeypatch.delenv("USERNAME", raising=False)
+    monkeypatch.setenv("HERMES_AGENT_NAME", "WrongAgent")
+    monkeypatch.setenv("HERMES_PROFILE", "wrong-profile")
+    calls = []
+
+    def fake_run(command, **_kwargs):
+        calls.append(command)
+        return _completed()
+
+    monkeypatch.setattr(tell_tool.subprocess, "run", fake_run)
 
     result = json.loads(
         tell_tool.tell_tool(
@@ -70,6 +74,9 @@ def test_tell_uses_profile_when_agent_name_is_absent(monkeypatch):
     )
 
     assert result["returncode"] == 0
+    assert "Incoming message from agent follows:" in calls[0][-1]
+    assert "WrongAgent" not in calls[0][-1]
+    assert "wrong-profile" not in calls[0][-1]
 
 
 def test_tell_echoes_exact_message_to_origin_before_send(monkeypatch):
@@ -168,7 +175,7 @@ def test_tell_preserves_send_failure_result_and_echoes_first(monkeypatch):
 def test_agent_runtime_routes_tell_to_mandatory_origin_callback(monkeypatch):
     from agent.agent_runtime_helpers import invoke_tool
 
-    monkeypatch.setenv("HERMES_AGENT_NAME", "Neo")
+    monkeypatch.setenv("USERNAME", "neo")
     sent = []
     echoes = []
 

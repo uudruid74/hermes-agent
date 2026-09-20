@@ -21,15 +21,14 @@ def _run_apply_profile_override(
     tmp_path, monkeypatch, *, hermes_home: str | None, active_profile: str | None,
     argv: list[str] | None = None,
     preset_profile: str | None = None,
-    preset_agent_name: str | None = None,
 ):
     """Run _apply_profile_override in isolation.
 
     Returns the value of os.environ["HERMES_HOME"] after the call,
     or None if unset.
 
-    ``preset_profile`` / ``preset_agent_name`` pre-set the identity env vars so
-    a test can assert that an explicit value is never clobbered by the export.
+    ``preset_profile`` pre-sets route state so a test can assert that an
+    explicit value is never clobbered by the export.
     """
     hermes_root = tmp_path / ".hermes"
     hermes_root.mkdir(parents=True, exist_ok=True)
@@ -56,12 +55,11 @@ def _run_apply_profile_override(
     else:
         monkeypatch.delenv("HERMES_HOME", raising=False)
 
-    for var, val in (("HERMES_PROFILE", preset_profile),
-                     ("HERMES_AGENT_NAME", preset_agent_name)):
-        if val is None:
-            monkeypatch.delenv(var, raising=False)
-        else:
-            monkeypatch.setenv(var, val)
+    monkeypatch.delenv("HERMES_AGENT_NAME", raising=False)
+    if preset_profile is None:
+        monkeypatch.delenv("HERMES_PROFILE", raising=False)
+    else:
+        monkeypatch.setenv("HERMES_PROFILE", preset_profile)
 
     monkeypatch.setattr(sys, "argv", argv or ["hermes", "gateway", "start"])
 
@@ -187,8 +185,8 @@ class TestSupervisedChildIgnoresStickyProfile:
         assert result.endswith("coder")
 
 
-class TestProfileIdentityExport:
-    """``-p``/HERMES_HOME must also export HERMES_PROFILE + HERMES_AGENT_NAME.
+class TestProfileRouteExport:
+    """``-p``/HERMES_HOME must export only HERMES_PROFILE route state.
 
     Regression for the empty-profile origin stamp: ``-p`` used to set ONLY
     HERMES_HOME, so ``os.environ.get("HERMES_PROFILE", "")`` returned empty in
@@ -203,8 +201,8 @@ class TestProfileIdentityExport:
         for var in ("HERMES_PROFILE", "HERMES_AGENT_NAME"):
             monkeypatch.delenv(var, raising=False)
 
-    def test_explicit_profile_flag_exports_identity(self, tmp_path, monkeypatch):
-        """`hermes -p coder ...` exports both vars as the profile slug."""
+    def test_explicit_profile_flag_exports_route_only(self, tmp_path, monkeypatch):
+        """`hermes -p coder ...` exports the profile route, not identity."""
         self._reset(monkeypatch)
         _run_apply_profile_override(
             tmp_path, monkeypatch, hermes_home=None, active_profile=None,
@@ -213,7 +211,7 @@ class TestProfileIdentityExport:
 
         assert os.environ.get("HERMES_HOME", "").endswith("coder")
         assert os.environ.get("HERMES_PROFILE") == "coder"
-        assert os.environ.get("HERMES_AGENT_NAME") == "coder"
+        assert "HERMES_AGENT_NAME" not in os.environ
 
     def test_preexisting_hermes_home_early_return_still_exports(self, tmp_path, monkeypatch):
         """The systemd contract: HERMES_HOME already points into profiles/.
@@ -230,25 +228,18 @@ class TestProfileIdentityExport:
         )
 
         assert os.environ.get("HERMES_PROFILE") == "gopher"
-        assert os.environ.get("HERMES_AGENT_NAME") == "gopher"
+        assert "HERMES_AGENT_NAME" not in os.environ
 
-    def test_identity_never_overrides_an_explicit_value(self, tmp_path, monkeypatch):
-        """A deliberate value wins.
-
-        ``HERMES_AGENT_NAME`` is a display identity ("Gopher") that legitimately
-        differs from the slug ("gopher"); a profile's .env load right after this
-        must be able to supply the human casing, and a tool subprocess may carry
-        HERMES_PROFILE on purpose.
-        """
+    def test_route_never_overrides_an_explicit_value(self, tmp_path, monkeypatch):
+        """A deliberate HERMES_PROFILE route value wins."""
         _run_apply_profile_override(
             tmp_path, monkeypatch, hermes_home=None, active_profile=None,
             argv=["hermes", "-p", "coder", "gateway", "run"],
             preset_profile="explicit-slug",
-            preset_agent_name="Gopher",
         )
 
         assert os.environ.get("HERMES_PROFILE") == "explicit-slug"
-        assert os.environ.get("HERMES_AGENT_NAME") == "Gopher"
+        assert "HERMES_AGENT_NAME" not in os.environ
 
     def test_default_profile_exports_literal_default(self, tmp_path, monkeypatch):
         """The root profile exports "default" — a concrete value, not blank.
@@ -263,5 +254,5 @@ class TestProfileIdentityExport:
         )
 
         assert os.environ.get("HERMES_PROFILE") == "default"
-        assert os.environ.get("HERMES_AGENT_NAME") == "default"
+        assert "HERMES_AGENT_NAME" not in os.environ
 

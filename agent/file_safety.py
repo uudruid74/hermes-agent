@@ -182,10 +182,12 @@ def _resolve_terminal_root(cwd: str) -> Optional[str]:
 def _agent_journal_root() -> Optional[str]:
     """Return this agent's vault journal directory when configured."""
     vault_root = os.environ.get("VAULT_ROOT", "").strip()
-    agent_name = os.environ.get("HERMES_AGENT_NAME", "").strip()
-    if not vault_root or not agent_name:
+    username = os.environ.get("USERNAME", "").strip()
+    if not vault_root or not username:
         return None
-    return os.path.realpath(os.path.join(vault_root, agent_name))
+    # Fleet USERNAME values are lowercase slugs; vault agent directories use
+    # their title-cased form (for example, ``neo`` -> ``Neo``).
+    return os.path.realpath(os.path.join(vault_root, username.capitalize()))
 
 
 def _plan_approval_timed_out() -> bool:

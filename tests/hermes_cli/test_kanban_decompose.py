@@ -161,3 +161,11 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
     assert "not in triage" in outcome.reason
 
 
+def test_profile_author_uses_username_only(monkeypatch):
+    monkeypatch.setenv("USERNAME", "decomposer-user")
+    monkeypatch.setenv("HERMES_PROFILE", "wrong-route")
+    monkeypatch.setenv("USER", "wrong-login")
+
+    assert decomp._profile_author() == "decomposer-user"
+
+

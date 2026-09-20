@@ -355,7 +355,7 @@ def inject_new_comments_from_env(agent: Any) -> bool:
     The first poll only *seeds* the watermark to the newest existing comment —
     those are already in the worker's context — so only comments added after
     the run started are injected. The worker's own authored comments (matched
-    by ``HERMES_PROFILE``) are skipped to avoid echoing itself.
+    by ``USERNAME``) are skipped to avoid echoing itself.
     """
     tid = os.environ.get("HERMES_KANBAN_TASK")
     if not tid or agent is None or not hasattr(agent, "steer"):
@@ -392,7 +392,7 @@ def inject_new_comments_from_env(agent: Any) -> bool:
     # notes) so nothing is re-injected next poll.
     _comment_watermark[tid] = max(c.id for c in rows)
 
-    own = (os.environ.get("HERMES_PROFILE") or "").strip()
+    own = (os.environ.get("USERNAME") or "").strip()
     fresh = [c for c in rows if (c.author or "").strip() != own and (c.body or "").strip()]
     if not fresh:
         return False
@@ -966,7 +966,7 @@ def _handle_comment(args: dict, **kw) -> str:
     # the future-worker context with what reads as a system directive.
     # Cross-task commenting itself remains unrestricted (see #19713) —
     # comments are the deliberate handoff channel between tasks.
-    author = os.environ.get("HERMES_PROFILE") or "worker"
+    author = (os.environ.get("USERNAME") or "").strip() or "worker"
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -1329,7 +1329,7 @@ def _handle_create(args: dict, **kw) -> str:
                     int(goal_max_turns) if goal_max_turns is not None else None
                 ),
                 initial_status=str(initial_status),
-                created_by=os.environ.get("HERMES_PROFILE") or "worker",
+                created_by=(os.environ.get("USERNAME") or "").strip() or "worker",
                 session_id=session_id,
             )
             new_task = kb.get_task(conn, new_tid)
@@ -1430,16 +1430,7 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
         user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
         chat_type = get_session_env("HERMES_SESSION_CHAT_TYPE", "") or None
         message_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "") or ""
-        notifier_profile = (
-            get_session_env("HERMES_SESSION_PROFILE", "")
-            or os.environ.get("HERMES_PROFILE")
-        )
-        if not notifier_profile:
-            try:
-                from hermes_cli.profiles import get_active_profile_name
-                notifier_profile = get_active_profile_name() or "default"
-            except Exception:
-                notifier_profile = "default"
+        notifier_profile = (os.environ.get("USERNAME") or "").strip()
         delivery_metadata: dict[str, Any] = {}
         if thread_id:
             delivery_metadata["thread_id"] = thread_id

@@ -97,6 +97,11 @@ def test_profile_suffixed_var_hydrates_canonical():
     report, env = _apply(
         {"TELEGRAM_BOT_TOKEN_MILLA": "123:tok"},
         home=PROFILE_HOME,
+        env={
+            "USERNAME": "milla",
+            "HERMES_AGENT_NAME": "WrongAgent",
+            "HERMES_PROFILE": "wrong-profile",
+        },
     )
     assert env["TELEGRAM_BOT_TOKEN_MILLA"] == "123:tok"
     assert env["TELEGRAM_BOT_TOKEN"] == "123:tok"
@@ -119,6 +124,7 @@ def test_hyphenated_profile_name_matches_underscore_suffix():
     _, env = _apply(
         {"SLACK_APP_TOKEN_MY_BOT": "xapp-1"},
         home=Path("/home/u/.hermes/profiles/my-bot"),
+        env={"USERNAME": "my-bot"},
     )
     assert env["SLACK_APP_TOKEN"] == "xapp-1"
 

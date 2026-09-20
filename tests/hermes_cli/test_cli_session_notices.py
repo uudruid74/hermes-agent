@@ -72,6 +72,30 @@ def test_send_cli_target_queues_notice_in_current_profile(tmp_path, monkeypatch)
     reopened.close()
 
 
+def test_kanban_identity_uses_username_only(monkeypatch):
+    monkeypatch.setenv("USERNAME", "neo")
+    monkeypatch.setenv("HERMES_PROFILE", "wrong-route")
+    monkeypatch.setenv("USER", "wrong-login")
+
+    assert kanban._profile_author() == "neo"
+
+
+def test_cli_origin_routing_uses_username_only(monkeypatch):
+    captured = {}
+    monkeypatch.setenv("USERNAME", "neo")
+    monkeypatch.setenv("HERMES_PROFILE", "wrong-route")
+    monkeypatch.setenv("HERMES_SESSION_PROFILE", "wrong-session-route")
+    monkeypatch.setattr(
+        kanban.kb,
+        "store_origin_routing",
+        lambda _conn, _task_id, **kwargs: captured.update(kwargs),
+    )
+
+    kanban._store_cli_origin_routing(object(), "t_test", "telegram:123")
+
+    assert captured["profile"] == "neo"
+
+
 def test_kanban_cli_origin_queues_session_notice(tmp_path, monkeypatch):
     profile_home = tmp_path / "profiles" / "neo"
     profile_home.mkdir(parents=True)

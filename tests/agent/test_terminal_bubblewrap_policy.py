@@ -33,7 +33,7 @@ def test_terminal_bubblewrap_root_allows_only_this_agents_journal(monkeypatch, t
     journal_child = vault / "Neo" / "daily"
     journal_child.mkdir(parents=True)
     monkeypatch.setenv("VAULT_ROOT", str(vault))
-    monkeypatch.setenv("HERMES_AGENT_NAME", "Neo")
+    monkeypatch.setenv("USERNAME", "neo")
 
     assert file_safety.terminal_bubblewrap_root(str(journal_child)) == str(journal_child)
     assert file_safety.terminal_bubblewrap_root(str(vault)) is None

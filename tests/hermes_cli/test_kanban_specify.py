@@ -138,3 +138,11 @@ def test_cli_specify_tenant_filter(kanban_home, capsys):
         assert kb.get_task(conn, inside).status in {"todo", "ready"}
 
 
+def test_profile_author_uses_username_only(monkeypatch):
+    monkeypatch.setenv("USERNAME", "specifier-user")
+    monkeypatch.setenv("HERMES_PROFILE", "wrong-route")
+    monkeypatch.setenv("USER", "wrong-login")
+
+    assert spec._profile_author() == "specifier-user"
+
+

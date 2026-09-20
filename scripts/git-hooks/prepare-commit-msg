@@ -11,12 +11,11 @@
 # commit permanently anonymous. This hook makes attribution a mechanism
 # instead of a convention.
 #
-# IDENTITY SOURCE (Evan, 2026-09-07, decided): `HERMES_AGENT_NAME` is THE
-# single source of agent identity. `HERMES_PROFILE` is *route state* — it is
-# mutated at runtime to the send/notification target — so it must never be
-# read as an author. Never fall back to git's global user.name.
+# IDENTITY SOURCE (Evan, 2026-09-20, decided): `USERNAME` is THE single source
+# of fleet identity. Never fall back to another env var or git's global
+# user.name.
 #
-# Human commits (no HERMES_AGENT_NAME in the environment) are left untouched.
+# Human commits (no USERNAME in the environment) are left untouched.
 #
 # Args (from git):
 #   $1  path to the file holding the proposed commit message
@@ -48,7 +47,7 @@ case "$source_kind" in
         ;;
 esac
 
-agent="${HERMES_AGENT_NAME:-}"
+agent="${USERNAME:-}"
 
 # No agent in the environment => a human commit at a terminal. Leave it alone.
 # (Do NOT substitute a generic label: that would misattribute human commits.)
@@ -56,7 +55,7 @@ if [ -z "$agent" ]; then
     exit 0
 fi
 
-# `HERMES_AGENT_NAME` is exported into the whole process tree an agent spawns —
+# `USERNAME` is exported into the whole process tree an agent spawns —
 # including a shell a human opens *inside* that tree. So its presence alone does
 # not prove an agent is the committer; stamping on that signal alone would
 # attribute a human's commit to whichever agent happened to be running.

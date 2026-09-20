@@ -102,6 +102,27 @@ def cad_args(path=None, i_am_evan=True):
     )
 
 
+def test_update_attribution_uses_username_only(monkeypatch, tmp_path):
+    bugtool, _projects_root, _state_root = load_bugtool(monkeypatch, tmp_path)
+    path = tmp_path / "2026-09-20-identity.md"
+    path.write_text("# Bug\n\n## Updates\n\n", encoding="utf-8")
+    monkeypatch.setattr(bugtool, "bug_path", lambda _value: path)
+    monkeypatch.setenv("USERNAME", "neo")
+    monkeypatch.setenv("HERMES_AGENT_NAME", "WrongAgent")
+    monkeypatch.setenv("HERMES_PROFILE", "wrong-route")
+    calls = []
+    monkeypatch.setattr(
+        bugtool.subprocess,
+        "run",
+        lambda args, **_kwargs: calls.append(args),
+    )
+
+    bugtool.cmd_update(argparse.Namespace(file=str(path), note="verified"))
+
+    assert ", neo)" in path.read_text(encoding="utf-8")
+    assert calls[-1][-1] == "bug: update 2026-09-20-identity (neo)"
+
+
 # --- the guard: no approval without Evan's explicit flag ----------------------
 
 

@@ -690,10 +690,7 @@ def _cmd_dispatch(agent, title: str, goal: str, project: str, assignee: str,
         if platform and chat_id:
             thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or ""
             chat_type = get_session_env("HERMES_SESSION_CHAT_TYPE", "") or ""
-            profile = (
-                get_session_env("HERMES_SESSION_PROFILE", "")
-                or os.environ.get("HERMES_PROFILE", "")
-            )
+            profile = (os.environ.get("USERNAME") or "").strip()
             with kdb as conn:
                 from hermes_cli.kanban_db import store_origin_routing
                 store_origin_routing(

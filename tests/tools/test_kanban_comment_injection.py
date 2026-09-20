@@ -74,7 +74,8 @@ def test_seed_then_inject_new_comment(worker_home, monkeypatch):
         conn.close()
 
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
-    monkeypatch.setenv("HERMES_PROFILE", "worker-bot")
+    monkeypatch.setenv("USERNAME", "worker-bot")
+    monkeypatch.setenv("HERMES_PROFILE", "wrong-route")
     agent = FakeAgent()
 
     # First poll seeds the watermark past the existing thread — no injection.
@@ -107,7 +108,8 @@ def test_skips_own_authored_comments(worker_home, monkeypatch):
         conn.close()
 
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
-    monkeypatch.setenv("HERMES_PROFILE", "worker-bot")
+    monkeypatch.setenv("USERNAME", "worker-bot")
+    monkeypatch.setenv("HERMES_PROFILE", "wrong-route")
     agent = FakeAgent()
 
     _unthrottle()

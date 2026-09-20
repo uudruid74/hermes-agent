@@ -576,8 +576,7 @@ def cmd_new(args: argparse.Namespace) -> None:
     slug = normalize_slug(args.slug)
     date = dt.date.fromisoformat(os.environ.get("BUGTOOL_DATE", dt.date.today().isoformat()))
     path = PROJECTS_ROOT / project / "bugs" / "pending" / f"{date.isoformat()}-{slug}.md"
-    agent_name = (os.environ.get("HERMES_AGENT_NAME", "").strip()
-                  or os.environ.get("HERMES_PROFILE", "").strip() or "unknown")
+    agent_name = os.environ.get("USERNAME", "").strip() or "unknown"
     # Session resolution, ground-truth-first:
     # 1. HERMES_SESSION_KEY env (always present in gateway tool shells,
     #    exact sessions.session_key format — the durable handle the CLI uses).
@@ -656,7 +655,7 @@ def cmd_new(args: argparse.Namespace) -> None:
     )
     subprocess.run(
         ["git", "-C", "/home/ekl/vault", "commit", "-m",
-         f"bug: {args.title} (filed by {os.environ.get('HERMES_AGENT_NAME', 'unknown-agent')})"],
+         f"bug: {args.title} (filed by {agent_name})"],
         capture_output=True, check=False,
     )
     print(path)
@@ -715,7 +714,8 @@ def cmd_append_failure(args: argparse.Namespace) -> None:
 def cmd_update(args: argparse.Namespace) -> None:
     """Append new information to a bug's ## Updates section + auto-commit."""
     path = bug_path(args.file)
-    entry = f"### Update ({dt.datetime.now().strftime('%Y-%m-%d %H:%M')}, {os.environ.get('HERMES_AGENT_NAME') or 'unknown'})\n\n{args.note.strip()}\n"
+    agent_name = os.environ.get("USERNAME", "").strip() or "unknown"
+    entry = f"### Update ({dt.datetime.now().strftime('%Y-%m-%d %H:%M')}, {agent_name})\n\n{args.note.strip()}\n"
     with locked_root():
         text = path.read_text(encoding="utf-8")
         if "## Updates" not in text:
@@ -731,7 +731,7 @@ def cmd_update(args: argparse.Namespace) -> None:
         rel = os.path.relpath(path, "/home/ekl/vault")
         subprocess.run(["git", "-C", "/home/ekl/vault", "add", rel], capture_output=True, check=False)
         subprocess.run(["git", "-C", "/home/ekl/vault", "commit", "-m",
-                        f"bug: update {path.stem} ({(os.environ.get('HERMES_AGENT_NAME') or 'unknown')})"],
+                        f"bug: update {path.stem} ({agent_name})"],
                        capture_output=True, check=False)
     print(f"update appended: {path}")
 

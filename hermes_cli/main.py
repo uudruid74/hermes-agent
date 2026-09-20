@@ -514,29 +514,11 @@ _ensure_project_root_on_path_fast()
 # The flag is stripped from sys.argv so argparse never sees it.
 # Falls back to ~/.hermes/active_profile for sticky default.
 # ---------------------------------------------------------------------------
-def _export_profile_identity() -> None:
-    """Export HERMES_PROFILE / HERMES_AGENT_NAME so they agree with HERMES_HOME.
+def _export_profile_route() -> None:
+    """Export the HERMES_PROFILE route label selected by HERMES_HOME.
 
-    ``HERMES_HOME`` is the single source of truth — ``--profile``/``-p`` exists
-    only to resolve it. Every other identity env var must be *derived* from it,
-    never stored separately. Before this existed, ``-p`` set ONLY HERMES_HOME,
-    which caused two real failures:
-
-    * ``HERMES_PROFILE`` stayed unset in gateway processes. Callers that use it
-      as a fallback (``tools/plan_tool.py:_cmd_dispatch``, the origin stamping
-      in ``tools/kanban_tools.py``) then stamped an EMPTY profile, so a
-      completion wake resolved to an unqualified ``platform:chat_id`` target
-      and was delivered by whichever gateway owned the bridge socket — not the
-      dispatcher's. See bugs/pending/2026-09-14-notify-wake-profile-less-origin.md.
-    * ``HERMES_AGENT_NAME`` had to be duplicated per profile in ``.env`` AND in
-      a systemd drop-in, so the two stores could disagree (and one profile had
-      no drop-in at all).
-
-    An explicitly-set value always wins (``setdefault``): a tool subprocess may
-    carry ``HERMES_PROFILE`` deliberately, and ``HERMES_AGENT_NAME`` is a
-    *display* identity (``Gopher``) that legitimately differs from the slug
-    (``gopher``) — a profile's ``.env`` is loaded just after this runs and
-    overrides the slug default with the human casing when it declares one.
+    USERNAME is the sole fleet identity and is loaded from the selected
+    profile's .env. HERMES_PROFILE remains route state only.
 
     The default profile exports the literal ``"default"``, which is safe: the
     ``HERMES_SESSION_*`` convention is that empty means "masked" while
@@ -553,7 +535,6 @@ def _export_profile_identity() -> None:
     if not name:
         return
     os.environ.setdefault("HERMES_PROFILE", name)
-    os.environ.setdefault("HERMES_AGENT_NAME", name)
 
 
 def _apply_profile_override() -> None:
@@ -674,7 +655,7 @@ def _apply_profile_override() -> None:
     hermes_home_env = os.environ.get("HERMES_HOME", "")
     if profile_name is None and hermes_home_env:
         if Path(hermes_home_env).parent.name == "profiles":
-            _export_profile_identity()
+            _export_profile_route()
             return
 
     # 2. If no flag, check active_profile in the hermes root.
@@ -724,17 +705,17 @@ def _apply_profile_override() -> None:
             )
             return
         os.environ["HERMES_HOME"] = hermes_home
-        _export_profile_identity()
+        _export_profile_route()
         # Strip the flag from argv so argparse doesn't choke
         if consume > 0 and profile_index is not None:
             start = profile_index + 1  # +1 because argv is sys.argv[1:]
             sys.argv = sys.argv[:start] + sys.argv[start + consume :]
 
     # No profile resolved (root profile, or no active_profile file): the
-    # identity export still runs so a default-profile gateway is explicitly
+    # route export still runs so a default-profile gateway is explicitly
     # "default" rather than unset. Empty is the ambiguous case that misrouted
-    # the completion wake — see _export_profile_identity above.
-    _export_profile_identity()
+    # the completion wake — see _export_profile_route above.
+    _export_profile_route()
 
 
 _apply_profile_override()

@@ -51,7 +51,8 @@ def worker_env(monkeypatch, tmp_path):
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
-    monkeypatch.setenv("HERMES_PROFILE", "test-worker")
+    monkeypatch.setenv("USERNAME", "test-worker")
+    monkeypatch.setenv("HERMES_PROFILE", "wrong-route")
     monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
     from pathlib import Path as _Path
     monkeypatch.setattr(_Path, "home", lambda: tmp_path)
@@ -364,7 +365,7 @@ def test_comment_happy_path(worker_env):
     try:
         comments = kb.list_comments(conn, worker_env)
         assert len(comments) == 1
-        # Author defaults to HERMES_PROFILE env we set in the fixture
+        # Author defaults to USERNAME env we set in the fixture.
         assert comments[0].author == "test-worker"
         assert comments[0].body == "hello thread"
     finally:
@@ -373,7 +374,7 @@ def test_comment_happy_path(worker_env):
 
 def test_comment_ignores_caller_supplied_author(worker_env):
     """``args["author"]`` is no longer honored — the author is always
-    derived from ``HERMES_PROFILE`` so a worker can't forge a comment
+    derived from ``USERNAME`` so a worker can't forge a comment
     under an authoritative-looking name like ``hermes-system`` and
     poison the next worker's prompt context. Cross-task commenting
     itself remains unrestricted (see #19713); only the author override
@@ -388,7 +389,7 @@ def test_comment_ignores_caller_supplied_author(worker_env):
     conn = kb.connect()
     try:
         comments = kb.list_comments(conn, worker_env)
-        # Author comes from HERMES_PROFILE in the fixture, not the
+        # Author comes from USERNAME in the fixture, not the
         # caller-supplied "hermes-system" override.
         assert comments[0].author == "test-worker"
     finally:
@@ -410,8 +411,10 @@ def test_create_happy_path(worker_env):
     conn = kb.connect()
     try:
         child = kb.get_task(conn, d["task_id"])
+        assert child is not None
         assert child.title == "child task"
         assert child.assignee == "peer"
+        assert child.created_by == "test-worker"
     finally:
         conn.close()
 
@@ -808,6 +811,25 @@ def _sub_index(subs):
                 "notifier_profile": getattr(s, "notifier_profile", None),
             })
     return out
+
+
+def test_create_auto_subscribe_uses_username_only(monkeypatch, worker_env):
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-42")
+    monkeypatch.setenv("HERMES_SESSION_PROFILE", "wrong-session-route")
+
+    from tools import kanban_tools as kt
+
+    result = json.loads(kt._handle_create({
+        "title": "username notifier",
+        "assignee": "peer",
+    }))
+
+    assert result["ok"] is True
+    assert result["subscribed"] is True
+    subs = _sub_index(_list_subs_for_task(result["task_id"]))
+    assert len(subs) == 1
+    assert subs[0]["notifier_profile"] == "test-worker"
 
 
 def test_create_respects_auto_subscribe_on_create_false(monkeypatch, worker_env, tmp_path):
