@@ -1208,6 +1208,7 @@ def _cmd_archive(task_id: str) -> str:
 from tools.plan_binding_adapter import (
     cmd_advance as _cmd_advance,
     cmd_approve as _cmd_approve,
+    cmd_archive as _cmd_archive_adapter,
     cmd_continue as _cmd_continue,
     cmd_fail as _cmd_fail,
     cmd_handoff as _cmd_handoff,
@@ -1326,9 +1327,7 @@ def plan_tool(
         return _cmd_block(task_id)
 
     elif command == "archive":
-        if not task_id:
-            return "ERROR: 'archive' requires task_id"
-        return _cmd_archive(task_id)
+        return _cmd_archive_adapter(agent, task_id)
 
     else:
         return f"ERROR: Unknown plan command '{command}'. Valid: new, advance, handoff, continue, dispatch, remind, fail, test-complete, approve, block, archive, cron"
@@ -1405,7 +1404,7 @@ PLAN_TOOL_SCHEMA = {
             },
             "task_id": {
                 "type": "string",
-                "description": "Task ID for 'continue', 'remind', 'approve', 'block', or 'archive' command",
+                "description": "Task ID for 'continue', 'remind', 'approve', 'block', or 'archive' command. Optional for 'remind' and 'archive': when omitted, remind reclaims the most recent orphaned manual plan for this agent and archive closes the active (or orphaned) plan.",
             },
             "board": {
                 "type": "string",

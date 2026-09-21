@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 from types import SimpleNamespace
 
 from hermes_cli.kanban_db import SCHEMA_SQL
@@ -493,3 +494,134 @@ def test_closing_the_plan_clears_the_subject(monkeypatch):
     plan_tool.plan_tool(agent, "advance", summary="finished", proof="ran it")
 
     assert agent.subjects[-1] == ""
+
+
+# ---------------------------------------------------------------------------
+# plan remind reclaims an orphaned open manual plan after /new
+# (bug 2026-09-10-plan-remind-reclaim-manual-task)
+# ---------------------------------------------------------------------------
+
+
+def _plan_task(conn, task_id, *, assignee="neo", created_at, status="manual", title="Orphaned plan"):
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, assignee, created_at, task_steps, "
+        "task_stepno, task_goal, board) VALUES (?, ?, ?, ?, ?, ?, 1, ?, 'default')",
+        (task_id, title, status, assignee, created_at, '["step one"]', "finish it"),
+    )
+
+
+def test_remind_reclaims_orphaned_manual_plan_after_new_session(monkeypatch):
+    from tools import plan_binding_adapter
+
+    conn = _db()
+    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    # A plan left open as 'manual' with NO execution binding (the /new case).
+    _plan_task(conn, "t_orphan", created_at=int(time.time()))
+
+    resumed = _SubjectAgent()
+    resumed.session_id = "new-session"
+
+    result = plan_tool.plan_tool(resumed, "remind")
+
+    assert "Task: Orphaned plan" in result
+    assert "reclaimed from a previous session" in result
+    binding = conn.execute(
+        "SELECT profile, root_session_id, task_id FROM execution_bindings"
+    ).fetchone()
+    assert tuple(binding) == ("neo", "root:new-session", "t_orphan")
+    # The agent was told how to delete the wrong plan.
+    assert "plan_tool archive" in result
+
+
+def test_remind_reclaims_the_most_recent_of_several_orphans(monkeypatch):
+    conn = _db()
+    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    now = int(time.time())
+    _plan_task(conn, "t_old", created_at=now - 100, title="Older plan")
+    _plan_task(conn, "t_new", created_at=now, title="Newer plan")
+
+    resumed = _SubjectAgent()
+    resumed.session_id = "new-session"
+
+    result = plan_tool.plan_tool(resumed, "remind")
+
+    assert "Task: Newer plan" in result
+    assert conn.execute(
+        "SELECT task_id FROM execution_bindings"
+    ).fetchone()[0] == "t_new"
+
+
+def test_remind_archives_plans_older_than_15_days(monkeypatch):
+    conn = _db()
+    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    now = int(time.time())
+    # 16-day-old plan: must be archived, never reclaimed.
+    _plan_task(conn, "t_stale", created_at=now - 16 * 24 * 3600, title="Stale plan")
+    # 1-day-old plan: the one that should be reclaimed.
+    _plan_task(conn, "t_fresh", created_at=now - 1 * 24 * 3600, title="Fresh plan")
+
+    resumed = _SubjectAgent()
+    resumed.session_id = "new-session"
+
+    result = plan_tool.plan_tool(resumed, "remind")
+
+    assert "Task: Fresh plan" in result
+    assert conn.execute(
+        "SELECT status FROM tasks WHERE id='t_stale'"
+    ).fetchone()[0] == "archived"
+    assert conn.execute(
+        "SELECT task_id FROM execution_bindings"
+    ).fetchone()[0] == "t_fresh"
+
+
+def test_remind_deletes_plans_older_than_30_days(monkeypatch):
+    conn = _db()
+    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    now = int(time.time())
+    # 31-day-old plan: must be hard deleted, not just archived.
+    _plan_task(conn, "t_ancient", created_at=now - 31 * 24 * 3600, title="Ancient plan")
+    # 20-day-old plan: archived, not deleted.
+    _plan_task(conn, "t_mid", created_at=now - 20 * 24 * 3600, title="Middle plan")
+    # 1-day-old plan: reclaimed.
+    _plan_task(conn, "t_fresh", created_at=now - 1 * 24 * 3600, title="Fresh plan")
+
+    resumed = _SubjectAgent()
+    resumed.session_id = "new-session"
+
+    result = plan_tool.plan_tool(resumed, "remind")
+
+    assert "Task: Fresh plan" in result
+    assert conn.execute("SELECT 1 FROM tasks WHERE id='t_ancient'").fetchone() is None
+    assert conn.execute(
+        "SELECT status FROM tasks WHERE id='t_mid'"
+    ).fetchone()[0] == "archived"
+
+
+def test_archive_without_task_id_archives_orphaned_plan(monkeypatch):
+    conn = _db()
+    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    now = int(time.time())
+    _plan_task(conn, "t_orphan", created_at=now, title="Wrong plan")
+
+    resumed = _SubjectAgent()
+    resumed.session_id = "new-session"
+
+    result = plan_tool.plan_tool(resumed, "archive")
+
+    assert "ARCHIVED: t_orphan" in result
+    assert conn.execute(
+        "SELECT status FROM tasks WHERE id='t_orphan'"
+    ).fetchone()[0] == "archived"
+
+
+def test_archive_without_task_id_and_no_plan_is_an_error(monkeypatch):
+    conn = _db()
+    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+
+    resumed = _SubjectAgent()
+    resumed.session_id = "new-session"
+
+    result = plan_tool.plan_tool(resumed, "archive")
+
+    assert result.startswith("ERROR: 'archive' requires task_id")
+
