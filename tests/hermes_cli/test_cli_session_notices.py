@@ -94,6 +94,47 @@ def test_cli_origin_routing_uses_username_only(monkeypatch):
     kanban._store_cli_origin_routing(object(), "t_test", "telegram:123")
 
     assert captured["profile"] == "neo"
+    assert captured["allow_non_session"] is True
+
+
+def test_cli_implicit_origin_rejects_channel_fallback_without_session(
+    monkeypatch, capsys
+):
+    calls = []
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "8900123006")
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    monkeypatch.setattr(
+        kanban.kb,
+        "store_origin_routing",
+        lambda *_args, **kwargs: calls.append(kwargs),
+    )
+
+    kanban._store_cli_implicit_origin(object(), "t_test")
+
+    assert calls == []
+    assert "refusing implicit channel origin" in capsys.readouterr().err
+
+
+def test_cli_implicit_origin_uses_durable_session_id(monkeypatch):
+    captured = {}
+    monkeypatch.setenv("USERNAME", "neo")
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "8900123006")
+    monkeypatch.setenv("HERMES_SESSION_ID", "20260921_010203_abcdef")
+    monkeypatch.setattr(
+        kanban.kb,
+        "store_origin_routing",
+        lambda _conn, _task_id, **kwargs: captured.update(kwargs),
+    )
+
+    kanban._store_cli_implicit_origin(object(), "t_test")
+
+    assert captured == {
+        "platform": "session",
+        "chat_id": "20260921_010203_abcdef",
+        "profile": "neo",
+    }
 
 
 def test_kanban_cli_origin_queues_session_notice(tmp_path, monkeypatch):

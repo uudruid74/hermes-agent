@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import shlex
+import sqlite3
 import subprocess
 import sys
 import time
@@ -1849,9 +1850,35 @@ def _store_cli_origin_routing(conn, task_id: str, channel_flag: str) -> None:
             thread_id=thread_id or "",
             chat_type=chat_type or "",
             profile=(os.environ.get("USERNAME") or "").strip(),
+            allow_non_session=True,
         )
-    except Exception as exc:
+    except sqlite3.Error as exc:
         print(f"kanban: failed to store origin routing: {exc}", file=sys.stderr)
+
+
+def _store_cli_implicit_origin(conn, task_id: str) -> None:
+    """Store an implicit CLI origin only when a durable session id exists."""
+    session_id = os.environ.get("HERMES_SESSION_ID", "").strip()
+    if not session_id:
+        if (
+            os.environ.get("HERMES_SESSION_PLATFORM", "").strip()
+            or os.environ.get("HERMES_SESSION_CHAT_ID", "").strip()
+        ):
+            print(
+                "kanban: refusing implicit channel origin without HERMES_SESSION_ID",
+                file=sys.stderr,
+            )
+        return
+    try:
+        kb.store_origin_routing(
+            conn,
+            task_id,
+            platform="session",
+            chat_id=session_id,
+            profile=(os.environ.get("USERNAME") or "").strip(),
+        )
+    except ValueError as exc:
+        print(f"kanban: refusing invalid implicit session origin: {exc}", file=sys.stderr)
 
 
 def _cmd_create(args: argparse.Namespace) -> int:
@@ -1909,21 +1936,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
         if channel_flag:
             _store_cli_origin_routing(conn, task_id, channel_flag)
         else:
-            _platform = os.environ.get("HERMES_SESSION_PLATFORM", "").strip()
-            _chat_id = os.environ.get("HERMES_SESSION_CHAT_ID", "").strip()
-            _thread_id = os.environ.get("HERMES_SESSION_THREAD_ID", "").strip()
-            _chat_type = os.environ.get("HERMES_SESSION_CHAT_TYPE", "").strip()
-            if _platform and _chat_id:
-                try:
-                    kb.store_origin_routing(
-                        conn, task_id,
-                        platform=_platform, chat_id=_chat_id,
-                        thread_id=_thread_id or "",
-                        chat_type=_chat_type or "",
-                        profile=(os.environ.get("USERNAME") or "").strip(),
-                    )
-                except Exception as exc:
-                    print(f"kanban: failed to store origin routing from env: {exc}", file=sys.stderr)
+            _store_cli_implicit_origin(conn, task_id)
     if getattr(args, "json", False):
         print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))
     else:

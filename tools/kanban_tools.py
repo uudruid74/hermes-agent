@@ -1460,14 +1460,19 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
         # Store origin routing as a system comment so the watcher can
         # always find the right channel — even if the subscription is
         # later lost/overwritten, the origin comment survives as the
-        # source of truth.
-        _kb.store_origin_routing(
-            conn, task_id=task_id,
-            platform=platform, chat_id=chat_id,
-            thread_id=thread_id or "",
-            chat_type=chat_type or "",
-            profile=notifier_profile or "",
-        )
+        # source of truth. Origin routing is session-addressed; the delivery
+        # channel above remains a separate subscription concern.
+        session_id = get_session_env("HERMES_SESSION_ID", "") or ""
+        try:
+            _kb.store_origin_routing(
+                conn, task_id=task_id,
+                platform="session", chat_id=session_id,
+                profile=notifier_profile or "",
+            )
+        except ValueError as exc:
+            logger.warning(
+                "origin routing not stored for %s: %s", task_id, exc
+            )
         return True
     except Exception as _exc:
         logger.warning(

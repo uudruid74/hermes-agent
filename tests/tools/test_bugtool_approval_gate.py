@@ -6,7 +6,7 @@ import subprocess
 import threading
 import time
 
-BUGTOOL_PATH = "/home/ekl/.hermes/hermes-agent/scripts/bugtool.py"
+BUGTOOL_PATH = pathlib.Path(__file__).parents[2] / "scripts" / "bugtool.py"
 
 
 def load_bugtool(monkeypatch, tmp_path):
@@ -76,7 +76,32 @@ def test_valid_assignee_plus_checked_box_dispatches_to_that_agent(monkeypatch, t
     joined_all = " ".join(" ".join(str(a) for a in c) for c in calls)
     assert "--assignee ornith" in joined_all  # assignee comes from the bug, not hardcoded
     origin_calls = [c for c in calls if any("comment" == str(a) for a in c[:4])]
-    assert any("t_gate1" in " ".join(str(a) for a in c) for c in origin_calls)  # origin comment AFTER task id known
+    assert origin_calls == []
+
+
+def test_valid_reporter_session_is_stored_on_initial_create(monkeypatch, tmp_path):
+    bt, proot, _ = load_bugtool(monkeypatch, tmp_path)
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(list(args))
+        return subprocess.CompletedProcess(
+            args, 0, json.dumps({"id": "t_gate1"}), ""
+        )
+
+    monkeypatch.setattr(bt.subprocess, "run", fake_run)
+    path = write_bug(proot, assignee="ornith", approved=True)
+    path.write_text(
+        "---\nsession: 20260921_012345_abcdef\n---\n" + path.read_text(),
+        encoding="utf-8",
+    )
+
+    assert bt.maybe_dispatch_locked(path, path.read_text()) == "t_gate1"
+
+    create_call = next(c for c in calls if c[:3] == ["hermes", "kanban", "create"])
+    assert "--channel" in create_call
+    assert "session:20260921_012345_abcdef" in create_call
+    assert not any(c[:3] == ["hermes", "kanban", "comment"] for c in calls)
 
 
 def test_check_respects_gates(monkeypatch, tmp_path):

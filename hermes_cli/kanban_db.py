@@ -3871,6 +3871,7 @@ def list_comments_after(
 # ---------------------------------------------------------------------------
 
 _ORIGIN_MARKER = "__kanban_origin__"
+_SESSION_ORIGIN_RE = re.compile(r"^\d{8}_\d{6}_[0-9a-f]{6}$")
 
 
 def store_origin_routing(
@@ -3882,6 +3883,7 @@ def store_origin_routing(
     thread_id: str = "",
     chat_type: str = "",
     profile: str = "",
+    allow_non_session: bool = False,
 ) -> None:
     """Persist the chat origin that created this task as a system comment.
 
@@ -3892,22 +3894,23 @@ def store_origin_routing(
     downstream display and the watcher can extract it reliably.
 
     Idempotent: only writes if no origin comment exists for the task yet.
+    By default, only ``platform='session'`` with a canonical session id is
+    accepted. ``allow_non_session`` is reserved for an explicit user-provided
+    CLI ``--channel`` destination.
     Does NOT emit a ``commented`` event — this is infrastructure metadata,
     not a user-visible notification.
     """
     import json
 
+    if not allow_non_session and (
+        platform != "session" or not _SESSION_ORIGIN_RE.fullmatch(chat_id)
+    ):
+        raise ValueError(
+            "origin routing requires platform='session' and a valid session id"
+        )
+
     # Escape _ for SQLite LIKE: _ is a single-char wildcard.
     _escaped_marker = _ORIGIN_MARKER.replace("_", "\\_")
-    existing = conn.execute(
-        "SELECT 1 FROM task_comments"
-        " WHERE task_id = ? AND author = 'system' AND body LIKE ? ESCAPE '\\'"
-        " LIMIT 1",
-        (task_id, f"{_escaped_marker}%"),
-    ).fetchone()
-    if existing:
-        return  # already stored; idempotent
-
     payload = json.dumps(
         {
             "platform": platform,
@@ -3920,6 +3923,14 @@ def store_origin_routing(
     body = f"{_ORIGIN_MARKER}{payload}"
     now = int(time.time())
     with write_txn(conn):
+        existing = conn.execute(
+            "SELECT 1 FROM task_comments"
+            " WHERE task_id = ? AND author = 'system' AND body LIKE ? ESCAPE '\\'"
+            " LIMIT 1",
+            (task_id, f"{_escaped_marker}%"),
+        ).fetchone()
+        if existing:
+            return  # already stored; idempotent
         conn.execute(
             "INSERT INTO task_comments (task_id, author, body, created_at)"
             " VALUES (?, 'system', ?, ?)",

@@ -1019,6 +1019,31 @@ def _make_create_ns(**overrides):
     return ns
 
 
+def test_cli_create_env_origin_uses_durable_session_id(
+    kanban_home, monkeypatch
+):
+    from hermes_cli import kanban as kb_cli
+
+    captured = {}
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "123")
+    monkeypatch.setenv("HERMES_SESSION_ID", "20260921_012345_abcdef")
+    monkeypatch.setattr(
+        kb_cli.kb,
+        "store_origin_routing",
+        lambda _conn, _task_id, **kwargs: captured.update(kwargs),
+    )
+    monkeypatch.setattr(kb_cli, "_notify_kanban_status_change", lambda *a, **k: None)
+
+    assert kb_cli._cmd_create(_make_create_ns()) == 0
+
+    assert captured == {
+        "platform": "session",
+        "chat_id": "20260921_012345_abcdef",
+        "profile": (os.environ.get("USERNAME") or "").strip(),
+    }
+
+
 def test_cli_daemon_help_marks_deprecated():
     """The argparse help string on `daemon` mentions deprecation so users
     scanning `--help` see the migration before running the stub."""

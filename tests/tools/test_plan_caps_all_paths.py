@@ -36,6 +36,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+from types import SimpleNamespace
 
 import pytest
 
@@ -164,11 +165,17 @@ def test_dispatch_origin_routing_uses_username_only(board, monkeypatch):
     )
 
     result = plan_tool._cmd_dispatch(
-        None, "username origin", "route correctly", "default", "neo"
+        SimpleNamespace(
+            canonical_session_id="20260921_010203_abcdef",
+            agent_name="neo",
+        ),
+        "username origin", "route correctly", "default", "neo"
     )
 
     assert "ERROR" not in result, result
     assert captured["profile"] == "neo"
+    assert captured["platform"] == "session"
+    assert captured["chat_id"] == "20260921_010203_abcdef"
 
 
 def test_dispatch_refuses_more_than_twelve_steps(board):

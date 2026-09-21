@@ -35,19 +35,82 @@ def test_origin_routing_persists_profile(kanban_home):
         kb.store_origin_routing(
             conn,
             task_id,
-            platform="telegram",
-            chat_id="123",
-            chat_type="dm",
+            platform="session",
+            chat_id="20260921_010203_abcdef",
             profile="zephyr",
         )
 
         assert kb.get_origin_routing(conn, task_id) == {
-            "platform": "telegram",
-            "chat_id": "123",
+            "platform": "session",
+            "chat_id": "20260921_010203_abcdef",
             "thread_id": "",
-            "chat_type": "dm",
+            "chat_type": "",
             "profile": "zephyr",
         }
+
+
+def test_origin_routing_rejects_fallback_then_accepts_session(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="session origin", assignee="neo")
+
+        with pytest.raises(ValueError, match="valid session id"):
+            kb.store_origin_routing(
+                conn,
+                task_id,
+                platform="telegram",
+                chat_id="8900123006",
+                chat_type="dm",
+                profile="gopher",
+            )
+        with pytest.raises(ValueError, match="valid session id"):
+            kb.store_origin_routing(
+                conn,
+                task_id,
+                platform="session",
+                chat_id="not-a-session-id",
+                profile="gopher",
+            )
+
+        assert kb.get_origin_routing(conn, task_id) is None
+
+        kb.store_origin_routing(
+            conn,
+            task_id,
+            platform="session",
+            chat_id="20260907_002921_aa84b9",
+            profile="gopher",
+        )
+        kb.store_origin_routing(
+            conn,
+            task_id,
+            platform="session",
+            chat_id="20260921_010203_abcdef",
+            profile="neo",
+        )
+
+        assert kb.get_origin_routing(conn, task_id) == {
+            "platform": "session",
+            "chat_id": "20260907_002921_aa84b9",
+            "thread_id": "",
+            "chat_type": "",
+            "profile": "gopher",
+        }
+
+
+def test_origin_routing_explicit_channel_is_the_only_non_session_bypass(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="explicit channel", assignee="neo")
+        kb.store_origin_routing(
+            conn,
+            task_id,
+            platform="telegram",
+            chat_id="8900123006",
+            chat_type="dm",
+            profile="gopher",
+            allow_non_session=True,
+        )
+
+        assert kb.get_origin_routing(conn, task_id)["chat_id"] == "8900123006"
 
 
 @pytest.mark.parametrize(

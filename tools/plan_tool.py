@@ -679,28 +679,24 @@ def _cmd_dispatch(agent, title: str, goal: str, project: str, assignee: str,
         except Exception:
             pass
 
-    # Stamp origin routing so completion notifications (hermes send -u)
-    # fire back to the originating channel. Mirrors _maybe_auto_subscribe
-    # in tools/kanban_tools.py — without this, plan-dispatched tasks get
-    # no __kanban_origin__ comment and send -u silently no-ops.
+    # Stamp the originating durable session so completion notifications return
+    # to the dispatcher rather than whichever gateway environment a worker
+    # inherits later.
     try:
-        from gateway.session_context import get_session_env
-        platform = get_session_env("HERMES_SESSION_PLATFORM", "")
-        chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
-        if platform and chat_id:
-            thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or ""
-            chat_type = get_session_env("HERMES_SESSION_CHAT_TYPE", "") or ""
+        if session_id:
             profile = (os.environ.get("USERNAME") or "").strip()
             with kdb as conn:
                 from hermes_cli.kanban_db import store_origin_routing
                 store_origin_routing(
                     conn, task_id,
-                    platform=platform, chat_id=chat_id,
-                    thread_id=thread_id, chat_type=chat_type,
+                    platform="session", chat_id=session_id,
                     profile=profile,
                 )
-    except Exception:
-        pass
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        import logging
+        logging.getLogger("plan_tool").warning(
+            "origin routing not stored for %s: %s", task_id, exc
+        )
 
     project_display = "**Random**" if project.lower() == "default" else project
     return f"Task {task_id} dispatched to {assignee} on {project_display}: {title}"

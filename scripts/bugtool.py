@@ -326,15 +326,12 @@ def cmd_fix_tags(args: argparse.Namespace) -> None:
         print(f"{'fixed ' if changed else 'ok    '} {path}")
 
 
-DM_CHAT_ID = "8900123006"  # Evan's telegram DM (same fallback tell uses)
-
-def origin_routing(text: str) -> str:
-    """JSON payload for __kanban_origin__: session id if present, else agent-name → telegram DM."""
+def origin_channel(text: str) -> Optional[str]:
+    """Return a session channel only when the bug names a valid reporter session."""
     reporter = reporter_session(text).strip()
-    agent = frontmatter(text).get("filed_by", "").split()[0].lower() if frontmatter(text).get("filed_by") else ""
-    if reporter and not reporter.startswith("MISSING") and re.match(r"^\d{8}_\d{6}_[0-9a-f]{6}$", reporter):
-        return json.dumps({"platform": "session", "chat_id": reporter, "thread_id": "", "chat_type": "", "profile": ""})
-    return json.dumps({"platform": "telegram", "chat_id": DM_CHAT_ID, "thread_id": "", "chat_type": "dm", "profile": agent})
+    if re.fullmatch(r"\d{8}_\d{6}_[0-9a-f]{6}", reporter):
+        return f"session:{reporter}"
+    return None
 
 
 def missing_dispatch_fields(text: str) -> list[str]:
@@ -473,8 +470,16 @@ def create_task(
         return None
     append_dispatch_record(identity, "reserved")
     slug = path.stem.split("-", 3)[-1]
+    command = [
+        HERMES, "kanban", "create", "--assignee", worker,
+        "--body", task_body(path, text, directive), f"BUG: {slug}",
+    ]
+    channel = origin_channel(text)
+    if channel:
+        command.extend(("--channel", channel))
+    command.append("--json")
     result = subprocess.run(
-        [HERMES, "kanban", "create", "--assignee", worker, "--body", task_body(path, text, directive), f"BUG: {slug}", "--json"],
+        command,
         text=True,
         capture_output=True,
         check=False,
@@ -490,12 +495,6 @@ def create_task(
             candidate = response.get("id")
             if isinstance(candidate, str) and re.fullmatch(r"t_[A-Za-z0-9]+", candidate):
                 created = candidate
-    if created:
-        subprocess.run(
-            [HERMES, "kanban", "comment", "--author", "system",
-             created, "__kanban_origin__" + origin_routing(text)],
-            text=True, capture_output=True, check=False,
-        )
     if created is None:
         append_dispatch_record(identity, "failed")
         print(f"dispatch failed for {path}: {output.strip()}", file=sys.stderr)
