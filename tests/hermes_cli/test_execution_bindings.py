@@ -365,3 +365,33 @@ def test_continue_rejects_terminal_done_status(tmp_path):
                 conn, _key(), "t_done",
                 actor="Ornith", session_id="session-2",
             )
+
+
+def test_continue_blocked_plan_converts_to_manual_and_rebinds(tmp_path):
+    """Evan 2026-09-21: `continue` must accept a blocked plan — convert it to
+    manual and bind it to the caller's current session (live handoff from the
+    kanban blocked pool to an active Telegram-watchable session)."""
+    with kb.connect(tmp_path / "kanban.db") as conn:
+        _insert_task(conn, "t_blocked", status="blocked",
+                     steps=("first", "second"), step_no=1)
+
+        result = bindings.continue_plan(
+            conn, _key(), "t_blocked",
+            actor="Neo", session_id="session-live",
+        )
+
+        assert result.task_id == "t_blocked"
+        row = conn.execute(
+            "SELECT status, assignee, session_id, task_stepno FROM tasks WHERE id='t_blocked'"
+        ).fetchone()
+        assert row["status"] == "manual"       # blocked → manual conversion
+        assert row["assignee"] == "Neo"
+        assert row["session_id"] == "session-live"
+        assert row["task_stepno"] == 1
+
+        event = conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id='t_blocked' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        assert event["kind"] == "plan-continued"
+        payload = json.loads(event["payload"])
+        assert payload["from_status"] == "blocked"

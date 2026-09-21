@@ -917,7 +917,7 @@ def continue_plan(
     now = int(time.time())
     with write_txn(conn):
         task = _task_row(conn, plan_id)
-        if task["status"] not in ("manual", "archived"):
+        if task["status"] not in ("manual", "archived", "blocked"):
             raise InvalidTaskState(
                 f"plan {plan_id} cannot continue from status {task['status']}"
             )
@@ -942,7 +942,7 @@ def continue_plan(
         )
         changed = conn.execute(
             "UPDATE tasks SET assignee = ?, session_id = ?, status = 'manual' "
-            "WHERE id = ? AND status IN ('manual', 'archived')",
+            "WHERE id = ? AND status IN ('manual', 'archived', 'blocked')",
             (actor, session_id, plan_id),
         ).rowcount
         if changed != 1:
