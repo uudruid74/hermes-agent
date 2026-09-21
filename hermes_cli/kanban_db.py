@@ -5269,7 +5269,8 @@ def _bug_autoremove_resolve(
         today = _dt.date.today().isoformat()
         agent = (os.environ.get("USERNAME") or "").strip() or "unknown"
         # frontmatter status + resolution stamps
-        text = _re.sub(r'(?m)^status: "pending"$', 'status: "resolved"', text, count=1)
+        text = _re.sub(r'(?m)^status: ["\']?(?:pending|dispatched|ready|running)["\']?\s*$',
+                       'status: "resolved"', text, count=1)
         text = _re.sub(r'(?m)^date: "(\d{4}-\d{2}-\d{2})"$',
                        lambda m: f'date: "{m.group(1)}"\nresolved: "{today}"\nresolved_by: "{agent}"',
                        text, count=1)
