@@ -1405,7 +1405,7 @@ PLAN_TOOL_SCHEMA = {
             },
             "task_id": {
                 "type": "string",
-                "description": "Task ID for 'approve' or 'continue' command",
+                "description": "Task ID for 'continue', 'remind', 'approve', 'block', or 'archive' command",
             },
             "board": {
                 "type": "string",
