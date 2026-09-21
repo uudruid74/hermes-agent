@@ -256,10 +256,54 @@ def set_session_tool(
     if note is not None:
         params["note"] = note if len(note) <= 300 else note[:297] + "..."
 
+    # ── In-process system message to the user's chat (Evan, 2026-09-21) ──
+    # Deliver the params copy as a PERSISTED chat message via the live
+    # gateway adapter — no subprocess, no hermes send. Best-effort: any
+    # failure (no runner, not connected, no chat destination) is silent.
+    _send_params_system_message(agent, params)
+
     if not changes:
         return json.dumps({"message": "set_session called with no arguments"})
 
     return json.dumps({"params": params, "changes": changes})
+
+
+def _send_params_system_message(agent, params: dict) -> None:
+    """Deliver the set_session params echo as a chat system message.
+
+    Uses the live gateway adapter directly (in-process) when the session
+    context carries a platform + chat destination. Never raises.
+    """
+    if not params:
+        return
+    try:
+        from gateway.session_context import get_session_env
+        from gateway.run import _gateway_runner_ref
+        from model_tools import _run_async
+
+        platform_name = get_session_env("HERMES_SESSION_PLATFORM", "").strip()
+        chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "").strip()
+        if not platform_name or not chat_id:
+            return
+
+        runner = _gateway_runner_ref()
+        if runner is None:
+            return
+        from gateway.config import Platform
+
+        try:
+            adapter = runner.adapters.get(Platform(platform_name))
+        except (ValueError, KeyError):
+            return
+        if adapter is None:
+            return
+
+        msg = "📝 set_session: " + " | ".join(
+            f"{k}: {v}" for k, v in params.items()
+        )
+        _run_async(adapter.send(chat_id, msg))
+    except Exception:
+        pass
 
 
 # --- Schema ---
