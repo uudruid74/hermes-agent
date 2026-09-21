@@ -445,6 +445,14 @@ def cmd_advance(
         task = conn.execute(
             "SELECT task_goal, plan_kind FROM tasks WHERE id=?", (result.task_id,)
         ).fetchone()
+        # Execution bindings are authoritative, but sessions.task_id remains a
+        # compatibility signal for session UI/context.  Mirror the atomic close:
+        # clear a finished root Plan or point at the restored parent Plan.
+        session_db = getattr(agent, "_session_db", None)
+        session_id = getattr(agent, "session_id", None)
+        set_task_id = getattr(session_db, "set_session_task_id", None)
+        if callable(set_task_id) and isinstance(session_id, str) and session_id:
+            set_task_id(session_id, result.restored_task_id)
         if task["plan_kind"] == "debug":
             source = conn.execute(
                 "SELECT assignee FROM tasks WHERE debug_plan_id=? ORDER BY created_at DESC LIMIT 1",
@@ -883,8 +891,10 @@ def cmd_remind(agent, task_id: Optional[str] = None) -> str:
             task_id = _reclaim_orphaned_plan(conn, agent)
             if task_id is not None:
                 reclaimed = True
+            elif error and error.startswith("PLAN_STATE_UNAVAILABLE:"):
+                return error
             else:
-                return error or "ERROR: No active task"
+                return "No active plan."
         else:
             task_id = binding.task_id
     task = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()

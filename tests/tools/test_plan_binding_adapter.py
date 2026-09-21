@@ -412,6 +412,7 @@ class _SubjectAgent(_Agent):
 
     def __init__(self):
         self.subjects: list = []
+        self.task_ids: list = []
         outer = self
 
         class _DB:
@@ -420,6 +421,9 @@ class _SubjectAgent(_Agent):
 
             def set_session_subject(self, session_id, subject) -> None:
                 outer.subjects.append(subject)
+
+            def set_session_task_id(self, session_id, task_id) -> None:
+                outer.task_ids.append(task_id)
 
         self._session_db = _DB()
         self.session_id = "subject-session"
@@ -494,6 +498,23 @@ def test_closing_the_plan_clears_the_subject(monkeypatch):
     plan_tool.plan_tool(agent, "advance", summary="finished", proof="ran it")
 
     assert agent.subjects[-1] == ""
+
+
+def test_final_advance_clears_session_task_and_remind_has_no_active_plan(monkeypatch):
+    """A root Plan's last advance must leave no active-plan identity anywhere."""
+    agent = _SubjectAgent()
+    conn = _start_plan(monkeypatch, agent, ["only step"])
+    task_id = conn.execute("SELECT task_id FROM execution_bindings").fetchone()[0]
+    # Compatibility state may still carry the Plan id from an older runtime.
+    agent.task_ids.append(task_id)
+
+    result = plan_tool.plan_tool(
+        agent, "advance", summary="finished", proof="pytest: regression passed"
+    )
+
+    assert "goal was: gate the compaction" in result
+    assert agent.task_ids[-1] is None
+    assert plan_tool.plan_tool(agent, "remind") == "No active plan."
 
 
 # ---------------------------------------------------------------------------
