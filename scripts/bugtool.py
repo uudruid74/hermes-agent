@@ -334,6 +334,37 @@ def origin_channel(text: str) -> Optional[str]:
     return None
 
 
+def _refresh_origin(text: str, path: Path) -> None:
+    """Overwrite the live task's origin routing with THIS dispatcher's session.
+
+    Called when a dispatch attempt hits the live-task dedup gate (2026-09-21,
+    Evan): the current dispatcher's session must win over a stale original,
+    or notifications keep routing to a channel that can never receive them.
+    Best-effort: failures are logged, never raise.
+    """
+    channel = origin_channel(text)
+    if not channel:
+        return
+    session_id = channel.split(":", 1)[1]
+    task_ids_owned = owned_live_task_ids(text)
+    if not task_ids_owned:
+        return
+    try:
+        import hermes_cli.kanban_db as kb
+        with kb.connect_closing() as conn:
+            for task_id in task_ids_owned:
+                kb.store_origin_routing(
+                    conn,
+                    task_id,
+                    platform="session",
+                    chat_id=session_id,
+                    profile=(os.environ.get("USERNAME") or "").strip(),
+                    overwrite=True,
+                )
+    except Exception as exc:  # best-effort: dispatch dedup still returns None
+        print(f"origin refresh failed for {path.name}: {exc}", file=sys.stderr)
+
+
 def missing_dispatch_fields(text: str) -> list[str]:
     """Human-readable list of what blocks dispatch (debugging + manual runs)."""
     missing = [s for s in REQUIRED_SECTIONS if not section_value(text, s)]
@@ -537,7 +568,12 @@ def maybe_dispatch_locked(path: Path, text: str, directive: Optional[str] = None
     # block dispatch (#3df9b2c04), and done/archived tasks are not live, so a
     # legitimate re-dispatch still works.
     if not force and owned_live_task_ids(text):
-        print(f"nothing to dispatch for {path.name}: live task exists")
+        # Re-dispatch with a NEW origin (2026-09-21, Evan): the live task stays,
+        # but the origin routing must point at the CURRENT dispatcher's session,
+        # not the original filer's (possibly dead) session. First-wins otherwise
+        # pins notifications to a channel that can never receive them.
+        _refresh_origin(text, path)
+        print(f"nothing to dispatch for {path.name}: live task exists (origin refreshed)")
         return None
     # AUTHORITATIVE idempotency gate (2026-09-14, Evan): "just change the
     # meta-data from 'pending' to 'dispatched' and do not dispatch a dispatched

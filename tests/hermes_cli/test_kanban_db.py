@@ -97,6 +97,50 @@ def test_origin_routing_rejects_fallback_then_accepts_session(kanban_home):
         }
 
 
+def test_origin_routing_overwrite_replaces_stale_original(kanban_home):
+    """Evan 2026-09-21: re-dispatch must REPLACE a stale original origin —
+    default stays first-wins idempotent; overwrite=True swaps in the new
+    dispatcher's session so notifications route to a live channel."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="stale origin", assignee="neo")
+        kb.store_origin_routing(
+            conn,
+            task_id,
+            platform="session",
+            chat_id="20260913_110505_dead00",
+            profile="gopher",
+        )
+        # Default (no overwrite): first-wins keeps the original.
+        kb.store_origin_routing(
+            conn,
+            task_id,
+            platform="session",
+            chat_id="20260921_030000_f00d00",
+            profile="zephyr",
+        )
+        assert kb.get_origin_routing(conn, task_id)["chat_id"] == "20260913_110505_dead00"
+
+        # overwrite=True: current dispatcher's session replaces the original.
+        kb.store_origin_routing(
+            conn,
+            task_id,
+            platform="session",
+            chat_id="20260921_030000_f00d00",
+            profile="zephyr",
+            overwrite=True,
+        )
+        routing = kb.get_origin_routing(conn, task_id)
+        assert routing["chat_id"] == "20260921_030000_f00d00"
+        assert routing["profile"] == "zephyr"
+        # exactly ONE origin comment remains (no duplicates stacked)
+        count = conn.execute(
+            "SELECT count(*) FROM task_comments"
+            " WHERE task_id = ? AND author = 'system' AND body LIKE '\\_\\_kanban\\_origin\\_%' ESCAPE '\\'",
+            (task_id,),
+        ).fetchone()[0]
+        assert count == 1
+
+
 def test_origin_routing_explicit_channel_is_the_only_non_session_bypass(kanban_home):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="explicit channel", assignee="neo")

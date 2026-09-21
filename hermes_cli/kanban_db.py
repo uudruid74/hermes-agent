@@ -3884,6 +3884,7 @@ def store_origin_routing(
     chat_type: str = "",
     profile: str = "",
     allow_non_session: bool = False,
+    overwrite: bool = False,
 ) -> None:
     """Persist the chat origin that created this task as a system comment.
 
@@ -3893,7 +3894,10 @@ def store_origin_routing(
     comment so no schema changes are needed — the body is opaque to
     downstream display and the watcher can extract it reliably.
 
-    Idempotent: only writes if no origin comment exists for the task yet.
+    By default idempotent: only writes if no origin comment exists for the
+    task yet. With ``overwrite=True`` the existing origin comment(s) are
+    REPLACED with the new one — used on re-dispatch, where the current
+    dispatcher's session must win over a stale original (2026-09-21).
     By default, only ``platform='session'`` with a canonical session id is
     accepted. ``allow_non_session`` is reserved for an explicit user-provided
     CLI ``--channel`` destination.
@@ -3930,7 +3934,13 @@ def store_origin_routing(
             (task_id, f"{_escaped_marker}%"),
         ).fetchone()
         if existing:
-            return  # already stored; idempotent
+            if not overwrite:
+                return  # already stored; idempotent
+            conn.execute(
+                "DELETE FROM task_comments"
+                " WHERE task_id = ? AND author = 'system' AND body LIKE ? ESCAPE '\\'",
+                (task_id, f"{_escaped_marker}%"),
+            )
         conn.execute(
             "INSERT INTO task_comments (task_id, author, body, created_at)"
             " VALUES (?, 'system', ?, ?)",
