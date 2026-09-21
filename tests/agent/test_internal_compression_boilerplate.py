@@ -174,6 +174,24 @@ def test_repeated_real_lines_are_deduped() -> None:
     assert len([u for u, _ in ranked if "Retrying" in u.text]) == 1
 
 
+def test_canonical_form_keeps_negations_distinct() -> None:
+    # Evan, 2026-09-20: negations must NEVER be stripped from the canonical key.
+    # "Fallbacks are not allowed." and "Fallbacks are allowed." are OPPOSITE
+    # facts — collapsing them dropped every correction from the compressed
+    # context, so the model kept re-learning the superseded claim. This test
+    # locks the polarity boundary: a negation flip must change the key.
+    first = "[USER]: Fallbacks are not allowed."
+    second = "[USER]: Fallbacks are allowed."
+    third = "[USER]: do not use USERNAME in kanban, tell, session logs"
+    fourth = "[USER]: use USERNAME in kanban, tell, session logs"
+    from agent.internal_compression_fallback import _canonical_form
+    assert _canonical_form(first) != _canonical_form(second)
+    assert _canonical_form(third) != _canonical_form(fourth)
+    # And the dedupe must keep both when polarity differs.
+    ranked = _rank_units([_unit(first, 0), _unit(second, 1)], [], [])
+    assert len([u for u, _ in ranked if "Fallbacks" in u.text]) == 2
+
+
 def test_canonical_form_ignores_word_order_and_function_words() -> None:
     # Two re-quoted wordings of one line carry the same information, so the
     # canonical form compares content words as a set.

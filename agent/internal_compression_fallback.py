@@ -373,13 +373,16 @@ def _is_boilerplate_only(text: str) -> bool:
     return len(_TOKEN_RE.findall(cleaned.casefold())) < _MIN_UNIT_TOKENS
 
 
-# Canonical-form stopwords (Evan, 2026-09-15).  Two units that differ only in
-# function words carry the same information, so dedupe must compare them on
-# content words alone.
+# Canonical-form stopwords (Evan, 2026-09-15; negation carve-out Evan, 2026-09-20).
+# Two units that differ only in function words carry the same information, so
+# dedupe must compare them on content words alone.
+# NEGATIONS ARE NEVER STRIPPED: "Fallbacks are not allowed" and "Fallbacks are
+# allowed" are OPPOSITE facts and must never collapse to one key. Turning a
+# sentence into its opposite is a correctness failure of the whole system.
 _STOPWORDS = frozenset(
     """
     a an and are as at be been but by can could did do does for from had has
-    have he her him his how i if in into is it its me my no nor not of on or
+    have he her him his how i if in into is it its me my of on or
     our out over own should so some such than that the their them then there
     these they this those to too us was we were what when where which who
     whom why will with would you your yours
