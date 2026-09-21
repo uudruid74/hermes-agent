@@ -173,6 +173,10 @@ def test_normal_failure_archives_without_rating_change(monkeypatch):
     assert state.ratings == {}
     assert conn.execute("SELECT status FROM tasks WHERE id = 'normal'").fetchone()[0] == "archived"
     assert state.moods == [("session", -1.0)]
+    assert state.conn.execute(
+        "SELECT task_id FROM sessions WHERE id = 'session'"
+    ).fetchone()[0] is None
+    assert getattr(agent, "_force_compression_after_plan_completion", False) is True
 
 
 def test_test_complete_archives_without_mood_or_rating_penalty(monkeypatch):
@@ -188,7 +192,10 @@ def test_test_complete_archives_without_mood_or_rating_penalty(monkeypatch):
     assert "Plan test test-complete" in result
     assert state.ratings == {}
     assert state.moods == []
-    assert state.conn.execute("SELECT task_id FROM sessions WHERE id = 'session'").fetchone()[0] == "test"
+    assert state.conn.execute(
+        "SELECT task_id FROM sessions WHERE id = 'session'"
+    ).fetchone()[0] is None
+    assert getattr(agent, "_force_compression_after_plan_completion", False) is True
     assert conn.execute("SELECT status FROM tasks WHERE id = 'test'").fetchone()[0] == "archived"
     comment = conn.execute("SELECT body FROM task_comments WHERE task_id = 'test'").fetchone()[0]
     event = conn.execute(

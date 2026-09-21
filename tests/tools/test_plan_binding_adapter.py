@@ -462,8 +462,9 @@ def test_subject_tracks_the_active_step_and_changes_on_advance(monkeypatch):
 
     plan_tool.plan_tool(agent, "advance", summary="implemented", proof="ran it")
     assert agent.subjects[-1] == "Subject plan: verify"
+    assert not getattr(agent, "_force_compression_after_plan_completion", False)
 
-    # Every transition wrote a DIFFERENT value: each is a full compaction.
+    # Every transition wrote a DIFFERENT value: each makes the next compaction full.
     assert len(set(agent.subjects)) == len(agent.subjects)
 
 
@@ -498,6 +499,7 @@ def test_closing_the_plan_clears_the_subject(monkeypatch):
     plan_tool.plan_tool(agent, "advance", summary="finished", proof="ran it")
 
     assert agent.subjects[-1] == ""
+    assert getattr(agent, "_force_compression_after_plan_completion", False) is True
 
 
 def test_final_advance_clears_session_task_and_remind_has_no_active_plan(monkeypatch):
@@ -515,6 +517,19 @@ def test_final_advance_clears_session_task_and_remind_has_no_active_plan(monkeyp
     assert "goal was: gate the compaction" in result
     assert agent.task_ids[-1] is None
     assert plan_tool.plan_tool(agent, "remind") == "No active plan."
+
+
+def test_archiving_the_active_plan_requests_completion_compression(monkeypatch):
+    agent = _SubjectAgent()
+    conn = _start_plan(monkeypatch, agent, ["only step"])
+    task_id = conn.execute("SELECT task_id FROM execution_bindings").fetchone()[0]
+
+    result = plan_tool.plan_tool(agent, "archive", task_id=task_id)
+
+    assert result == f"ARCHIVED: {task_id}"
+    assert agent.subjects[-1] == ""
+    assert agent.task_ids[-1] is None
+    assert getattr(agent, "_force_compression_after_plan_completion", False) is True
 
 
 # ---------------------------------------------------------------------------

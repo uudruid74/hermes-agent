@@ -6475,12 +6475,25 @@ def run_conversation(
                         messages, tools=agent.tools or None
                     )
 
+                _force_plan_completion_compression = bool(
+                    getattr(
+                        agent,
+                        "_force_compression_after_plan_completion",
+                        False,
+                    )
+                )
                 if (
                     agent.compression_enabled
-                    and compression_attempts < max_compression_attempts
-                    and _compressor.should_compress(_real_tokens)
+                    and (
+                        _force_plan_completion_compression
+                        or (
+                            compression_attempts < max_compression_attempts
+                            and _compressor.should_compress(_real_tokens)
+                        )
+                    )
                 ):
-                    compression_attempts += 1
+                    if not _force_plan_completion_compression:
+                        compression_attempts += 1
                     # Compression is actually running (block cleared / was
                     # never blocked) — reset the blocked-overflow warning
                     # dedup so a future blocked-over-threshold turn can warn
@@ -6495,10 +6508,16 @@ def run_conversation(
                     # Route the overhead-aware _real_tokens (computed above) into compression, not
                     # the bare last_prompt_tokens — which is 0 in the no-usage fallback, hiding the
                     # true request size from the engine's overflow guard (upstream PR #77169 review).
+                    _force_kwargs = (
+                        {"force": True}
+                        if _force_plan_completion_compression
+                        else {}
+                    )
                     messages, active_system_prompt = agent._compress_context(
                         messages, system_message,
                         approx_tokens=_real_tokens,
                         task_id=effective_task_id,
+                        **_force_kwargs,
                     )
                     if (
                         messages is _post_tool_input
@@ -6510,8 +6529,11 @@ def run_conversation(
                         # Refund the attempt so a lock-loser tool loop does not
                         # burn the shared per-turn budget toward
                         # compression_exhausted (#9893/#35809).
-                        compression_attempts -= 1
+                        if not _force_plan_completion_compression:
+                            compression_attempts -= 1
                     else:
+                        if _force_plan_completion_compression:
+                            agent._force_compression_after_plan_completion = False
                         conversation_history = conversation_history_after_compression(
                             agent, messages, conversation_history
                         )

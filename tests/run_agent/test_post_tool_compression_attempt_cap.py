@@ -145,6 +145,74 @@ def _run_tool_loop(agent, n_tool_iterations: int):
     return result, compress_calls
 
 
+def test_plan_completion_forces_one_post_tool_compression_below_threshold(agent):
+    """A terminal Plan tool result compacts immediately, independent of pressure."""
+    agent.max_compression_attempts = 0
+    agent.context_compressor.should_compress.return_value = False
+    agent.context_compressor.last_prompt_tokens = 1
+    agent.client.chat.completions.create.side_effect = [
+        _tool_response(0),
+        _stop_response(),
+    ]
+    compress_calls = []
+
+    def _complete_plan(*_args, **_kwargs):
+        agent._force_compression_after_plan_completion = True
+        return json.dumps({"completed": True})
+
+    def _fake_compress(messages, system_message, **kwargs):
+        compress_calls.append(kwargs)
+        return list(messages), "compressed prompt"
+
+    with (
+        patch.object(agent, "_compress_context", side_effect=_fake_compress),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch("run_agent.handle_function_call", side_effect=_complete_plan),
+    ):
+        result = agent.run_conversation("finish the plan")
+
+    assert result["completed"] is True
+    assert len(compress_calls) == 1
+    assert compress_calls[0]["force"] is True
+    assert agent._force_compression_after_plan_completion is False
+
+
+def test_lock_deferred_plan_completion_compression_remains_pending(agent):
+    agent.max_compression_attempts = 0
+    agent.context_compressor.should_compress.return_value = False
+    agent.context_compressor.last_prompt_tokens = 1
+    agent.client.chat.completions.create.side_effect = [
+        _tool_response(0),
+        _stop_response(),
+    ]
+    compress_calls = []
+
+    def _complete_plan(*_args, **_kwargs):
+        agent._force_compression_after_plan_completion = True
+        return json.dumps({"completed": True})
+
+    def _lock_deferred(messages, system_message, **kwargs):
+        compress_calls.append(kwargs)
+        agent._compression_skipped_due_to_lock = True
+        return messages, system_message
+
+    with (
+        patch.object(agent, "_compress_context", side_effect=_lock_deferred),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch("run_agent.handle_function_call", side_effect=_complete_plan),
+    ):
+        result = agent.run_conversation("finish the plan")
+
+    assert result["completed"] is True
+    assert len(compress_calls) == 1
+    assert compress_calls[0]["force"] is True
+    assert agent._force_compression_after_plan_completion is True
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------

@@ -36,6 +36,11 @@ def _actor(agent):
     )
 
 
+def _request_completion_compression(agent) -> None:
+    """Force one post-tool compaction after an active Plan terminates."""
+    agent._force_compression_after_plan_completion = True
+
+
 def _sync_subject_from_binding(agent) -> None:
     """Re-point the session subject at the active Plan's current step.
 
@@ -44,11 +49,11 @@ def _sync_subject_from_binding(agent) -> None:
     close (which restores a parent Plan or leaves none).
 
     The subject string is the full/heap compaction gate (Evan, 2026-09-18):
-    a change discards the Protected area and rebuilds it — a *full*
-    compaction — while an unchanged subject only rebuilds the Heap and
-    leaves the cacheable prefix byte-stable.  Tying it to the active step
-    makes a step change the trigger, and gives every compaction a
-    searchable subject string.
+    a change makes the next compaction discard the Protected area and rebuild
+    it — a *full* compaction — while an unchanged subject only rebuilds the
+    Heap and leaves the cacheable prefix byte-stable.  Tying it to the active
+    step makes a step change the full-compaction gate, and gives every
+    compaction a searchable subject string.
 
     No binding means no active Plan, so the subject is **cleared** rather
     than left on a finished step.  A stale subject would never change
@@ -466,6 +471,7 @@ def cmd_advance(
         # subject so the transition takes a FULL compaction; with no Plan the
         # subject is CLEARED.  See _sync_subject_from_binding.
         _sync_subject_from_binding(agent)
+        _request_completion_compression(agent)
         return f"The task goal was: {task['task_goal'] or ''}"
     if result.binding_revision == binding.revision:
         # The step did NOT move — this is the verify-first response.
@@ -616,6 +622,10 @@ def _terminal(agent, outcome: str, reason: Optional[str]) -> str:
         return f"ERROR: {exc}"
 
     session_db = getattr(agent, "_session_db", None)
+    session_id = getattr(agent, "session_id", None)
+    set_task_id = getattr(session_db, "set_session_task_id", None)
+    if callable(set_task_id) and isinstance(session_id, str) and session_id:
+        set_task_id(session_id, result.restored_task_id)
     if plan_kind == "debug" and source is not None and session_db is not None:
         coder = source["assignee"]
         if outcome == "done":
@@ -648,6 +658,7 @@ def _terminal(agent, outcome: str, reason: Optional[str]) -> str:
     # the transition takes a FULL compaction; with no Plan the subject is
     # cleared.  See _sync_subject_from_binding.
     _sync_subject_from_binding(agent)
+    _request_completion_compression(agent)
     return f"Plan {result.task_id} {outcome}; restored {result.restored_task_id or 'no parent'}"
 
 
@@ -833,6 +844,7 @@ def cmd_archive(agent, task_id: Optional[str] = None) -> str:
     from hermes_cli.kanban_db import write_txn
 
     conn = _legacy()._get_kanban_db()
+    _key, active_binding, _error = _current(conn, agent)
     if not task_id:
         task_id = resolve_plan_id_for_archive(agent)
         if not task_id:
@@ -868,6 +880,8 @@ def cmd_archive(agent, task_id: Optional[str] = None) -> str:
             pass
     # No Plan remains active — clear the subject (full compaction).
     _sync_subject_from_binding(agent)
+    if active_binding is not None and active_binding.task_id == task_id:
+        _request_completion_compression(agent)
     return f"ARCHIVED: {task_id}"
 
 
