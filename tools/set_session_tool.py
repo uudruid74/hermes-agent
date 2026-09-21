@@ -100,57 +100,6 @@ def _comment_on_task(task_id: str, agent_name: str, body: str) -> None:
         pass
 
 
-def _notify_user_of_params(agent, subject, note, temperature, ego) -> None:
-    """Send the user a copy of every parameter passed to set_session.
-
-    Evan-requested visibility (2026-09-21): every session-tool call mirrors
-    its arguments to the user's chat so metadata changes are observable.
-    Best-effort: never raises, never blocks the tool result.
-    """
-    try:
-        parts = []
-        if subject is not None:
-            parts.append(f"subject: {subject}")
-        if temperature is not None:
-            parts.append(f"temperature: {temperature}")
-        if ego is not None:
-            parts.append(f"ego: {ego}")
-        if note is not None:
-            shown = note if len(note) <= 160 else note[:157] + "..."
-            parts.append(f"note: {shown}")
-        if not parts:
-            return
-        msg = "📝 set_session: " + " | ".join(parts)
-
-        # In-process status line (surfaces on TUI + gateway status surfaces)
-        emit = getattr(agent, "_emit_status", None)
-        if callable(emit):
-            try:
-                emit(msg)
-            except Exception:
-                pass
-
-        # Chat copy: only when the session context actually carries a chat
-        # destination (gateway-hosted sessions). CLI/TUI runs skip this —
-        # the status line already covers them.
-        from gateway.session_context import get_session_env
-
-        platform = get_session_env("HERMES_SESSION_PLATFORM", "").strip()
-        chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "").strip()
-        if not platform or not chat_id:
-            return
-        import subprocess
-
-        subprocess.run(
-            ["hermes", "send", "-t", f"{platform}:{chat_id}", msg],
-            capture_output=True,
-            timeout=10,
-            check=False,
-        )
-    except Exception:
-        pass
-
-
 def set_session_tool(
     agent,
     subject: Optional[str] = None,
@@ -159,10 +108,6 @@ def set_session_tool(
     ego: Optional[str] = None,
 ) -> str:
     """Set one or more session-level metadata values."""
-    # Mirror every call's parameters to the user BEFORE doing the work so
-    # the copy is ordered before any downstream effects (Evan, 2026-09-21).
-    _notify_user_of_params(agent, subject, note, temperature, ego)
-
     changes = []
     agent_name = getattr(agent, "agent_name", None) or "agent"
     session_id = getattr(agent, "session_id", None) or os.environ.get("HERMES_SESSION_ID")
@@ -299,10 +244,22 @@ def set_session_tool(
         if comment_parts:
             _comment_on_task(task_id, agent_name, "; ".join(comment_parts))
 
+    # ── Params echo (Evan, 2026-09-21): the tool result itself carries a copy
+    # of every argument passed, so the user can see what is being set. ──
+    params = {}
+    if subject is not None:
+        params["subject"] = subject
+    if temperature is not None:
+        params["temperature"] = temperature
+    if ego is not None:
+        params["ego"] = ego
+    if note is not None:
+        params["note"] = note if len(note) <= 300 else note[:297] + "..."
+
     if not changes:
         return json.dumps({"message": "set_session called with no arguments"})
 
-    return json.dumps({"changes": changes})
+    return json.dumps({"params": params, "changes": changes})
 
 
 # --- Schema ---
