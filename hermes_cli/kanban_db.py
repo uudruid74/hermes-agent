@@ -5132,6 +5132,92 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+def _auto_commit_task_workspace(task: Task, summary: Optional[str]) -> Optional[str]:
+    """Commit changes in a dedicated task Git workspace and return its SHA."""
+    if task.workspace_kind not in {"scratch", "worktree"} or not task.workspace_path:
+        return None
+
+    workspace = Path(task.workspace_path).expanduser()
+    if not workspace.is_absolute():
+        _log.warning(
+            "Skipping auto-commit for task %s: workspace path is not absolute: %s",
+            task.id,
+            workspace,
+        )
+        return None
+    workspace = workspace.resolve()
+    if not workspace.is_dir():
+        return None
+
+    def _git(*args: str, timeout: int = 10, env: Optional[dict] = None):
+        return subprocess.run(
+            ["git", "-C", str(workspace), *args],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            env=env,
+        )
+
+    repo_probe = _git("rev-parse", "--show-toplevel", timeout=5)
+    if repo_probe.returncode != 0:
+        return None
+    repo_root = Path(repo_probe.stdout.strip()).resolve()
+    if repo_root != workspace:
+        _log.debug(
+            "Skipping auto-commit for task %s: workspace %s is inside shared repo %s",
+            task.id,
+            workspace,
+            repo_root,
+        )
+        return None
+
+    status = _git("status", "--porcelain")
+    if status.returncode != 0:
+        raise RuntimeError(status.stderr.strip() or "git status failed")
+    if not status.stdout.strip():
+        return None
+
+    staged = _git("add", "--all", "--", ".", timeout=15)
+    if staged.returncode != 0:
+        raise RuntimeError(staged.stderr.strip() or "git add failed")
+
+    diff = _git("diff", "--cached", "--quiet")
+    if diff.returncode == 0:
+        return None
+    if diff.returncode != 1:
+        raise RuntimeError(diff.stderr.strip() or "git diff --cached failed")
+
+    from agent.redact import redact_sensitive_text
+
+    agent_name = (os.environ.get("USERNAME") or "").strip() or "unknown-agent"
+    redacted_summary = redact_sensitive_text(summary or "", force=True).strip()
+    commit_env = os.environ.copy()
+    commit_env["GIT_AUTHOR_NAME"] = agent_name
+    commit_env["GIT_COMMITTER_NAME"] = agent_name
+    committed = _git(
+        "commit",
+        "-m",
+        f"{task.title} ({task.id})",
+        "-m",
+        f"{agent_name} — {redacted_summary}",
+        timeout=30,
+        env=commit_env,
+    )
+    if committed.returncode != 0:
+        detail = redact_sensitive_text(
+            committed.stderr.strip() or committed.stdout.strip() or "git commit failed",
+            force=True,
+        )
+        raise RuntimeError(detail)
+
+    resolved = _git("rev-parse", "HEAD", timeout=5)
+    if resolved.returncode != 0:
+        raise RuntimeError(resolved.stderr.strip() or "git rev-parse HEAD failed")
+    return resolved.stdout.strip()
+
+
 _BUG_VAULT = Path("/home/ekl/vault")
 
 
@@ -5385,6 +5471,27 @@ def complete_task(
         ).fetchone()
         _bug_title = (_bug_row[0] or "") if _bug_row else ""
         _bug_body = (_bug_row[1] or "") if _bug_row else ""
+    completed_task = get_task(conn, task_id)
+    auto_commit_warning = None
+    if completed_task is not None:
+        try:
+            commit_sha = _auto_commit_task_workspace(
+                completed_task,
+                summary if summary is not None else result,
+            )
+            if commit_sha:
+                _log.info("Auto-committed task %s as %s", task_id, commit_sha)
+        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            from agent.redact import redact_sensitive_text
+
+            detail = redact_sensitive_text(str(exc), force=True)
+            auto_commit_warning = f"auto-commit failed: {detail}"
+            _log.warning(
+                "Task %s auto-commit failed; completion remains done: %s",
+                task_id,
+                detail,
+                exc_info=True,
+            )
     # Post-txn best-effort: resolve the bug file named by body or legacy title.
     try:
         _bug_autoremove_resolve(
@@ -5425,7 +5532,7 @@ def complete_task(
     recompute_ready(conn)
     # Clean up the scratch workspace and any stale tmux session for the worker.
     _cleanup_workspace(conn, task_id)
-    _done_task = get_task(conn, task_id)
+    _done_task = completed_task or get_task(conn, task_id)
     _fire_kanban_lifecycle_hook(
         "kanban_task_completed",
         task_id,
@@ -5436,9 +5543,15 @@ def complete_task(
     )
     try:
         from hermes_cli.kanban import _notify_kanban_status_change
+        notify_summary = summary or result
+        if auto_commit_warning:
+            notify_summary = (
+                f"{notify_summary}\n\n{auto_commit_warning}"
+                if notify_summary else auto_commit_warning
+            )
         _notify_kanban_status_change(
             task_id, "done",
-            summary=summary or result,
+            summary=notify_summary,
             title=_done_task.title if _done_task else None,
             assignee=_done_task.assignee if _done_task else None,
         )

@@ -99,6 +99,155 @@ def _init_git_repo(repo: Path) -> None:
     subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True, text=True)
 
 
+def test_complete_task_auto_commits_dedicated_git_workspace(
+    kanban_home, tmp_path, monkeypatch,
+):
+    repo = tmp_path / "task-repo"
+    _init_git_repo(repo)
+    monkeypatch.setenv("USERNAME", "Neo")
+    monkeypatch.setenv("HERMES_AGENT_NAME", "stale-agent-name")
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="fix completion trace",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        (repo / "change.txt").write_text("task change\n", encoding="utf-8")
+
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary="shipped safely\napi_key=sk-abcdefghijklmnop",
+        )
+
+    commit = subprocess.run(
+        ["git", "-C", str(repo), "log", "-1", "--format=%an%n%cn%n%B"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert commit.startswith(
+        "Neo\n"
+        "Neo\n"
+        f"fix completion trace ({task_id})\n\n"
+        "Neo — shipped safely\n"
+    )
+    assert "sk-abcdefghijklmnop" not in commit
+    assert "api_key=***" in commit
+    status = subprocess.run(
+        ["git", "-C", str(repo), "status", "--porcelain"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert status == ""
+
+
+def test_complete_task_does_not_commit_parent_repository(
+    kanban_home, tmp_path, monkeypatch,
+):
+    repo = tmp_path / "shared-repo"
+    _init_git_repo(repo)
+    workspace = repo / "nested-task"
+    workspace.mkdir()
+    (workspace / "change.txt").write_text("do not sweep\n", encoding="utf-8")
+    before = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    monkeypatch.setenv("USERNAME", "Neo")
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="shared tree task",
+            workspace_kind="scratch",
+            workspace_path=str(workspace),
+        )
+        assert kb.complete_task(conn, task_id, summary="done")
+
+    after = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert after == before
+    assert (workspace / "change.txt").exists()
+
+
+def test_complete_task_does_not_resolve_relative_workspace_from_caller_cwd(
+    kanban_home, tmp_path, monkeypatch,
+):
+    repo = tmp_path / "caller-repo"
+    _init_git_repo(repo)
+    monkeypatch.chdir(repo)
+    (repo / "change.txt").write_text("do not sweep\n", encoding="utf-8")
+    before = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="invalid relative workspace",
+            workspace_kind="worktree",
+            workspace_path=".",
+        )
+        assert kb.complete_task(conn, task_id, summary="done")
+
+    after = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert after == before
+    assert (repo / "change.txt").exists()
+
+
+def test_complete_task_auto_commit_failure_is_soft_and_notified(
+    kanban_home, tmp_path, monkeypatch, caplog,
+):
+    repo = tmp_path / "task-repo"
+    _init_git_repo(repo)
+    notifications = []
+
+    def fail_commit(*_args, **_kwargs):
+        raise RuntimeError("commit hook rejected change")
+
+    monkeypatch.setattr(kb, "_auto_commit_task_workspace", fail_commit)
+    monkeypatch.setattr(
+        "hermes_cli.kanban._notify_kanban_status_change",
+        lambda *args, **kwargs: notifications.append((args, kwargs)),
+    )
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="soft failure",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        (repo / "change.txt").write_text("change\n", encoding="utf-8")
+
+        assert kb.complete_task(conn, task_id, summary="still done")
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "done"
+
+    assert "auto-commit failed" in caplog.text
+    assert notifications
+    assert "auto-commit failed" in notifications[-1][1]["summary"]
+
+
 @pytest.mark.parametrize(
     ("title", "body_template"),
     [
