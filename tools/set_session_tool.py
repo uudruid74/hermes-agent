@@ -272,14 +272,20 @@ def _send_params_system_message(agent, params: dict) -> None:
     """Deliver the set_session params echo as a chat system message.
 
     Uses the live gateway adapter directly (in-process) when the session
-    context carries a platform + chat destination. Never raises.
+    context carries a platform + chat destination. The coroutine is scheduled
+    on the gateway's event loop (worker threads have no running loop and the
+    adapter's bot object is bound to the gateway loop), never created fresh —
+    a new loop fails with 'Event bound to a different event loop'.
+    Never raises.
     """
     if not params:
         return
     try:
+        import asyncio
+
         from gateway.session_context import get_session_env
         from gateway.run import _gateway_runner_ref
-        from model_tools import _run_async
+        from agent.async_utils import safe_schedule_threadsafe
 
         platform_name = get_session_env("HERMES_SESSION_PLATFORM", "").strip()
         chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "").strip()
@@ -301,7 +307,24 @@ def _send_params_system_message(agent, params: dict) -> None:
         msg = "📝 set_session: " + " | ".join(
             f"{k}: {v}" for k, v in params.items()
         )
-        _run_async(adapter.send(chat_id, msg))
+
+        # Schedule on the gateway's own loop — the adapter's HTTP client and
+        # locks live there. Fall back to a fresh loop only when the gateway
+        # loop is unavailable (non-gateway hosts).
+        loop = None
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = getattr(runner, "_gateway_loop", None)
+        if loop is not None and not loop.is_closed():
+            safe_schedule_threadsafe(
+                adapter.send(chat_id, msg), loop, logger=None,
+                log_message="set_session params system message failed",
+            )
+        else:
+            from model_tools import _run_async
+
+            _run_async(adapter.send(chat_id, msg))
     except Exception:
         pass
 
