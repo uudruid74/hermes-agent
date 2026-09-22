@@ -157,7 +157,17 @@ def latest_dispatch_record(identity: dict[str, object]) -> Optional[dict[str, ob
 
 
 def dispatch_is_recorded(identity: dict[str, object]) -> bool:
-    return latest_dispatch_record(identity) is not None
+    """True when a prior dispatch attempt for this identity actually RESERVED.
+
+    Records with status 'failed' do NOT count: a failed attempt (e.g. an
+    infrastructure error like a rejected CLI flag) must not permanently block
+    redispatch — only a genuine reserve/create does (2026-09-21: the --channel
+    argparse failure deadlocked every retry of the notify-silent-fail bug).
+    """
+    record = latest_dispatch_record(identity)
+    if record is None:
+        return False
+    return record.get("status") in ("reserved", "created")
 
 
 def die(message: str) -> None:
@@ -817,6 +827,56 @@ def cmd_dispatch(args: argparse.Namespace) -> None:
         print(f"nothing to dispatch for {path.name}: live task exists or already dispatched")
 
 
+def cmd_check(args: argparse.Namespace) -> None:
+    """Sweep pending bugs and dispatch every one Evan ALREADY checked.
+
+    Bare `check` (Evan's workflow, restored 2026-09-22): he edits bug files in
+    Obsidian and ticks the `## Approved to run` boxes himself, then runs ONE
+    command to dispatch everything checked. This sweep NEVER writes approval
+    boxes — it only dispatches files whose box is already checked. A bug with
+    an unchecked box is reported and skipped, never approved behind his back.
+    The old danger (48327b3778, Sep 16) was the sweep dispatching on
+    required-fields alone, stamping boxes on Evan's behalf — that stamping
+    stays in the Evan-only `check-and-dispatch` path.
+
+    Requires --i-am-evan (Evan, 2026-09-22): the sweep dispatches paid
+    workers, so it stays a human-issued command even though it never
+    writes approval boxes.
+    """
+    if not getattr(args, "i_am_evan", False):
+        die(
+            "check refuses to run without --i-am-evan.\n"
+            "This sweep DISPATCHES a paid worker for every already-checked "
+            "bug. It never writes approval boxes, but only Evan runs it."
+        )
+    dispatched: list[str] = []
+    for path in all_bug_files(getattr(args, "project", None)):
+        if path.parent.name != "pending":
+            continue
+        with locked_root():
+            fresh = path.read_text(encoding="utf-8")
+            identity = dispatch_identity(path, fresh, None)
+            if dispatch_is_recorded(identity):
+                record = latest_dispatch_record(identity)
+                task_id = record.get("task_id") if record else None
+                print(f"{path.name}: dispatched={task_id or 'reserved'} failures={failure_count(fresh)}/4")
+                continue
+            live = live_task_ids(fresh)
+            if not approved_to_run(fresh):
+                state = f"live={','.join(live) if live else 'none'} failures={failure_count(fresh)}/4"
+                print(f"{path.name}: {state} — NOT checked, skipped")
+                continue
+            print(f"{path.name}: checked, dispatching…")
+            created = maybe_dispatch_locked(path, fresh)
+            if created:
+                dispatched.append(created)
+                print(f"  dispatched {created}")
+            else:
+                print("  dispatch deferred: live task exists or failure limit reached")
+    if not dispatched:
+        print("no checked bugs to dispatch")
+
+
 def cmd_check_and_dispatch(args: argparse.Namespace) -> None:
     """Approve ONE bug (check its box) and dispatch it -- in a single step.
 
@@ -937,6 +997,17 @@ def parser() -> argparse.ArgumentParser:
     dispatch.add_argument("file")
     dispatch.set_defaults(func=cmd_dispatch)
     check = commands.add_parser(
+        "check",
+        help=(
+            "SWEEP (--i-am-evan required): dispatch every pending bug whose "
+            "approval box Evan already checked in the file. Never writes boxes."
+        ),
+    )
+    check.add_argument("project", nargs="?")
+    check.add_argument("--i-am-evan", dest="i_am_evan", action="store_true",
+                       help="required — the sweep dispatches paid workers")
+    check.set_defaults(func=cmd_check)
+    cad = commands.add_parser(
         "check-and-dispatch",
         help=(
             "WRITES: Evan-only. Checks the approval box on ONE bug AND dispatches it "
@@ -944,11 +1015,11 @@ def parser() -> argparse.ArgumentParser:
             "`list`, `search`, or read the file."
         ),
     )
-    check.add_argument("file", nargs="?", default="",
+    cad.add_argument("file", nargs="?", default="",
                        help="the ONE bug file to approve and dispatch")
-    check.add_argument("--i-am-evan", dest="i_am_evan", action="store_true",
+    cad.add_argument("--i-am-evan", dest="i_am_evan", action="store_true",
                        help="required confirmation that Evan is performing this approval himself")
-    check.set_defaults(func=cmd_check_and_dispatch)
+    cad.set_defaults(func=cmd_check_and_dispatch)
     listing = commands.add_parser(
         "list", help="READ-ONLY: per-file status + failure counts (use this to inspect bug state)"
     )
