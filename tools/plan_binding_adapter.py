@@ -252,11 +252,15 @@ def _create_plan(
         cap_steps, cap_text, goal_text_error, step_count_error, steps_text_error,
     )
 
+    creator_agent_name = _legacy()._get_agent_name(agent)
+
     if not title or not goal or not steps:
         return "ERROR: 'new' requires title, goal, and steps[]"
     kind = (kind or "normal").strip().lower()
     if kind not in {"normal", "debug"}:
         return "ERROR: 'kind' must be 'normal' or 'debug'"
+    assigned = (assignee or "").strip()
+    delegated = bool(assigned and assigned != creator_agent_name)
     over_limit = step_count_error(steps)
     if over_limit:
         return over_limit
@@ -314,7 +318,7 @@ def _create_plan(
                 debug_plan_id=debug_plan_id,
                 assignee=assignee,
             )
-            if kind == "debug" and pre_approved:
+            if kind == "debug" and pre_approved and not delegated:
                 _activate(
                     conn,
                     agent=agent,
@@ -322,6 +326,13 @@ def _create_plan(
                     task_id=task_id,
                     parent_task_id=parent_task_id,
                     revision=current.revision if current is not None else None,
+                )
+                approved = True
+            elif kind == "debug" and pre_approved and delegated:
+                from hermes_cli import plan_authorizations
+
+                plan_authorizations.resolve_plan_in_txn(
+                    conn, task_id, "approved", _actor(agent)
                 )
                 approved = True
             else:
@@ -356,15 +367,29 @@ def _create_plan(
         try:
             with write_txn(conn):
                 if "appr" in str(response).lower():
-                    _activate(
-                        conn,
-                        agent=agent,
-                        key=key,
-                        task_id=task_id,
-                        parent_task_id=parent_task_id,
-                        revision=current.revision if current is not None else None,
-                    )
-                    approved = True
+                    if delegated:
+                        # Delegated plan: approve the authorization so the
+                        # worker's `plan continue` binds cleanly, but do NOT
+                        # activate into the creator's binding and do NOT flip
+                        # the task to manual — it stays blocked, which
+                        # continue_plan accepts (780f7f99cc), so the WORKER's
+                        # continue does blocked→manual→bind on their session.
+                        from hermes_cli import plan_authorizations
+
+                        plan_authorizations.resolve_plan_in_txn(
+                            conn, task_id, "approved", _actor(agent)
+                        )
+                        approved = True
+                    else:
+                        _activate(
+                            conn,
+                            agent=agent,
+                            key=key,
+                            task_id=task_id,
+                            parent_task_id=parent_task_id,
+                            revision=current.revision if current is not None else None,
+                        )
+                        approved = True
                 else:
                     from hermes_cli import plan_authorizations
 
@@ -383,7 +408,8 @@ def _create_plan(
             return f"Plan denied ({task_id}): {response}."
     # Active step changed (new step-1) — re-point the subject so the change
     # triggers a FULL compaction.  See _sync_subject_from_binding.
-    _sync_subject_from_binding(agent)
+    if not delegated:
+        _sync_subject_from_binding(agent)
 
     if repeat_of is not None:
         parent_id, parent_step = repeat_of
@@ -414,6 +440,46 @@ def _create_plan(
             f"Work the corrective plan. When its final step completes, the "
             f"parent reopens at step {parent_step} carrying this plan's "
             f"completion summary."
+        )
+    if delegated:
+        # Wake the assignee with the continue instruction; the plan stays
+        # bound to their session from here, not ours.
+        worker_msg = (
+            f"You have been assigned a new task by {creator_agent_name}.\n"
+            f"Title: {title}\n"
+            f"Goal: {goal}\n"
+            f"Please call plan_tool with command=continue and task_id={task_id} "
+            f"to bind it to your session and begin step 1."
+        )
+        wrapped = (
+            f"Incoming message from {creator_agent_name} follows:\n"
+            "---\n"
+            f"{worker_msg}\n"
+            "---\n"
+            "If a reply is required, use the 'tell' command to reply."
+        )
+        notify_result = "ok"
+        try:
+            import subprocess
+
+            proc = subprocess.run(
+                ["hermes", "send", "-u", assigned, wrapped],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            if proc.returncode != 0:
+                notify_result = (
+                    f"tell failed (rc={proc.returncode}): "
+                    f"{(proc.stderr or proc.stdout or '').strip()[:200]}"
+                )
+        except (OSError, subprocess.SubprocessError) as exc:
+            notify_result = f"tell failed: {exc}"
+        # No binding activation on our side — surface the dispatch notice.
+        return (
+            f"TASK APPROVED ({task_id}): {title}\n"
+            f"{assigned} has been notified of task {task_id}"
+            + (f" (WARNING: {notify_result})" if notify_result != "ok" else "")
         )
     return f"TASK APPROVED ({task_id}): {title}\n\n>>> STEP 1: {steps[0]} <<<"
 
