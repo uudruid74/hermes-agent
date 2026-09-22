@@ -444,12 +444,10 @@ def _create_plan(
     if delegated:
         # Wake the assignee with the continue instruction; the plan stays
         # bound to their session from here, not ours.
+        # Evan's exact pseudo text (2026-09-22) — verbatim, nothing added:
         worker_msg = (
-            f"You have been assigned a new task by {creator_agent_name}.\n"
-            f"Title: {title}\n"
-            f"Goal: {goal}\n"
-            f"Please call plan_tool with command=continue and task_id={task_id} "
-            f"to bind it to your session and begin step 1."
+            f"You have been assigned a new task.  Please call "
+            f"'plan_tool continue {task_id}' to begin the new task."
         )
         wrapped = (
             f"Incoming message from {creator_agent_name} follows:\n"
@@ -558,7 +556,11 @@ def cmd_advance(
         # subject is CLEARED.  See _sync_subject_from_binding.
         _sync_subject_from_binding(agent)
         _request_completion_compression(agent)
-        return f"The task goal was: {task['task_goal'] or ''}"
+        # Evan's spec (2026-09-22): the close response states completion with
+        # the task id — the old "The task goal was: ..." echo (from the Aug 10
+        # Phase 4 text, verify-line dropped in 8cbd834191) misled a worker into
+        # reporting a completed plan as failed. State the outcome plainly.
+        return f"TASK COMPLETE ({result.task_id}): {task['title'] or ''}"
     if result.binding_revision == binding.revision:
         # The step did NOT move — this is the verify-first response.
         return (
