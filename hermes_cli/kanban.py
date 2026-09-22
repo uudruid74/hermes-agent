@@ -356,6 +356,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create.add_argument("--idempotency-key", default=None,
                           help="Dedup key. If a non-archived task with this key exists, "
                                "its id is returned instead of creating a duplicate.")
+    p_create.add_argument("--channel", default=None,
+                          help="Explicit origin routing for CLI-created tasks: "
+                               "platform:chat_id[:thread_id] or session:<session_id>. "
+                               "Only an explicit user-provided destination may store "
+                               "a non-session origin (Evan's origin-routing rule).")
     p_create.add_argument("--max-runtime", default=None,
                           help="Per-task runtime cap. Accepts seconds (300) or "
                                "durations (90s, 30m, 2h, 1d). When exceeded, "
