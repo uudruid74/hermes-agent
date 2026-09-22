@@ -827,6 +827,75 @@ def cmd_dispatch(args: argparse.Namespace) -> None:
         print(f"nothing to dispatch for {path.name}: live task exists or already dispatched")
 
 
+def cmd_reconcile(args: argparse.Namespace) -> None:
+    """Sync pending/ directory state with each file's frontmatter status.
+
+    `reconcile` (Evan, 2026-09-22): files he resolved manually in Obsidian
+    (or that agents left in pending/ after finishing) carry
+    frontmatter `status: resolved` while sitting in pending/ — the same
+    incomplete-cleanup drift that stranded notify-wrong-telegram-id and
+    pente-new-transport. One command finds and moves them:
+
+    - pending/ file with status resolved → moved to resolved/
+    - pending/ file with any terminal status (resolved/done/archived) → moved
+    - pending/ file that is not a bug file at all (no type: bug frontmatter,
+      e.g. vault-sync junk like Home.md/INDEX.md) → reported, NOT moved
+    - files marked pending → untouched; `--force-resolve` moves them to
+      resolved/ with the given summary (for files Evan declares done but
+      whose frontmatter he didn't update)
+
+    Read-only on everything else; no dispatch, no checkbox writes.
+    """
+    import re as _re
+
+    moved = 0
+    for path in all_bug_files(getattr(args, "project", None)):
+        if path.parent.name != "pending":
+            continue
+        text = path.read_text(encoding="utf-8")
+        fm = frontmatter(text)
+        fm_status = (fm.get("status") or "").strip().lower()
+        if not fm.get("type"):
+            print(f"{path.name}: not a bug file (no type: bug) — left in place, consider deleting")
+            continue
+        if fm_status in {"resolved", "done", "archived"}:
+            target = path.parent.parent / "resolved" / path.name
+            with locked_root():
+                if target.exists():
+                    print(f"{path.name}: SKIPPED — resolved/ twin already exists")
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(path, target)
+            print(f"{path.name}: frontmatter says '{fm_status}' — moved to resolved/")
+            moved += 1
+        elif getattr(args, "force_resolve", False):
+            summary = getattr(args, "summary", "") or "Manually resolved by Evan (reconcile)"
+            target = path.parent.parent / "resolved" / path.name
+            with locked_root():
+                if target.exists():
+                    print(f"{path.name}: SKIPPED — resolved/ twin already exists")
+                    continue
+                updated = replace_section(text, "Resolution", summary)
+                path.write_text(updated, encoding="utf-8")
+                _set_frontmatter_status(updated, "resolved", path)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(path, target)
+            print(f"{path.name}: force-resolved → moved to resolved/")
+            moved += 1
+    print(f"reconcile complete: {moved} moved")
+
+
+def _set_frontmatter_status(text: str, status: str, path: Path) -> str:
+    import re as _re
+
+    m = _re.search(r"(?m)^status:\s*.*$", text)
+    if m:
+        text = text[:m.start()] + f"status: \"{status}\"" + text[m.end():]
+    else:
+        text = _re.sub(r"(?m)^type:.*$", lambda mm: mm.group(0) + f"\nstatus: \"{status}\"", text, count=1)
+    return text
+
+
 def cmd_check(args: argparse.Namespace) -> None:
     """Sweep pending bugs and dispatch every one Evan ALREADY checked.
 
@@ -1007,6 +1076,20 @@ def parser() -> argparse.ArgumentParser:
     check.add_argument("--i-am-evan", dest="i_am_evan", action="store_true",
                        help="required — the sweep dispatches paid workers")
     check.set_defaults(func=cmd_check)
+    recon = commands.add_parser(
+        "reconcile",
+        help=(
+            "SYNC: move pending/ files whose frontmatter says resolved/done/"
+            "archived to resolved/; report non-bug junk files. Read-only on "
+            "approval state."
+        ),
+    )
+    recon.add_argument("project", nargs="?")
+    recon.add_argument("--force-resolve", dest="force_resolve", action="store_true",
+                       help="also move files still marked pending (Evan declares them done)")
+    recon.add_argument("--summary", default="",
+                       help="Resolution summary used with --force-resolve")
+    recon.set_defaults(func=cmd_reconcile)
     cad = commands.add_parser(
         "check-and-dispatch",
         help=(
