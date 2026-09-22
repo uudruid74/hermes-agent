@@ -1397,6 +1397,56 @@ def _send_kanban_human_notification(
     return f"mcp_bridge:{bridge_path}", result
 
 
+def _resolve_session_chat(
+    profile: Optional[str], session_id: str
+) -> Optional[tuple[str, str, str, str]]:
+    """Resolve a session-origin id to (platform, chat_id, chat_type, thread_id).
+
+    Looks up the session row in the origin profile's state.db and parses its
+    ``session_key`` (format: agent:<agent>:<platform>:<chat_type>:<chat>).
+    The chat_id column is the authoritative chat destination; the key supplies
+    the platform. Returns None when the profile or session row can't be read.
+    """
+    if not session_id:
+        return None
+    try:
+        import sqlite3
+
+        from hermes_cli.profiles import get_profile_dir
+    except (ImportError, ValueError):
+        return None
+    try:
+        profile_home = get_profile_dir(profile) if profile else None
+        if not profile_home:
+            return None
+        db_path = Path(profile_home) / "state.db"
+        if not db_path.exists():
+            return None
+        conn = sqlite3.connect(str(db_path))
+        try:
+            row = conn.execute(
+                "SELECT session_key, chat_id FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            return None
+        session_key, chat_id_col = row[0], row[1]
+        # session_key format: agent:<agent>:<platform>:<chat_type>:<chat>
+        parts = (session_key or "").split(":")
+        if len(parts) < 5:
+            return None
+        platform = parts[2]
+        chat_type = parts[3] if len(parts) > 4 else "dm"
+        chat_id = (chat_id_col or (parts[4] if len(parts) > 4 else "") or "").strip()
+        if not platform or not chat_id:
+            return None
+        return platform, chat_id, chat_type, ""
+    except (OSError, sqlite3.Error, ImportError, ValueError):
+        return None
+
+
 def _notify_kanban_status_change(
     task_id: str,
     new_status: str,
@@ -1461,6 +1511,29 @@ def _notify_kanban_status_change(
     chat_id = origin["chat_id"]
     thread_id = origin.get("thread_id", "")
     chat_type = origin.get("chat_type", "group")
+
+    # Session origins are not deliverable directly — "session" is not a
+    # Platform. Resolve the originating session's live chat from the origin
+    # profile's state.db (sessions.session_key carries platform/chat_type/chat)
+    # and deliver via that real platform. Unresolvable → session-notice fallback.
+    if platform == "session":
+        resolved = _resolve_session_chat(origin.get("profile"), chat_id)
+        if resolved is None:
+            logger.warning(
+                "kanban notify task=%s status=%s session origin %s could not be "
+                "resolved to a live chat — falling back to session notice",
+                task_id, new_status, chat_id,
+            )
+            try:
+                _enqueue_kanban_session_notice(task, human_msg)
+            except Exception:
+                logger.exception(
+                    "kanban notify task=%s status=%s session fallback failed",
+                    task_id, new_status,
+                )
+            return
+        platform, chat_id, chat_type, thread_id = resolved
+
     target = f"{platform}:{chat_id}"
     if thread_id:
         target = f"{target}:{thread_id}"
