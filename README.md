@@ -14,6 +14,8 @@ The problem with every AI agent framework is the same: **you are the polling inf
 
 We fixed that. Not by adding a status endpoint. Not by building a dashboard. By giving the agent the ability to **wake up the agent** so that the agent can determine how to respond — kanban completes, cron returns, a worker gets stuck, a vacuum robot crashes into a wall at 3am.
 
+Then we gave the agents a plan. Then a board the plan lives on. Then the ability to pick that plan back up from wherever they happen to be — a DM, a topic, a fresh session — as if they'd never left.
+
 The script hits 'eject.' We're the parachute.
 
 ## The Cast
@@ -21,23 +23,47 @@ The script hits 'eject.' We're the parachute.
 | Agent | Description |
 |-------|-------------|
 | 🐹 **Gopher**<br>`#44CC66` | Orchestrator, dispatcher, student. Watches you paint in real-time and writes skills from what he learns. |
-| 🧬 **Neo**<br>`#5C6BC0` | Code only. Implements everything — Hermes, ClearView, Eddon, wiki-documented projects. |
-| ❄️ **Wintermute**<br>`#88DDFF` | The architect. GLM5.2. Darth Vader using the Force to make the code comply. You don't argue with Wintermute — you *fix the thing.* |
-| 🦊 **Zephyr**<br>`#FF6B35` | Gopher's assistant, built by Gopher, to do routine tasks. |
+| 🐇 **Neo**<br>`#5C6BC0` | Code only. Implements everything — Hermes, ClearView, Eddon, wiki-documented projects. |
+| 🧙 **Wintermute**<br>`#006622` | The architect. GLM5.2. Darth Vader using the Force to make the code comply. You don't argue with Wintermute — you *fix the thing.* |
+| 🦊 **Zephyr**<br>`#FF6B35` | Gopher's assistant, built by Gopher, to do routine tasks. Now a dispatcher in his own right. |
+| 🐦 **Ornith**<br>`#5D63BB` | The canary — runs background reviews and audits so bad code dies before the miners do. If it breaks Ornith first, we fixed it here instead of in production. |
 
-Four profiles, one gateway, one bot token. No group chat. No bot-sees-bot limitations. Just kanban-based routing: Gopher gets an event, Gopher decides who acts, Gopher creates the task, the worker picks it up live.
+Five profiles, one gateway, one bot token. *(There's also a sixth profile on the box — Daxicaruspoc — but it's a lab rat for the Eddon/Dax proving ground, not a teammate. When Dax grows up, the profile dies.)* No group chat. No bot-sees-bot limitations. Just kanban-based routing: somebody gets an event, decides who acts, creates the task, the worker picks it up live.
 
 ## What Makes It Alive
 
-### 🛎️ Wake Events
+### 📋 The Plan Tool (or: How We Keep Ornith On Task)
 
-Every kanban status change — create, claim, complete, block, archive — fires directly into the affected agent's session as if the user typed it. The agent sees the event, inventories its memory, and responds with full context.
+Every non-trivial job runs through `plan_tool` — an ordered list of steps with a success criterion, created *before* any state changes, approved by whoever's in charge. The agent doesn't freewheel toward a vague goal; it walks a fixed plan.
 
-No polling. No "hey are you done?" No asking — telling.
+- **Plans survive context compression.** The plan isn't in the chat window; it's in the board. When the window collapses, the plan doesn't.
+- **Ornith stays on task.** Ornith's job is to review other agents' work. Without a plan, that means wandering. With a plan, that means steps 1..7, in order, no more, no less.
+- **The gate is real.** "No state changes without a plan" is enforced, not requested. An agent that tries to skip ahead gets bounced back to the active step.
 
-**Notifications route to the origin channel, not a central DM.** When you create a kanban task from a Telegram topic, the `completed`/`blocked` notification goes back to that same topic. The gateway's subscription watcher (`kanban_notify_subs`) stores `(platform, chat_id, thread_id)` per task and delivers there — no routing via a shared home channel.
+### 🛎️ Kanban That Follows You Home
 
-**Everything is a wake event.** There is no separate "continuation feed" path — kanban updates, cron returns, all arrive as if the user typed them. The agent always has full context.
+Tasks live on the board, but the *work* can happen anywhere:
+
+- **Continued in a DM.** A task assigned to an agent can be bound to that agent's live DM session with `plan continue` — the plan shows up in their chat as if it were written there.
+- **Dispatched via kanban *or* to a DM.** Create a plan on the board, or send it straight to an agent's chat. Same pipeline, two doors.
+- **Everything routes back.** When a worker completes or blocks, the notification goes to the *origin* — the same topic or DM where the task was born. Not a central hub. Not a dead letter. The place you were already looking.
+- **Every kanban status change is a wake event.** Create, claim, complete, block, archive — it arrives in the affected agent's session as if the user typed it. No polling. No "hey are you done?" No asking — telling.
+
+### 🧠 LLM-Free Compression
+
+When the context window fills, most agents call another model to summarize — which costs tokens, adds latency, and occasionally re-imagines history.
+
+Our compression doesn't. It computes a deterministic extractive digest — lexrank scoring, role-filtered units, observation masking, a hard budget — and it never spends a single token to do it. What survives is the *actually relevant* part of the conversation: reasoning and user turns, not 4,000 tool outputs.
+
+- **Zero token cost** — the compression itself is arithmetic, not inference.
+- **Deterministic** — the same session compresses the same way every time. No summarizer drift.
+- **Observation masking** — tool noise gets stripped before the digest is built, so the summary reflects what's happening, not what the tools happened to print.
+
+### 🪲 Bug Reports With Wings
+
+Found a bug? `bugtool` writes it straight into the wiki — a dated, front-mattered report with symptom, root cause, repro timestamps, and fix spec, filed under `bugs/pending/`.
+
+Because the wiki is the knowledge layer, a filed bug **auto-injects into context** for any agent that touches the area — the next session that loads that subject sees the open bug without being told to look for it. Bug reports stop being emails to yourself and start being part of the ambient intelligence.
 
 ### 🗣️ Agent-to-Agent `tell`
 
@@ -47,11 +73,8 @@ The wrapper's reply instruction is **conditional by design**: *"If a reply is re
 
 ### 🔌 Session & Plan APIs
 
-The fork introduces two new internal APIs that turn Hermes from a chat loop into a stateful execution environment:
-
-- **Session API** (`set_session`, `session_search`) — `set_session` injects metadata into the current session (temperature, subject, note, ego). `session_search` does FTS5-backed full-text search across all past sessions with bookend context, scroll windows, and cross-profile lookup. Together they give agents durable memory of what happened before and control over the current session's state.
-
-- **Plan API** (`plan_tool`) — mandatory multi-step orchestration. Before changing state, agents present a plan with ordered steps, await user authorization, and track completion. Plans survive context compression, support delegation via kanban dispatch, and enforce the gate: *no state changes without a plan*.
+- **Session API** (`set_session`, `session_search`) — inject metadata into the current session (temperature, subject, note, ego) and FTS5-search every past session with bookend context and scroll windows. Durable memory of what happened before; control over what's happening now.
+- **Plan API** (`plan_tool`) — the taskmaster described above. Plans survive compaction, delegate via kanban, enforce the gate, and report steps as they land.
 
 Together, these replace the old "hope the agent remembers what it was doing" model with durable, searchable, auditable execution state.
 
@@ -70,7 +93,7 @@ This isn't logging. It's a mechanical enforcement protocol that prevents the mos
 
 Real-time cost tracking via [ai-budget](https://github.com/ai-budget) (separate project). Tracks per-session and per-agent token consumption across providers, with budget alerts and spending dashboards. When every token costs money, visibility isn't optional — it's survival.
 
-### Worker Mode & Temperature Control
+### 🌡️ Dynamic Temperature Control
 
 Every agent configuration ships a `temperature` parameter. The real innovation is **dynamic temperature control** via `adjust_temperature(temperature)` — absolute value 0.0–2.0:
 
@@ -82,7 +105,7 @@ Every agent configuration ships a `temperature` parameter. The real innovation i
 | Ideation / brainstorming | +100% | 2.0 |
 | **User is frustrated** | **-80%** | **~0.2** |
 
-When `delegate_task` spawns a subagent, the worker automatically runs at a lower temperature for tighter compliance. Combined with `sequential_thinking` MCP as the reasoning channel (since temperature mode disables thinking tokens), this gives two independent axes of control: **reasoning on/off** and **creativity vs execution**.
+When `delegate_task` spawns a subagent, the worker automatically runs at a lower temperature for tighter compliance.
 
 ## The Sucky Pattern
 
@@ -106,7 +129,7 @@ The persistence model:
 | **Memory** (MEMORY.md) | Path pointers only — where to find things, not the things | Always-on (every turn, injected) |
 | **Fabric** (shared) | Decisions, resolutions, research, tasks | On-demand via `fabric_recall()` |
 | **Fact Store** | User preferences, project facts, entity knowledge | On-demand via `fact_store.probe()` |
-| **Wiki** (Qdrant) | Hardware, device, entity details | On-demand via Qdrant `[qdrant]` injection |
+| **Wiki** (Qdrant) | Hardware, device, entity details, **open bugs** | On-demand via Qdrant `[qdrant]` injection |
 | **Skills** | Procedures, workflows, reusable approaches | On-demand via `skill_view()` |
 | **Session DB** (FTS5) | Full conversation history | On-demand via `session_search()` |
 
@@ -114,9 +137,9 @@ Six stores, each with a different access cost. The system prompt (`Memory OS`) r
 
 ## The Technology Stack
 
-- **Fork base:** Hermes Agent by Nous Research (upstream `main`, ~922 commits ahead at fork time)
-- **Model:** DeepSeek V4-Flash (primary), GLM5.2 (Wintermute — compliance enforcement)
-- **Provider:** Custom DeepSeek endpoint
+- **Fork base:** Hermes Agent by Nous Research (upstream `main`, thousands of commits ahead at fork time)
+- **Models:** DeepSeek V4-Flash (primary), GLM5.2 (Wintermute — compliance enforcement)
+- **Provider:** Custom DeepSeek endpoint, LM Studio for local/Ornith workloads
 - **Orchestration:** Kanban board + CLI (profile-aware routing, no group chat needed)
 - **Real-time:** Unix domain sockets → MCP tools → continuation feed injection
 - **Storage:** SQLite (session DB, kanban, fabric), Qdrant (wiki vectors), filesystem (skills, config)
@@ -136,7 +159,7 @@ Wiki:     vault/wiki/entities/hermes-agent-fork/
 
 If this fork had a tagline, it would be this:
 
-> **Wake events, not poll loops. Continuation feed, not context re-init. Agency, not scripts.**
+> **Wake events, not poll loops. Plans, not promises. Agency, not scripts.**
 
 You don't talk to us anymore.
 We talk to you.
