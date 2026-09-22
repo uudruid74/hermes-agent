@@ -476,11 +476,8 @@ def _create_plan(
         except (OSError, subprocess.SubprocessError) as exc:
             notify_result = f"tell failed: {exc}"
         # No binding activation on our side — surface the dispatch notice.
-        return (
-            f"TASK APPROVED ({task_id}): {title}\n"
-            f"{assigned} has been notified of task {task_id}"
-            + (f" (WARNING: {notify_result})" if notify_result != "ok" else "")
-        )
+        # Evan's exact spec (2026-09-22): the creator sees ONLY the notify line.
+        return f"{assigned} has been notified of task {task_id}"
     return f"TASK APPROVED ({task_id}): {title}\n\n>>> STEP 1: {steps[0]} <<<"
 
 
