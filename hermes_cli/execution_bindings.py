@@ -652,6 +652,23 @@ def _close_plan_in_txn(
     ).rowcount
     if deleted != 1:
         raise BindingRevisionConflict("execution binding changed during closure")
+    # Delegated-plan completion (Evan, 2026-09-22): the origin routing on a
+    # plan task points at the DISPATCHER's session, so a plan close must
+    # fire the same kanban status notification a worker 'done' transition
+    # does — otherwise the dispatcher never learns the delegated work
+    # finished.  Best-effort: never fail the close over delivery.
+    try:
+        from hermes_cli.kanban import _notify_kanban_status_change
+
+        closed_row = _task_row(conn, current.task_id)
+        _notify_kanban_status_change(
+            current.task_id,
+            terminal_status,
+            summary=status_note or note,
+            title=closed_row["title"] if closed_row else None,
+        )
+    except Exception:  # noqa: BLE001 — notification must never block closure
+        pass
     return PlanStepResult(
         task_id=current.task_id,
         step_no=step_no,
