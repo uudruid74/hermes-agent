@@ -8,6 +8,7 @@ module and ``hermes_cli.execution_bindings``.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import time
 import uuid
@@ -93,7 +94,7 @@ def _sync_subject_from_binding(agent) -> None:
 def _insert_request(
     conn, *, task_id: str, title: str, goal: str, steps: list[str], agent,
     board: Optional[str], kind: str, parent_task_id: Optional[str], pre_approved: bool,
-    debug_plan_id: Optional[str],
+    debug_plan_id: Optional[str], assignee: Optional[str] = None,
 ) -> str:
     """Create a blocked Plan and its pending durable authorization atomically.
 
@@ -111,10 +112,11 @@ def _insert_request(
 
     legacy = _legacy()
     now = int(time.time())
+    task_assignee = (assignee or "").strip() or legacy._get_agent_name(agent)
     body = "\n".join(
         [
             f"## Plan: {title}",
-            f"**Agent:** {legacy._get_agent_name(agent)}",
+            f"**Agent:** {task_assignee}",
             f"**Goal:** {goal}",
             "",
             "### Steps",
@@ -133,7 +135,7 @@ def _insert_request(
             task_id,
             title,
             body,
-            legacy._get_agent_name(agent),
+            task_assignee,
             now,
             json.dumps(steps),
             goal,
@@ -154,7 +156,7 @@ def _insert_request(
                 "goal": goal,
                 "steps": steps,
                 "kind": "manual",
-                "assign": None,
+                "assign": task_assignee,
                 "board": legacy._resolve_board(board),
                 "root": None,
                 "cron": None,
@@ -166,6 +168,24 @@ def _insert_request(
             origin_session_id=getattr(agent, "session_id", None),
         ),
     )
+    # Delegated plan (assignee set): notifications must return to the
+    # DISPATCHER (the agent that created this plan), not the worker profile.
+    # Stamp the creator's durable session as origin routing.
+    if task_assignee != legacy._get_agent_name(agent):
+        try:
+            from hermes_cli.kanban_db import store_origin_routing
+
+            creator_session = (getattr(agent, "session_id", None) or "").strip()
+            if creator_session:
+                store_origin_routing(
+                    conn,
+                    task_id,
+                    platform="session",
+                    chat_id=creator_session,
+                    profile=(os.environ.get("USERNAME") or "").strip() or "user",
+                )
+        except (sqlite3.Error, ValueError, OSError, ImportError):
+            pass  # best-effort; status-notify falls back to session notices
     if kind == "debug" and debug_plan_id:
         linked = conn.execute(
             "UPDATE tasks SET debug_plan_id=? WHERE id=?",
@@ -194,7 +214,7 @@ def cmd_new(
     agent, title: str, goal: str, steps: list[str], temp: Optional[str] = None,
     board: Optional[str] = None, kind: str = "normal",
     debug_plan_id: Optional[str] = None, pre_approved: bool = False,
-    parent_task_id: Optional[str] = None,
+    parent_task_id: Optional[str] = None, assignee: Optional[str] = None,
 ) -> str:
     """Create a Plan without implicit nesting or legacy task identity reads."""
     return _create_plan(
@@ -208,6 +228,7 @@ def cmd_new(
         debug_plan_id=debug_plan_id,
         pre_approved=pre_approved,
         parent_task_id=parent_task_id,
+        assignee=assignee,
     )
 
 
@@ -217,6 +238,7 @@ def _create_plan(
     debug_plan_id: Optional[str] = None, pre_approved: bool = False,
     parent_task_id: Optional[str] = None,
     repeat_of: Optional[tuple[str, int]] = None,
+    assignee: Optional[str] = None,
 ) -> str:
     """Create, approve and activate a Plan.
 
@@ -290,6 +312,7 @@ def _create_plan(
                 parent_task_id=parent_task_id,
                 pre_approved=pre_approved,
                 debug_plan_id=debug_plan_id,
+                assignee=assignee,
             )
             if kind == "debug" and pre_approved:
                 _activate(

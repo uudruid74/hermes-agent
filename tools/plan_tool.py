@@ -1264,7 +1264,7 @@ def plan_tool(
             return "ERROR: 'new' requires title, goal, and steps[]"
         return _cmd_new(
             agent, title, goal, steps, temp, board, kind, debug_plan_id,
-            pre_approved, parent_task_id,
+            pre_approved, parent_task_id, assignee,
         )
 
     elif command == "cron":
@@ -1392,7 +1392,7 @@ PLAN_TOOL_SCHEMA = {
             },
             "assignee": {
                 "type": "string",
-                "description": "Agent profile name to assign (required for dispatch)",
+                "description": "Agent profile name to assign (required for dispatch). For 'new': create the plan delegated to this agent — the task is created blocked (approval gate), assigned to them, NOT dispatched, and notifications route back to the creating agent's session. The worker then runs `plan continue <task_id>` from their session to bind and start it.",
             },
             "resume": {
                 "type": "string",
