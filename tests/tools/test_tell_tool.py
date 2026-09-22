@@ -53,6 +53,91 @@ def test_tell_wraps_message_and_targets_agent_profile(monkeypatch):
     assert result == {"returncode": 0, "stdout": "sent\n", "stderr": ""}
 
 
+def test_tell_routes_to_explicit_session_and_displays_reply_session(monkeypatch):
+    monkeypatch.setenv("USERNAME", "zephyr")
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return _completed()
+
+    monkeypatch.setattr(tell_tool.subprocess, "run", fake_run)
+
+    tell_tool.tell_tool(
+        agent="neo",
+        message="Cron reply.",
+        session_id="cron_daily_20260922_120000",
+        origin_session_id="20260922_121500_receiver",
+        echo_callback=lambda _message: None,
+    )
+
+    command = calls[0][0]
+    assert command[:4] == [
+        "hermes",
+        "send",
+        "-u",
+        "neo:cli:cron_daily_20260922_120000",
+    ]
+    assert "agent='zephyr'" in command[-1]
+    assert "session_id='20260922_121500_receiver'" in command[-1]
+
+
+def test_tell_reply_reaches_explicit_session_via_send_cli(monkeypatch, tmp_path):
+    import argparse
+
+    from hermes_cli import profiles, send_cmd
+    from hermes_state import SessionDB
+
+    target_home = tmp_path / "neo"
+    target_home.mkdir()
+    target_session = "cron_daily_20260922_120000"
+    session_db = SessionDB(db_path=target_home / "state.db")
+    session_db.create_session(session_id=target_session, source="cron")
+    session_db.close()
+
+    monkeypatch.setenv("USERNAME", "zephyr")
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: name == "neo")
+    monkeypatch.setattr(profiles, "get_profile_dir", lambda _name: target_home)
+    monkeypatch.setattr(send_cmd, "_load_hermes_env", lambda: None)
+
+    def run_send_cli(command, **_kwargs):
+        args = argparse.Namespace(
+            to=None,
+            user=command[3],
+            message=command[4],
+            file=None,
+            subject=None,
+            list_targets=False,
+            json=False,
+            quiet=True,
+        )
+        with pytest.raises(SystemExit) as exc:
+            send_cmd.cmd_send(args)
+        assert exc.value.code == 0
+        return _completed(returncode=0)
+
+    monkeypatch.setattr(tell_tool.subprocess, "run", run_send_cli)
+
+    result = json.loads(
+        tell_tool.tell_tool(
+            agent="neo",
+            message="Round trip reply.",
+            session_id=target_session,
+            origin_session_id="20260922_121500_receiver",
+            echo_callback=lambda _message: None,
+        )
+    )
+
+    session_db = SessionDB(db_path=target_home / "state.db")
+    notices = session_db.drain_session_notices(target_session)
+    session_db.close()
+
+    assert result["returncode"] == 0
+    assert len(notices) == 1
+    assert "Round trip reply." in notices[0]["text"]
+    assert "session_id='20260922_121500_receiver'" in notices[0]["text"]
+
+
 def test_tell_does_not_fall_back_to_superseded_identity_vars(monkeypatch):
     monkeypatch.delenv("USERNAME", raising=False)
     monkeypatch.setenv("HERMES_AGENT_NAME", "WrongAgent")
@@ -207,6 +292,47 @@ def test_agent_runtime_routes_tell_to_mandatory_origin_callback(monkeypatch):
     assert result["returncode"] == 0
 
 
+def test_agent_runtime_exposes_cron_session_id_for_a_reply(monkeypatch):
+    from agent.agent_runtime_helpers import invoke_tool
+
+    monkeypatch.setenv("USERNAME", "neo")
+    sent = []
+
+    def fake_run(command, **kwargs):
+        sent.append(command)
+        return _completed()
+
+    monkeypatch.setattr(tell_tool.subprocess, "run", fake_run)
+    agent = SimpleNamespace(
+        _memory_manager=None,
+        tell_echo_callback=lambda _message: None,
+        session_id="cron_journal_20260922_120000",
+    )
+
+    invoke_tool(
+        agent,
+        "tell",
+        {
+            "agent": "zephyr",
+            "message": "Talk with me.",
+            "session_id": "20260922_121500_receiver",
+        },
+        "",
+        pre_tool_block_checked=True,
+        skip_tool_request_middleware=True,
+        skip_tool_execution_middleware=True,
+    )
+
+    assert sent[0][:4] == [
+        "hermes",
+        "send",
+        "-u",
+        "zephyr:cli:20260922_121500_receiver",
+    ]
+    assert "agent='neo'" in sent[0][-1]
+    assert "session_id='cron_journal_20260922_120000'" in sent[0][-1]
+
+
 def test_agent_runtime_refuses_tell_without_origin_callback(monkeypatch):
     from agent.agent_runtime_helpers import invoke_tool
 
@@ -236,8 +362,9 @@ def test_tell_is_owned_by_agent_runtime():
     assert "tell" in _AGENT_LOOP_TOOLS
 
 
-def test_tell_schema_requires_agent_and_message():
+def test_tell_schema_requires_agent_and_message_and_accepts_session_id():
     assert tell_tool.TELL_SCHEMA["parameters"]["required"] == ["agent", "message"]
+    assert "session_id" in tell_tool.TELL_SCHEMA["parameters"]["properties"]
     assert tell_tool.TELL_SCHEMA["name"] == "tell"
 
 

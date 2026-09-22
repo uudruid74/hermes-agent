@@ -3009,6 +3009,8 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                     agent=next_args.get("agent", ""),
                     message=next_args.get("message", ""),
                     echo_callback=echo_callback,
+                    session_id=next_args.get("session_id"),
+                    origin_session_id=getattr(agent, "session_id", "") or "",
                 ),
                 next_args,
             )
