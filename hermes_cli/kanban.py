@@ -1891,28 +1891,50 @@ def _store_cli_origin_routing(conn, task_id: str, channel_flag: str) -> None:
 
 
 def _store_cli_implicit_origin(conn, task_id: str) -> None:
-    """Store an implicit CLI origin only when a durable session id exists."""
+    """Store an implicit CLI origin from the session env.
+
+    Preference order:
+    1. HERMES_SESSION_ID (durable session handle — survives as the origin)
+    2. HERMES_SESSION_PLATFORM + HERMES_SESSION_CHAT_ID (direct chat routing —
+       what tool shells actually carry; the pre-432363c37c mechanism that
+       worked and was silently lost when the session-id requirement made
+       origin storage impossible in those shells)
+    Neither present → nothing to store; exit quietly.
+    """
     session_id = os.environ.get("HERMES_SESSION_ID", "").strip()
-    if not session_id:
-        if (
-            os.environ.get("HERMES_SESSION_PLATFORM", "").strip()
-            or os.environ.get("HERMES_SESSION_CHAT_ID", "").strip()
-        ):
-            print(
-                "kanban: refusing implicit channel origin without HERMES_SESSION_ID",
-                file=sys.stderr,
+    if session_id:
+        try:
+            kb.store_origin_routing(
+                conn,
+                task_id,
+                platform="session",
+                chat_id=session_id,
+                profile=(os.environ.get("USERNAME") or "").strip(),
             )
+        except ValueError as exc:
+            print(f"kanban: refusing invalid implicit session origin: {exc}", file=sys.stderr)
         return
-    try:
-        kb.store_origin_routing(
-            conn,
-            task_id,
-            platform="session",
-            chat_id=session_id,
-            profile=(os.environ.get("USERNAME") or "").strip(),
-        )
-    except ValueError as exc:
-        print(f"kanban: refusing invalid implicit session origin: {exc}", file=sys.stderr)
+    # Fallback: direct platform/chat routing (tool shells carry these; the
+    # session id does not survive the gateway→CLI subprocess env bridge).
+    # allow_non_session=True: this is the env-bridge implicit path — the env
+    # vars were set BY the gateway for this very conversation, so a
+    # platform/chat origin here is as trustworthy as a session origin.
+    platform = os.environ.get("HERMES_SESSION_PLATFORM", "").strip()
+    chat_id = os.environ.get("HERMES_SESSION_CHAT_ID", "").strip()
+    if platform and chat_id:
+        try:
+            kb.store_origin_routing(
+                conn,
+                task_id,
+                platform=platform,
+                chat_id=chat_id,
+                thread_id=os.environ.get("HERMES_SESSION_THREAD_ID", "").strip(),
+                chat_type=os.environ.get("HERMES_SESSION_CHAT_TYPE", "").strip(),
+                profile=(os.environ.get("USERNAME") or "").strip(),
+                allow_non_session=True,
+            )
+        except Exception as exc:
+            print(f"kanban: failed to store origin routing from env: {exc}", file=sys.stderr)
 
 
 def _cmd_create(args: argparse.Namespace) -> int:

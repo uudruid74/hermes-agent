@@ -3871,7 +3871,7 @@ def list_comments_after(
 # ---------------------------------------------------------------------------
 
 _ORIGIN_MARKER = "__kanban_origin__"
-_SESSION_ORIGIN_RE = re.compile(r"^\d{8}_\d{6}_[0-9a-f]{6}$")
+_SESSION_ORIGIN_RE = re.compile(r"^\d{8}_\d{6}_[0-9a-f]{6,8}$")
 
 
 def store_origin_routing(
