@@ -1005,11 +1005,24 @@ def cmd_remind(agent, task_id: Optional[str] = None) -> str:
         return f"Task {task_id} not found"
 
     steps = json.loads(task["task_steps"] or "[]")
-    stepno = task["task_stepno"] or 1
     lines = [
         f"Task: {task['title'] or task['id']}",
         f"Goal: {task['task_goal'] or ''}",
     ]
+    # Terminal plans must never render as active (t_b4a93053, 2026-09-22):
+    # close_plan NULLs task_stepno, and the old `stepno or 1` fallback made a
+    # DONE plan read as "Active Step 1 of 1". Report the real status instead.
+    if task["status"] not in {"manual", "running"}:
+        lines.append(f"Status: {task['status']} — this plan is closed, not active.")
+        if task["status"] == "done" and steps:
+            lines.append(f"Final step was: {steps[-1]}")
+        lines.append("")
+        lines.append(
+            "If this plan needs more work, call `plan_tool repeat` with "
+            "step=1 plus a corrective plan, or `plan_tool archive` to close it."
+        )
+        return "\n".join(lines)
+    stepno = task["task_stepno"] or 1
     if not steps:
         lines.append("Active Step: (no steps defined)")
     elif 0 < stepno <= len(steps):
