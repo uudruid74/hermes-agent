@@ -893,10 +893,6 @@ async def _send_via_bridge(
     bridge_path=None,
 ):
     """Inject a message through the running gateway's bridge socket."""
-    import socket as _socket
-
-    bridge_socket = bridge_path or bridge_socket_path()
-
     platform_name = platform.value if hasattr(platform, "value") else str(platform)
     payload = {
         "action": "inject",
@@ -911,6 +907,45 @@ async def _send_via_bridge(
         chat_type = user_context.get("chat_type")
         if chat_type:
             payload["chat_type"] = chat_type
+
+    return await _send_bridge_command(
+        payload,
+        bridge_path=bridge_path,
+        operation="inject",
+    )
+
+
+async def _send_delivery_via_bridge(
+    platform,
+    chat_id,
+    text,
+    *,
+    thread_id=None,
+    bridge_path=None,
+):
+    """Queue an outbound send on the running gateway's live adapter."""
+    platform_name = platform.value if hasattr(platform, "value") else str(platform)
+    payload = {
+        "action": "send",
+        "platform": platform_name,
+        "chat_id": chat_id,
+        "text": text,
+    }
+    if thread_id is not None:
+        payload["thread_id"] = thread_id
+
+    return await _send_bridge_command(
+        payload,
+        bridge_path=bridge_path,
+        operation="delivery",
+    )
+
+
+async def _send_bridge_command(payload, *, bridge_path=None, operation: str):
+    """Send one command to the profile-scoped gateway bridge."""
+    import socket as _socket
+
+    bridge_socket = bridge_path or bridge_socket_path()
 
     try:
         with _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM) as sock:
@@ -939,8 +974,12 @@ async def _send_via_bridge(
     except json.JSONDecodeError:
         return {"error": f"Bridge returned invalid JSON: {data[:200]!r}"}
     if response.get("ok"):
-        return {"success": True, "queued": True}
-    return {"error": f"Bridge inject failed: {response.get('error', 'unknown')}"}
+        return {"success": True, "queued": bool(response.get("queued", True))}
+    return {
+        "error": (
+            f"Bridge {operation} failed: {response.get('error', 'unknown')}"
+        )
+    }
 
 
 async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False):

@@ -5,11 +5,17 @@ import json
 import sys
 from types import SimpleNamespace
 from types import ModuleType
+from typing import cast
 from unittest.mock import AsyncMock, patch
 
+import gateway.mcp_bridge as mcp_bridge
 from gateway.config import Platform
-from gateway.mcp_bridge import _handle_inject
-from tools.send_message_tool import _send_via_bridge, send_message_tool
+from gateway.mcp_bridge import _handle_inject, _handle_send
+from tools.send_message_tool import (
+    _send_delivery_via_bridge,
+    _send_via_bridge,
+    send_message_tool,
+)
 
 
 class _Writer:
@@ -126,6 +132,173 @@ def test_bridge_payload_carries_user_identity_and_chat_type(monkeypatch):
     asyncio.run(_bridge_payload_with_user_identity(monkeypatch))
 
 
+async def _delivery_bridge_payload(monkeypatch):
+    class FakeSocket:
+        def __init__(self, *_args):
+            self.payload = None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def settimeout(self, _timeout):
+            return None
+
+        def connect(self, _path):
+            return None
+
+        def sendall(self, payload):
+            self.payload = json.loads(payload.decode("utf-8"))
+
+        def recv(self, _size):
+            return b'{"ok": true, "queued": true}\n'
+
+    fake_socket = FakeSocket()
+    monkeypatch.setattr("socket.socket", lambda *_args: fake_socket)
+
+    result = await _send_delivery_via_bridge(
+        Platform.TELEGRAM,
+        "8900123006",
+        "task done",
+        thread_id="456",
+        bridge_path="/tmp/hermes/mcp_bridge.zephyr.sock",
+    )
+
+    assert result == {"success": True, "queued": True}
+    assert fake_socket.payload == {
+        "action": "send",
+        "platform": "telegram",
+        "chat_id": "8900123006",
+        "text": "task done",
+        "thread_id": "456",
+    }
+
+
+def test_delivery_bridge_queues_platform_send(monkeypatch):
+    asyncio.run(_delivery_bridge_payload(monkeypatch))
+
+
+async def _queued_bridge_send():
+    adapter = SimpleNamespace(
+        send=AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="m1", error=None)
+        )
+    )
+    runner = SimpleNamespace(
+        adapters={Platform.TELEGRAM: adapter},
+        _background_tasks=set(),
+    )
+    writer = _Writer()
+
+    await _handle_send(
+        runner,
+        {
+            "platform": "telegram",
+            "chat_id": "8900123006",
+            "text": "task done",
+            "thread_id": "456",
+        },
+        cast(asyncio.StreamWriter, writer),
+    )
+
+    assert writer.payload == {"ok": True, "queued": True}
+    assert writer.closed is True
+    tasks = list(runner._background_tasks)
+    assert len(tasks) == 1
+    await asyncio.gather(*tasks)
+    adapter.send.assert_awaited_once_with(
+        chat_id="8900123006",
+        content="task done",
+        metadata={"thread_id": "456"},
+    )
+
+
+def test_bridge_send_acknowledges_before_adapter_delivery():
+    asyncio.run(_queued_bridge_send())
+
+
+async def _failed_bridge_send():
+    adapter = SimpleNamespace(
+        send=AsyncMock(
+            return_value=SimpleNamespace(
+                success=False,
+                message_id=None,
+                error="transport unavailable",
+            )
+        )
+    )
+    runner = SimpleNamespace(
+        adapters={Platform.TELEGRAM: adapter},
+        _background_tasks=set(),
+    )
+
+    await _handle_send(
+        runner,
+        {
+            "platform": "telegram",
+            "chat_id": "8900123006",
+            "text": "task done",
+        },
+        cast(asyncio.StreamWriter, _Writer()),
+    )
+    await asyncio.gather(*list(runner._background_tasks))
+
+
+def test_bridge_send_logs_background_delivery_failure(caplog):
+    caplog.set_level("ERROR", logger="gateway.mcp_bridge")
+    asyncio.run(_failed_bridge_send())
+    assert "Bridge outbound delivery failed" in caplog.text
+    assert "transport unavailable" in caplog.text
+
+
+async def _real_socket_delivery(monkeypatch, tmp_path):
+    bridge_path = str(tmp_path / "mcp_bridge.test.sock")
+    monkeypatch.setattr(mcp_bridge, "BRIDGE_SOCKET", bridge_path)
+    release = asyncio.Event()
+
+    async def delayed_send(**_kwargs):
+        await release.wait()
+        return SimpleNamespace(success=True, message_id="m1", error=None)
+
+    adapter = SimpleNamespace(send=AsyncMock(side_effect=delayed_send))
+    runner = SimpleNamespace(
+        adapters={Platform.TELEGRAM: adapter},
+        _background_tasks=set(),
+    )
+    server = await mcp_bridge.start_bridge_server(runner)
+    try:
+        result = await asyncio.to_thread(
+            asyncio.run,
+            _send_delivery_via_bridge(
+                Platform.TELEGRAM,
+                "8900123006",
+                "task done",
+                bridge_path=bridge_path,
+            ),
+        )
+
+        assert result == {"success": True, "queued": True}
+        assert len(runner._background_tasks) == 1
+        release.set()
+        await asyncio.gather(*list(runner._background_tasks))
+        adapter.send.assert_awaited_once_with(
+            chat_id="8900123006",
+            content="task done",
+            metadata=None,
+        )
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+def test_bridge_server_routes_delivery_without_waiting_for_adapter(
+    monkeypatch, tmp_path
+):
+    asyncio.run(_real_socket_delivery(monkeypatch, tmp_path))
+
+
 def test_inject_with_user_context_creates_real_inbound_user_event():
     captured = []
 
@@ -153,7 +326,7 @@ def test_inject_with_user_context_creates_real_inbound_user_event():
                     "sender_name": "Evan",
                 },
             },
-            writer,
+            cast(asyncio.StreamWriter, writer),
         )
     )
 

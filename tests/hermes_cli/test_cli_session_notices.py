@@ -257,6 +257,52 @@ def test_kanban_wake_uses_origin_profile_bridge_and_identity(monkeypatch):
     ]
 
 
+def test_kanban_human_notice_uses_origin_profile_bridge(monkeypatch):
+    import gateway.mcp_bridge
+    import model_tools
+    import tools.send_message_tool
+
+    calls = []
+    monkeypatch.setattr(
+        gateway.mcp_bridge,
+        "bridge_socket_path",
+        lambda hermes_home=None: f"{hermes_home}/mcp.sock",
+    )
+
+    def send_delivery(platform, chat_id, message, **kwargs):
+        calls.append((platform.value, chat_id, message, kwargs))
+        return {"success": True, "queued": True}
+
+    monkeypatch.setattr(
+        tools.send_message_tool,
+        "_send_delivery_via_bridge",
+        send_delivery,
+    )
+    monkeypatch.setattr(model_tools, "_run_async", lambda value: value)
+
+    adapter, result = kanban._send_kanban_human_notification(
+        platform="telegram",
+        chat_id="123",
+        thread_id="456",
+        message="task done",
+        notify_env={"HERMES_HOME": "/profiles/zephyr"},
+    )
+
+    assert adapter == "mcp_bridge:/profiles/zephyr/mcp.sock"
+    assert result == {"success": True, "queued": True}
+    assert calls == [
+        (
+            "telegram",
+            "123",
+            "task done",
+            {
+                "thread_id": "456",
+                "bridge_path": "/profiles/zephyr/mcp.sock",
+            },
+        )
+    ]
+
+
 def test_kanban_gateway_origin_shares_profile_env_and_injects_wake(
     monkeypatch, caplog
 ):
@@ -264,7 +310,7 @@ def test_kanban_gateway_origin_shares_profile_env_and_injects_wake(
         def close(self):
             pass
 
-    subprocess_calls = []
+    human_calls = []
     wake_calls = []
     loader_calls = []
 
@@ -296,13 +342,20 @@ def test_kanban_gateway_origin_shares_profile_env_and_injects_wake(
             "queued": True,
         }
 
+    def send_human(**kwargs):
+        human_calls.append(kwargs)
+        return "mcp_bridge:/tmp/hermes/mcp_bridge.zephyr.sock", {
+            "success": True,
+            "queued": True,
+        }
+
     monkeypatch.setattr(kanban, "_load_user_profile_env", load_origin)
+    monkeypatch.setattr(kanban, "_send_kanban_human_notification", send_human)
     monkeypatch.setattr(kanban, "_send_kanban_wake", send_wake)
     monkeypatch.setattr(
         "subprocess.run",
-        lambda args, **kwargs: (
-            subprocess_calls.append((args, kwargs))
-            or SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("kanban notification must not spawn subprocesses")
         ),
     )
     caplog.set_level("INFO", logger="hermes_cli.kanban")
@@ -310,18 +363,17 @@ def test_kanban_gateway_origin_shares_profile_env_and_injects_wake(
     kanban._notify_kanban_status_change("t_gateway", "done", title="Gateway task")
 
     assert loader_calls == ["zephyr"]
-    assert len(subprocess_calls) == 1
-    assert subprocess_calls[0][0][:4] == [
-        "hermes", "send", "-t", "telegram:123"
-    ]
-    human_env = subprocess_calls[0][1]["env"]
+    assert len(human_calls) == 1
+    assert human_calls[0]["platform"] == "telegram"
+    assert human_calls[0]["chat_id"] == "123"
+    assert human_calls[0]["message"] == "✅ Gateway task → done"
+    human_env = human_calls[0]["notify_env"]
     assert human_env["HERMES_PROFILE"] == "zephyr"
     assert human_env["TELEGRAM_BOT_TOKEN"] == "zephyr-token"
 
     assert len(wake_calls) == 1
     assert wake_calls[0]["target"] == "telegram:123"
     assert wake_calls[0]["notify_env"] is human_env
-    assert not any("-u" in call[0] for call in subprocess_calls)
     assert "target=telegram:123" in caplog.text
     assert "adapter=mcp_bridge:/tmp/hermes/mcp_bridge.zephyr.sock" in caplog.text
     assert "result=success" in caplog.text
@@ -368,13 +420,18 @@ def test_kanban_failed_internal_wake_queues_session_notice(
     )
     monkeypatch.setattr(
         kanban,
+        "_send_kanban_human_notification",
+        lambda **_kwargs: ("mcp_bridge", {"success": True, "queued": True}),
+    )
+    monkeypatch.setattr(
+        kanban,
         "_send_kanban_wake",
         lambda **_kwargs: ("mcp_bridge", {"error": "gateway unavailable"}),
     )
     monkeypatch.setattr(
         "subprocess.run",
-        lambda *_args, **_kwargs: SimpleNamespace(
-            returncode=0, stdout=b"", stderr=b""
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("kanban notification must not spawn subprocesses")
         ),
     )
     import hermes_cli.profiles

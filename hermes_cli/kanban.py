@@ -1369,6 +1369,34 @@ def _send_kanban_wake(
     return f"mcp_bridge:{bridge_path}", result
 
 
+def _send_kanban_human_notification(
+    *,
+    platform: str,
+    chat_id: str,
+    thread_id: str,
+    message: str,
+    notify_env: dict,
+) -> tuple[str, dict]:
+    """Queue a human notice on the origin profile's live gateway adapter."""
+    from gateway.config import Platform
+    from gateway.mcp_bridge import bridge_socket_path
+    from model_tools import _run_async
+    from tools.send_message_tool import _send_delivery_via_bridge
+
+    profile_home = notify_env.get("HERMES_HOME")
+    bridge_path = bridge_socket_path(profile_home) if profile_home else bridge_socket_path()
+    result = _run_async(
+        _send_delivery_via_bridge(
+            Platform(platform),
+            chat_id,
+            message,
+            thread_id=thread_id or None,
+            bridge_path=bridge_path,
+        )
+    )
+    return f"mcp_bridge:{bridge_path}", result
+
+
 def _notify_kanban_status_change(
     task_id: str,
     new_status: str,
@@ -1379,9 +1407,8 @@ def _notify_kanban_status_change(
 ) -> None:
     """Best-effort human delivery and LLM wake for a Kanban state change.
 
-    Both paths resolve the task's origin profile once. The human message uses
-    ``hermes send -t`` with that profile's credentials; the LLM wake is injected
-    through the same profile's live gateway bridge, never a worker subprocess.
+    Both paths resolve the task's origin profile once, then queue delivery on
+    that profile's live gateway bridge. Neither path spawns a CLI subprocess.
     Delivery failures are logged and fall back to a creator-session notice.
     """
     try:
@@ -1444,27 +1471,29 @@ def _notify_kanban_status_change(
     profile = notify_env.get("HERMES_PROFILE", "inherited")
 
     try:
-        completed = subprocess.run(
-            ["hermes", "send", "-t", target, human_msg],
-            capture_output=True,
-            timeout=10,
-            env=notify_env,
+        human_adapter, human_result = _send_kanban_human_notification(
+            platform=platform,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            message=human_msg,
+            notify_env=notify_env,
         )
-        human_result = "success" if completed.returncode == 0 else f"exit-{completed.returncode}"
-        log = logger.info if completed.returncode == 0 else logger.warning
+        human_ok = bool(human_result.get("success"))
+        log = logger.info if human_ok else logger.warning
         log(
             "kanban notify task=%s status=%s target=%s profile=%s "
-            "adapter=hermes-send-t result=%s",
+            "adapter=%s result=%s",
             task_id,
             new_status,
             target,
             profile,
-            human_result,
+            human_adapter,
+            "queued" if human_ok else human_result.get("error", "error"),
         )
-    except (OSError, subprocess.SubprocessError):
+    except (RuntimeError, ValueError):
         logger.exception(
             "kanban notify task=%s status=%s target=%s profile=%s "
-            "adapter=hermes-send-t result=error",
+            "adapter=internal-delivery result=error",
             task_id,
             new_status,
             target,

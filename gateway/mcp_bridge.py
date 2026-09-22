@@ -14,6 +14,8 @@ Protocol (newline-delimited JSON):
   <- {"ok": true, "response": {"msg_id": "...", ...}}   (after plugin responds)
   -> {"action": "unwatch", "handle": "abc123"}
   <- {"ok": true}
+  -> {"action": "send", "platform": "telegram", "chat_id": "...", "text": "..."}
+  <- {"ok": true, "queued": true}
 
 For write actions, the bridge sends the command to the persistent peer
 and waits for a response with a matching msg_id.  Commands on the
@@ -93,6 +95,8 @@ async def start_bridge_server(runner) -> asyncio.AbstractServer:
                 await _handle_write(runner, cmd, writer)
             elif action == "inject":
                 await _handle_inject(runner, cmd, writer)
+            elif action == "send":
+                await _handle_send(runner, cmd, writer)
             else:
                 _respond(writer, {"error": f"Unknown action: {action}"})
         except Exception as e:
@@ -285,6 +289,69 @@ async def _handle_inject(runner, cmd: dict, writer: asyncio.StreamWriter) -> Non
         raise
     except Exception as e:
         _respond(writer, {"error": str(e)})
+
+
+async def _handle_send(runner, cmd: dict, writer: asyncio.StreamWriter) -> None:
+    """Queue an outbound message on the gateway's live platform adapter."""
+    platform_name = cmd.get("platform", "")
+    chat_id = cmd.get("chat_id", "")
+    text = cmd.get("text", "")
+    thread_id = cmd.get("thread_id")
+
+    if not platform_name or not chat_id or not text:
+        _respond(writer, {"error": "Missing required fields: platform, chat_id, text"})
+        return
+
+    from gateway.config import Platform
+    try:
+        platform = Platform(platform_name)
+    except (ValueError, KeyError):
+        _respond(writer, {"error": f"Unknown platform: {platform_name}"})
+        return
+
+    adapter = runner.adapters.get(platform)
+    if adapter is None:
+        _respond(writer, {"error": f"No adapter for platform '{platform_name}'"})
+        return
+
+    metadata = {}
+    if thread_id:
+        metadata["thread_id"] = thread_id
+    if platform_name == "ntfy":
+        metadata["publish_topic"] = chat_id
+
+    async def _deliver() -> None:
+        try:
+            result = await adapter.send(
+                chat_id=chat_id,
+                content=text,
+                metadata=metadata or None,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "Bridge outbound delivery raised platform=%s chat_id=%s",
+                platform_name,
+                chat_id,
+            )
+            return
+        if not getattr(result, "success", False):
+            logger.error(
+                "Bridge outbound delivery failed platform=%s chat_id=%s: %s",
+                platform_name,
+                chat_id,
+                getattr(result, "error", None) or "unknown error",
+            )
+
+    task = asyncio.create_task(_deliver())
+    background_tasks = getattr(runner, "_background_tasks", None)
+    if not isinstance(background_tasks, set):
+        background_tasks = set()
+        runner._background_tasks = background_tasks
+    background_tasks.add(task)
+    task.add_done_callback(background_tasks.discard)
+    _respond(writer, {"ok": True, "queued": True})
 
 
 async def _handle_write(runner, cmd: dict, writer: asyncio.StreamWriter) -> None:
