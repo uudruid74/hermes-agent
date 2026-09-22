@@ -556,11 +556,12 @@ def cmd_advance(
         # subject is CLEARED.  See _sync_subject_from_binding.
         _sync_subject_from_binding(agent)
         _request_completion_compression(agent)
-        # Evan's spec (2026-09-22): the close response states completion with
-        # the task id — the old "The task goal was: ..." echo (from the Aug 10
-        # Phase 4 text, verify-line dropped in 8cbd834191) misled a worker into
-        # reporting a completed plan as failed. State the outcome plainly.
-        return f"TASK COMPLETE ({result.task_id}): {task['title'] or ''}"
+        # Restored to Evan's original Aug 10 Phase 4 close text, verbatim —
+        # 8cbd834191 (Aug 27) dropped the verify line during the refactor.
+        return (
+            f"The task goal was: {task['task_goal'] or ''}\n"
+            f"Verify this goal has been achieved, or present a new plan."
+        )
     if result.binding_revision == binding.revision:
         # The step did NOT move — this is the verify-first response.
         return (
