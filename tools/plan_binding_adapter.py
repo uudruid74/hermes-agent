@@ -532,7 +532,7 @@ def cmd_advance(
         return f"ERROR: {exc}"
     if result.closed:
         task = conn.execute(
-            "SELECT task_goal, plan_kind FROM tasks WHERE id=?", (result.task_id,)
+            "SELECT title, task_goal, plan_kind FROM tasks WHERE id=?", (result.task_id,)
         ).fetchone()
         # Execution bindings are authoritative, but sessions.task_id remains a
         # compatibility signal for session UI/context.  Mirror the atomic close:
@@ -556,12 +556,7 @@ def cmd_advance(
         # subject is CLEARED.  See _sync_subject_from_binding.
         _sync_subject_from_binding(agent)
         _request_completion_compression(agent)
-        # Restored to Evan's original Aug 10 Phase 4 close text, verbatim —
-        # 8cbd834191 (Aug 27) dropped the verify line during the refactor.
-        return (
-            f"The task goal was: {task['task_goal'] or ''}\n"
-            f"Verify this goal has been achieved, or present a new plan."
-        )
+        return f"TASK COMPLETE ({result.task_id}): {task['title'] or result.task_id}"
     if result.binding_revision == binding.revision:
         # The step did NOT move — this is the verify-first response.
         return (

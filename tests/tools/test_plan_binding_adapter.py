@@ -191,7 +191,7 @@ def test_advance_closes_binding_and_records_required_summary(monkeypatch):
 
     assert missing == "ERROR: 'advance' requires summary"
     assert "NOT ADVANCED" in held, "a bare claim must not close the plan"
-    assert "goal was: finish" in advanced
+    assert advanced == f"TASK COMPLETE ({task_id}): Finish"
     assert conn.execute("SELECT status FROM tasks WHERE id=?", (task_id,)).fetchone()[0] == "done"
     assert conn.execute("SELECT COUNT(*) FROM execution_bindings").fetchone()[0] == 0
     body = conn.execute(
@@ -514,7 +514,7 @@ def test_final_advance_clears_session_task_and_remind_has_no_active_plan(monkeyp
         agent, "advance", summary="finished", proof="pytest: regression passed"
     )
 
-    assert "goal was: gate the compaction" in result
+    assert result == f"TASK COMPLETE ({task_id}): Subject plan"
     assert agent.task_ids[-1] is None
     assert plan_tool.plan_tool(agent, "remind") == "No active plan."
 
