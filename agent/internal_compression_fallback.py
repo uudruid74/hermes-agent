@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
 import logging
 import math
 import re
@@ -241,6 +242,7 @@ class _Unit:
     order: tuple[int, ...]
     token_count: int
     is_note: bool = False
+    is_marker: bool = False
     role: str = "unknown"
     semantic_chunk: int | None = None
 
@@ -950,6 +952,204 @@ def _prune_reingested_payload(text: str, *, is_newest: bool = False) -> str:
     return text
 
 
+# ------------------------------------------------- terminal decision spine (Evan, 2026-09-23)
+# The agent's own `echo "=== label ==="` header lines, emitted before every
+# terminal call, are the decision spine of a trajectory: self-authored intent
+# recorded while it was fresh.  After compaction the model re-orients on
+# decisions, not on tool output (which it already acted on), so these markers
+# are worth far more than their token count suggests.  Each is paired with a
+# sibling exit-code tombstone so intent and outcome survive together — a bare
+# `=== deploy ===` that outlived its failed command would read as success.
+#
+# The two halves live in DIFFERENT messages — the command in the assistant
+# tool_call arguments, the outcome in the tool result JSON — and the
+# compressor's `_message_units` skips both (tool results are observations,
+# tool_calls are ignored).  This section reconstructs the fused unit by
+# correlating on ``tool_call_id``.
+_ECHO_MARKER_RE = re.compile(
+    r"""echo\s+["']\s*((?:={3,})[^"']*?(?:={3,}))\s*["']"""
+)
+_ECHO_LABEL_DIGIT_RE = re.compile(r"\d")
+
+
+def _is_echo_marker_command(command: str) -> bool:
+    """True when a terminal command carries an `echo "=== label ==="` marker."""
+    return bool(command) and bool(_ECHO_MARKER_RE.search(command))
+
+
+def _echo_marker_verbatim(command: str) -> str:
+    """The byte-exact echoed marker line (``=== label ===``), or ''.
+
+    Captures the full span between the quotes so the echoed output survives
+    compaction verbatim — the agent's own line, un-normalized.  This is the
+    evidence layer; a Dax "spore" is contractually an exact source extract.
+    """
+    match = _ECHO_MARKER_RE.search(command or "")
+    return match.group(1) if match else ""
+
+
+def _echo_marker_label(marker: str) -> str:
+    """The label inside a verbatim ``=== label ===`` marker, for the keep rules."""
+    return re.sub(r"^=+\s*|\s*=+$", "", marker).strip()
+
+
+def _marker_keep_label(label: str) -> bool:
+    """Apply the keep rules: >3 ws-words, or a digit, or an opening paren.
+
+    Underscores count as whitespace so ``test_undo_scratch.py`` is 3 words,
+    not 1.  Terse boilerplate (``git log``, ``HEAD``, ``status``) is cut;
+    descriptive labels and line-refs (``undo (875,965)``) survive.
+    """
+    words = [word for word in re.split(r"[\s_]+", label) if word]
+    if len(words) > 3:
+        return True
+    if _ECHO_LABEL_DIGIT_RE.search(label):
+        return True
+    return "(" in label
+
+
+def _parse_exit_code(content: str) -> int | None:
+    """Best-effort ``exit_code`` from a terminal tool-result JSON string.
+
+    Returns ``None`` when the result is not terminal-shaped (or already
+    masked into a placeholder), so non-terminal observations are skipped.
+    """
+    try:
+        data = json.loads(content)
+    except (ValueError, TypeError):
+        data = None
+    if isinstance(data, dict) and "exit_code" in data:
+        try:
+            return int(data["exit_code"])
+        except (ValueError, TypeError):
+            return None
+    match = re.search(r'"exit_code"\s*:\s*(-?\d+)', content)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def _render_exit_tombstone(command: str, exit_code: int) -> str:
+    """Sibling ``[exit …]`` line, using terminal_tool's semantics where known."""
+    if exit_code == 0:
+        return "[exit 0]"
+    try:
+        from tools.terminal_tool import _interpret_exit_code
+        note = _interpret_exit_code(command, exit_code)
+    except ImportError:
+        note = None
+    if note:
+        return f"[exit {exit_code} — {note}]"
+    return f"[exit {exit_code}]"
+
+
+def _terminal_marker_units(
+    messages: list[dict[str, Any]],
+    start_index: int = 0,
+) -> list[_Unit]:
+    """Fuse each ``echo "=== label ==="`` decision marker with its exit code.
+
+    Scans assistant terminal tool_calls for the marker command, pairs each
+    with its tool result by ``tool_call_id``, and emits one unit per marker —
+    the verbatim label line plus a sibling exit tombstone.  A marker whose
+    label fails the keep rules is dropped whole, and a marker whose tool
+    result is missing (masked/missing) is skipped rather than hallucinated.
+
+    The unit's ``order`` is the tool-result offset, so markers stay in strict
+    chronological order through compaction.
+    """
+    pending: dict[str, str] = {}
+    results: dict[str, int] = {}
+    result_offsets: dict[str, int] = {}
+    for offset, message in enumerate(messages):
+        role = message.get("role")
+        if role == "assistant":
+            for tc in message.get("tool_calls") or []:
+                if not isinstance(tc, dict):
+                    continue
+                fn = tc.get("function") or {}
+                if not isinstance(fn, dict):
+                    continue
+                if fn.get("name") != "terminal":
+                    continue
+                args = fn.get("arguments")
+                command = ""
+                if isinstance(args, str):
+                    try:
+                        command = json.loads(args).get("command", "")
+                    except (ValueError, TypeError):
+                        command = ""
+                if _is_echo_marker_command(command):
+                    pending[str(tc.get("id") or "")] = command
+        elif role == "tool":
+            cid = str(message.get("tool_call_id") or "")
+            if cid in pending:
+                content = _content_text(message.get("content"))
+                exit_code = _parse_exit_code(content)
+                if exit_code is not None:
+                    results[cid] = exit_code
+                    result_offsets[cid] = offset
+
+    units: list[_Unit] = []
+    for cid, command in pending.items():
+        if cid not in results:
+            continue
+        marker = _echo_marker_verbatim(command)
+        label = _echo_marker_label(marker)
+        if not label or not _marker_keep_label(label):
+            continue
+        exit_code = results[cid]
+        text = f"{marker}\n{_render_exit_tombstone(command, exit_code)}"
+        units.append(
+            _Unit(
+                text=text,
+                order=(start_index + result_offsets[cid], 0),
+                token_count=estimate_tokens_rough(text),
+                is_marker=True,
+                role="tool",
+            )
+        )
+    return units
+
+
+def _split_marker_tiers(
+    markers: list[_Unit], recent_count: int
+) -> tuple[list[_Unit], list[_Unit]]:
+    """Split fused markers into (recent-unconditional, ranked-rest).
+
+    The ``recent_count`` markers closest to the hot window are returned first,
+    most-recent-first, to be locked ahead of the ranked heap.  The remainder
+    are returned in chronological order to compete on rank as an ordinary
+    candidate class.  ``recent_count <= 0`` sends everything to the ranked tier.
+    """
+    if not markers:
+        return [], []
+    ordered = sorted(markers, key=lambda unit: unit.order, reverse=True)
+    if recent_count <= 0:
+        return [], sorted(markers, key=lambda unit: unit.order)
+    # Recent tier: most-recent-first.  Ranked tier: chronological, so it can
+    # be appended to middle_units and compete as an ordinary candidate class.
+    recent = ordered[:recent_count]
+    ranked = sorted(ordered[recent_count:], key=lambda unit: unit.order)
+    return recent, ranked
+
+
+def _recent_markers_first(
+    ranked: list[tuple[_Unit, float]],
+    recent_markers: list[_Unit],
+) -> list[tuple[_Unit, float]]:
+    """Prepend the recent markers so they pack before the ranked heap.
+
+    "Unconditional" here is a selection-ORDER guarantee, not a budget
+    exemption: the recent markers are not ranked, they lead the packing order
+    in recency order — but the packer still stops at the budget, so a marker
+    can lose on a very tight window.  That is the hybrid Evan described: the
+    recent markers get priority, the rest compete, and nothing is exempt from
+    the real token budget.
+    """
+    return [(unit, float("inf")) for unit in recent_markers] + ranked
+
+
 def _message_units(
     messages: list[dict[str, Any]],
     start_index: int = 0,
@@ -1405,6 +1605,7 @@ def _semantic_rank_candidates(
             token_count=unit.token_count,
             role=unit.role,
             is_note=unit.is_note,
+            is_marker=unit.is_marker,
         )
         for unit in candidates
     ]
@@ -1415,6 +1616,7 @@ def _semantic_rank_candidates(
             token_count=unit.token_count,
             role=unit.role,
             is_note=unit.is_note,
+            is_marker=unit.is_marker,
         )
         for unit in reference_units
     ]
@@ -1437,6 +1639,7 @@ def _semantic_rank_candidates(
             order=item.unit.order,
             token_count=item.unit.token_count,
             is_note=item.unit.is_note,
+            is_marker=item.unit.is_marker,
             role=item.unit.role,
             semantic_chunk=item.chunk_index,
         )
@@ -1506,12 +1709,18 @@ def _rank_units(
     for unit in candidates:
         if _is_boilerplate_only(unit.text) or _is_fragment(unit.text):
             continue
-        # Notes and pruned-skill reload markers are protected content: they
-        # are short by nature ("Critical deployment note: never restart the
-        # database automatically.") and were never the junk this filter
-        # targets.  A length floor applied to them empties the emitted block
-        # and takes the whole fallback down with it.
-        protected = unit.is_note or bool(_PRUNED_SKILL_RE.search(unit.text))
+        # Notes, pruned-skill reload markers, and terminal decision markers are
+        # protected content: they are short by nature and were never the junk
+        # this filter targets.  A length floor applied to them empties the
+        # emitted block and takes the whole fallback down with it.  Terminal
+        # markers (the agent's own `=== label ===` + exit tombstone) are a
+        # decision spine, not prose — they must compete on rank, not be
+        # filtered for being terse.
+        protected = (
+            unit.is_note
+            or unit.is_marker
+            or bool(_PRUNED_SKILL_RE.search(unit.text))
+        )
         if not protected:
             if _is_narration(unit.text):
                 # "Let me check the code" / "Now let me see the bodies".
@@ -1773,6 +1982,7 @@ def _add_plan_lexrank_area(
     target_tokens: int,
     protected: list[_Unit] | None = None,
     selection_telemetry: dict[str, Any] | None = None,
+    marker_recent_count: int = 0,
 ) -> tuple[str, int]:
     """Spend the leftover plan budget on the ranked middle (Evan, 2026-09-15).
 
@@ -1801,6 +2011,11 @@ def _add_plan_lexrank_area(
             selection_telemetry["no_op_reason"] = "no_candidates"
         return summary, tail_start
     middle_units = _message_units(middle_messages, start_index=rank_start)
+    marker_units = _terminal_marker_units(middle_messages, start_index=rank_start)
+    recent_markers, rank_markers = _split_marker_tiers(
+        marker_units, marker_recent_count
+    )
+    middle_units = middle_units + rank_markers
     marker_notes = {note for note in notes if _PRUNED_SKILL_RE.fullmatch(note)}
     if marker_notes:
         middle_units = [
@@ -1817,12 +2032,13 @@ def _add_plan_lexrank_area(
         semantic=True,
         selection_telemetry=selection_telemetry,
     )
-    if not ranked:
+    if not ranked and not recent_markers:
         if selection_telemetry is not None:
             selection_telemetry["no_op_reason"] = (
                 selection_telemetry.get("no_op_reason") or "no_ranked_candidates"
             )
         return summary, tail_start
+    ranked = _recent_markers_first(ranked, recent_markers)
 
     # Do not spend heap budget re-stating the verbatim tail — it is already in
     # the window.  The plan/summary text is deliberately NOT a tier: it stands
@@ -1848,7 +2064,8 @@ def _add_plan_lexrank_area(
         initial=summary,
         render=lambda chosen: _with_lexrank_section(summary, chosen, protected),
         fits=lambda text: _fits(messages, head_count, tail_start, text, target_tokens),
-        accept=lambda unit: not _heap_repeat_covered(unit.text, outside_tiers),
+        accept=lambda unit: unit.is_marker
+        or not _heap_repeat_covered(unit.text, outside_tiers),
     )
     if selection_telemetry is not None:
         _record_selected_units(selection_telemetry, selected)
@@ -1895,6 +2112,7 @@ def build_internal_fallback(
     previous_summary: str = "",
     protected_memory: "ProtectedMemory | None" = None,
     session_subject: str = "",
+    marker_recent_count: int = 0,
 ) -> InternalFallback:
     """Build the last-resort local compression payload within ``target_tokens``.
 
@@ -1993,6 +2211,7 @@ def build_internal_fallback(
                 target_tokens=target_tokens,
                 protected=protected,
                 selection_telemetry=selection_telemetry,
+                marker_recent_count=marker_recent_count,
             )
             return make_result(summary, head_count, fitted_tail_start, "plan")
 
@@ -2022,6 +2241,7 @@ def build_internal_fallback(
             target_tokens=target_tokens,
             protected=protected,
             selection_telemetry=selection_telemetry,
+            marker_recent_count=marker_recent_count,
         )
         return make_result(
             summary,
@@ -2039,6 +2259,11 @@ def build_internal_fallback(
     rank_start = _plan_step_change_index(messages, head_count, tail_start)
     middle_messages = messages[rank_start:tail_start]
     middle_units = _message_units(middle_messages, start_index=rank_start)
+    marker_units = _terminal_marker_units(middle_messages, start_index=rank_start)
+    recent_markers, rank_markers = _split_marker_tiers(
+        marker_units, marker_recent_count
+    )
+    middle_units = middle_units + rank_markers
     marker_notes = {note for note in notes if _PRUNED_SKILL_RE.fullmatch(note)}
     if marker_notes:
         middle_units = [
@@ -2057,7 +2282,7 @@ def build_internal_fallback(
         )
         for index, note in enumerate(notes)
     ]
-    candidates = middle_units + note_units
+    candidates = middle_units + note_units + recent_markers
     if not candidates:
         selection_telemetry["no_op_reason"] = "no_candidates"
         summary = _lexrank_summary([], protected)
@@ -2076,6 +2301,7 @@ def build_internal_fallback(
         semantic=True,
         selection_telemetry=selection_telemetry,
     )
+    ranked = _recent_markers_first(ranked, recent_markers)
     # Same gate as the plan path: only the verbatim tail counts as a repeat
     # source.  Notes are exempt (they route separately below).
     # _content_text, not a raw join: multimodal messages carry `content` as a
@@ -2095,6 +2321,7 @@ def build_internal_fallback(
         render=lambda chosen: _lexrank_summary(chosen, protected),
         fits=lambda text: _fits(messages, head_count, tail_start, text, target_tokens),
         accept=lambda unit: unit.is_note
+        or unit.is_marker
         or not _heap_repeat_covered(unit.text, outside_tiers),
     )
     _record_selected_units(selection_telemetry, selected)

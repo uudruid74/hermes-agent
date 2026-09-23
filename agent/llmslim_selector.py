@@ -75,6 +75,7 @@ class SelectionUnit:
     token_count: int
     role: str = "unknown"
     is_note: bool = False
+    is_marker: bool = False
 
 
 @dataclass(frozen=True)
