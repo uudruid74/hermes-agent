@@ -30,17 +30,16 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Background-review aux-model selector + routed digest.
+# Background-review aux-model selector + pruned digest.
 #
-# The review fork runs on the MAIN model by default ("auto"), replaying the
-# full conversation — already warm in the prompt cache, so cheap cache reads.
-# Optimal and unchanged. A user can route the review to a different, cheaper
-# model via auxiliary.background_review.{provider,model}. A different model
-# cannot reuse the parent's cache (different key), so the fork is cold
-# regardless — replaying the full transcript would just cold-write it. So when
-# (and only when) routed to a different model, we replay a compact DIGEST to
-# minimise cold-written tokens. Same model -> full replay; different model ->
-# digest. That's the whole policy.
+# The review fork runs on the MAIN model by default ("auto") or on a cheaper
+# routed model (auxiliary.background_review.{provider,model}). On BOTH paths
+# the fork receives a PRUNED replay (_digest_history), not the raw snapshot:
+# full tool outputs in recent history routinely blow up small loaded contexts
+# (LM Studio: 326KB across 368 recent messages vs 78K loaded) and inflate
+# billed tokens on every API model. Pruning the digest bounds the review
+# prompt for everyone; only the input digest shrinks, never the review
+# instructions.
 # ---------------------------------------------------------------------------
 
 
@@ -120,22 +119,24 @@ def _msg_text(m: Dict) -> str:
     return ""
 
 
-def _digest_history(messages_snapshot: List[Dict], tail: int = 24) -> List[Dict]:
-    """Compact replay for the routed (different-model) path only.
+def _digest_history(messages_snapshot: List[Dict], tail: int = 10) -> List[Dict]:
+    """Compact, size-bounded replay for the background-review fork.
 
-    Keeps the recent ``tail`` messages verbatim, collapses older turns into one
-    synthetic user-role digest, preserving role alternation. Used ONLY when
-    routed to a different model (cache cold regardless, so fewer cold-written
-    tokens is a pure win). Never on the main-model path (full replay stays warm).
+    Keeps the recent ``tail`` messages pruned (tool outputs truncated to ~500
+    chars, first+last 250), collapses older turns into one synthetic user-role
+    digest, and caps the whole digest at ``_DIGEST_BUDGET`` chars with
+    oldest-truncated-first eviction. Used on EVERY review path — routed and
+    same-model — so review prompts stay inside small loaded contexts (LM Studio
+    overflow bug) and smaller on billed models.
     """
     msgs = list(messages_snapshot or [])
     if len(msgs) <= tail:
-        return msgs
+        return [_prune_msg(m) for m in msgs]
     keep = msgs[-tail:]
     while keep and isinstance(keep[0], dict) and keep[0].get("role") == "tool":
         tail += 1
         if len(msgs) <= tail:
-            return msgs
+            return [_prune_msg(m) for m in msgs]
         keep = msgs[-tail:]
     old = msgs[:-len(keep)]
     lines: List[str] = []
@@ -153,15 +154,148 @@ def _digest_history(messages_snapshot: List[Dict], tail: int = 24) -> List[Dict]
                 lines.append(f"ASSISTANT[tools: {', '.join(names)}]")
             if text:
                 lines.append(f"ASSISTANT: {text[:200]}")
+    # Hard budget: drop the OLDEST digest lines first so the most recent
+    # context always survives (spec: oldest-truncated-first eviction).
+    if lines:
+        budget = _DIGEST_BUDGET
+        lines.reverse()
+        kept: List[str] = []
+        used = 0
+        for line in lines:
+            cost = len(line) + 1
+            if used + cost > budget:
+                break
+            kept.append(line)
+            used += cost
+        kept.reverse()
+        lines = kept
+    digest_content = (
+        "[Earlier conversation digest — older turns summarised to bound the "
+        "review's input size. Recent turns follow below, with tool outputs "
+        "truncated.]\n" + "\n".join(lines)
+    )
     digest = {
         "role": "user",
-        "content": (
-            "[Earlier conversation digest — older turns summarised to bound the "
-            "review's cold-write cost on the routed aux model. Recent turns "
-            "follow verbatim below.]\n" + "\n".join(lines)
-        ),
+        "content": digest_content,
     }
-    return [digest] + keep
+    return [digest] + [_prune_msg(m) for m in keep]
+
+
+_DIGEST_BUDGET = 8192  # hard char cap on the total digest (spec: ~8K chars)
+_TOOL_OUTPUT_TAIL = 250  # chars kept from each edge of a truncated tool output
+_TOOL_OUTPUT_MAX = 500  # 2 * _TOOL_OUTPUT_TAIL (spec: ~500 chars total)
+_TOOL_REPEAT_CAP = 20  # identical consecutive tool outputs collapsed to one
+
+
+def _slice_keep(text: str, limit: int) -> str:
+    """First ``limit//2`` + last ``limit//2`` chars, with an ellipsis between."""
+    if len(text) <= limit:
+        return text
+    half = max(1, limit // 2)
+    return text[:half] + f" …[{len(text) - limit} chars truncated]… " + text[-half:]
+
+
+def _prune_msg(m: Dict) -> Dict:
+    """Return ``m`` with massive/duplicated tool outputs shrunk in place.
+
+    - Tool content over ``_TOOL_OUTPUT_MAX`` chars is reduced to first+last
+      ``_TOOL_OUTPUT_TAIL`` chars (spec item 1).
+    - Runs of identical consecutive tool outputs collapse to one line listing
+      the repeat count (spec item 1).
+    - Everything else is returned unchanged (roles, tool_calls, ordering).
+    """
+    if not isinstance(m, dict):
+        return m
+    content = m.get("content")
+    if isinstance(content, str) or not isinstance(content, list):
+        return m  # tool payloads live in the list form; nothing to do here
+    new_blocks: List[Dict] = []
+    last_tool_text: Optional[str] = None
+    repeated = 0
+    for block in content:
+        if not isinstance(block, dict):
+            new_blocks.append(block)
+            continue
+        if block.get("type") == "tool_result":
+            tc = block.get("tool_call_id")
+            base = {
+                "type": "tool_result",
+                "tool_call_id": tc or "",
+                "is_error": block.get("is_error", False),
+            }
+            tc_text = _block_text(block)
+            # Collapse a run of identical consecutive tool outputs to one line.
+            if tc_text and tc_text == last_tool_text:
+                repeated += 1
+                continue
+            if repeated:
+                new_blocks[-1]["content"] = (
+                    f"[{repeated + 1}× identical] " + str(new_blocks[-1].get("content", ""))
+                )
+                repeated = 0
+            if tc_text and len(tc_text) > _TOOL_OUTPUT_MAX:
+                base["content"] = _slice_keep(tc_text, _TOOL_OUTPUT_MAX)
+            else:
+                base["content"] = block.get("content")
+            new_blocks.append(base)
+            last_tool_text = tc_text if tc_text else None
+        else:
+            new_blocks.append(block)
+    if repeated:
+        new_blocks[-1]["content"] = (
+            f"[{repeated + 1}× identical] " + str(new_blocks[-1].get("content", ""))
+        )
+    m = dict(m)
+    m["content"] = new_blocks
+    return m
+
+
+def _block_text(block: Dict) -> str:
+    """Plain-text view of one content block (both OpenAI 'text' and tool shapes)."""
+    c = block.get("content")
+    if isinstance(c, str):
+        return c.strip()
+    if isinstance(c, list):
+        return " ".join(b.get("text", "") for b in c if isinstance(b, dict)).strip()
+    return ""
+
+
+def _digest_exceeds_loaded_ctx(history: List[Dict], runtime: Dict) -> bool:
+    """True when the pruned history would overflow the review model's loaded ctx.
+
+    Self-check used only for LM Studio endpoints (provider ``lmstudio`` /
+    ``lm_studio`` or a loopback base_url): queries ``GET /api/v0/models`` and
+    compares the digest size against 60% of ``loaded_context_length``. Returns
+    False for every other provider — API models bill the digest at ~4 chars
+    per token but never 500 on it. Failures (network, missing JSON) return
+    False so the review still runs rather than being skipped on a flaky probe.
+    """
+    provider = str(runtime.get("provider") or "").lower()
+    base_url = str(runtime.get("base_url") or "")
+    is_lmstudio = provider in {"lmstudio", "lm_studio", "local"} or "127.0.0.1" in base_url or "localhost" in base_url
+    if not is_lmstudio:
+        return False
+    digest_chars = sum(
+        len(_msg_text(m)) + 300 for m in history if isinstance(m, dict)
+    ) + 2000  # system prompt + review instructions + tool defs headroom
+    try:
+        import urllib.request
+
+        endpoint = base_url.rstrip("/") + "/api/v0/models"
+        with urllib.request.urlopen(endpoint, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        models = data.get("data") or []
+        loaded_ctx = 0
+        for model in models:
+            lcl = (model or {}).get("loaded_context_length") or 0
+            if lcl:
+                loaded_ctx = lcl
+                break
+        if not loaded_ctx:
+            return False
+        return digest_chars > 0.6 * loaded_ctx
+    except Exception:
+        return False
 
 
 # Review-prompt strings — used by ``spawn_background_review_thread`` to build
@@ -915,22 +1049,35 @@ def _run_review_in_thread(
                 pass
 
             try:
-                # Routed to a different model -> replay a digest (cache is cold
-                # on that model anyway, so minimise cold-written tokens). Same
-                # model -> replay the full snapshot (warm cache reads).
-                _review_history = (
-                    _digest_history(messages_snapshot) if _routed
-                    else messages_snapshot
-                )
-                review_agent.run_conversation(
-                    user_message=(
-                        prompt
-                        + "\n\nYou can only call memory and skill "
-                        "management tools. Other tools will be denied "
-                        "at runtime — do not attempt them."
-                    ),
-                    conversation_history=_review_history,
-                )
+                # Always replay the PRUNED digest, routed or same-model: full
+                # recent tool outputs routinely overflow small loaded contexts
+                # (LM Studio) and inflate billed tokens on API models. The old
+                # routed-only digest is obsolete — pruning is cheaper for EVERY
+                # model. Optional pre-flight: when the fork targets an LM Studio
+                # endpoint, skip the review outright if the pruned digest would
+                # still exceed 60% of the model's *loaded* context (the 500
+                # error is otherwise unavoidable). Loaded ctx is queried fresh
+                # each run — a big model may be swapped into LM Studio later.
+                _review_history = _digest_history(messages_snapshot)
+                if _digest_exceeds_loaded_ctx(_review_history, _rt):
+                    logger.warning(
+                        "Skipping background review: pruned digest "
+                        "approaches the model's loaded context on %s "
+                        "(%s); refusing to send an overflowing prompt. "
+                        "Try loading a larger model in LM Studio.",
+                        _rt.get("provider"),
+                        _rt.get("model"),
+                    )
+                else:
+                    review_agent.run_conversation(
+                        user_message=(
+                            prompt
+                            + "\n\nYou can only call memory and skill "
+                            "management tools. Other tools will be denied "
+                            "at runtime — do not attempt them."
+                        ),
+                        conversation_history=_review_history,
+                    )
             finally:
                 clear_thread_tool_whitelist()
 
