@@ -652,23 +652,6 @@ def _close_plan_in_txn(
     ).rowcount
     if deleted != 1:
         raise BindingRevisionConflict("execution binding changed during closure")
-    # Delegated-plan completion (Evan, 2026-09-22): the origin routing on a
-    # plan task points at the DISPATCHER's session, so a plan close must
-    # fire the same kanban status notification a worker 'done' transition
-    # does — otherwise the dispatcher never learns the delegated work
-    # finished.  Best-effort: never fail the close over delivery.
-    try:
-        from hermes_cli.kanban import _notify_kanban_status_change
-
-        closed_row = _task_row(conn, current.task_id)
-        _notify_kanban_status_change(
-            current.task_id,
-            terminal_status,
-            summary=status_note or note,
-            title=closed_row["title"] if closed_row else None,
-        )
-    except Exception:  # noqa: BLE001 — notification must never block closure
-        pass
     return PlanStepResult(
         task_id=current.task_id,
         step_no=step_no,
@@ -691,6 +674,41 @@ def _clear_step_summary(
     conn.execute(
         "DELETE FROM task_comments WHERE task_id = ? AND body LIKE ?",
         (task_id, f"{marker}%"),
+    )
+
+
+def _notify_root_plan_closed(
+    conn: sqlite3.Connection,
+    result: PlanStepResult,
+    *,
+    outcome: PlanOutcome,
+) -> None:
+    """Notify the dispatcher after a root Plan close has committed."""
+    if not result.closed or result.restored_task_id is not None:
+        return
+
+    prefixes = {
+        "done": "Step % complete%",
+        "failed": "FAILED at Step %",
+        "test-complete": "TEST COMPLETE at Step %",
+    }
+    summary_row = conn.execute(
+        "SELECT body FROM task_comments WHERE task_id = ? AND body LIKE ? "
+        "ORDER BY id DESC LIMIT 1",
+        (result.task_id, prefixes[outcome]),
+    ).fetchone()
+    task = _task_row(conn, result.task_id)
+
+    # Import lazily to avoid the kanban -> execution_bindings cycle. The
+    # notifier owns best-effort error handling; most importantly, it opens its
+    # own Kanban connection only after the closing transaction has committed.
+    from hermes_cli.kanban import _notify_kanban_status_change
+
+    _notify_kanban_status_change(
+        result.task_id,
+        task["status"],
+        summary=summary_row["body"] if summary_row else None,
+        title=task["title"],
     )
 
 
@@ -738,7 +756,7 @@ def _step_receipts(conn: sqlite3.Connection, task_id: str) -> set[int]:
     return steps
 
 
-def advance_plan(
+def _advance_plan_transaction(
     conn: sqlite3.Connection,
     key: ExecutionKey,
     *,
@@ -877,6 +895,32 @@ def advance_plan(
         )
 
 
+def advance_plan(
+    conn: sqlite3.Connection,
+    key: ExecutionKey,
+    *,
+    expected_task_id: str,
+    expected_revision: int,
+    summary: str,
+    actor: str,
+    proof: Optional[str] = None,
+    step: Optional[int] = None,
+) -> PlanStepResult:
+    """Complete one step and notify only after a root Plan close commits."""
+    result = _advance_plan_transaction(
+        conn,
+        key,
+        expected_task_id=expected_task_id,
+        expected_revision=expected_revision,
+        summary=summary,
+        actor=actor,
+        proof=proof,
+        step=step,
+    )
+    _notify_root_plan_closed(conn, result, outcome="done")
+    return result
+
+
 def handoff_plan(
     conn: sqlite3.Connection,
     key: ExecutionKey,
@@ -996,7 +1040,7 @@ def close_plan(
         current = _assert_expected_binding(
             conn, key, expected_task_id, expected_revision
         )
-        return _close_plan_in_txn(
+        result = _close_plan_in_txn(
             conn,
             key,
             current,
@@ -1004,3 +1048,6 @@ def close_plan(
             reason=reason,
             actor=actor,
         )
+
+    _notify_root_plan_closed(conn, result, outcome=outcome)
+    return result

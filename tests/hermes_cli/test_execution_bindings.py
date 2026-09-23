@@ -248,10 +248,15 @@ def test_every_terminal_outcome_restores_the_same_parent(
         ).fetchone()
 
 
-def test_final_advance_closes_root_and_removes_binding(tmp_path):
+def test_final_advance_closes_root_and_removes_binding(tmp_path, monkeypatch):
     with kb.connect(tmp_path / "kanban.db") as conn:
         _insert_task(conn, "t_plan")
         current = bindings.bootstrap_worker_binding(conn, _key(), "t_plan")
+        transaction_states: list[bool] = []
+        monkeypatch.setattr(
+            "hermes_cli.kanban._notify_kanban_status_change",
+            lambda *_args, **_kwargs: transaction_states.append(conn.in_transaction),
+        )
 
         result = bindings.advance_plan(
             conn,
@@ -271,6 +276,33 @@ def test_final_advance_closes_root_and_removes_binding(tmp_path):
         ).fetchone()
         assert row["status"] == "done"
         assert row["task_stepno"] is None
+        assert transaction_states == [False]
+
+
+def test_root_close_notifies_only_after_transaction_commits(tmp_path, monkeypatch):
+    """Notification must never run while close_plan owns the Kanban write lock."""
+    with kb.connect(tmp_path / "kanban.db") as conn:
+        _insert_task(conn, "t_root")
+        current = bindings.bootstrap_worker_binding(conn, _key(), "t_root")
+        transaction_states: list[bool] = []
+        monkeypatch.setattr(
+            "hermes_cli.kanban._notify_kanban_status_change",
+            lambda *_args, **_kwargs: transaction_states.append(conn.in_transaction),
+        )
+
+        result = bindings.close_plan(
+            conn,
+            _key(),
+            expected_task_id="t_root",
+            expected_revision=current.revision,
+            outcome="failed",
+            reason="controlled failure",
+            actor="Wintermute",
+        )
+
+        assert result.closed is True
+        assert result.restored_task_id is None
+        assert transaction_states == [False]
 
 
 def test_stale_compare_and_set_does_not_mutate_plan(tmp_path):
