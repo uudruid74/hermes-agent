@@ -2100,6 +2100,29 @@ def _lexrank_summary(
     return "\n\n".join(parts)
 
 
+def _with_prior_summary(summary: str, previous_summary: str) -> str:
+    """Fold a recovered fossil summary into the fallback payload body.
+
+    The restart self-heal scan rehydrates a prior handoff into
+    ``_previous_summary``, which reaches ``build_internal_fallback`` as
+    ``previous_summary``.  The fallback must carry that durable local summary
+    forward — otherwise a resume followed by a fallback compression silently
+    drops the whole prior compaction, stranding the model mid-task.
+    ``_session_notes`` already mines it for pruned-skill markers; this is the
+    full-body fold that keeps the canonical summary alive.
+    """
+    prior = (previous_summary or "").strip()
+    if not prior:
+        return summary
+    block = f"## Prior Context Summary\n{prior}"
+    if VERBATIM_CONTEXT_MARKER in summary:
+        head, _, rest = summary.partition(VERBATIM_CONTEXT_MARKER)
+        return (
+            head.rstrip() + "\n\n" + block + "\n\n" + VERBATIM_CONTEXT_MARKER + rest
+        )
+    return summary.rstrip() + "\n\n" + block
+
+
 def build_internal_fallback(
     messages: list[dict[str, Any]],
     *,
@@ -2166,6 +2189,7 @@ def build_internal_fallback(
         result_tail_start: int,
         mode: str,
     ) -> InternalFallback:
+        summary = _with_prior_summary(summary, previous_summary)
         assembled_tokens = (
             estimate_messages_tokens_rough(
                 [
