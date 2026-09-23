@@ -147,7 +147,7 @@ def _resolve_temp(temp: Optional[str], agent) -> Optional[float]:
     config_path = os.path.expanduser(f"~/.hermes/profiles/{profile}/config.yaml")
     try:
         import yaml
-        with open(config_path) as f:
+        with open(config_path, encoding="utf-8") as f:
             cfg = yaml.safe_load(f) or {}
         temps = cfg.get("temperature_map", {}) or cfg.get("temperatures", {})
         return temps.get(temp)
@@ -788,7 +788,7 @@ def _cmd_cron(agent, cron: str, root: str, title: str, goal: str,
             f"if __name__ == '__main__':\n"
             f"    fire_plan_cron({task_id!r})\n"
         )
-        with open(fire_script_path, "w") as f:
+        with open(fire_script_path, "w", encoding="utf-8") as f:
             f.write(_fire_script_content)
         job = create_job(
             prompt=None,
