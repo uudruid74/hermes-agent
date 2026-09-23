@@ -12,17 +12,15 @@ These tests exist so that gap cannot reopen: they exercise each creation path
 against a temp copy of a real board and assert on the STORED row, not on the
 function's return value.
 
-2026-09-19 addition — the two-phase ADVANCE gate
-------------------------------------------------
-``execution_bindings.advance_plan`` (Evan, 2026-09-15) refuses to move a step on
-a bare claim: without ``proof`` the step is recorded and returned unchanged, and
-a ``RECEIPT:n:<proof>`` comment is what actually advances it.
+2026-09-23 addition — the reviewed ADVANCE gate
+-----------------------------------------------
+``execution_bindings.advance_plan`` records one summary and leaves the step in
+place until the dispatcher or user resolves the durable pending review.
 
 Live ``advance`` calls do NOT resolve to ``plan_tool._cmd_advance`` — the
 adapter in :mod:`tools.plan_binding_adapter` SHADOWS it, so that module's
-forwarding of ``proof``/``step`` is the only thing standing between a correct
-call and a silently-recorded claim.  That is a one-line refactor away from being
-dropped, with no visible symptom except "my proven step won't advance".  The
+forwarding of ``step`` is what prevents a stale worker from submitting a summary
+for the wrong step.  The
 tests below drive the REAL ``advance_plan`` against a real binding row and pin
 the forwarding contract on the adapter, not on the legacy helper.
 """
@@ -315,43 +313,39 @@ def bound_plan(board):
     return conn, B, key, task_id, row["revision"]
 
 
-def test_bare_claim_does_not_advance(bound_plan):
-    """No proof => the step is recorded as a claim and comes back unchanged."""
+def test_summary_creates_pending_review_without_advancing(bound_plan):
+    """The worker's single summary holds the step for review."""
     conn, B, key, task_id, revision = bound_plan
     result = B.advance_plan(
         conn, key, expected_task_id=task_id, expected_revision=revision,
-        summary="claim only", actor="gopher", proof=None, step=1,
+        summary="claim only", actor="gopher", step=1,
     )
     assert result.binding_revision == revision, "a bare claim must not move the step"
     assert not result.closed
-    assert B._step_receipts(conn, task_id) == set()
+    assert B.pending_step_review(conn, task_id).summary == "claim only"
 
 
-def test_proof_advances_and_writes_a_receipt(bound_plan):
-    """Proof => the step closes and a RECEIPT comment lands on the task row."""
+def test_approval_closes_a_one_step_plan(bound_plan):
+    """Only review approval closes the one-step Plan."""
     conn, B, key, task_id, revision = bound_plan
-    result = B.advance_plan(
+    B.advance_plan(
         conn, key, expected_task_id=task_id, expected_revision=revision,
-        summary="verified", actor="gopher", proof="git commit 09f34a1", step=1,
+        summary="verified", actor="gopher", step=1,
+    )
+    result = B.review_plan_step(
+        conn, task_id=task_id, decision="approved", reviewer="neo"
     )
     assert result.closed, "the last step of a one-step plan closes it"
-    receipts = B._step_receipts(conn, task_id)
-    assert receipts == {1}, "advancing with proof must record a receipt"
     stored = conn.execute(
         "SELECT body FROM task_comments WHERE task_id=? "
-        "AND body LIKE 'RECEIPT:%'",
+        "AND body LIKE '[plan-step-summary:1]%'",
         (task_id,),
     ).fetchone()["body"]
-    assert "09f34a1" in stored
+    assert "verified" in stored
 
 
-def test_adapter_forwards_proof_and_step(bound_plan, monkeypatch):
-    """The SHADOWING adapter must pass `proof` and `step` through.
-
-    This contract has no other guard: if a refactor calls the legacy helper
-    with ``summary`` alone, every proven advance degrades into a recorded
-    claim and the only symptom is a step that will not move.
-    """
+def test_adapter_forwards_step(bound_plan, monkeypatch):
+    """The SHADOWING adapter must pass the caller's step through."""
     conn, B, key, task_id, _revision = bound_plan
     from tools import plan_binding_adapter as adapter
 
@@ -377,9 +371,10 @@ def test_adapter_forwards_proof_and_step(bound_plan, monkeypatch):
         adapter, "_current", lambda c, a: (key, B.require_binding(c, key), None)
     )
     monkeypatch.setattr(adapter, "_sync_subject_from_binding", lambda agent: None)
+    monkeypatch.setattr(adapter, "_dispatcher_for_task", lambda *_args: "neo")
+    monkeypatch.setattr(adapter, "_send_user", lambda *_args: None)
 
-    adapter.cmd_advance(_Agent(), "verified step", proof="git commit 09f34a1", step=1)
-    assert seen.get("proof") == "git commit 09f34a1", "adapter dropped `proof`"
+    adapter.cmd_advance(_Agent(), "verified step", step=1)
     assert seen.get("step") == 1, "adapter dropped `step`"
 
 
@@ -389,5 +384,5 @@ def test_step_guard_refuses_a_drifted_step(bound_plan):
     with pytest.raises(B.InvalidTaskState):
         B.advance_plan(
             conn, key, expected_task_id=task_id, expected_revision=revision,
-            summary="lost agent", actor="gopher", proof="x", step=7,
+            summary="lost agent", actor="gopher", step=7,
         )

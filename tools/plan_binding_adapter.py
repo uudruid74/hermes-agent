@@ -8,11 +8,13 @@ module and ``hermes_cli.execution_bindings``.
 from __future__ import annotations
 
 import json
-import os
+import logging
 import sqlite3
 import time
 import uuid
-from typing import Optional
+from typing import Literal, Optional, cast
+
+logger = logging.getLogger(__name__)
 
 
 def _legacy():
@@ -128,8 +130,8 @@ def _insert_request(
         INSERT INTO tasks (
             id, title, body, status, assignee, created_at, task_steps,
             task_stepno, task_goal, block_kind, prev_temperature,
-            previous_task, session_id, board, plan_kind, pre_approved
-        ) VALUES (?, ?, ?, 'blocked', ?, ?, ?, 1, ?, 'approval', ?, ?, ?, ?, ?, ?)
+            previous_task, session_id, board, plan_kind, pre_approved, created_by
+        ) VALUES (?, ?, ?, 'blocked', ?, ?, ?, 1, ?, 'approval', ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             task_id,
@@ -145,6 +147,7 @@ def _insert_request(
             legacy._resolve_board(board),
             kind,
             int(bool(pre_approved)),
+            legacy._get_agent_name(agent),
         ),
     )
     plan_authorizations.create_pending_plan(
@@ -182,10 +185,18 @@ def _insert_request(
                     task_id,
                     platform="session",
                     chat_id=creator_session,
-                    profile=(os.environ.get("USERNAME") or "").strip() or "user",
+                    profile=legacy._get_agent_name(agent),
                 )
-        except (sqlite3.Error, ValueError, OSError, ImportError):
-            pass  # best-effort; status-notify falls back to session notices
+        except (sqlite3.Error, ValueError, OSError, ImportError) as exc:
+            # The durable created_by column is now the primary dispatcher
+            # source, so this comment is a fallback only.  Still, a silent
+            # failure here used to drop dispatcher routing with no signal —
+            # log it so the degradation is visible instead of invisible.
+            logger.warning(
+                "origin routing for plan %s could not be stored: %s",
+                task_id,
+                exc,
+            )
     if kind == "debug" and debug_plan_id:
         linked = conn.execute(
             "UPDATE tasks SET debug_plan_id=? WHERE id=?",
@@ -456,23 +467,12 @@ def _create_plan(
             "---\n"
             "If a reply is required, use the 'tell' command to reply."
         )
-        notify_result = "ok"
-        try:
-            import subprocess
+        # Fire-and-forget wake: the assignee is notified out-of-band, so the
+        # creator's tool loop never blocks on delivery. Delivery status lives
+        # in the durable task row, not in this synchronous call.
+        from hermes_cli._subprocess_compat import spawn_detached
 
-            proc = subprocess.run(
-                ["hermes", "send", "-u", assigned, wrapped],
-                capture_output=True,
-                text=True,
-                timeout=15,
-            )
-            if proc.returncode != 0:
-                notify_result = (
-                    f"tell failed (rc={proc.returncode}): "
-                    f"{(proc.stderr or proc.stdout or '').strip()[:200]}"
-                )
-        except (OSError, subprocess.SubprocessError) as exc:
-            notify_result = f"tell failed: {exc}"
+        spawn_detached(["hermes", "send", "-u", assigned, wrapped])
         # No binding activation on our side — surface the dispatch notice.
         # Evan's exact spec (2026-09-22): the creator sees ONLY the notify line.
         return f"{assigned} has been notified of task {task_id}"
@@ -492,23 +492,149 @@ def _current(conn, agent):
     return key, binding, None
 
 
-def cmd_advance(
-    agent, summary: str, proof: Optional[str] = None, step: Optional[int] = None
-) -> str:
-    """Complete the active plan step.
+def _dispatcher_for_task(conn, task_id: str) -> Optional[str]:
+    """Resolve the AI dispatcher that reviews this Plan's steps.
 
-    This adapter SHADOWS ``plan_tool._cmd_advance`` — live ``advance`` calls
-    resolve here, not to the legacy helper — so when the two-phase completion
-    gate (``execution_bindings.advance_plan``, Evan 2026-09-15) was added, it
-    became this function's job to forward ``proof``.  It does.
+    A delegated Plan has a creator distinct from its assignee — that creator
+    is the dispatcher.  A self-created Plan's creator IS its assignee, so
+    there is no AI dispatcher and the user becomes the approval gate.
 
-    Two-phase completion: without ``proof`` the step is recorded as a bare
-    claim and returned unchanged ("STEP n NOT ADVANCED — verify before
-    claiming"); with ``proof`` a ``RECEIPT:n:<proof>`` comment is written and
-    the step advances.  Both ``proof`` and ``step`` are load-bearing here —
-    ``step`` is what makes a drifted or duplicate advance refuse instead of
-    moving the plan forward.  Do not drop either when refactoring.
+    Prefer the durable ``tasks.created_by`` column (stamped unconditionally
+    at insert); fall back to the origin-routing system comment for legacy
+    Plans created before ``created_by`` was populated.
     """
+    task = conn.execute(
+        "SELECT created_by, assignee FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    creator = str(task["created_by"] or "").strip() if task is not None else ""
+    assignee = str(task["assignee"] or "").strip() if task is not None else ""
+    if creator and creator.casefold() != assignee.casefold():
+        return creator
+
+    from hermes_cli.kanban_db import get_origin_routing
+
+    origin = get_origin_routing(conn, task_id)
+    if not origin:
+        return None
+    dispatcher = str(origin.get("profile") or "").strip()
+    if dispatcher and dispatcher.casefold() != assignee.casefold():
+        return dispatcher
+    return None
+
+
+def _send_user(profile: str, message: str) -> Optional[str]:
+    from hermes_cli._subprocess_compat import spawn_detached
+
+    proc = spawn_detached(["hermes", "send", "-u", profile, message])
+    if proc is None:
+        # Spawn failure (binary missing, permission) — surfaced, not buried.
+        return f"failed to launch 'hermes send' for {profile}"
+    return None
+
+
+def _review_request_text(task, pending) -> str:
+    steps = json.loads(task["task_steps"] or "[]")
+    lines = [
+        f"{pending.worker} has completed step {pending.step_no}, task id {task['id']}",
+        "",
+        f"Goal: {task['task_goal'] or ''}",
+        "",
+        "Plan:",
+    ]
+    for index, step_text in enumerate(steps, 1):
+        marker = "[X]" if index < pending.step_no else "[-]" if index == pending.step_no else "[ ]"
+        lines.append(f"{marker} Step {index}: {step_text}")
+    lines.extend(
+        [
+            "",
+            "Summary:",
+            pending.summary,
+            "",
+            "Please make sure this step is completed correctly and approve or deny "
+            "this step using 'plan_tool review'. Pass the task id and decision "
+            "'approved' or 'denied'. A denial must include a reason.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _worker_review_message(task, result, reviewer: str, reason: Optional[str]) -> str:
+    steps = json.loads(task["task_steps"] or "[]")
+    if result.decision == "denied":
+        step_text = steps[result.reviewed_step - 1]
+        return (
+            f"Advancement has been denied. Reason: {reason}\n\n"
+            f"Goal: {task['task_goal'] or ''}\n"
+            f"Step {result.reviewed_step}: {step_text}\n\n"
+            "Please correct before attempting to advance again"
+        )
+    if result.closed:
+        return (
+            f"Task {task['id']} Step {result.reviewed_step} Approved by {reviewer}. "
+            "Plan complete."
+        )
+    return (
+        f"Task {task['id']} Step {result.reviewed_step} Approved by {reviewer}. "
+        f"Now complete Step {result.next_step_no}\n\n"
+        f"Goal: {task['task_goal'] or ''}\n"
+        f"Step {result.next_step_no}: {result.next_step}\n\n"
+        "Please work this step and when this step is complete, use plan_tool "
+        "to advance to the next"
+    )
+
+
+def _resolve_review(
+    agent,
+    conn,
+    *,
+    task_id: str,
+    decision: Literal["approved", "denied"],
+    reviewer: str,
+    reason: Optional[str],
+    notify_worker: bool,
+):
+    from hermes_cli import execution_bindings as bindings
+
+    try:
+        result = bindings.review_plan_step(
+            conn,
+            task_id=task_id,
+            decision=cast(Literal["approved", "denied"], decision),
+            reviewer=reviewer,
+            reason=reason,
+        )
+    except bindings.ExecutionBindingError as exc:
+        return f"ERROR: {exc}", None
+    task = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+    if result.closed and task["plan_kind"] == "debug":
+        source = conn.execute(
+            "SELECT assignee FROM tasks WHERE debug_plan_id=? "
+            "ORDER BY created_at DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        session_db = getattr(agent, "_session_db", None)
+        if source is not None and session_db is not None:
+            session_db.update_agent_rating(source["assignee"], 0.5)
+    message = _worker_review_message(task, result, reviewer, reason)
+    if notify_worker:
+        failure = _send_user(str(task["assignee"]), message)
+        if failure:
+            return f"ERROR: Review recorded, but worker notification failed: {failure}", result
+    else:
+        if result.decision == "approved":
+            _sync_subject_from_binding(agent)
+            if result.closed:
+                session_db = getattr(agent, "_session_db", None)
+                session_id = getattr(agent, "session_id", None)
+                set_task_id = getattr(session_db, "set_session_task_id", None)
+                if callable(set_task_id) and session_id:
+                    set_task_id(session_id, result.restored_task_id)
+                _request_completion_compression(agent)
+    return message, result
+
+
+def cmd_advance(agent, summary: str, step: Optional[int] = None) -> str:
+    """Submit one summary, then pause until dispatcher or user review."""
     from hermes_cli import execution_bindings as bindings
 
     conn = _legacy()._get_kanban_db()
@@ -525,58 +651,134 @@ def cmd_advance(
             expected_revision=binding.revision,
             summary=summary,
             actor=_legacy()._get_agent_name(agent),
-            proof=proof,
             step=step,
         )
     except bindings.ExecutionBindingError as exc:
         return f"ERROR: {exc}"
-    if result.closed:
-        task = conn.execute(
-            "SELECT title, task_goal, plan_kind FROM tasks WHERE id=?", (result.task_id,)
-        ).fetchone()
-        # Execution bindings are authoritative, but sessions.task_id remains a
-        # compatibility signal for session UI/context.  Mirror the atomic close:
-        # clear a finished root Plan or point at the restored parent Plan.
-        session_db = getattr(agent, "_session_db", None)
-        session_id = getattr(agent, "session_id", None)
-        set_task_id = getattr(session_db, "set_session_task_id", None)
-        if callable(set_task_id) and isinstance(session_id, str) and session_id:
-            set_task_id(session_id, result.restored_task_id)
-        if task["plan_kind"] == "debug":
-            source = conn.execute(
-                "SELECT assignee FROM tasks WHERE debug_plan_id=? ORDER BY created_at DESC LIMIT 1",
-                (result.task_id,),
-            ).fetchone()
-            session_db = getattr(agent, "_session_db", None)
-            if source is not None and session_db is not None:
-                session_db.update_agent_rating(source["assignee"], 0.5)
-        # Closing restores a parent Plan or leaves none — either way the
-        # active step is a different step (or there is no Plan).  Re-point the
-        # subject so the transition takes a FULL compaction; with no Plan the
-        # subject is CLEARED.  See _sync_subject_from_binding.
-        _sync_subject_from_binding(agent)
-        _request_completion_compression(agent)
-        return f"TASK COMPLETE ({result.task_id}): {task['title'] or result.task_id}"
-    if result.binding_revision == binding.revision:
-        # The step did NOT move — this is the verify-first response.
+
+    pending = bindings.pending_step_review(conn, result.task_id)
+    if pending is None:
+        return f"ERROR: Plan {result.task_id} did not create a pending review"
+    task = conn.execute("SELECT * FROM tasks WHERE id=?", (result.task_id,)).fetchone()
+    request = _review_request_text(task, pending)
+    dispatcher = _dispatcher_for_task(conn, result.task_id)
+    if dispatcher:
+        failure = _send_user(dispatcher, request)
+        suffix = f" Dispatcher notification failed: {failure}" if failure else ""
         return (
-            f"STEP {result.step_no} NOT ADVANCED — verify before claiming.\n\n"
-            f">>> STEP {result.step_no}: {result.next_step} <<<\n\n"
-            f"Return to the ground-truth source and confirm this step's goal is "
-            f"actually met. If it is, submit checkable proof by calling `advance` "
-            f"again for step {result.step_no} with `proof` — a git commit hash, a "
-            f"test result, a file path, or the command you ran and its output. A "
-            f"summary alone is a claim, not evidence.\n\n"
-            f"If the step is NOT done and needs real work, call `repeat` with "
-            f"step={result.step_no} plus a corrective plan (title, goal, steps) — "
-            f"that opens a child plan, and the parent resumes here when it "
-            f"completes."
+            f"Step {pending.step_no} summary submitted. Pause and wait for "
+            f"verification.{suffix}"
         )
-    # The active step moved — re-point the subject.  The verify-first branch
-    # above returns before this line and writes nothing, so a step that did
-    # not advance leaves the Protected area in place.
-    _sync_subject_from_binding(agent)
-    return f"Complete Step {result.step_no}: {result.next_step}"
+
+    callback = getattr(agent, "clarify_callback", None)
+    if callback is None:
+        return (
+            f"ERROR: Step {pending.step_no} summary submitted for plan "
+            f"{result.task_id}, but there is no dispatcher and no interactive "
+            "user session available to approve or deny it. This step is now "
+            "blocked with no reviewer — reopen this Plan from an interactive "
+            "session or assign a dispatcher before advancing again."
+        )
+    try:
+        response = json.loads(
+            _legacy().clarify_tool(
+                request,
+                choices=["Approve", "Deny"],
+                callback=callback,
+                agent=agent,
+                task_id=result.task_id,
+            )
+        ).get("user_response", "")
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        return (
+            f"Step {pending.step_no} summary submitted. Pause and wait for "
+            f"verification. User review is pending: {exc}"
+        )
+    if not response:
+        return (
+            f"Step {pending.step_no} summary submitted. Pause and wait for "
+            "verification. User review is pending."
+        )
+    decision = "approved" if str(response).strip().lower().startswith("appr") else "denied"
+    reason = None
+    if decision == "denied":
+        try:
+            reason = str(
+                json.loads(
+                    _legacy().clarify_tool(
+                        "Why is this step denied?",
+                        callback=callback,
+                        agent=agent,
+                        task_id=result.task_id,
+                    )
+                ).get("user_response", "")
+            ).strip()
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            return f"ERROR: Denial reason was not recorded: {exc}"
+        if not reason:
+            return "ERROR: denied review requires reason"
+        if len(reason) > 1024:
+            return "ERROR: review reason must be at most 1024 characters"
+    message, _reviewed = _resolve_review(
+        agent,
+        conn,
+        task_id=result.task_id,
+        decision=cast(Literal["approved", "denied"], decision),
+        reviewer="user",
+        reason=reason,
+        notify_worker=False,
+    )
+    return message
+
+
+def cmd_review(
+    agent, task_id: str, decision: str, reason: Optional[str] = None
+) -> str:
+    """Approve or deny the dispatcher-gated pending step review."""
+    from hermes_cli import execution_bindings as bindings
+
+    decision = (decision or "").strip().lower()
+    if decision not in {"approved", "denied"}:
+        return "ERROR: 'review' decision must be 'approved' or 'denied'"
+    reason = (reason or "").strip() or None
+    if decision == "denied" and reason is None:
+        return "ERROR: denied review requires reason"
+    if reason is not None and len(reason) > 1024:
+        return "ERROR: review reason must be at most 1024 characters"
+
+    conn = _legacy()._get_kanban_db()
+    task = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+    if task is None:
+        return f"ERROR: Task {task_id} not found"
+    dispatcher = _dispatcher_for_task(conn, task_id)
+    if not dispatcher:
+        return f"ERROR: Task {task_id} has no AI dispatcher; user review is required"
+    reviewer = _legacy()._get_agent_name(agent)
+    if reviewer.casefold() != dispatcher.casefold():
+        return f"ERROR: Task {task_id} must be reviewed by dispatcher {dispatcher}"
+
+    pending = bindings.pending_step_review(conn, task_id)
+    if pending is None:
+        return f"ERROR: Plan {task_id} has no pending review"
+    message, result = _resolve_review(
+        agent,
+        conn,
+        task_id=task_id,
+        decision=cast(Literal["approved", "denied"], decision),
+        reviewer=reviewer,
+        reason=reason,
+        notify_worker=True,
+    )
+    if result is None:
+        return message
+    if decision == "denied":
+        return f"Task {task_id} Step {result.reviewed_step} denied. Worker notified."
+    if result.closed:
+        return (
+            f"Task {task_id} Step {result.reviewed_step} approved. "
+            "Plan complete. Worker notified."
+        )
+    return f"Task {task_id} Step {result.reviewed_step} approved. Worker notified."
 
 
 def cmd_repeat(

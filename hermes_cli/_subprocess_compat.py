@@ -28,11 +28,14 @@ guarantee.
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import subprocess
 import sys
 from typing import Mapping, Sequence
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "IS_WINDOWS",
@@ -42,6 +45,7 @@ __all__ = [
     "windows_detach_flags_without_breakaway",
     "windows_hide_flags",
     "windows_detach_popen_kwargs",
+    "spawn_detached",
     "bounded_git_probe",
     "noninteractive_git_env",
 ]
@@ -297,6 +301,47 @@ def windows_detach_popen_kwargs() -> dict:
     if IS_WINDOWS:
         return {"creationflags": windows_detach_flags()}
     return {"start_new_session": True}
+
+
+def spawn_detached(
+    argv,
+    *,
+    env: "Mapping[str, str] | None" = None,
+) -> "subprocess.Popen | None":
+    """Fire-and-forget spawn: launch ``argv`` detached from the parent process
+    group and session, with stdio pointed at DEVNULL.
+
+    Returns the live ``Popen`` handle (rarely needed) or ``None`` when the
+    spawn itself fails with ``OSError``.  The spawned command's delivery
+    success/failure is NOT observable synchronously — use this only for
+    notifications whose state-of-record lives elsewhere (a durable DB row, a
+    queue) or whose ack is optional.  It is the safe replacement for the raw
+    ``fork()`` / trailing-``&`` pattern: no inherited fds (``close_fds=True``),
+    no zombie (Popen reaps on exit), no shell injection (argv list, not a
+    string).
+
+    Detachment uses :func:`windows_detach_popen_kwargs`: ``start_new_session``
+    on POSIX, the CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW |
+    CREATE_BREAKAWAY_FROM_JOB bundle on Windows.  ``env``, when given, replaces
+    the child environment (otherwise inherits ``os.environ``).
+    """
+    kwargs: dict = dict(
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+    )
+    if env is not None:
+        kwargs["env"] = env
+    kwargs.update(windows_detach_popen_kwargs())
+    try:
+        return subprocess.Popen(list(argv), **kwargs)
+    except OSError as exc:
+        # Spawn failure (binary missing, permission, ...) — log it, don't bury
+        # it.  The caller's contract is fire-and-forget, but a missing binary
+        # is a real misconfiguration worth surfacing in the logs.
+        logger.warning("spawn_detached: failed to launch %r: %s", list(argv), exc)
+        return None
 
 
 # -----------------------------------------------------------------------------

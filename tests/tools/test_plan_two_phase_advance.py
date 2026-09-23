@@ -1,13 +1,4 @@
-"""Two-phase `advance`: only proof moves a step. A claim holds it, forever.
-
-Regression target (2026-09-15): an agent advanced four steps in four minutes
-and then said "I did not actually fix Step 1."  The plan tool accepted every
-claim because a claim and a completed step looked identical.
-
-Evan's rule (2026-09-15): repeating a bare claim must NOT advance.  The only
-ways past a held step are `proof` on `advance`, or `repeat` to re-open the
-step as a corrective child plan.
-"""
+"""Corrective child Plans after a dispatcher or user denies advancement."""
 
 from __future__ import annotations
 
@@ -48,88 +39,17 @@ def _stepno(conn) -> int:
     return conn.execute("SELECT task_stepno FROM tasks WHERE status='manual'").fetchone()[0]
 
 
-def test_claim_without_proof_holds_the_step(monkeypatch):
-    conn, agent = _plan(monkeypatch, ["do one thing", "do another"])
-
-    result = plan_tool.plan_tool(agent, "advance", summary="finished step 1")
-
-    assert "NOT ADVANCED" in result
-    assert "STEP 1" in result
-    assert "proof" in result
-    assert _stepno(conn) == 1, "a bare claim must not move the step"
-
-
-def test_repeating_the_claim_still_does_not_advance(monkeypatch):
-    """Evan, 2026-09-15: a second bare claim is NOT an escape hatch."""
-    conn, agent = _plan(monkeypatch, ["do one thing", "do another"])
-
-    plan_tool.plan_tool(agent, "advance", summary="finished step 1")
-    result = plan_tool.plan_tool(agent, "advance", summary="finished step 1")
-
-    assert "NOT ADVANCED" in result
-    assert _stepno(conn) == 1
-    assert conn.execute(
-        "SELECT COUNT(*) FROM task_comments WHERE body LIKE 'RECEIPT:%'"
-    ).fetchone()[0] == 0
-
-
-def test_claim_records_the_summary_for_the_step(monkeypatch):
-    """The claim is not wasted: its summary lands on the step it claimed."""
-    conn, agent = _plan(monkeypatch, ["do one thing", "do another"])
-
-    plan_tool.plan_tool(agent, "advance", summary="wired the parser")
-
-    body = conn.execute(
-        "SELECT body FROM task_comments WHERE body LIKE '[plan-step-summary:1]%'"
-    ).fetchone()[0]
-    assert body == "[plan-step-summary:1] wired the parser"
-    assert _stepno(conn) == 1
-
-
-def test_proof_advances_immediately(monkeypatch):
-    conn, agent = _plan(monkeypatch, ["do one thing", "do another"])
-
-    result = plan_tool.plan_tool(
-        agent, "advance", summary="finished step 1", proof="commit abc1234"
-    )
-
-    assert result.startswith("Complete Step 2")
-    assert _stepno(conn) == 2
-    receipt = conn.execute(
-        "SELECT body FROM task_comments WHERE body LIKE 'RECEIPT:%'"
-    ).fetchone()
-    assert receipt[0] == "RECEIPT:1:commit abc1234"
-
-
-def test_final_step_with_proof_closes_the_plan(monkeypatch):
-    conn, agent = _plan(monkeypatch, ["only step"])
-
-    result = plan_tool.plan_tool(
-        agent, "advance", summary="done", proof="pytest: 12 passed"
-    )
-
-    assert "The task goal was:" in result
-    assert conn.execute("SELECT status FROM tasks").fetchone()[0] == "done"
-    assert conn.execute("SELECT COUNT(*) FROM execution_bindings").fetchone()[0] == 0
-
-
-def test_final_step_proof_is_still_recorded(monkeypatch):
-    """A close must not swallow the receipt for the step that closed it."""
-    conn, agent = _plan(monkeypatch, ["only step"])
-
-    plan_tool.plan_tool(agent, "advance", summary="done", proof="pytest: 12 passed")
-
-    body = conn.execute(
-        "SELECT body FROM task_comments WHERE body LIKE 'RECEIPT:%'"
-    ).fetchone()[0]
-    assert body == "RECEIPT:1:pytest: 12 passed"
-
-
 # --- repeat: re-open a step as a corrective child plan -------------------
 
 
 def _repeat_without_plan(monkeypatch):
     conn, agent = _plan(monkeypatch, ["do one thing", "do another"])
+    responses = iter(["Deny", "The step was not actually completed", "Approve", "Approve"])
+    monkeypatch.setattr(
+        plan_tool,
+        "clarify_tool",
+        lambda *_a, **_k: '{"user_response":"' + next(responses) + '"}',
+    )
     plan_tool.plan_tool(agent, "advance", summary="claimed it")
     return conn, agent
 
@@ -214,11 +134,9 @@ def test_child_completion_summary_returns_to_the_parent_step(monkeypatch):
         "SELECT previous_task FROM tasks WHERE previous_task IS NOT NULL"
     ).fetchone()[0]
 
-    result = plan_tool.plan_tool(
-        agent, "advance", summary="parser wired and tested", proof="pytest: 4 passed"
-    )
+    result = plan_tool.plan_tool(agent, "advance", summary="parser wired and tested")
 
-    assert "Continuing parent" in result or "The task goal was:" in result
+    assert "Approved by user" in result
     body = conn.execute(
         "SELECT body FROM task_comments WHERE task_id = ? "
         "AND body LIKE '[plan-step-summary:1]%'",
@@ -252,10 +170,11 @@ def test_repeat_defaults_to_the_active_step(monkeypatch):
     assert "requires title and goal" in result, "active step 1 is the default target"
 
 
-def test_schema_exposes_repeat_and_proof():
+def test_schema_exposes_repeat_and_review():
     schema = plan_tool.PLAN_TOOL_SCHEMA
     commands = schema["parameters"]["properties"]["command"]["enum"]
     properties = schema["parameters"]["properties"]
     assert "repeat" in commands
-    assert "proof" in properties
+    assert "review" in commands
+    assert "proof" not in properties
     assert "repeat" in properties["steps"]["description"]

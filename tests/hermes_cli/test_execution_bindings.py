@@ -177,23 +177,31 @@ def test_explicit_nested_activation_requires_exact_parent_and_revision(tmp_path)
         assert dict(row) == {"previous_task": "t_parent", "status": "manual"}
 
 
-def test_intermediate_advance_changes_step_and_binding_revision(tmp_path):
+def test_approved_review_changes_step_and_binding_revision(tmp_path):
     with kb.connect(tmp_path / "kanban.db") as conn:
         _insert_task(conn, "t_plan", steps=("first", "second"))
         current = bindings.bootstrap_worker_binding(conn, _key(), "t_plan")
 
-        result = bindings.advance_plan(
+        pending = bindings.advance_plan(
             conn,
             _key(),
             expected_task_id="t_plan",
             expected_revision=current.revision,
             summary="verified first",
             actor="Wintermute",
-            proof="pytest: 3 passed",
+        )
+        assert pending.step_no == 1
+        assert pending.binding_revision == current.revision
+
+        result = bindings.review_plan_step(
+            conn,
+            task_id="t_plan",
+            decision="approved",
+            reviewer="Neo",
         )
 
         assert result.closed is False
-        assert result.step_no == 2
+        assert result.next_step_no == 2
         assert result.next_step == "second"
         assert result.binding_revision == current.revision + 1
         assert conn.execute(
@@ -258,14 +266,20 @@ def test_final_advance_closes_root_and_removes_binding(tmp_path, monkeypatch):
             lambda *_args, **_kwargs: transaction_states.append(conn.in_transaction),
         )
 
-        result = bindings.advance_plan(
+        pending = bindings.advance_plan(
             conn,
             _key(),
             expected_task_id="t_plan",
             expected_revision=current.revision,
             summary="verified final step",
             actor="Wintermute",
-            proof="commit deadbeef",
+        )
+        assert pending.closed is False
+        result = bindings.review_plan_step(
+            conn,
+            task_id="t_plan",
+            decision="approved",
+            reviewer="Neo",
         )
 
         assert result.closed is True
@@ -343,7 +357,6 @@ def test_event_failure_rolls_back_task_binding_comment_and_event(tmp_path, monke
                 expected_revision=current.revision,
                 summary="must roll back",
                 actor="Wintermute",
-                proof="commit deadbeef",
             )
 
         assert conn.execute(

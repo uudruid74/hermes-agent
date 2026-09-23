@@ -1,7 +1,7 @@
 """
 plan_tool — Mandatory Action Protocol for Hermes agents.
 
-Commands: new, advance, handoff, continue, dispatch, remind, fail, approve
+Commands: new, advance, review, handoff, continue, dispatch, remind, fail, approve
 
 Default = Deny All. Without an active task_id in the session, file
 writes, cron creation, and kanban task creation are blocked. The Plan
@@ -1206,7 +1206,7 @@ def _cmd_archive(task_id: str) -> str:
 # Live Plan commands resolve identity only through execution bindings. The
 # legacy private helpers above remain provenance and are not dispatched.
 from tools.plan_binding_adapter import (
-    cmd_advance as _cmd_advance,
+    cmd_advance as _binding_cmd_advance,
     cmd_approve as _cmd_approve,
     cmd_archive as _cmd_archive_adapter,
     cmd_continue as _cmd_continue,
@@ -1215,8 +1215,13 @@ from tools.plan_binding_adapter import (
     cmd_new as _cmd_new,
     cmd_remind as _cmd_remind,
     cmd_repeat as _cmd_repeat,
+    cmd_review as _cmd_review,
     cmd_test_complete as _cmd_test_complete,
 )
+
+# Preserve the historical private name for callers/tests while live dispatch
+# uses the unambiguous adapter alias above.
+_cmd_advance = _binding_cmd_advance
 
 
 def plan_tool(
@@ -1239,14 +1244,15 @@ def plan_tool(
     debug_plan_id: Optional[str] = None,
     pre_approved: bool = False,
     parent_task_id: Optional[str] = None,
-    proof: Optional[str] = None,
     step: Optional[int] = None,
+    decision: Optional[str] = None,
 ) -> str:
     """Mandatory Action Protocol — multistep plan management.
 
     Commands:
       new           — present a plan for approval
-      advance       — record completed work and advance one step
+      advance       — submit one completed-step summary for review
+      review        — dispatcher approves or denies a pending step
       repeat        — re-open a step as a corrective child plan (needs a plan)
       handoff       — replace the current step's in-progress summary
       continue      — resume a task in the caller's current session
@@ -1275,12 +1281,18 @@ def plan_tool(
     elif command == "advance":
         if not summary or not summary.strip():
             return "ERROR: 'advance' requires summary"
-        return _cmd_advance(
+        return _binding_cmd_advance(
             agent,
             summary.strip(),
-            (proof or "").strip() or None,
-            step if isinstance(step, int) else None,
+            step=step if isinstance(step, int) else None,
         )
+
+    elif command == "review":
+        if not task_id:
+            return "ERROR: 'review' requires task_id"
+        if not decision:
+            return "ERROR: 'review' requires decision"
+        return _cmd_review(agent, task_id, decision, reason)
 
     elif command == "repeat":
         return _cmd_repeat(
@@ -1330,7 +1342,7 @@ def plan_tool(
         return _cmd_archive_adapter(agent, task_id)
 
     else:
-        return f"ERROR: Unknown plan command '{command}'. Valid: new, advance, handoff, continue, dispatch, remind, fail, test-complete, approve, block, archive, cron"
+        return f"ERROR: Unknown plan command '{command}'. Valid: new, advance, review, handoff, continue, dispatch, remind, fail, test-complete, approve, block, archive, cron"
 
 
 # --- Schema ---
@@ -1339,7 +1351,8 @@ PLAN_TOOL_SCHEMA = {
     "name": "plan_tool",
     "description": (
         "Mandatory Action Protocol — create and manage multistep plans. "
-        "Commands: new (present plan for approval), advance (record completed work and advance), "
+        "Commands: new (present plan for approval), advance (submit a completed-step summary for review), "
+        "review (approve or deny a pending step), "
         "repeat (re-open a step as a corrective child plan), "
         "handoff (record in-progress work), continue (resume a task in this session), "
         "dispatch (create kanban task), remind (show current plan), "
@@ -1354,8 +1367,8 @@ PLAN_TOOL_SCHEMA = {
         "properties": {
             "command": {
                 "type": "string",
-                "description": "Command: new, advance, repeat, handoff, continue, dispatch, remind, fail, test-complete, approve, block, archive, or cron",
-                "enum": ["new", "advance", "repeat", "handoff", "continue", "dispatch", "remind", "fail", "test-complete", "approve", "block", "archive", "cron"],
+                "description": "Command: new, advance, review, repeat, handoff, continue, dispatch, remind, fail, test-complete, approve, block, archive, or cron",
+                "enum": ["new", "advance", "review", "repeat", "handoff", "continue", "dispatch", "remind", "fail", "test-complete", "approve", "block", "archive", "cron"],
             },
             "title": {
                 "type": "string",
@@ -1376,11 +1389,12 @@ PLAN_TOOL_SCHEMA = {
             },
             "summary": {
                 "type": "string",
-                "description": "Required for 'advance' and 'handoff'. For 'advance', summarize the work completed in this step, including any files changed. For 'handoff', summarize what has been done and what remains to complete the current step.",
+                "description": "Required for 'advance' and 'handoff'. For 'advance', summarize what was done in this step, including any files changed. This single summary is submitted to the dispatcher or user for review. For 'handoff', summarize what has been done and what remains to complete the current step.",
             },
-            "proof": {
+            "decision": {
                 "type": "string",
-                "description": "For 'advance': checkable evidence the step is actually complete — a git commit hash, a test result, a file path, or the command you ran and its output. Without proof the step is NOT advanced the first time you claim it: you get the step back with an instruction to verify against ground truth. A summary alone is a claim, not evidence.",
+                "enum": ["approved", "denied"],
+                "description": "Required for 'review': approve or deny the pending step advancement.",
             },
             "step": {
                 "type": "integer",
@@ -1400,11 +1414,11 @@ PLAN_TOOL_SCHEMA = {
             },
             "reason": {
                 "type": "string",
-                "description": "Failure reason for 'fail' command",
+                "description": "Failure reason for 'fail'. For a denied 'review', required and limited to 1024 characters.",
             },
             "task_id": {
                 "type": "string",
-                "description": "Task ID for 'continue', 'remind', 'approve', 'block', or 'archive' command. Optional for 'remind' and 'archive': when omitted, remind reclaims the most recent orphaned manual plan for this agent and archive closes the active (or orphaned) plan.",
+                "description": "Task ID for 'continue', 'remind', 'review', 'approve', 'block', or 'archive' command. Optional for 'remind' and 'archive': when omitted, remind reclaims the most recent orphaned manual plan for this agent and archive closes the active (or orphaned) plan.",
             },
             "board": {
                 "type": "string",
@@ -1467,8 +1481,8 @@ registry.register(
         debug_plan_id=args.get("debug_plan_id"),
         pre_approved=args.get("pre_approved", False),
         parent_task_id=args.get("parent_task_id"),
-        proof=args.get("proof"),
         step=args.get("step"),
+        decision=args.get("decision"),
     ),
     emoji="📋",
 )

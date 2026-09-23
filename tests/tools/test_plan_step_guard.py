@@ -36,20 +36,16 @@ def _plan(monkeypatch, steps):
 def test_matching_step_advances(monkeypatch):
     conn, agent = _plan(monkeypatch, ["one", "two"])
 
-    result = plan_tool.plan_tool(
-        agent, "advance", summary="did one", proof="commit abc", step=1
-    )
+    result = plan_tool.plan_tool(agent, "advance", summary="did one", step=1)
 
-    assert result.startswith("Complete Step 2")
+    assert "Now complete Step 2" in result
     assert conn.execute("SELECT task_stepno FROM tasks").fetchone()[0] == 2
 
 
 def test_wrong_step_is_refused_and_plan_does_not_move(monkeypatch):
     conn, agent = _plan(monkeypatch, ["one", "two"])
 
-    result = plan_tool.plan_tool(
-        agent, "advance", summary="did two", proof="commit abc", step=2
-    )
+    result = plan_tool.plan_tool(agent, "advance", summary="did two", step=2)
 
     assert "step 2 is not the active step" in result
     assert "remind" in result
@@ -57,7 +53,7 @@ def test_wrong_step_is_refused_and_plan_does_not_move(monkeypatch):
         "a drifted step claim must not move the plan"
     )
     assert conn.execute(
-        "SELECT COUNT(*) FROM task_comments WHERE body LIKE 'RECEIPT:%'"
+        "SELECT COUNT(*) FROM task_events WHERE kind='plan-step-review-pending'"
     ).fetchone()[0] == 0
 
 
@@ -65,14 +61,10 @@ def test_duplicate_advance_cannot_double_advance(monkeypatch):
     """The exact 2026-09-15 shape: the same call issued twice."""
     conn, agent = _plan(monkeypatch, ["one", "two", "three"])
 
-    first = plan_tool.plan_tool(
-        agent, "advance", summary="did one", proof="commit abc", step=1
-    )
-    second = plan_tool.plan_tool(
-        agent, "advance", summary="did one", proof="commit abc", step=1
-    )
+    first = plan_tool.plan_tool(agent, "advance", summary="did one", step=1)
+    second = plan_tool.plan_tool(agent, "advance", summary="did one", step=1)
 
-    assert first.startswith("Complete Step 2")
+    assert "Now complete Step 2" in first
     assert "not the active step" in second, "the repeat must be refused"
     assert conn.execute("SELECT task_stepno FROM tasks").fetchone()[0] == 2
 
@@ -80,9 +72,9 @@ def test_duplicate_advance_cannot_double_advance(monkeypatch):
 def test_omitting_step_still_works(monkeypatch):
     conn, agent = _plan(monkeypatch, ["one", "two"])
 
-    result = plan_tool.plan_tool(agent, "advance", summary="did one", proof="commit abc")
+    result = plan_tool.plan_tool(agent, "advance", summary="did one")
 
-    assert result.startswith("Complete Step 2")
+    assert "Now complete Step 2" in result
 
 
 def test_schema_exposes_step():

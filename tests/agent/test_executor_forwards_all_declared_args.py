@@ -19,13 +19,10 @@ That list is **hand-maintained**, and when a parameter was added to the schema
 and the tool function, nobody updated the middle.  Three live defects came from
 exactly this shape:
 
-  * ``plan_tool``: ``proof`` and ``step`` were declared in ``PLAN_TOOL_SCHEMA``
-    and accepted by ``plan_tool()``, but never forwarded.  Every ``advance``
-    reached the two-phase completion gate with ``proof=None``, so a step with a
-    commit hash + test result was recorded as a bare CLAIM and returned
-    unchanged — *"STEP n NOT ADVANCED — verify before claiming"* — and no
-    ``RECEIPT`` was ever written.  The gate was blamed for three calls before
-    the real cause was found.
+  * ``plan_tool``: command-specific parameters have repeatedly been declared in
+    ``PLAN_TOOL_SCHEMA`` and accepted by ``plan_tool()``, but omitted here.
+    The review gate now depends on both ``decision`` and ``step`` surviving this
+    forwarding path.
   * ``plan_tool``: ``parent_task_id`` — a nested sub-plan silently became a
     root plan.
   * ``session_search``: ``profile`` — cross-profile recall silently read the
@@ -140,23 +137,23 @@ def test_executor_forwards_all_declared_args(tool, forwarded):
         f"They are present in the schema and accepted by the tool, but the "
         f"hardcoded branch in tool_executor.py never forwards them — so the "
         f"tool silently behaves as if they were not supplied. This is how "
-        f"plan_tool lost `proof`/`step` (2026-09-19)."
+        f"plan_tool lost command-specific parameters (2026-09-19)."
     )
 
 
 def test_guard_is_load_bearing(monkeypatch, forwarded):
     """Prove the check fails when an arg is dropped — not just that it passes.
 
-    Reproduces the original defect shape in-memory: remove `proof` from the
+    Reproduces the original defect shape in-memory: remove `decision` from the
     forwarded set and confirm the comparison catches it. Without this the guard
     could pass for the wrong reason (e.g. schema resolution returning nothing).
     """
     if "plan_tool" not in forwarded:
         pytest.skip("plan_tool has no whitelist in this build")
     declared = _declared_args("tools.plan_tool", SCHEMAS["plan_tool"][1])
-    assert "proof" in declared, "fixture assumption: proof is a declared arg"
+    assert "decision" in declared, "fixture assumption: decision is a declared arg"
 
     mutated = dict(forwarded)
-    mutated["plan_tool"] = set(forwarded["plan_tool"]) - {"proof"}
+    mutated["plan_tool"] = set(forwarded["plan_tool"]) - {"decision"}
     dropped = sorted(declared - mutated["plan_tool"])
-    assert "proof" in dropped, "the guard must detect a dropped `proof`"
+    assert "decision" in dropped, "the guard must detect a dropped `decision`"

@@ -14,8 +14,9 @@ no secret agent-to-agent traffic.
 import json
 import logging
 import os
-import subprocess
 from typing import Callable
+
+from hermes_cli._subprocess_compat import spawn_detached
 
 logger = logging.getLogger(__name__)
 
@@ -51,19 +52,14 @@ def tell_tool(
     echo_callback(echo)
 
     target = f"{agent}:cli:{target_session_id}" if target_session_id else agent
-    result = subprocess.run(
-        ["hermes", "send", "-u", target, wrapped],
-        capture_output=True,
-        text=True,
-        timeout=15,
-    )
-    return json.dumps(
-        {
-            "returncode": result.returncode,
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-        }
-    )
+    # Fire-and-forget: the message is echoed + logged above (the mandatory
+    # transparency contract), then dispatched detached so the caller's tool
+    # loop never blocks on delivery. A spawn failure (binary missing) is the
+    # only synchronous error we can still observe and report.
+    proc = spawn_detached(["hermes", "send", "-u", target, wrapped])
+    if proc is None:
+        return json.dumps({"error": f"failed to launch 'hermes send' for {agent}"})
+    return json.dumps({"dispatched": True, "note": f"notified {agent}"})
 
 
 TELL_SCHEMA = {

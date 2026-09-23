@@ -184,14 +184,10 @@ def test_advance_closes_binding_and_records_required_summary(monkeypatch):
     task_id = conn.execute("SELECT task_id FROM execution_bindings").fetchone()[0]
 
     missing = plan_tool.plan_tool(agent, "advance")
-    held = plan_tool.plan_tool(agent, "advance", summary="Finished the only step")
-    advanced = plan_tool.plan_tool(
-        agent, "advance", summary="Finished the only step", proof="pytest: 6 passed"
-    )
+    advanced = plan_tool.plan_tool(agent, "advance", summary="Finished the only step")
 
     assert missing == "ERROR: 'advance' requires summary"
-    assert "NOT ADVANCED" in held, "a bare claim must not close the plan"
-    assert advanced == f"TASK COMPLETE ({task_id}): Finish"
+    assert f"Task {task_id} Step 1 Approved by user. Plan complete." == advanced
     assert conn.execute("SELECT status FROM tasks WHERE id=?", (task_id,)).fetchone()[0] == "done"
     assert conn.execute("SELECT COUNT(*) FROM execution_bindings").fetchone()[0] == 0
     body = conn.execute(
@@ -319,7 +315,6 @@ def test_continue_rebinds_session_and_agent_and_returns_step_summaries(monkeypat
         original,
         "advance",
         summary="Completed first step in tools/a.py",
-        proof="commit 17258c7",
     )
     plan_tool.plan_tool(original, "handoff", summary="Started second step in tests/test_a.py")
     resumed = SimpleNamespace(
@@ -457,10 +452,10 @@ def test_subject_tracks_the_active_step_and_changes_on_advance(monkeypatch):
     # Activation named step 1.
     assert agent.subjects[-1] == "Subject plan: inspect"
 
-    plan_tool.plan_tool(agent, "advance", summary="inspected", proof="ran it")
+    plan_tool.plan_tool(agent, "advance", summary="inspected")
     assert agent.subjects[-1] == "Subject plan: implement"
 
-    plan_tool.plan_tool(agent, "advance", summary="implemented", proof="ran it")
+    plan_tool.plan_tool(agent, "advance", summary="implemented")
     assert agent.subjects[-1] == "Subject plan: verify"
     assert not getattr(agent, "_force_compression_after_plan_completion", False)
 
@@ -468,8 +463,8 @@ def test_subject_tracks_the_active_step_and_changes_on_advance(monkeypatch):
     assert len(set(agent.subjects)) == len(agent.subjects)
 
 
-def test_step_that_did_not_advance_leaves_the_subject_alone(monkeypatch):
-    """Verify-first: a summary without proof must not fake a subject change.
+def test_step_awaiting_user_review_leaves_the_subject_alone(monkeypatch):
+    """A pending user review must not fake a subject change.
 
     A no-op write would be harmless (same value = cache preserved), but a
     wrong value would trigger a needless full compaction, so nothing is
@@ -478,10 +473,13 @@ def test_step_that_did_not_advance_leaves_the_subject_alone(monkeypatch):
     agent = _SubjectAgent()
     _start_plan(monkeypatch, agent, ["inspect", "implement"])
     assert agent.subjects[-1] == "Subject plan: inspect"
+    monkeypatch.setattr(
+        plan_tool, "clarify_tool", lambda *_a, **_k: '{"user_response":""}'
+    )
 
     result = plan_tool.plan_tool(agent, "advance", summary="claim only")
 
-    assert "NOT ADVANCED" in result
+    assert "wait for verification" in result
     assert agent.subjects[-1] == "Subject plan: inspect"
     assert agent.subjects.count("Subject plan: implement") == 0
 
@@ -496,7 +494,7 @@ def test_closing_the_plan_clears_the_subject(monkeypatch):
     _start_plan(monkeypatch, agent, ["only step"])
     assert agent.subjects[-1] == "Subject plan: only step"
 
-    plan_tool.plan_tool(agent, "advance", summary="finished", proof="ran it")
+    plan_tool.plan_tool(agent, "advance", summary="finished")
 
     assert agent.subjects[-1] == ""
     assert getattr(agent, "_force_compression_after_plan_completion", False) is True
@@ -510,11 +508,9 @@ def test_final_advance_clears_session_task_and_remind_has_no_active_plan(monkeyp
     # Compatibility state may still carry the Plan id from an older runtime.
     agent.task_ids.append(task_id)
 
-    result = plan_tool.plan_tool(
-        agent, "advance", summary="finished", proof="pytest: regression passed"
-    )
+    result = plan_tool.plan_tool(agent, "advance", summary="finished")
 
-    assert result == f"TASK COMPLETE ({task_id}): Subject plan"
+    assert result == f"Task {task_id} Step 1 Approved by user. Plan complete."
     assert agent.task_ids[-1] is None
     assert plan_tool.plan_tool(agent, "remind") == "No active plan."
 

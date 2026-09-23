@@ -8,8 +8,9 @@ import pytest
 from tools import tell_tool
 
 
-def _completed(*, returncode=0, stdout="sent\n", stderr=""):
-    return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
+def _spawned():
+    """A truthy stand-in for a live Popen handle (spawn succeeded)."""
+    return SimpleNamespace()
 
 
 def test_tell_wraps_message_and_targets_agent_profile(monkeypatch):
@@ -19,11 +20,11 @@ def test_tell_wraps_message_and_targets_agent_profile(monkeypatch):
     calls = []
     echoes = []
 
-    def fake_run(command, **kwargs):
-        calls.append((command, kwargs))
-        return _completed()
+    def fake_spawn(command, **_kwargs):
+        calls.append(command)
+        return _spawned()
 
-    monkeypatch.setattr(tell_tool.subprocess, "run", fake_run)
+    monkeypatch.setattr(tell_tool, "spawn_detached", fake_spawn)
 
     result = json.loads(
         tell_tool.tell_tool(
@@ -34,34 +35,31 @@ def test_tell_wraps_message_and_targets_agent_profile(monkeypatch):
     )
 
     assert calls == [
-        (
-            [
-                "hermes",
-                "send",
-                "-u",
-                "gopher",
-                "Incoming message from zephyr follows:\n"
-                "---\n"
-                "Check the relay.\n"
-                "---\n"
-                "If a reply is required, use the 'tell' command to reply.",
-            ],
-            {"capture_output": True, "text": True, "timeout": 15},
-        )
+        [
+            "hermes",
+            "send",
+            "-u",
+            "gopher",
+            "Incoming message from zephyr follows:\n"
+            "---\n"
+            "Check the relay.\n"
+            "---\n"
+            "If a reply is required, use the 'tell' command to reply.",
+        ]
     ]
     assert echoes == ["gopher: Check the relay."]
-    assert result == {"returncode": 0, "stdout": "sent\n", "stderr": ""}
+    assert result == {"dispatched": True, "note": "notified gopher"}
 
 
 def test_tell_routes_to_explicit_session_and_displays_reply_session(monkeypatch):
     monkeypatch.setenv("USERNAME", "zephyr")
     calls = []
 
-    def fake_run(command, **kwargs):
-        calls.append((command, kwargs))
-        return _completed()
+    def fake_spawn(command, **_kwargs):
+        calls.append(command)
+        return _spawned()
 
-    monkeypatch.setattr(tell_tool.subprocess, "run", fake_run)
+    monkeypatch.setattr(tell_tool, "spawn_detached", fake_spawn)
 
     tell_tool.tell_tool(
         agent="neo",
@@ -71,7 +69,7 @@ def test_tell_routes_to_explicit_session_and_displays_reply_session(monkeypatch)
         echo_callback=lambda _message: None,
     )
 
-    command = calls[0][0]
+    command = calls[0]
     assert command[:4] == [
         "hermes",
         "send",
@@ -114,9 +112,9 @@ def test_tell_reply_reaches_explicit_session_via_send_cli(monkeypatch, tmp_path)
         with pytest.raises(SystemExit) as exc:
             send_cmd.cmd_send(args)
         assert exc.value.code == 0
-        return _completed(returncode=0)
+        return _spawned()
 
-    monkeypatch.setattr(tell_tool.subprocess, "run", run_send_cli)
+    monkeypatch.setattr(tell_tool, "spawn_detached", run_send_cli)
 
     result = json.loads(
         tell_tool.tell_tool(
@@ -132,7 +130,7 @@ def test_tell_reply_reaches_explicit_session_via_send_cli(monkeypatch, tmp_path)
     notices = session_db.drain_session_notices(target_session)
     session_db.close()
 
-    assert result["returncode"] == 0
+    assert result == {"dispatched": True, "note": "notified neo"}
     assert len(notices) == 1
     assert "Round trip reply." in notices[0]["text"]
     assert "session_id='20260922_121500_receiver'" in notices[0]["text"]
@@ -144,11 +142,11 @@ def test_tell_does_not_fall_back_to_superseded_identity_vars(monkeypatch):
     monkeypatch.setenv("HERMES_PROFILE", "wrong-profile")
     calls = []
 
-    def fake_run(command, **_kwargs):
+    def fake_spawn(command, **_kwargs):
         calls.append(command)
-        return _completed()
+        return _spawned()
 
-    monkeypatch.setattr(tell_tool.subprocess, "run", fake_run)
+    monkeypatch.setattr(tell_tool, "spawn_detached", fake_spawn)
 
     result = json.loads(
         tell_tool.tell_tool(
@@ -158,7 +156,7 @@ def test_tell_does_not_fall_back_to_superseded_identity_vars(monkeypatch):
         )
     )
 
-    assert result["returncode"] == 0
+    assert result["dispatched"] is True
     assert "Incoming message from agent follows:" in calls[0][-1]
     assert "WrongAgent" not in calls[0][-1]
     assert "wrong-profile" not in calls[0][-1]
@@ -168,15 +166,15 @@ def test_tell_echoes_exact_message_to_origin_before_send(monkeypatch):
     events = []
     echoes = []
 
-    def fake_run(command, **kwargs):
+    def fake_spawn(command, **_kwargs):
         events.append("send")
-        return _completed()
+        return _spawned()
 
     def capture_echo(payload):
         events.append("echo")
         echoes.append(payload)
 
-    monkeypatch.setattr(tell_tool.subprocess, "run", fake_run)
+    monkeypatch.setattr(tell_tool, "spawn_detached", fake_spawn)
 
     tell_tool.tell_tool(
         agent="gopher",
@@ -190,7 +188,7 @@ def test_tell_echoes_exact_message_to_origin_before_send(monkeypatch):
 
 def test_tell_requires_echo_callback_and_does_not_send_without_one(monkeypatch):
     calls = []
-    monkeypatch.setattr(tell_tool.subprocess, "run", lambda *_a, **_kw: calls.append(True))
+    monkeypatch.setattr(tell_tool, "spawn_detached", lambda *_a, **_kw: calls.append(True))
 
     with pytest.raises(TypeError):
         tell_tool.tell_tool(agent="gopher", message="This must not be secret.")
@@ -200,7 +198,7 @@ def test_tell_requires_echo_callback_and_does_not_send_without_one(monkeypatch):
 
 def test_tell_does_not_send_when_origin_echo_delivery_fails(monkeypatch):
     calls = []
-    monkeypatch.setattr(tell_tool.subprocess, "run", lambda *_a, **_kw: calls.append(True))
+    monkeypatch.setattr(tell_tool, "spawn_detached", lambda *_a, **_kw: calls.append(True))
 
     def fail_echo(_message):
         raise RuntimeError("origin unavailable")
@@ -216,7 +214,7 @@ def test_tell_does_not_send_when_origin_echo_delivery_fails(monkeypatch):
 
 
 def test_tell_logs_exact_echo(monkeypatch):
-    monkeypatch.setattr(tell_tool.subprocess, "run", lambda *_args, **_kwargs: _completed())
+    monkeypatch.setattr(tell_tool, "spawn_detached", lambda *_args, **_kwargs: _spawned())
     logs = []
     monkeypatch.setattr(tell_tool.logger, "info", lambda *args, **_kwargs: logs.append(args))
 
@@ -229,17 +227,13 @@ def test_tell_logs_exact_echo(monkeypatch):
     assert logs == [("%s", "gopher: Check the relay.")]
 
 
-def test_tell_preserves_send_failure_result_and_echoes_first(monkeypatch):
+def test_tell_reports_spawn_failure_and_echoes_first(monkeypatch):
     echoes = []
 
-    def fake_run(command, **kwargs):
-        return _completed(
-            returncode=1,
-            stdout="",
-            stderr="hermes send: bridge socket missing\n",
-        )
+    def fake_spawn(command, **_kwargs):
+        return None  # spawn failure (binary missing, permission, ...)
 
-    monkeypatch.setattr(tell_tool.subprocess, "run", fake_run)
+    monkeypatch.setattr(tell_tool, "spawn_detached", fake_spawn)
 
     result = json.loads(
         tell_tool.tell_tool(
@@ -250,11 +244,7 @@ def test_tell_preserves_send_failure_result_and_echoes_first(monkeypatch):
     )
 
     assert echoes == ["zephyr: Are you there?"]
-    assert result == {
-        "returncode": 1,
-        "stdout": "",
-        "stderr": "hermes send: bridge socket missing\n",
-    }
+    assert result == {"error": "failed to launch 'hermes send' for zephyr"}
 
 
 def test_agent_runtime_routes_tell_to_mandatory_origin_callback(monkeypatch):
@@ -264,11 +254,11 @@ def test_agent_runtime_routes_tell_to_mandatory_origin_callback(monkeypatch):
     sent = []
     echoes = []
 
-    def fake_run(command, **kwargs):
+    def fake_spawn(command, **_kwargs):
         sent.append(command[-1])
-        return _completed()
+        return _spawned()
 
-    monkeypatch.setattr(tell_tool.subprocess, "run", fake_run)
+    monkeypatch.setattr(tell_tool, "spawn_detached", fake_spawn)
     agent = SimpleNamespace(
         _memory_manager=None,
         tell_echo_callback=echoes.append,
@@ -289,7 +279,7 @@ def test_agent_runtime_routes_tell_to_mandatory_origin_callback(monkeypatch):
 
     assert echoes == ["wintermute: Trace this."]
     assert sent and "Trace this." in sent[0]
-    assert result["returncode"] == 0
+    assert result["dispatched"] is True
 
 
 def test_agent_runtime_exposes_cron_session_id_for_a_reply(monkeypatch):
@@ -298,11 +288,11 @@ def test_agent_runtime_exposes_cron_session_id_for_a_reply(monkeypatch):
     monkeypatch.setenv("USERNAME", "neo")
     sent = []
 
-    def fake_run(command, **kwargs):
+    def fake_spawn(command, **_kwargs):
         sent.append(command)
-        return _completed()
+        return _spawned()
 
-    monkeypatch.setattr(tell_tool.subprocess, "run", fake_run)
+    monkeypatch.setattr(tell_tool, "spawn_detached", fake_spawn)
     agent = SimpleNamespace(
         _memory_manager=None,
         tell_echo_callback=lambda _message: None,
@@ -337,7 +327,7 @@ def test_agent_runtime_refuses_tell_without_origin_callback(monkeypatch):
     from agent.agent_runtime_helpers import invoke_tool
 
     calls = []
-    monkeypatch.setattr(tell_tool.subprocess, "run", lambda *_a, **_kw: calls.append(True))
+    monkeypatch.setattr(tell_tool, "spawn_detached", lambda *_a, **_kw: calls.append(True))
     agent = SimpleNamespace(_memory_manager=None, session_id="session-1")
 
     with pytest.raises(RuntimeError, match="origin echo callback"):

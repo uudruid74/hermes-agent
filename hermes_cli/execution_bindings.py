@@ -92,6 +92,30 @@ class PlanStepResult:
     binding_revision: Optional[int]
 
 
+@dataclass(frozen=True)
+class PendingStepReview:
+    event_id: int
+    task_id: str
+    step_no: int
+    summary: str
+    worker: str
+    profile: str
+    root_session_id: str
+    binding_revision: int
+
+
+@dataclass(frozen=True)
+class PlanReviewResult:
+    task_id: str
+    reviewed_step: int
+    next_step_no: Optional[int]
+    next_step: Optional[str]
+    closed: bool
+    restored_task_id: Optional[str]
+    binding_revision: Optional[int]
+    decision: Literal["approved", "denied"]
+
+
 PlanOutcome = Literal["done", "failed", "test-complete"]
 _EXECUTABLE_BOOTSTRAP_STATUSES = frozenset({"manual", "running"})
 
@@ -518,8 +542,6 @@ def _close_plan_in_txn(
         terminal_status = "done"
         event_kind = "plan-completed"
         note = f"Step {step_no} complete"
-        if status_note:
-            note += f" — {status_note}"
     elif outcome == "failed":
         terminal_status = "archived"
         event_kind = "plan-failed"
@@ -735,25 +757,34 @@ def _repeat_target(conn: sqlite3.Connection, task_id: str) -> Optional[tuple[str
         return None
 
 
-def _step_receipts(conn: sqlite3.Connection, task_id: str) -> set[int]:
-    """Return the step numbers that carry a completion receipt.
-
-    A receipt is an `advance` that supplied ``proof`` (a commit, a test
-    result, a file path — anything checkable).  A summary alone is a CLAIM;
-    this set is what separates a claim from evidence.
-    """
+def pending_step_review(
+    conn: sqlite3.Connection, task_id: str
+) -> Optional[PendingStepReview]:
+    """Return the latest unresolved review request for ``task_id``."""
     rows = conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND body LIKE 'RECEIPT:%'",
+        "SELECT id, kind, payload FROM task_events WHERE task_id = ? "
+        "AND kind IN ('plan-step-review-pending', 'plan-step-review-approved', "
+        "'plan-step-review-denied') ORDER BY id DESC",
         (task_id,),
     ).fetchall()
-    steps: set[int] = set()
-    for row in rows:
-        body = row["body"] if isinstance(row, sqlite3.Row) else row[0]
-        try:
-            steps.add(int(str(body).split(":", 2)[1]))
-        except (IndexError, ValueError):
-            continue
-    return steps
+    if not rows or rows[0]["kind"] != "plan-step-review-pending":
+        return None
+    try:
+        payload = json.loads(rows[0]["payload"] or "{}")
+        return PendingStepReview(
+            event_id=int(rows[0]["id"]),
+            task_id=task_id,
+            step_no=int(payload["step"]),
+            summary=str(payload["summary"]),
+            worker=str(payload["worker"]),
+            profile=str(payload["profile"]),
+            root_session_id=str(payload["root_session_id"]),
+            binding_revision=int(payload["binding_revision"]),
+        )
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise InvalidTaskState(
+            f"plan {task_id} has an invalid pending step review"
+        ) from exc
 
 
 def _advance_plan_transaction(
@@ -764,23 +795,9 @@ def _advance_plan_transaction(
     expected_revision: int,
     summary: str,
     actor: str,
-    proof: Optional[str] = None,
     step: Optional[int] = None,
 ) -> PlanStepResult:
-    """Complete one step, atomically advancing or closing the active Plan.
-
-    Two-phase completion (Evan, 2026-09-15): a plan step may not advance on a
-    bare claim.  ``advance`` without ``proof`` for a step that has no receipt
-    RECORDS the claim and returns the SAME step with an instruction to verify
-    against ground truth and resubmit.  Supplying ``proof`` (or re-claiming an
-    already-recorded claim) completes the step.  This catches the failure that
-    actually happened — Ornith advanced four steps in four minutes, then said
-    "I did not actually fix Step 1."
-
-    ``step`` is the caller stating which step it believes it is completing.
-    A mismatch is refused instead of advancing: an agent that has lost its
-    place must re-read ``remind``, not silently move the plan forward.
-    """
+    """Record one summary and hold the active step for independent review."""
     _validate_key(key)
     with write_txn(conn):
         current = _assert_expected_binding(
@@ -798,50 +815,9 @@ def _advance_plan_transaction(
                 f"(active: {step_no}) — call `remind` before advancing"
             )
         now = int(time.time())
-
-        # Two-phase completion (Evan, 2026-09-15).  A bare claim never moves the
-        # step: it is recorded as a summary and the SAME step comes back with an
-        # instruction to verify and resubmit WITH `proof`.  Only `proof` — or a
-        # receipt already on file — advances.  Repeating the claim no longer
-        # sneaks past the gate; the explicit escape hatch is `repeat`, which
-        # opens a corrective child plan.
-        if not proof:
-            if step_no not in _step_receipts(conn, current.task_id):
-                _set_step_summary(
-                    conn, current.task_id, step_no, summary, actor=actor, now=now
-                )
-                return PlanStepResult(
-                    task_id=current.task_id,
-                    step_no=step_no,
-                    next_step=steps[step_no - 1],
-                    closed=False,
-                    restored_task_id=None,
-                    binding_revision=current.revision,
-                )
-
-        if step_no == len(steps):
-            closed = _close_plan_in_txn(
-                conn,
-                key,
-                current,
-                outcome="done",
-                reason=None,
-                actor=actor,
-                status_note=summary,
-            )
-            if proof:
-                conn.execute(
-                    "INSERT INTO task_comments (task_id, author, body, created_at) "
-                    "VALUES (?, ?, ?, ?)",
-                    (current.task_id, actor, f"RECEIPT:{step_no}:{proof}", now),
-                )
-            return closed
-
-        if proof:
-            conn.execute(
-                "INSERT INTO task_comments (task_id, author, body, created_at) "
-                "VALUES (?, ?, ?, ?)",
-                (current.task_id, actor, f"RECEIPT:{step_no}:{proof}", now),
+        if pending_step_review(conn, current.task_id) is not None:
+            raise InvalidTaskState(
+                f"plan {current.task_id} Step {step_no} is already awaiting review"
             )
         _set_step_summary(
             conn,
@@ -851,47 +827,25 @@ def _advance_plan_transaction(
             actor=actor,
             now=now,
         )
-        changed = conn.execute(
-            "UPDATE tasks SET task_stepno = ? "
-            "WHERE id = ? AND status = 'manual' AND task_stepno = ?",
-            (step_no + 1, current.task_id, step_no),
-        ).rowcount
-        if changed != 1:
-            raise InvalidTaskState(f"plan {current.task_id} changed during advance")
-        new_revision = current.revision + 1
-        rebound = conn.execute(
-            "UPDATE execution_bindings SET revision = ?, updated_at = ? "
-            "WHERE profile = ? AND root_session_id = ? "
-            "AND task_id = ? AND revision = ?",
-            (
-                new_revision,
-                now,
-                key.profile,
-                key.root_session_id,
-                current.task_id,
-                current.revision,
-            ),
-        ).rowcount
-        if rebound != 1:
-            raise BindingRevisionConflict("execution binding changed during advance")
         _append_event(
             conn,
             current.task_id,
-            "plan-step-completed",
+            "plan-step-review-pending",
             payload={
-                **_binding_payload(key, new_revision),
-                "completed_step": step_no,
-                "next_step": step_no + 1,
+                **_binding_payload(key, current.revision),
+                "step": step_no,
+                "summary": summary,
+                "worker": actor,
             },
             now=now,
         )
         return PlanStepResult(
             task_id=current.task_id,
-            step_no=step_no + 1,
-            next_step=steps[step_no],
+            step_no=step_no,
+            next_step=steps[step_no - 1],
             closed=False,
             restored_task_id=None,
-            binding_revision=new_revision,
+            binding_revision=current.revision,
         )
 
 
@@ -903,21 +857,175 @@ def advance_plan(
     expected_revision: int,
     summary: str,
     actor: str,
-    proof: Optional[str] = None,
     step: Optional[int] = None,
 ) -> PlanStepResult:
-    """Complete one step and notify only after a root Plan close commits."""
-    result = _advance_plan_transaction(
+    """Submit one step summary for review without moving the Plan."""
+    return _advance_plan_transaction(
         conn,
         key,
         expected_task_id=expected_task_id,
         expected_revision=expected_revision,
         summary=summary,
         actor=actor,
-        proof=proof,
         step=step,
     )
-    _notify_root_plan_closed(conn, result, outcome="done")
+
+
+def review_plan_step(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    decision: Literal["approved", "denied"],
+    reviewer: str,
+    reason: Optional[str] = None,
+) -> PlanReviewResult:
+    """Resolve the current pending review and advance only on approval."""
+    if decision not in {"approved", "denied"}:
+        raise ValueError("decision must be 'approved' or 'denied'")
+    with write_txn(conn):
+        pending = pending_step_review(conn, task_id)
+        if pending is None:
+            raise InvalidTaskState(f"plan {task_id} has no pending review")
+        key = ExecutionKey(pending.profile, pending.root_session_id)
+        current = _assert_expected_binding(
+            conn, key, task_id, pending.binding_revision
+        )
+        task = _task_row(conn, task_id)
+        steps, step_no = _steps_for_task(task)
+        if step_no != pending.step_no:
+            raise InvalidTaskState(
+                f"pending review is stale for plan {task_id}: "
+                f"review Step {pending.step_no}, active Step {step_no}"
+            )
+        now = int(time.time())
+        if decision == "denied":
+            _append_event(
+                conn,
+                task_id,
+                "plan-step-review-denied",
+                payload={
+                    **_binding_payload(key, current.revision),
+                    "step": step_no,
+                    "review_event_id": pending.event_id,
+                    "reviewer": reviewer,
+                    "reason": reason or "",
+                },
+                now=now,
+            )
+            return PlanReviewResult(
+                task_id=task_id,
+                reviewed_step=step_no,
+                next_step_no=step_no,
+                next_step=steps[step_no - 1],
+                closed=False,
+                restored_task_id=None,
+                binding_revision=current.revision,
+                decision="denied",
+            )
+
+        if step_no == len(steps):
+            closed = _close_plan_in_txn(
+                conn,
+                key,
+                current,
+                outcome="done",
+                reason=None,
+                actor=pending.worker,
+                status_note=pending.summary,
+            )
+            _append_event(
+                conn,
+                task_id,
+                "plan-step-review-approved",
+                payload={
+                    **_binding_payload(key, current.revision),
+                    "step": step_no,
+                    "review_event_id": pending.event_id,
+                    "reviewer": reviewer,
+                },
+                now=now,
+            )
+            result = PlanReviewResult(
+                task_id=task_id,
+                reviewed_step=step_no,
+                next_step_no=None,
+                next_step=None,
+                closed=True,
+                restored_task_id=closed.restored_task_id,
+                binding_revision=closed.binding_revision,
+                decision="approved",
+            )
+        else:
+            changed = conn.execute(
+                "UPDATE tasks SET task_stepno = ? "
+                "WHERE id = ? AND status = 'manual' AND task_stepno = ?",
+                (step_no + 1, task_id, step_no),
+            ).rowcount
+            if changed != 1:
+                raise InvalidTaskState(f"plan {task_id} changed during review")
+            new_revision = current.revision + 1
+            rebound = conn.execute(
+                "UPDATE execution_bindings SET revision = ?, updated_at = ? "
+                "WHERE profile = ? AND root_session_id = ? "
+                "AND task_id = ? AND revision = ?",
+                (
+                    new_revision,
+                    now,
+                    key.profile,
+                    key.root_session_id,
+                    task_id,
+                    current.revision,
+                ),
+            ).rowcount
+            if rebound != 1:
+                raise BindingRevisionConflict("execution binding changed during review")
+            _append_event(
+                conn,
+                task_id,
+                "plan-step-completed",
+                payload={
+                    **_binding_payload(key, new_revision),
+                    "completed_step": step_no,
+                    "next_step": step_no + 1,
+                    "reviewer": reviewer,
+                },
+                now=now,
+            )
+            _append_event(
+                conn,
+                task_id,
+                "plan-step-review-approved",
+                payload={
+                    **_binding_payload(key, new_revision),
+                    "step": step_no,
+                    "review_event_id": pending.event_id,
+                    "reviewer": reviewer,
+                },
+                now=now,
+            )
+            result = PlanReviewResult(
+                task_id=task_id,
+                reviewed_step=step_no,
+                next_step_no=step_no + 1,
+                next_step=steps[step_no],
+                closed=False,
+                restored_task_id=None,
+                binding_revision=new_revision,
+                decision="approved",
+            )
+    if result.closed:
+        _notify_root_plan_closed(
+            conn,
+            PlanStepResult(
+                task_id=result.task_id,
+                step_no=result.reviewed_step,
+                next_step=None,
+                closed=True,
+                restored_task_id=result.restored_task_id,
+                binding_revision=result.binding_revision,
+            ),
+            outcome="done",
+        )
     return result
 
 
