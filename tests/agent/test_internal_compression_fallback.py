@@ -411,8 +411,8 @@ def test_context_compressor_uses_plan_fallback_after_all_summary_providers_fail(
         protect_first_n=1,
         protect_last_n=8,
     )
-    assert compressor.threshold_tokens == 64_000
-    assert compressor.tail_token_budget == 9_600
+    assert compressor.threshold_tokens == 62_464  # 78,080 * 0.80, no longer floored at 64K
+    assert compressor.tail_token_budget == 9_369  # 62,464 * 0.15
     monkeypatch.setattr(compressor, "_generate_summary", lambda *_args, **_kwargs: None)
     messages = _compressor_messages()
 

@@ -2815,6 +2815,57 @@ class TestRunConversation:
         assert "Ollama runtime context too small for Hermes tool use" in caplog.text
         assert "runtime_context=4096" in caplog.text
 
+    def test_lmstudio_small_runtime_context_fails_before_api_call(self, agent, caplog):
+        """LM Studio answers /api/show with a 200 error body, so the Ollama
+        num_ctx probe returns None. The guard must fall back to the compressor's
+        resolved context_length and fire for a small LM Studio window."""
+        self._setup_agent(agent)
+        agent.model = "qwen3.5:9b"
+        agent.provider = "lmstudio"
+        agent.base_url = "http://localhost:1234/v1"
+        # Probe came up empty (LM Studio, not Ollama) — the fallback path.
+        agent._ollama_num_ctx = None
+        # Simulate LM Studio running a 9B model with too little num_ctx.
+        agent.context_compressor.context_length = 4096
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            caplog.at_level(logging.WARNING, logger="agent.conversation_loop"),
+        ):
+            result = agent.run_conversation("Call ps -aux")
+
+        assert result["failed"] is True
+        assert result["completed"] is False
+        assert result["api_calls"] == 0
+        assert result["turn_exit_reason"] == "ollama_runtime_context_too_small"
+        assert "with only 4,096 tokens" in result["final_response"]
+        assert "model.ollama_num_ctx: 65536" in result["final_response"]
+        assert not agent.client.chat.completions.create.called
+        assert "runtime_context=4096" in caplog.text
+
+    def test_lmstudio_large_runtime_context_does_not_fire(self, agent, caplog):
+        """A healthy LM Studio window (>= MINIMUM_CONTEXT_LENGTH) must NOT trip
+        the Ollama guard — the fallback is a window check, not a provider check."""
+        self._setup_agent(agent)
+        agent.model = "qwen3.5:9b"
+        agent.provider = "lmstudio"
+        agent.base_url = "http://localhost:1234/v1"
+        agent._ollama_num_ctx = None
+        agent.context_compressor.context_length = 131072
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("Call ps -aux")
+
+        assert result["failed"] is False
+        assert result["turn_exit_reason"] != "ollama_runtime_context_too_small"
+        assert agent.client.chat.completions.create.called
+
     def test_tool_calls_then_stop(self, agent):
         self._setup_agent(agent)
         tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")

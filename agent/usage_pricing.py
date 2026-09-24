@@ -1207,6 +1207,7 @@ def normalize_usage(
     *,
     provider: Optional[str] = None,
     api_mode: Optional[str] = None,
+    reasoning_text: Optional[str] = None,
 ) -> CanonicalUsage:
     """Normalize raw API response usage into canonical token buckets.
 
@@ -1218,6 +1219,14 @@ def normalize_usage(
     In both Codex and OpenAI modes, input_tokens is derived by subtracting cache
     tokens from the total — the API contract is that input/prompt totals include
     cached tokens and the details object breaks them out.
+
+    ``reasoning_text`` is the raw, unstructured reasoning scratchpad some
+    providers (notably ollama-cloud) return as a bare ``message.reasoning``
+    string rather than in the usage object. Those routes report no
+    ``reasoning_tokens`` in ``response.usage`` at all, so reading only the usage
+    object left reasoning invisible in session accounting. When the structured
+    usage fields come up empty, the reasoning text is counted (rough token
+    estimate) so ollama-cloud reasoning shows up like every other provider.
     """
     if not response_usage:
         return CanonicalUsage()
@@ -1287,6 +1296,14 @@ def normalize_usage(
             reasoning_tokens = _to_int(
                 getattr(completion_details, "reasoning_tokens", 0)
             )
+    # ollama-cloud (and other bare-reasoning routes) report reasoning as a
+    # message.reasoning string, never in the usage object — so the structured
+    # fields above are empty. When no structured reasoning tokens were found,
+    # fall back to a rough token estimate of the raw reasoning text so the
+    # thinking still shows up in accounting. (Structured fields win when both
+    # are present, avoiding double-counting.)
+    if not reasoning_tokens and reasoning_text:
+        reasoning_tokens = _to_int(len(reasoning_text.strip()) / 4)
 
     return CanonicalUsage(
         input_tokens=input_tokens,

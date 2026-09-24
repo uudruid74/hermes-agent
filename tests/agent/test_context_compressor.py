@@ -625,6 +625,38 @@ class TestSummaryAccessFailureFallback:
         assert c._last_summary_fallback_used is True
         assert c._last_summary_dropped_count > 0
 
+    def test_internal_fallback_path_increments_compression_count(self):
+        """The deterministic internal fallback (the CPU-only last-resort
+        provider used when the summary model is unavailable) must increment the
+        SAME ``compression_count`` counter as the LLM summary path.
+
+        ``compression_count`` is incremented once per completed compaction in
+        ``compress()`` (context_compressor.py:6867), AFTER both the LLM path
+        (``_generate_summary``) and the fallback path
+        (``build_internal_fallback``) merge at the top of the assembly phase.
+        So a fallback-driven compaction is a real compaction and must count —
+        otherwise a session running on the internal fallback (e.g. an LLM-free
+        / internal_only deployment) silently under-reports its compactions, and
+        the "compressed N times" warning (#36908) never fires for it.
+        """
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=2,
+                protect_last_n=2,
+                abort_on_summary_failure=False,
+            )
+        assert c.compression_count == 0
+        msgs = self._msgs(12)
+        with patch("agent.context_compressor.call_llm", side_effect=RuntimeError("no provider")):
+            result = c.compress(msgs, current_tokens=999999, force=True)
+        # The fallback actually compacted the window.
+        assert result != msgs
+        assert c._last_summary_fallback_used is True
+        # And it counts exactly like the LLM path would.
+        assert c.compression_count == 1
+
     def test_402_quota_with_retry_uses_existing_fallback(self):
         """A reset-window quota remains transient instead of aborting compression."""
         err = StubProviderError(

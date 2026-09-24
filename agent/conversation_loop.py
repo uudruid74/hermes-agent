@@ -279,11 +279,31 @@ def _image_error_max_dimension(error: Exception) -> Optional[int]:
 
 
 def _ollama_context_limit_error(agent: Any, request_tokens: int) -> Optional[str]:
-    """Return a user-facing error when Ollama is loaded with too little context."""
+    """Return a user-facing error when the runtime context is too small.
+
+    Ollama defaults to 2048 tokens regardless of the model's capabilities, so
+    ``agent._ollama_num_ctx`` (from ``query_ollama_num_ctx``) is the authoritative
+    runtime context there. But that probe requires ``server_type == "ollama"`` —
+    LM Studio answers ``/api/show`` with a 200 *error body*, so detection returns
+    "lm-studio" and the probe returns None. Without a fallback, LM Studio users
+    running a 9B model with too little ``num_ctx`` blew out silently instead of
+    being told to raise it. For LM Studio (and any local provider where the
+    probe came up empty) fall back to the effective context length the
+    compressor resolved for this model — the same number that drives the
+    threshold — so the guard fires on the real window, not just on Ollama.
+    """
     if not getattr(agent, "tools", None):
         return None
 
     runtime_ctx = getattr(agent, "_ollama_num_ctx", None)
+    if not isinstance(runtime_ctx, int) or runtime_ctx <= 0:
+        # Ollama probe returned None (non-Ollama local server, e.g. LM Studio).
+        # Fall back to the effective context length the compressor resolved.
+        provider = (getattr(agent, "provider", "") or "").strip().lower()
+        if provider == "lmstudio" and getattr(agent, "context_compressor", None) is not None:
+            runtime_ctx = getattr(agent.context_compressor, "context_length", None)
+        else:
+            return None
     if not isinstance(runtime_ctx, int) or runtime_ctx <= 0:
         return None
     if runtime_ctx >= MINIMUM_CONTEXT_LENGTH:
@@ -3215,10 +3235,22 @@ def run_conversation(
                 
                 # Track actual token usage from response for context management
                 if hasattr(response, 'usage') and response.usage:
+                    # ollama-cloud returns reasoning as a bare
+                    # ``message.reasoning`` string rather than in the usage
+                    # object. Forward it so normalize_usage() can estimate
+                    # reasoning_tokens when the structured usage fields are empty.
+                    _reasoning_text = None
+                    try:
+                        _choice = response.choices[0] if response.choices else None
+                        _msg = getattr(_choice, "message", None) if _choice is not None else None
+                        _reasoning_text = getattr(_msg, "reasoning", None)
+                    except Exception:
+                        _reasoning_text = None
                     canonical_usage = normalize_usage(
                         response.usage,
                         provider=agent.provider,
                         api_mode=agent.api_mode,
+                        reasoning_text=_reasoning_text,
                     )
                     # Aggregator-only usage is retained for cost pricing: MoA
                     # advisor tokens must be priced at each advisor's OWN model

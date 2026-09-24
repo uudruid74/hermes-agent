@@ -2245,12 +2245,25 @@ class ContextCompressor(ContextEngine):
         if effective_window <= 0:
             effective_window = context_length
         pct_value = int(effective_window * threshold_percent)
-        floored = max(pct_value, MINIMUM_CONTEXT_LENGTH)
-        # If flooring pushed the threshold to/over the effective window it can
+        # No longer floors at MINIMUM_CONTEXT_LENGTH. That hardcoded 64K floor
+        # pinned the trigger to a fixed absolute value regardless of window, so
+        # a window just above the minimum (e.g. 78,080 at 50%) compressed at
+        # ~82% of the window instead of its configured percentage — leaving too
+        # little headroom for the provider's output reservation and letting the
+        # session ride into a provider 400 before compaction fired. The
+        # threshold now derives from the real effective window. The guard below
+        # still lifts at/below-minimum windows to 85% so a tiny model does not
+        # fire the summary model with half its budget free (#14690).
+        floored = pct_value
+        # If the threshold would meet/exceed the effective window (percentage
+        # ~100%) OR the window is at/below the minimum context length, it can
         # never be reached. Trigger at 85% of the effective input budget so a
         # minimum-context model rides most of its budget before compacting
         # instead of wasting half.
-        if effective_window > 0 and floored >= effective_window:
+        if effective_window > 0 and (
+            floored >= effective_window
+            or effective_window <= MINIMUM_CONTEXT_LENGTH
+        ):
             return max(1, min(int(effective_window * ContextCompressor._MIN_CTX_TRIGGER_RATIO),
                               effective_window - 1))
         return floored
@@ -6755,14 +6768,35 @@ This compaction should PRIORITISE preserving all information related to the focu
             summary = summary + "\n\n" + _SUMMARY_END_MARKER
 
         if not _merge_summary_into_tail:
-            compressed.append({
+            summary_dict = {
                 "role": summary_role,
                 "content": summary,
                 COMPRESSED_SUMMARY_METADATA_KEY: True,
                 COMPRESSED_SUMMARY_HAS_USER_TURN_KEY: bool(
                     self._summary_has_user_turn
                 ),
-            })
+            }
+            # BUG E: carry the newest summarized turn's timestamp onto the
+            # summary message. Head and tail copies keep their own timestamp
+            # via _fresh_compaction_message_copy (shallow .copy()), but this
+            # freshly-built summary had none — so _insert_message_rows stamped
+            # it with the compaction clock, re-writing every compacted turn to
+            # the compaction's timestamp instead of the time it was spoken.
+            # The summary replaces turns_to_summarize, so its newest turn is
+            # the correct timestamp to preserve. (When the merged-into-tail
+            # path is taken the carrier already keeps its own timestamp, so no
+            # carry is needed there.)
+            summary_timestamp = next(
+                (
+                    m.get("timestamp")
+                    for m in reversed(turns_to_summarize)
+                    if isinstance(m, dict) and m.get("timestamp") is not None
+                ),
+                None,
+            )
+            if summary_timestamp is not None:
+                summary_dict["timestamp"] = summary_timestamp
+            compressed.append(summary_dict)
 
         # Default merge target: literal tail index 0. For an ordinary
         # alternation collision the summary only has to stay *invisible* to
