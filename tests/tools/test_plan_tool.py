@@ -215,5 +215,9 @@ def test_remind_returns_requested_task_status(monkeypatch):
 
     result = plan_tool._cmd_remind(_UnavailableAgent(), "t_remind")
 
-    assert "Historical task: Status check" in result
+    # Live dispatch routes `_cmd_remind` to the adapter (import override at
+    # plan_tool.py:1216), which labels a blocked/closed plan as not-active
+    # rather than the old “Historical task:” wording.
+    assert "Task: Status check" in result
     assert "Status: blocked" in result
+    assert "closed, not active" in result

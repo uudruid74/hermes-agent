@@ -1194,6 +1194,29 @@ def cmd_remind(agent, task_id: Optional[str] = None) -> str:
             elif error and error.startswith("PLAN_STATE_UNAVAILABLE:"):
                 return error
             else:
+                # No active or orphaned plan. Before giving a dead-end, check
+                # whether a plan is assigned to this agent but not yet claimed
+                # (still in a waiting state: blocked/review/ready/triage/todo),
+                # and steer the worker to `continue` to claim it. This is the
+                # case a freshly-dispatched plan sits in before the receiver
+                # runs `plan continue <id>` — and it is NOT a "not real task".
+                names = list({n.casefold() for n in _agent_identity_names(agent) if n})
+                if names:
+                    ph = ",".join("?" for _ in names)
+                    waiting = conn.execute(
+                        f"SELECT id, title FROM tasks "
+                        f"WHERE lower(assignee) IN ({ph}) "
+                        f"AND status IN ('blocked','review','ready','triage','todo') "
+                        f"ORDER BY created_at DESC LIMIT 1",
+                        names,
+                    ).fetchone()
+                    if waiting is not None:
+                        tid = waiting["id"]
+                        title = waiting["title"] or tid
+                        return (
+                            f"You are assigned to task {tid} ({title}) but have not "
+                            f"claimed it yet. Run `plan_tool continue {tid}` to claim it."
+                        )
                 return "No active plan."
         else:
             task_id = binding.task_id

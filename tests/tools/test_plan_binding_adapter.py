@@ -565,6 +565,26 @@ def test_remind_reclaims_orphaned_manual_plan_after_new_session(monkeypatch):
     assert "plan_tool archive" in result
 
 
+def test_remind_steers_to_continue_for_unclaimed_dispatched_task(monkeypatch):
+    from tools import plan_binding_adapter
+
+    conn = _db()
+    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    now = int(time.time())
+    # A task assigned to this agent but still in a waiting state, no binding.
+    _plan_task(conn, "t_await", created_at=now, status="blocked", title="Claim me")
+
+    resumed = _SubjectAgent()
+    resumed.session_id = "new-session"
+
+    result = plan_tool.plan_tool(resumed, "remind")
+
+    # It steers the worker to `continue`, it does NOT say "no plan / not real".
+    assert "t_await" in result
+    assert "plan_tool continue t_await" in result
+    assert "No active plan." not in result
+
+
 def test_remind_reclaims_the_most_recent_of_several_orphans(monkeypatch):
     conn = _db()
     monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
