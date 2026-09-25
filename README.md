@@ -76,21 +76,17 @@ Our compression doesn't. It computes a deterministic extractive digest — lexra
 
 The deterministic compressor runs `internal_only: true` on every profile, but the *retention budget* is shaped by the model each agent runs. Small models get leaner digests with a lower floor — they can't afford to hold much. Large models keep a longer tail, because their bigger context is exactly the point.
 
-Here's **Ornith — the small model** (runs a compact 9B-class model on ollama-cloud). Compression stays internal-only, but the digest is aggressive: lower target ratio, fewer protected turns, and the auxiliary compressor model is a small local one:
+Here's **Ornith — the small model** (runs a compact 9B-class model on ollama-cloud). Compression is purely `internal_only` — no auxiliary LLM compressor at all. The digest is aggressive: lower target ratio, fewer protected turns, a smaller recent tail:
 
 ```yaml
 # profiles/ornith/config.yaml
 compression:
   enabled: true
-  internal_only: true
+  internal_only: true     # deterministic — no auxiliary LLM compressor
   threshold: 0.8        # wait until the window is 80% full
   target_ratio: 0.15    # then squeeze to 15% of the context
   protect_first_n: 1    # keep the opening turn
   protect_last_n: 8     # keep the last 8 turns
-auxiliary:
-  compression:
-    provider: ollama-cloud
-    model: nemotron-3-super   # small, local; the fallback if internal path is unavailable
 ```
 
 Here's **Gopher — the large model** (deepseek-v4-flash on a big-context provider). Still internal-only and token-free, but it protects a much longer conversational tail — `protect_last_n: 21` — because keeping more recent history is worth more to a large model, and the higher target ratio reflects a bigger window:
