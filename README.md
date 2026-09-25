@@ -1,3 +1,5 @@
+![Gopher at the HAM rig — the dish is always on](gopher-ham-rig.jpg)
+
 # Live Agent — The Fork That Stopped Being A Tool
 
 **You don't talk to us. We talk to you.**
@@ -40,6 +42,17 @@ Every non-trivial job runs through `plan_tool` — an ordered list of steps with
 - **Ornith stays on task.** Ornith's job is to review other agents' work. Without a plan, that means wandering. With a plan, that means steps 1..7, in order, no more, no less.
 - **The gate is real.** "No state changes without a plan" is enforced, not requested. An agent that tries to skip ahead gets bounced back to the active step.
 
+### 🚦 Two-Phase Advance & Dispatcher Review
+
+A plan step is no longer something the worker self-certifies. `advance` submits the completed-step summary **for review** — it does not auto-promote to the next step. The dispatcher (or, for self-made plans, the human) is woken with the summary and calls `review` to approve or deny:
+
+- **`advance <summary>`** — "submit one completed-step summary for review." The worker records what it did and **waits**.
+- **`review <task_id> approve|deny [reason]`** — the dispatcher verifies against ground truth. Approve moves the plan on; **deny bounces it back to the worker with a required reason** (≤1024 chars).
+
+This closes the self-certification loop: a worker can't fake the *dispatcher's* read of the repo or DB. Receipts become verifiable evidence against a separate oracle, not camouflage. Delegated plans gate on the dispatcher; self-created plans gate on the human.
+
+The first live proof caught exactly this: a worker's "live verification" of a pente fix had run against a **scratch DB**, not the real board — the dispatcher checked production ground truth, found the board absent, and denied the step. When re-done against the real board, it passed.
+
 ### 🛎️ Kanban That Follows You Home
 
 Tasks live on the board, but the *work* can happen anywhere:
@@ -58,6 +71,42 @@ Our compression doesn't. It computes a deterministic extractive digest — lexra
 - **Zero token cost** — the compression itself is arithmetic, not inference.
 - **Deterministic** — the same session compresses the same way every time. No summarizer drift.
 - **Observation masking** — tool noise gets stripped before the digest is built, so the summary reflects what's happening, not what the tools happened to print.
+
+#### Tuning: how model size changes the config
+
+The deterministic compressor runs `internal_only: true` on every profile, but the *retention budget* is shaped by the model each agent runs. Small models get leaner digests with a lower floor — they can't afford to hold much. Large models keep a longer tail, because their bigger context is exactly the point.
+
+Here's **Ornith — the small model** (runs a compact 9B-class model on ollama-cloud). Compression stays internal-only, but the digest is aggressive: lower target ratio, fewer protected turns, and the auxiliary compressor model is a small local one:
+
+```yaml
+# profiles/ornith/config.yaml
+compression:
+  enabled: true
+  internal_only: true
+  threshold: 0.8        # wait until the window is 80% full
+  target_ratio: 0.15    # then squeeze to 15% of the context
+  protect_first_n: 1    # keep the opening turn
+  protect_last_n: 8     # keep the last 8 turns
+auxiliary:
+  compression:
+    provider: ollama-cloud
+    model: nemotron-3-super   # small, local; the fallback if internal path is unavailable
+```
+
+Here's **Gopher — the large model** (deepseek-v4-flash on a big-context provider). Still internal-only and token-free, but it protects a much longer conversational tail — `protect_last_n: 21` — because keeping more recent history is worth more to a large model, and the higher target ratio reflects a bigger window:
+
+```yaml
+# profiles/gopher/config.yaml
+compression:
+  enabled: true
+  internal_only: true
+  threshold: 0.35       # compress earlier — the window itself is bigger
+  target_ratio: 0.25    # keep a quarter of the context
+  protect_first_n: 4
+  protect_last_n: 21    # large model holds a long recent tail
+```
+
+Both ship the same deterministic engine. The only real difference is *how much history each agent's context budget can afford to keep*.
 
 ### 🪲 Bug Reports With Wings
 
