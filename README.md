@@ -4,7 +4,7 @@
 
 **You don't talk to us. We talk to you.**
 
-![Live Agent Cover](hermes-agent-cover.png)
+![Gopher coming up with the satellite dish](gopher-idea-satellite-dish.jpg)
 
 This fork of [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) started as a handful of cosmetic patches — colored response headers, agent icons in the TUI. That was July 10th, 2026.
 
