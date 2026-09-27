@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import json
+from unittest.mock import patch
 
+from agent.context_compressor import ContextCompressor
 from agent.internal_compression_fallback import (
+    INTERNAL_FALLBACK_PREFIX,
+    VERBATIM_CONTEXT_MARKER,
     _echo_marker_label,
     _echo_marker_verbatim,
     _is_echo_marker_command,
@@ -181,6 +185,89 @@ def test_marker_and_tombstone_survive_compaction():
     assert "[exit 0]" in summary
     # echo + exit stay adjacent
     assert "=== verify the new index exists ===\n[exit 0]" in summary
+
+
+def test_context_compressor_uses_protected_tail_size_for_recent_marker_tier():
+    messages = [
+        _message("system", "system prompt"),
+        _message("user", "Run each checkpoint and preserve the decision spine."),
+    ]
+    marker_lines = []
+    for index in range(10):
+        marker = f"=== complete migration checkpoint {index} now ==="
+        marker_lines.append(marker)
+        messages.extend(
+            _terminal_call(
+                f"call-{index}",
+                f'echo "{marker}" && migrate --checkpoint {index}',
+            )
+        )
+        messages.append(
+            _message(
+                "assistant",
+                f"Checkpoint {index} completed and its result was verified.",
+            )
+        )
+
+    # Keep the terminal calls out of the protected tail: these eight visible
+    # turns become the contiguous tail selected by protect_last_n=8.
+    for index in range(4):
+        messages.extend([
+            _message("user", f"Recent follow-up request {index} with details."),
+            _message("assistant", f"Recent follow-up answer {index} with details."),
+        ])
+
+    with patch(
+        "agent.context_compressor.get_model_context_length",
+        return_value=100_000,
+    ):
+        compressor = ContextCompressor(
+            model="test/model",
+            protect_first_n=1,
+            protect_last_n=8,
+            summary_target_ratio=0.50,
+            quiet_mode=True,
+            internal_only=True,
+            config_context_length=100_000,
+        )
+
+    with patch(
+        "agent.context_compressor.build_internal_fallback",
+        wraps=build_internal_fallback,
+    ) as fallback_builder:
+        compressed = compressor.compress(
+            messages,
+            current_tokens=100_000,
+            force=True,
+        )
+
+    assert fallback_builder.call_args.kwargs.get("marker_recent_count") == 8
+    rendered = "\n".join(str(message.get("content") or "") for message in compressed)
+    for marker in marker_lines[-8:]:
+        assert f"{marker}\n[exit 0]" in rendered
+
+    summary_indexes = [
+        index
+        for index, message in enumerate(compressed)
+        if str(message.get("content") or "").startswith(INTERNAL_FALLBACK_PREFIX)
+    ]
+    assert len(summary_indexes) == 1
+    summary_index = summary_indexes[0]
+    summary = str(compressed[summary_index]["content"])
+    assert summary.count(VERBATIM_CONTEXT_MARKER) == 1
+
+    expected_tail = [
+        text
+        for index in range(4)
+        for text in (
+            f"Recent follow-up request {index} with details.",
+            f"Recent follow-up answer {index} with details.",
+        )
+    ]
+    assert [
+        message["content"] for message in compressed[summary_index + 1 :]
+    ] == expected_tail
+    assert all(text not in summary for text in expected_tail)
 
 
 def test_marker_is_not_emitted_without_its_tombstone():

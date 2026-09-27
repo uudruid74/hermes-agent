@@ -11,6 +11,11 @@ from agent.context_compressor import (
     _RESTART_HANDOFF_PROBE_EXTRA_MESSAGES,
     _SUMMARY_END_MARKER,
 )
+from agent.internal_compression_fallback import (
+    INTERNAL_FALLBACK_PREFIX,
+    VERBATIM_CONTEXT_MARKER,
+    build_internal_fallback,
+)
 
 
 def _compressor(protect_first_n: int = 1) -> ContextCompressor:
@@ -309,6 +314,43 @@ def test_restart_fossil_is_folded_into_internal_fallback_state():
     ) == 1
 
 
+
+
+def test_repeated_internal_fallback_keeps_prior_summary_single_level():
+    messages = [
+        {"role": "system", "content": "system prompt"},
+        {
+            "role": "user",
+            "content": "Preserve the durable migration decision across compactions.",
+        },
+        {
+            "role": "assistant",
+            "content": "The migration decision remains active and fully verified.",
+        },
+        {"role": "user", "content": "Current request remains in the recent tail."},
+        {
+            "role": "assistant",
+            "content": "Current response remains in the recent tail.",
+        },
+    ]
+    previous_summary = "DURABLE-PRIOR-FACT: schema migration uses revision 42."
+
+    for _ in range(3):
+        fallback = build_internal_fallback(
+            messages,
+            protect_head_count=1,
+            protect_last_n=1,
+            target_tokens=4_000,
+            previous_summary=previous_summary,
+        )
+        previous_summary = fallback.summary.removeprefix(
+            INTERNAL_FALLBACK_PREFIX
+        ).lstrip()
+
+    assert previous_summary.count("DURABLE-PRIOR-FACT") == 1
+    assert previous_summary.count(INTERNAL_FALLBACK_PREFIX) == 0
+    assert previous_summary.count("## Prior Context Summary") == 1
+    assert previous_summary.count(VERBATIM_CONTEXT_MARKER) == 1
 
 
 def test_forced_leading_merged_summary_strips_live_tail_from_summary_body():

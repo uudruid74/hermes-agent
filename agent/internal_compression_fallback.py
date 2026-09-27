@@ -2100,26 +2100,59 @@ def _lexrank_summary(
     return "\n\n".join(parts)
 
 
-def _with_prior_summary(summary: str, previous_summary: str) -> str:
-    """Fold a recovered fossil summary into the fallback payload body.
+def _canonical_prior_summary(previous_summary: str, current_summary: str) -> str:
+    """Flatten one persisted fallback payload into unique semantic paragraphs.
 
-    The restart self-heal scan rehydrates a prior handoff into
-    ``_previous_summary``, which reaches ``build_internal_fallback`` as
-    ``previous_summary``.  The fallback must carry that durable local summary
-    forward — otherwise a resume followed by a fallback compression silently
-    drops the whole prior compaction, stranding the model mid-task.
-    ``_session_notes`` already mines it for pruned-skill markers; this is the
-    full-body fold that keeps the canonical summary alive.
+    Internal fallback output is a transport envelope persisted as a transcript
+    row.  Carrying that envelope wholesale recursively nests its prefix, prior
+    header, and verbatim boundary on every fallback compaction.  Strip only
+    those exact transport lines, then retain each semantic paragraph once.
+    Paragraphs already regenerated in the current payload need not be carried
+    again; older facts absent from the current window still survive.
+
+    Non-fallback summaries keep their existing byte-for-byte carry behavior.
     """
     prior = (previous_summary or "").strip()
+    is_internal_fallback = (
+        prior.lstrip().startswith(INTERNAL_FALLBACK_PREFIX)
+        or VERBATIM_CONTEXT_MARKER in prior
+    )
+    if not prior or not is_internal_fallback:
+        return prior
+
+    transport_lines = {
+        INTERNAL_FALLBACK_PREFIX,
+        "## Prior Context Summary",
+        "## Verbatim Recent Context",
+        "The messages after this summary marker are preserved verbatim.",
+    }
+    current_blocks = {
+        block.strip() for block in re.split(r"\n{2,}", current_summary) if block.strip()
+    }
+    blocks: list[str] = []
+    seen: set[str] = set()
+    for raw_block in re.split(r"\n{2,}", prior):
+        block = "\n".join(
+            line
+            for line in raw_block.splitlines()
+            if line.strip() not in transport_lines
+        ).strip()
+        if not block or block in seen or block in current_blocks:
+            continue
+        seen.add(block)
+        blocks.append(block)
+    return "\n\n".join(blocks)
+
+
+def _with_prior_summary(summary: str, previous_summary: str) -> str:
+    """Fold recovered prior context into one canonical fallback block."""
+    prior = _canonical_prior_summary(previous_summary, summary)
     if not prior:
         return summary
     block = f"## Prior Context Summary\n{prior}"
     if VERBATIM_CONTEXT_MARKER in summary:
         head, _, rest = summary.partition(VERBATIM_CONTEXT_MARKER)
-        return (
-            head.rstrip() + "\n\n" + block + "\n\n" + VERBATIM_CONTEXT_MARKER + rest
-        )
+        return head.rstrip() + "\n\n" + block + "\n\n" + VERBATIM_CONTEXT_MARKER + rest
     return summary.rstrip() + "\n\n" + block
 
 

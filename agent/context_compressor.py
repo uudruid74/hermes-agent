@@ -6550,6 +6550,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                 previous_summary=self._previous_summary or "",
                 protected_memory=self._protected_memory,
                 session_subject=self._session_subject(),
+                marker_recent_count=self.protect_last_n,
             )
             # Carry the Protected area's state to the next compaction.  The
             # returned value is immutable; we only ever replace the
