@@ -62,6 +62,13 @@ def board(monkeypatch):
     shutil.copy(REAL_BOARD, db_path)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
+    # The live application opens boards through kanban_db.connect(), which
+    # applies additive migrations before plan_tool sees a task row. This fixture
+    # opens its copy with raw sqlite3, so mirror that production precondition.
+    from hermes_cli.kanban_db import _migrate_add_optional_columns
+
+    _migrate_add_optional_columns(conn)
+    conn.commit()
 
     monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: contextlib.nullcontext(conn))
     yield conn, plan_tool

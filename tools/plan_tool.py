@@ -1252,7 +1252,7 @@ def plan_tool(
     Commands:
       new           — present a plan for approval
       advance       — submit one completed-step summary for review
-      review        — dispatcher approves or denies a pending step
+      review        — dispatcher approves, denies, or yolo-enables a pending step
       repeat        — re-open a step as a corrective child plan (needs a plan)
       handoff       — replace the current step's in-progress summary
       continue      — resume a task in the caller's current session
@@ -1352,7 +1352,7 @@ PLAN_TOOL_SCHEMA = {
     "description": (
         "Mandatory Action Protocol — create and manage multistep plans. "
         "Commands: new (present plan for approval), advance (submit a completed-step summary for review), "
-        "review (approve or deny a pending step), "
+        "review (approve, deny, or yolo-enable a pending step), "
         "repeat (re-open a step as a corrective child plan), "
         "handoff (record in-progress work), continue (resume a task in this session), "
         "dispatch (create kanban task), remind (show current plan), "
@@ -1393,8 +1393,8 @@ PLAN_TOOL_SCHEMA = {
             },
             "decision": {
                 "type": "string",
-                "enum": ["approved", "denied"],
-                "description": "Required for 'review': approve or deny the pending step advancement.",
+                "enum": ["approved", "denied", "yolo"],
+                "description": "Required for 'review': approve or deny the pending step, or yolo to approve it and auto-approve later steps for this plan.",
             },
             "step": {
                 "type": "integer",

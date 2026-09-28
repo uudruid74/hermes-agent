@@ -119,6 +119,9 @@ def test_advance_records_one_summary_holds_step_and_notifies_dispatcher(monkeypa
     assert "[ ] Step 2: implement" in notice
     assert "Summary:\nInspected parser and documented the failure" in notice
     assert "approve or deny this step using 'plan_tool review'" in notice
+    assert conn.execute(
+        "SELECT plan_auto_approve FROM tasks WHERE id=?", (task_id,)
+    ).fetchone()[0] == 0
 
 
 def test_second_advance_is_refused_while_review_is_pending(monkeypatch):
@@ -150,6 +153,78 @@ def test_approved_review_advances_and_notifies_worker(monkeypatch):
     assert "Goal: Ship verified work" in message
     assert "Step 2: implement" in message
     assert "Please work this step and when this step is complete, use plan_tool to advance to the next" in message
+
+
+def test_yolo_review_persists_and_auto_approves_later_steps(monkeypatch):
+    """One dispatcher yolo keeps evidence + notices but removes later clicks."""
+    from hermes_cli import execution_bindings as bindings
+
+    conn, sent, worker, dispatcher, task_id = _delegated_plan(
+        monkeypatch, steps=("inspect", "implement", "verify")
+    )
+    plan_tool.plan_tool(worker, "advance", summary="inspection complete", step=1)
+    sent.clear()
+
+    enabled = plan_tool.plan_tool(
+        dispatcher, "review", task_id=task_id, decision="yolo"
+    )
+
+    assert enabled == (
+        f"Task {task_id} Step 1 approved. YOLO enabled. Worker notified."
+    )
+    assert _stepno(conn, task_id) == 2
+    assert conn.execute(
+        "SELECT plan_auto_approve FROM tasks WHERE id=?", (task_id,)
+    ).fetchone()[0] == 1
+    assert len(sent) == 1
+    assert sent[0][:4] == ["hermes", "send", "-u", "ornith"]
+
+    sent.clear()
+    advanced = plan_tool.plan_tool(
+        worker, "advance", summary="implementation tested", step=2
+    )
+
+    assert advanced == f"Task {task_id} Step 2 auto-approved. Now complete Step 3"
+    assert _stepno(conn, task_id) == 3
+    assert bindings.pending_step_review(conn, task_id) is None
+    assert len(sent) == 1
+    assert sent[0][:4] == ["hermes", "send", "-u", "neo"]
+    notice = sent[0][4]
+    assert "ornith has completed step 2" in notice
+    assert "YOLO auto-approved this step" in notice
+    assert "Summary:\nimplementation tested" in notice
+
+    sent.clear()
+    completed = plan_tool.plan_tool(
+        worker, "advance", summary="verification complete", step=3
+    )
+
+    assert completed == f"Task {task_id} Step 3 auto-approved. Plan complete."
+    assert conn.execute(
+        "SELECT status FROM tasks WHERE id=?", (task_id,)
+    ).fetchone()[0] == "done"
+    assert bindings.pending_step_review(conn, task_id) is None
+    assert conn.execute("SELECT COUNT(*) FROM execution_bindings").fetchone()[0] == 0
+    assert len(sent) == 1
+    assert sent[0][:4] == ["hermes", "send", "-u", "neo"]
+    assert "YOLO auto-approved this step" in sent[0][4]
+
+    kinds = [
+        row[0]
+        for row in conn.execute(
+            "SELECT kind FROM task_events WHERE task_id=? "
+            "AND kind LIKE 'plan-step-review-%' ORDER BY id",
+            (task_id,),
+        )
+    ]
+    assert kinds == [
+        "plan-step-review-pending",
+        "plan-step-review-approved",
+        "plan-step-review-pending",
+        "plan-step-review-approved",
+        "plan-step-review-pending",
+        "plan-step-review-approved",
+    ]
 
 
 def test_denied_review_requires_bounded_reason_and_keeps_step_open(monkeypatch):
@@ -284,7 +359,7 @@ def test_manifest_exposes_review_and_only_one_advance_summary():
 
     assert "review" in commands
     assert "decision" in properties
-    assert properties["decision"]["enum"] == ["approved", "denied"]
+    assert properties["decision"]["enum"] == ["approved", "denied", "yolo"]
     assert "summarize what was done" in properties["summary"]["description"].lower()
     assert "proof" not in properties
     assert "review" in properties["reason"]["description"].lower()

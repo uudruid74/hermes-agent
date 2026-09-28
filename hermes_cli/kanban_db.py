@@ -1279,6 +1279,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Debug plans attach their plan id to the coding task they exercise.
     plan_kind            TEXT NOT NULL DEFAULT 'normal',
     pre_approved         INTEGER NOT NULL DEFAULT 0,
+    -- Per-plan opt-in: later step summaries are still recorded/notified, then
+    -- their pending reviews are resolved automatically.
+    plan_auto_approve    INTEGER NOT NULL DEFAULT 0,
     debug_plan_id        TEXT,
     board                TEXT NOT NULL DEFAULT 'default',
     root                 TEXT,
@@ -2594,6 +2597,13 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     if "pre_approved" not in cols:
         _add_column_if_missing(
             conn, "tasks", "pre_approved", "pre_approved INTEGER NOT NULL DEFAULT 0"
+        )
+    if "plan_auto_approve" not in cols:
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "plan_auto_approve",
+            "plan_auto_approve INTEGER NOT NULL DEFAULT 0",
         )
     if "debug_plan_id" not in cols:
         _add_column_if_missing(conn, "tasks", "debug_plan_id", "debug_plan_id TEXT")

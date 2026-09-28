@@ -532,7 +532,7 @@ def _send_user(profile: str, message: str) -> Optional[str]:
     return None
 
 
-def _review_request_text(task, pending) -> str:
+def _review_request_text(task, pending, *, auto_approved: bool = False) -> str:
     steps = json.loads(task["task_steps"] or "[]")
     lines = [
         f"{pending.worker} has completed step {pending.step_no}, task id {task['id']}",
@@ -544,17 +544,18 @@ def _review_request_text(task, pending) -> str:
     for index, step_text in enumerate(steps, 1):
         marker = "[X]" if index < pending.step_no else "[-]" if index == pending.step_no else "[ ]"
         lines.append(f"{marker} Step {index}: {step_text}")
-    lines.extend(
-        [
-            "",
-            "Summary:",
-            pending.summary,
-            "",
+    lines.extend(["", "Summary:", pending.summary, ""])
+    if auto_approved:
+        lines.append(
+            "YOLO auto-approved this step. Verify the evidence as usual; no human "
+            "review click is required."
+        )
+    else:
+        lines.append(
             "Please make sure this step is completed correctly and approve or deny "
             "this step using 'plan_tool review'. Pass the task id and decision "
-            "'approved' or 'denied'. A denial must include a reason.",
-        ]
-    )
+            "'approved' or 'denied'. A denial must include a reason."
+        )
     return "\n".join(lines)
 
 
@@ -573,13 +574,18 @@ def _worker_review_message(task, result, reviewer: str, reason: Optional[str]) -
             f"Task {task['id']} Step {result.reviewed_step} Approved by {reviewer}. "
             "Plan complete."
         )
+    yolo_note = (
+        "\n\nYOLO enabled: later steps will auto-approve after notification."
+        if result.auto_approve_enabled
+        else ""
+    )
     return (
         f"Task {task['id']} Step {result.reviewed_step} Approved by {reviewer}. "
         f"Now complete Step {result.next_step_no}\n\n"
         f"Goal: {task['task_goal'] or ''}\n"
         f"Step {result.next_step_no}: {result.next_step}\n\n"
         "Please work this step and when this step is complete, use plan_tool "
-        "to advance to the next"
+        f"to advance to the next{yolo_note}"
     )
 
 
@@ -588,7 +594,7 @@ def _resolve_review(
     conn,
     *,
     task_id: str,
-    decision: Literal["approved", "denied"],
+    decision: Literal["approved", "denied", "yolo"],
     reviewer: str,
     reason: Optional[str],
     notify_worker: bool,
@@ -599,7 +605,7 @@ def _resolve_review(
         result = bindings.review_plan_step(
             conn,
             task_id=task_id,
-            decision=cast(Literal["approved", "denied"], decision),
+            decision=cast(Literal["approved", "denied", "yolo"], decision),
             reviewer=reviewer,
             reason=reason,
         )
@@ -660,8 +666,38 @@ def cmd_advance(agent, summary: str, step: Optional[int] = None) -> str:
     if pending is None:
         return f"ERROR: Plan {result.task_id} did not create a pending review"
     task = conn.execute("SELECT * FROM tasks WHERE id=?", (result.task_id,)).fetchone()
-    request = _review_request_text(task, pending)
     dispatcher = _dispatcher_for_task(conn, result.task_id)
+    if bool(task["plan_auto_approve"]):
+        if not dispatcher:
+            return (
+                f"ERROR: Plan {result.task_id} has YOLO enabled but no dispatcher "
+                "is available for the required step notification. Review remains pending."
+            )
+        message, reviewed = _resolve_review(
+            agent,
+            conn,
+            task_id=result.task_id,
+            decision="approved",
+            reviewer="yolo",
+            reason=None,
+            notify_worker=False,
+        )
+        if reviewed is None:
+            return message
+        request = _review_request_text(task, pending, auto_approved=True)
+        failure = _send_user(dispatcher, request)
+        suffix = f" Dispatcher notification failed: {failure}" if failure else ""
+        if reviewed.closed:
+            return (
+                f"Task {result.task_id} Step {reviewed.reviewed_step} auto-approved. "
+                f"Plan complete.{suffix}"
+            )
+        return (
+            f"Task {result.task_id} Step {reviewed.reviewed_step} auto-approved. "
+            f"Now complete Step {reviewed.next_step_no}{suffix}"
+        )
+
+    request = _review_request_text(task, pending)
     if dispatcher:
         failure = _send_user(dispatcher, request)
         suffix = f" Dispatcher notification failed: {failure}" if failure else ""
@@ -723,7 +759,7 @@ def cmd_advance(agent, summary: str, step: Optional[int] = None) -> str:
         agent,
         conn,
         task_id=result.task_id,
-        decision=cast(Literal["approved", "denied"], decision),
+        decision=cast(Literal["approved", "denied", "yolo"], decision),
         reviewer="user",
         reason=reason,
         notify_worker=False,
@@ -734,12 +770,12 @@ def cmd_advance(agent, summary: str, step: Optional[int] = None) -> str:
 def cmd_review(
     agent, task_id: str, decision: str, reason: Optional[str] = None
 ) -> str:
-    """Approve or deny the dispatcher-gated pending step review."""
+    """Approve, deny, or yolo the dispatcher-gated pending step review."""
     from hermes_cli import execution_bindings as bindings
 
     decision = (decision or "").strip().lower()
-    if decision not in {"approved", "denied"}:
-        return "ERROR: 'review' decision must be 'approved' or 'denied'"
+    if decision not in {"approved", "denied", "yolo"}:
+        return "ERROR: 'review' decision must be 'approved', 'denied', or 'yolo'"
     reason = (reason or "").strip() or None
     if decision == "denied" and reason is None:
         return "ERROR: denied review requires reason"
@@ -764,7 +800,7 @@ def cmd_review(
         agent,
         conn,
         task_id=task_id,
-        decision=cast(Literal["approved", "denied"], decision),
+        decision=cast(Literal["approved", "denied", "yolo"], decision),
         reviewer=reviewer,
         reason=reason,
         notify_worker=True,
@@ -773,6 +809,16 @@ def cmd_review(
         return message
     if decision == "denied":
         return f"Task {task_id} Step {result.reviewed_step} denied. Worker notified."
+    if decision == "yolo":
+        if result.closed:
+            return (
+                f"Task {task_id} Step {result.reviewed_step} approved. "
+                "Plan complete. Worker notified."
+            )
+        return (
+            f"Task {task_id} Step {result.reviewed_step} approved. "
+            "YOLO enabled. Worker notified."
+        )
     if result.closed:
         return (
             f"Task {task_id} Step {result.reviewed_step} approved. "

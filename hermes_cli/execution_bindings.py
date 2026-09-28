@@ -114,6 +114,7 @@ class PlanReviewResult:
     restored_task_id: Optional[str]
     binding_revision: Optional[int]
     decision: Literal["approved", "denied"]
+    auto_approve_enabled: bool = False
 
 
 PlanOutcome = Literal["done", "failed", "test-complete"]
@@ -875,13 +876,13 @@ def review_plan_step(
     conn: sqlite3.Connection,
     *,
     task_id: str,
-    decision: Literal["approved", "denied"],
+    decision: Literal["approved", "denied", "yolo"],
     reviewer: str,
     reason: Optional[str] = None,
 ) -> PlanReviewResult:
     """Resolve the current pending review and advance only on approval."""
-    if decision not in {"approved", "denied"}:
-        raise ValueError("decision must be 'approved' or 'denied'")
+    if decision not in {"approved", "denied", "yolo"}:
+        raise ValueError("decision must be 'approved', 'denied', or 'yolo'")
     with write_txn(conn):
         pending = pending_step_review(conn, task_id)
         if pending is None:
@@ -898,6 +899,13 @@ def review_plan_step(
                 f"review Step {pending.step_no}, active Step {step_no}"
             )
         now = int(time.time())
+        if decision == "yolo":
+            changed = conn.execute(
+                "UPDATE tasks SET plan_auto_approve = 1 WHERE id = ?",
+                (task_id,),
+            ).rowcount
+            if changed != 1:
+                raise InvalidTaskState(f"plan {task_id} changed during review")
         if decision == "denied":
             _append_event(
                 conn,
@@ -942,6 +950,7 @@ def review_plan_step(
                     "step": step_no,
                     "review_event_id": pending.event_id,
                     "reviewer": reviewer,
+                    "auto_approve_enabled": decision == "yolo",
                 },
                 now=now,
             )
@@ -954,6 +963,7 @@ def review_plan_step(
                 restored_task_id=closed.restored_task_id,
                 binding_revision=closed.binding_revision,
                 decision="approved",
+                auto_approve_enabled=decision == "yolo",
             )
         else:
             changed = conn.execute(
@@ -1000,6 +1010,7 @@ def review_plan_step(
                     "step": step_no,
                     "review_event_id": pending.event_id,
                     "reviewer": reviewer,
+                    "auto_approve_enabled": decision == "yolo",
                 },
                 now=now,
             )
@@ -1012,6 +1023,7 @@ def review_plan_step(
                 restored_task_id=None,
                 binding_revision=new_revision,
                 decision="approved",
+                auto_approve_enabled=decision == "yolo",
             )
     if result.closed:
         _notify_root_plan_closed(
