@@ -31,14 +31,10 @@ def tell_tool(
     """Wake another Hermes profile after exposing the exact message to the caller."""
     sender = (os.environ.get("USERNAME") or "").strip() or "agent"
     target_session_id = (session_id or "").strip()
-    reply_session_id = (origin_session_id or "").strip()
-    if reply_session_id:
-        reply_instruction = (
-            "If a reply is required, use 'tell' with "
-            f"agent='{sender}' and session_id='{reply_session_id}'."
-        )
-    else:
-        reply_instruction = "If a reply is required, use the 'tell' command to reply."
+    # Replies must use profile discovery. A gateway session ID is not a CLI
+    # session target, and presenting it here causes `tell` to misroute replies
+    # into the CLI notice queue instead of the sender's messaging DM.
+    reply_instruction = f"If a reply is required, use 'tell' with agent='{sender}'."
     wrapped = (
         f"Incoming message from {sender} follows:\n"
         "---\n"
@@ -66,8 +62,8 @@ TELL_SCHEMA = {
     "name": "tell",
     "description": (
         "Send a wrapped message to another Hermes agent profile. By default this wakes its "
-        "Telegram DM session; session_id targets one full session directly. The receiver is "
-        "told which session to reply to when that information is available."
+        "Telegram DM session; session_id targets one full session directly. Replies are routed "
+        "by the sender's agent profile rather than by session ID."
     ),
     "parameters": {
         "type": "object",

@@ -44,14 +44,14 @@ def test_tell_wraps_message_and_targets_agent_profile(monkeypatch):
             "---\n"
             "Check the relay.\n"
             "---\n"
-            "If a reply is required, use the 'tell' command to reply.",
+            "If a reply is required, use 'tell' with agent='zephyr'.",
         ]
     ]
     assert echoes == ["gopher: Check the relay."]
     assert result == {"dispatched": True, "note": "notified gopher"}
 
 
-def test_tell_routes_to_explicit_session_and_displays_reply_session(monkeypatch):
+def test_tell_routes_to_explicit_session_but_reply_names_only_sender(monkeypatch):
     monkeypatch.setenv("USERNAME", "zephyr")
     calls = []
 
@@ -77,7 +77,7 @@ def test_tell_routes_to_explicit_session_and_displays_reply_session(monkeypatch)
         "neo:cli:cron_daily_20260922_120000",
     ]
     assert "agent='zephyr'" in command[-1]
-    assert "session_id='20260922_121500_receiver'" in command[-1]
+    assert "session_id=" not in command[-1]
 
 
 def test_tell_reply_reaches_explicit_session_via_send_cli(monkeypatch, tmp_path):
@@ -133,7 +133,8 @@ def test_tell_reply_reaches_explicit_session_via_send_cli(monkeypatch, tmp_path)
     assert result == {"dispatched": True, "note": "notified neo"}
     assert len(notices) == 1
     assert "Round trip reply." in notices[0]["text"]
-    assert "session_id='20260922_121500_receiver'" in notices[0]["text"]
+    assert "agent='zephyr'" in notices[0]["text"]
+    assert "session_id=" not in notices[0]["text"]
 
 
 def test_tell_does_not_fall_back_to_superseded_identity_vars(monkeypatch):
@@ -282,7 +283,7 @@ def test_agent_runtime_routes_tell_to_mandatory_origin_callback(monkeypatch):
     assert result["dispatched"] is True
 
 
-def test_agent_runtime_exposes_cron_session_id_for_a_reply(monkeypatch):
+def test_agent_runtime_reply_instruction_names_only_sender(monkeypatch):
     from agent.agent_runtime_helpers import invoke_tool
 
     monkeypatch.setenv("USERNAME", "neo")
@@ -320,7 +321,7 @@ def test_agent_runtime_exposes_cron_session_id_for_a_reply(monkeypatch):
         "zephyr:cli:20260922_121500_receiver",
     ]
     assert "agent='neo'" in sent[0][-1]
-    assert "session_id='cron_journal_20260922_120000'" in sent[0][-1]
+    assert "session_id=" not in sent[0][-1]
 
 
 def test_agent_runtime_refuses_tell_without_origin_callback(monkeypatch):
