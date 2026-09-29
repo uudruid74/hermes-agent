@@ -37,6 +37,43 @@ def test_normalize_usage_reads_deepseek_native_cache_hit_tokens():
     assert normalized.output_tokens == 400
 
 
+def test_normalize_usage_estimates_bare_ollama_cloud_reasoning():
+    """ollama-cloud exposes reasoning on the message, not in usage details."""
+    usage = SimpleNamespace(
+        prompt_tokens=10,
+        completion_tokens=20,
+        total_tokens=30,
+    )
+
+    normalized = normalize_usage(
+        usage,
+        provider="ollama-cloud",
+        api_mode="chat_completions",
+        reasoning_text="r" * 76,
+    )
+
+    assert normalized.reasoning_tokens == 19
+
+
+def test_normalize_usage_prefers_structured_reasoning_tokens():
+    """A provider figure wins over the rough bare-text estimate."""
+    usage = SimpleNamespace(
+        prompt_tokens=10,
+        completion_tokens=20,
+        total_tokens=30,
+        completion_tokens_details=SimpleNamespace(reasoning_tokens=7),
+    )
+
+    normalized = normalize_usage(
+        usage,
+        provider="ollama-cloud",
+        api_mode="chat_completions",
+        reasoning_text="r" * 76,
+    )
+
+    assert normalized.reasoning_tokens == 7
+
+
 
 
 def test_normalize_usage_openai_reads_top_level_anthropic_cache_fields():

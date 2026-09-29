@@ -1558,9 +1558,8 @@ class ContextCompressor(ContextEngine):
             # threshold_percent as a side effect) so the percent read below
             # is the floored value regardless of argument evaluation order.
             _ctx = self.context_length
-            # Floor: never compress below MINIMUM_CONTEXT_LENGTH tokens even
-            # if the percentage would suggest a lower value (#14690 handles
-            # the degenerate small-window case inside the helper).
+            # Derive the trigger from the effective window. The helper handles
+            # at/below-minimum windows specially so they trigger below 100%.
             self._threshold_tokens = self._compute_threshold_tokens(
                 _ctx, self.threshold_percent, self.max_tokens,
             )
@@ -2219,15 +2218,14 @@ class ContextCompressor(ContextEngine):
     ) -> int:
         """Compute the compaction trigger threshold in tokens.
 
-        The base value is ``effective_input_budget * threshold_percent``, floored
-        at ``MINIMUM_CONTEXT_LENGTH`` so large-context models don't compress
-        prematurely at 50%. BUT that floor degenerates at small windows: for a
-        model whose ``context_length`` is at/below the minimum (e.g. a 64K
-        local model), ``max(0.5*64000, 64000) == 64000`` makes the threshold
-        equal the ENTIRE window — auto-compression can never fire because the
-        provider rejects the request before usage reaches 100% (#14690).
+        The base value is ``effective_input_budget * threshold_percent``. An
+        earlier implementation floored that result at ``MINIMUM_CONTEXT_LENGTH``;
+        for a 78,080-token window at 50%, that silently changed the configured
+        39,040-token trigger into a fixed 64,000-token trigger. At a 64K local
+        window the same floor made the threshold equal the ENTIRE window, so the
+        provider rejected the request before auto-compression could fire.
 
-        When the floor would meet or exceed the context window, trigger at
+        When the threshold would meet or exceed the context window, trigger at
         ``_MIN_CTX_TRIGGER_RATIO`` (85%) of the window — high enough that a
         small model uses most of its context before compacting, but below
         100% so compaction fires before the provider rejects the request.

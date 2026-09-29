@@ -175,6 +175,11 @@ class TestCompress:
         assert t < MINIMUM_CONTEXT_LENGTH
         assert t == 54400  # 85% of 64000
 
+    def test_threshold_above_minimum_uses_configured_window_ratio(self):
+        """A window just above 64K must not inherit the old absolute floor."""
+        t = ContextCompressor._compute_threshold_tokens(78_080, 0.50)
+        assert t == 39_040
+
 
 
 
