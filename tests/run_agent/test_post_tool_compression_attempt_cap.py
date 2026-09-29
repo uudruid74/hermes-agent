@@ -1,11 +1,11 @@
 """Behavioral regression tests for the post-tool compression attempt cap.
 
 The pre-API pressure gate, the overflow/413 error handlers, and the post-tool
-compaction gate all share ``compression_attempts`` as a per-turn backstop,
-bounded by the resolved ``compression.max_attempts`` cap (default 3).  Before
-the fix the post-tool path neither checked nor incremented the counter, so a
-long tool loop could compact after every tool response for the lifetime of
-the turn.
+compaction gate all share ``compression_attempts`` as a pressure-episode
+backstop, bounded by the resolved ``compression.max_attempts`` cap (default 3).
+Before the fix the post-tool path neither checked nor incremented the counter,
+so a long tool loop could compact after every tool response. Real provider
+usage below the threshold re-arms the cap for later growth in the same turn.
 
 These tests drive ``run_conversation()`` through real tool iterations with a
 compressor that always demands compression and assert ``_compress_context``
@@ -37,7 +37,7 @@ def _tool_call(i: int):
     )
 
 
-def _tool_response(i: int):
+def _tool_response(i: int, prompt_tokens: int | None = None):
     msg = SimpleNamespace(
         content=None,
         reasoning_content=None,
@@ -45,7 +45,14 @@ def _tool_response(i: int):
         tool_calls=[_tool_call(i)],
     )
     choice = SimpleNamespace(message=msg, finish_reason="tool_calls")
-    return SimpleNamespace(choices=[choice], model="test/model", usage=None)
+    usage = None
+    if prompt_tokens is not None:
+        usage = SimpleNamespace(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=1,
+            total_tokens=prompt_tokens + 1,
+        )
+    return SimpleNamespace(choices=[choice], model="test/model", usage=usage)
 
 
 def _stop_response():
@@ -118,9 +125,21 @@ def agent():
     return a
 
 
-def _run_tool_loop(agent, n_tool_iterations: int):
+def _run_tool_loop(
+    agent,
+    n_tool_iterations: int,
+    *,
+    prompt_tokens: list[int] | None = None,
+):
     """Drive one turn: ``n_tool_iterations`` tool calls, then a stop."""
-    responses = [_tool_response(i) for i in range(n_tool_iterations)]
+    if prompt_tokens is None:
+        responses = [_tool_response(i) for i in range(n_tool_iterations)]
+    else:
+        assert len(prompt_tokens) == n_tool_iterations
+        responses = [
+            _tool_response(i, prompt_tokens=tokens)
+            for i, tokens in enumerate(prompt_tokens)
+        ]
     responses.append(_stop_response())
     agent.client.chat.completions.create.side_effect = responses
 
@@ -128,7 +147,7 @@ def _run_tool_loop(agent, n_tool_iterations: int):
 
     def _fake_compress(messages, system_message, **_kwargs):
         compress_calls.append(len(messages))
-        return messages, "compressed prompt"
+        return list(messages), "compressed prompt"
 
     with (
         patch.object(agent, "_compress_context", side_effect=_fake_compress),
@@ -256,6 +275,49 @@ class TestPostToolCompressionAttemptCap:
             "pre-API and post-tool compactions must share one per-turn "
             f"attempt budget, got {len(compress_calls)} total compactions"
         )
+
+    def test_provider_confirmed_recovery_rearms_cap_in_same_turn(self, agent):
+        """A long tool loop may refill after three successful recovery cycles."""
+        compressor = agent.context_compressor
+        threshold = compressor.threshold_tokens
+
+        def _update_from_response(usage):
+            compressor.last_prompt_tokens = usage.get("prompt_tokens", 0)
+
+        compressor.update_from_response.side_effect = _update_from_response
+        compressor.should_compress.side_effect = lambda tokens: tokens >= threshold
+
+        result, compress_calls = _run_tool_loop(
+            agent,
+            n_tool_iterations=7,
+            prompt_tokens=[15_000, 5_000, 15_000, 5_000, 15_000, 5_000, 15_000],
+        )
+
+        assert result["completed"] is True
+        assert len(compress_calls) == 4, (
+            "a below-threshold provider response must re-arm compression for "
+            "later context regrowth in the same turn"
+        )
+
+    def test_usage_at_threshold_does_not_rearm_cap(self, agent):
+        """Only a confirmed fit below the trigger starts a new pressure episode."""
+        compressor = agent.context_compressor
+        threshold = compressor.threshold_tokens
+
+        def _update_from_response(usage):
+            compressor.last_prompt_tokens = usage.get("prompt_tokens", 0)
+
+        compressor.update_from_response.side_effect = _update_from_response
+        compressor.should_compress.side_effect = lambda tokens: tokens >= threshold
+
+        result, compress_calls = _run_tool_loop(
+            agent,
+            n_tool_iterations=5,
+            prompt_tokens=[15_000, 15_000, 15_000, threshold, 15_000],
+        )
+
+        assert result["completed"] is True
+        assert len(compress_calls) == 3
 
     def test_cap_is_per_turn_not_per_session(self, agent):
         """A fresh turn gets a fresh attempt budget."""
