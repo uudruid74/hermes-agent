@@ -590,6 +590,22 @@ def _close_plan_in_txn(
     previous_task_id = task["previous_task"]
     if previous_task_id:
         parent = _task_row(conn, previous_task_id)
+        # Ownership guard (Evan, 2026-09-29).  A parent Plan is restored onto
+        # the WHOLE (profile, root_session_id) key, so restoring a parent the
+        # closing task does not belong with hands that task to the wrong
+        # agent.  Legacy rows created before delegated plans were barred from
+        # nesting still carry a cross-agent `previous_task`; closing the child
+        # would rebind the worker to the creator's plan (observed live:
+        # ornith was restored onto a zephyr-assigned task).  Only an
+        # unassigned parent (a pure container) may be adopted across agents.
+        child_assignee = (task["assignee"] or "").strip().casefold()
+        parent_assignee = (parent["assignee"] or "").strip().casefold()
+        if parent_assignee and child_assignee and parent_assignee != child_assignee:
+            raise InvalidTaskState(
+                f"parent {previous_task_id} is assigned to "
+                f"{parent['assignee']!r}, not {task['assignee']!r}; refusing to "
+                f"restore another agent's plan onto this binding"
+            )
         if parent["status"] == "blocked":
             if parent["block_kind"] not in {None, "approval"}:
                 raise InvalidTaskState(

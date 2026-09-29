@@ -173,6 +173,160 @@ def test_new_rejects_a_parent_that_is_not_the_active_plan(monkeypatch):
     assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == before
 
 
+def test_delegated_new_does_not_nest_under_the_callers_active_plan(monkeypatch):
+    """A dispatched Plan must NOT inherit the dispatcher's active Plan.
+
+    Evan, 2026-09-29.  Nesting is for your OWN plans.  A delegated plan that
+    stores the caller's task id in `previous_task` restores THAT task onto the
+    worker's binding when it closes (even on outcome=failed) — handing the
+    worker a task assigned to someone else, which the worker then resumes.  A
+    dispatched plan starts its own chain: previous_task must be NULL.
+    """
+    conn = _db()
+    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    monkeypatch.setattr(
+        plan_tool, "clarify_tool", lambda *_args, **_kwargs: '{"user_response":"Approve"}'
+    )
+    agent = _Agent()
+
+    # The caller has its own active Plan — the dispatcher's own work.
+    own = plan_tool.plan_tool(agent, "new", title="My own plan", goal="mine", steps=["one"])
+    assert own.startswith("TASK APPROVED"), own
+    own_task = conn.execute("SELECT task_id FROM execution_bindings").fetchone()[0]
+
+    # Now dispatch a plan at ANOTHER agent while our own plan is still active.
+    delegated = plan_tool.plan_tool(
+        agent, "new", title="Worker plan", goal="theirs", steps=["one"],
+        assignee="ornith",
+    )
+    # A delegated plan is NOT auto-approved — it notifies the worker instead.
+    assert delegated.startswith("ornith has been notified"), delegated
+
+    child_id = conn.execute(
+        "SELECT id FROM tasks WHERE assignee='ornith' ORDER BY created_at DESC LIMIT 1"
+    ).fetchone()[0]
+    prev = conn.execute(
+        "SELECT previous_task FROM tasks WHERE id=?", (child_id,)
+    ).fetchone()[0]
+    assert prev is None, (
+        f"delegated plan {child_id} must not nest under the dispatcher's plan "
+        f"({own_task}); got previous_task={prev!r}"
+    )
+
+
+def test_delegated_new_rejects_an_explicit_parent(monkeypatch):
+    """A delegated Plan may not nest under ANY explicit parent.
+
+    Including the caller's own active Plan: the parent would be the
+    dispatcher's task, and closing the child would restore it onto the
+    worker's binding.
+    """
+    conn = _db()
+    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    monkeypatch.setattr(
+        plan_tool, "clarify_tool", lambda *_args, **_kwargs: '{"user_response":"Approve"}'
+    )
+    agent = _Agent()
+
+    plan_tool.plan_tool(agent, "new", title="My own plan", goal="mine", steps=["one"])
+    own_task = conn.execute("SELECT task_id FROM execution_bindings").fetchone()[0]
+    before = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+
+    blocked = plan_tool.plan_tool(
+        agent, "new", title="Nested dispatch", goal="theirs", steps=["one"],
+        assignee="ornith", parent_task_id=own_task,
+    )
+    assert blocked.startswith("PLAN_CONFLICT"), blocked
+    assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == before
+
+
+
+def test_closing_a_cross_agent_child_refuses_to_restore_foreign_parent(monkeypatch):
+    """Legacy cross-agent rows must not rebind a worker onto another's task.
+
+    Defence in depth for rows already written before delegated plans were
+    barred from nesting: the restore path re-checks ownership, so a worker
+    closing its own plan can never be handed the dispatcher's task.
+    """
+    conn = _db()
+    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    monkeypatch.setattr(
+        plan_tool, "clarify_tool", lambda *_args, **_kwargs: '{"user_response":"Approve"}'
+    )
+    agent = _Agent()
+
+    # A dispatcher's own active plan.
+    plan_tool.plan_tool(agent, "new", title="Dispatcher plan", goal="mine", steps=["one"])
+    own_task = conn.execute("SELECT task_id FROM execution_bindings").fetchone()[0]
+
+    # A delegated child pointed at it by hand — exactly what the pre-fix code
+    # wrote.  This is the row that produced the live incident.
+    now = int(time.time())
+    conn.execute(
+        "INSERT INTO tasks (id, title, body, status, assignee, created_at, "
+        "task_steps, task_stepno, task_goal, previous_task, plan_kind, "
+        "pre_approved, created_by) VALUES "
+        "('t_legacy_child','Legacy child','body','manual','ornith',?,?,1,'g',"
+        "?, 'normal',1,'zephyr')",
+        (now, '["one"]', own_task),
+    )
+    conn.execute(
+        "INSERT INTO execution_bindings (profile, root_session_id, task_id, "
+        "revision, bound_at, updated_at) VALUES ('ornith','ornith-root',"
+        "'t_legacy_child',1,?,?)",
+        (now, now),
+    )
+    conn.commit()
+
+    from hermes_cli.execution_bindings import (
+        ExecutionKey,
+        InvalidTaskState,
+        _close_plan_in_txn,
+    )
+
+    key = ExecutionKey(profile="ornith", root_session_id="ornith-root")
+    task_row = conn.execute("SELECT * FROM tasks WHERE id='t_legacy_child'").fetchone()
+    binding = conn.execute(
+        "SELECT * FROM execution_bindings WHERE profile='ornith'"
+    ).fetchone()
+    from hermes_cli.execution_bindings import ExecutionBinding
+
+    current = ExecutionBinding(
+        profile=binding["profile"],
+        root_session_id=binding["root_session_id"],
+        task_id=binding["task_id"],
+        revision=binding["revision"],
+        bound_at=binding["bound_at"],
+        updated_at=binding["updated_at"],
+    )
+
+    try:
+        _close_plan_in_txn(
+            conn,
+            key,
+            current,
+            outcome="failed",
+            reason="test",
+            actor="ornith",
+        )
+        raised = None
+    except InvalidTaskState as exc:
+        raised = exc
+
+    assert raised is not None, "cross-agent parent restore must be refused"
+    assert "another agent's plan" in str(raised)
+    # The worker must still own its own binding — not be rebound to the
+    # dispatcher's task.
+    bound = conn.execute(
+        "SELECT task_id FROM execution_bindings WHERE profile='ornith'"
+    ).fetchone()[0]
+    assert bound == "t_legacy_child", bound
+    assert task_row["previous_task"] == own_task
+
+
+
+
+
 def test_advance_closes_binding_and_records_required_summary(monkeypatch):
     conn = _db()
     monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)

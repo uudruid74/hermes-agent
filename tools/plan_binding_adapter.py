@@ -302,12 +302,32 @@ def _create_plan(
         # parent binding (`_close_plan_in_txn`), so nesting works to any
         # depth.  Refusing instead of nesting was the bug — an active
         # binding is the normal, expected state, not a lock.
-        if current is not None and parent_task_id is None:
+        #
+        # BUT nesting is for YOUR OWN plans only (Evan, 2026-09-29).  A
+        # delegated Plan (assignee is another agent) must NOT inherit the
+        # caller's active Plan as its parent: the parent is the *creator's*
+        # task, and closing the child would restore it onto the WORKER's
+        # binding — handing the worker a task assigned to someone else.
+        # Observed live: a dispatched child carrying
+        # previous_task=<creator's task> closed with outcome=failed and
+        # rebound the worker's (profile, root_session_id) to the creator's
+        # task, which the worker then resumed.  Your old plan has nothing to
+        # do with the plans you dispatch.
+        if delegated:
+            if parent_task_id is not None:
+                return (
+                    f"PLAN_CONFLICT: delegated Plan for {assigned!r} cannot "
+                    f"nest under {parent_task_id!r}; delegated plans start "
+                    f"their own chain"
+                )
+            parent_task_id = None
+        elif current is not None and parent_task_id is None:
             parent_task_id = current.task_id
-        if current is None and parent_task_id is not None:
+        if not delegated and current is None and parent_task_id is not None:
             return f"PLAN_CONFLICT: expected parent {parent_task_id}, but no Plan is active"
         if (
-            current is not None
+            not delegated
+            and current is not None
             and parent_task_id is not None
             and parent_task_id != current.task_id
         ):
