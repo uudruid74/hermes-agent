@@ -1371,9 +1371,11 @@ def run_conversation(
     truncated_tool_call_retries = 0
     truncated_response_parts: List[str] = []
     compression_attempts = 0
-    # One resolved per-turn compression attempt cap, shared by every site that
-    # consumes ``compression_attempts``: the pre-API pressure gate, the
-    # overflow/413 retry handlers, and the post-tool compaction gate.
+    # One resolved compression attempt cap, shared by every site that consumes
+    # ``compression_attempts``: the pre-API pressure gate, the overflow/413
+    # retry handlers, and the post-tool compaction gate.  The counter is a
+    # backstop for one unresolved pressure episode; real provider usage below
+    # threshold re-arms it so a long tool loop can compact again after refilling.
     # Config-driven via compression.max_attempts (parsed + validated in
     # agent_init); default 3 preserves the prior hardcoded behavior for
     # objects without the attribute (older pickles / minimal stubs).
@@ -1949,7 +1951,7 @@ def run_conversation(
         # should_compress() — reusing the canonical threshold_tokens (output
         # room already reserved by _compute_threshold_tokens) and its summary-
         # LLM cooldown + anti-thrash guards (#11529). compression_attempts is a
-        # hard per-turn backstop shared with the overflow error handlers.
+        # pressure-episode backstop shared with the overflow error handlers.
         _compressor = agent.context_compressor
         _preflight_threshold = int(
             getattr(_compressor, "threshold_tokens", 0) or 0
@@ -3308,6 +3310,19 @@ def run_conversation(
                         "reasoning_tokens": canonical_usage.reasoning_tokens,
                     }
                     agent.context_compressor.update_from_response(usage_dict)
+
+                    # The shared attempt cap prevents repeated compaction while
+                    # one oversized request is still unresolved.  It must not be
+                    # a lifetime cap for a long tool-calling turn: once real
+                    # provider usage proves the request is below threshold, a
+                    # later refill is a new pressure episode and needs a fresh
+                    # recovery budget.
+                    if prompt_tokens < int(
+                        getattr(agent.context_compressor, "threshold_tokens", 0)
+                        or 0
+                    ):
+                        compression_attempts = 0
+                        _preflight_compression_blocked = False
 
                     # Stash this response's canonical usage so the post-turn
                     # on_turn_complete() observation hook can forward it (the
