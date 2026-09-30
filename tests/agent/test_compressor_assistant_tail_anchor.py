@@ -261,7 +261,7 @@ class TestFindTailCutByTokensAnchorsAssistant:
         permits a single oversized tail message; the assistant anchor
         must still recover the reply on the other side of it."""
         c = compressor
-        c.tail_token_budget = 100  # soft ceiling 150
+        c.tail_token_budget = 100
         messages = [
             {"role": "user", "content": "earlier"},
             {"role": "assistant", "content": "VISIBLE REPLY"},

@@ -5202,10 +5202,9 @@ This compaction should PRIORITISE preserving all information related to the focu
 
         Token budget is the primary criterion.  A bounded message-count floor
         keeps a short run of recent turns verbatim even when the budget is
-        exhausted, but the budget is allowed to exceed by up to 1.5x to avoid
-        cutting inside an oversized message (tool output, file read, etc.). If
-        even that floor exceeds 1.5x the budget, the cut is placed right after
-        the head so compression still runs.
+        exhausted.  That floor may exceed the budget when it contains an
+        oversized message (tool output, file read, etc.); messages are always
+        retained whole.
 
         Never cuts inside a tool_call/result group.  Always ensures the most
         recent user message is in the tail (see ``_ensure_last_user_message_in_tail``).
@@ -5226,47 +5225,19 @@ This compaction should PRIORITISE preserving all information related to the focu
             min(min_tail_floor, compressible_tail_cap, available_tail)
             if available_tail > 1 else 0
         )
-        soft_ceiling = int(token_budget * 1.5)
         accumulated = 0
         cut_idx = n  # start from beyond the end
 
         for i in range(n - 1, head_end - 1, -1):
             msg = messages[i]
             msg_tokens = _estimate_msg_budget_tokens(msg)
-            # Stop once we exceed the soft ceiling (unless we haven't hit min_tail yet)
-            if accumulated + msg_tokens > soft_ceiling and (n - i) >= min_tail:
+            # Honour the configured target once the bounded recent-message
+            # floor is protected. The fallback below admits the floor's
+            # boundary message whole when that message is itself oversized.
+            if accumulated + msg_tokens > token_budget and (n - i) >= min_tail:
                 break
             accumulated += msg_tokens
             cut_idx = i
-
-        # If the backward walk never broke early because the entire transcript
-        # fits within soft_ceiling, accumulated now holds the total transcript
-        # size.  Without intervention _ensure_last_user_message_in_tail pushes
-        # cut_idx forward to include the last user message, and the caller's
-        # compress_start >= compress_end guard either returns unchanged (no-op)
-        # or compresses a single message — both of which trigger the infinite
-        # compaction loop described in #40803.
-        #
-        # Fix: when the whole transcript fits in soft_ceiling, compute a
-        # meaningful cut point using the raw (non-inflated) budget so that
-        # compression actually summarizes a worthwhile middle section.
-        if cut_idx <= head_end and accumulated <= soft_ceiling and accumulated > 0:
-            # The entire compressable region fits in the soft ceiling.
-            # Re-walk with the raw budget (no 1.5x multiplier) to find a
-            # split that gives the summarizer something useful.
-            raw_budget = token_budget
-            raw_accumulated = 0
-            for j in range(n - 1, head_end - 1, -1):
-                raw_msg = messages[j]
-                raw_tok = _estimate_msg_budget_tokens(raw_msg)
-                if raw_accumulated + raw_tok > raw_budget and (n - j) >= min_tail:
-                    cut_idx = j
-                    break
-                raw_accumulated += raw_tok
-                cut_idx = j
-            # If the raw-budget walk also consumed everything (very small
-            # transcript), fall through — the existing fallback logic below
-            # will still force a minimal cut after head_end.
 
         # Ensure we protect at least min_tail messages
         fallback_cut = n - min_tail

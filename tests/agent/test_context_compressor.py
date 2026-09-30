@@ -10,6 +10,7 @@ from agent.context_compressor import (
     HISTORICAL_TASK_HEADING,
     SUMMARY_PREFIX,
     COMPRESSED_SUMMARY_METADATA_KEY,
+    _estimate_msg_budget_tokens,
     _summarize_tool_result,
     _is_summary_access_or_quota_error,
 )
@@ -320,9 +321,12 @@ class TestTailBudgetCodexReplayFields:
             for i in range(14)
         )
 
+        # t_06894b19: the walk now stops AT the configured budget rather than
+        # its former 1.5x soft ceiling, so the anchored cut is one step later
+        # than before (still on the other side of the oversized message).
         cut_idx = c._find_tail_cut_by_tokens(messages, head_end=1, token_budget=150)
 
-        assert cut_idx == 5
+        assert cut_idx == 10
         assert messages[4]["codex_reasoning_items"][0]["encrypted_content"].startswith("enc_")
         assert messages[4]["codex_message_items"][0]["content"][0]["text"].startswith("reply ")
 
@@ -374,7 +378,7 @@ class TestTailBudgetCodexReplayFields:
             for i in range(14)
         )
 
-        assert c._find_tail_cut_by_tokens(messages, head_end=1, token_budget=150) == 5
+        assert c._find_tail_cut_by_tokens(messages, head_end=1, token_budget=150) == 10
 
 
 class TestGenerateSummaryNoneContent:
@@ -1566,6 +1570,46 @@ class TestTokenBudgetTailProtection:
             )
             return c
 
+    def test_many_small_messages_stop_at_configured_budget(self, budget_compressor):
+        """The 1.5x safety ceiling must not inflate an ordinary small-message tail."""
+        c = budget_compressor
+        c.protect_last_n = 8
+        budget = 9_369
+        messages = [{"role": "system", "content": "sys"}]
+        messages.extend(
+            {
+                "role": "user" if i % 2 == 0 else "assistant",
+                "content": f"{i:03d} " + ("x" * 196),
+            }
+            for i in range(300)
+        )
+
+        cut = c._find_tail_cut_by_tokens(messages, head_end=1, token_budget=budget)
+        tail_tokens = sum(_estimate_msg_budget_tokens(msg) for msg in messages[cut:])
+
+        assert tail_tokens <= budget
+
+    def test_oversized_recent_message_remains_intact(self, budget_compressor):
+        """A message larger than the budget is still retained whole in the recent floor."""
+        c = budget_compressor
+        c.protect_last_n = 3
+        budget = 100
+        oversized = {"role": "assistant", "content": "important tool output " + ("x" * 800)}
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "old request"},
+            {"role": "assistant", "content": "old answer"},
+            {"role": "user", "content": "recent request"},
+            oversized,
+            {"role": "user", "content": "latest request"},
+        ]
+
+        cut = c._find_tail_cut_by_tokens(messages, head_end=1, token_budget=budget)
+
+        assert cut <= messages.index(oversized)
+        assert messages[cut:][messages[cut:].index(oversized)] is oversized
+        assert oversized["content"] == "important tool output " + ("x" * 800)
+
 
 
     def test_tiny_budget_preserves_bounded_recent_turns(self, budget_compressor):
@@ -1621,7 +1665,8 @@ class TestTokenBudgetTailProtection:
         assert len(result) < len(messages)
 
     def test_oversized_last_n_tail_collapses_tools_before_internal_fallback(self):
-        """Historical call arguments must not crowd the visible last-N tail."""
+        """Historical call arguments must not crowd the visible last-N tail (the
+    budget was set pre-fix so the whole protected tail would exceed 1800*1.5)."""
         with patch(
             "agent.context_compressor.get_model_context_length", return_value=100_000
         ):
@@ -1744,10 +1789,10 @@ class TestTokenBudgetTailProtection:
         """_find_tail_cut_by_tokens must use text char count, not list length,
         for multimodal content. Regression guard for #16087.
 
-        Setup: 6 messages, budget=80 (soft_ceiling=120).  The multimodal message
+        Setup: 6 messages, budget=80.  The multimodal message
         at index 1 has 500 chars of text → 135 tokens (correct) or 10 tokens (bug).
 
-        Fixed path: walk stops at the multimodal (44+135=179 > 120), cut stays at 2,
+        Fixed path: walk stops at the multimodal (44+135=179 > 80), cut stays at 2,
         tail = messages[2:] = 4 messages.
 
         Bug path: walk counts only 10 tokens for the multimodal, exhausts to head_end,
