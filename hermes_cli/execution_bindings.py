@@ -833,8 +833,21 @@ def _advance_plan_transaction(
             )
         now = int(time.time())
         if pending_step_review(conn, current.task_id) is not None:
-            raise InvalidTaskState(
-                f"plan {current.task_id} Step {step_no} is already awaiting review"
+            # Evan 2026-09-29 (ornith t_e147304f): a repeat advance of the SAME
+            # active step while its review is pending is the worker's only
+            # escalation channel — the retry IS the signal.  It must re-notify,
+            # not refuse: return the outstanding pending state unchanged so the
+            # adapter's notify path re-sends the existing review request.
+            # Mutates nothing: no second pending event, no step move, no
+            # revision bump, held summary untouched.  A DIFFERENT step (or a
+            # non-active plan) still raises via the guards above.
+            return PlanStepResult(
+                task_id=current.task_id,
+                step_no=step_no,
+                next_step=steps[step_no - 1],
+                closed=False,
+                restored_task_id=None,
+                binding_revision=current.revision,
             )
         _set_step_summary(
             conn,

@@ -124,15 +124,48 @@ def test_advance_records_one_summary_holds_step_and_notifies_dispatcher(monkeypa
     ).fetchone()[0] == 0
 
 
-def test_second_advance_is_refused_while_review_is_pending(monkeypatch):
+def test_repeat_advance_while_pending_renotifies_without_mutation(monkeypatch):
+    """Evan 2026-09-29 (ornith t_e147304f): a repeat advance while a step
+    review is pending is the worker's only escalation channel — it must
+    re-notify the dispatcher, not refuse.  Idempotent: no second pending
+    event, no step move, no revision bump, held summary untouched."""
+    from hermes_cli import execution_bindings as bindings
+
     conn, sent, worker, _dispatcher, task_id = _delegated_plan(monkeypatch)
-    plan_tool.plan_tool(worker, "advance", summary="first summary", step=1)
+    first = plan_tool.plan_tool(worker, "advance", summary="first summary", step=1)
+    assert "pause" in first.lower()
+    assert len(sent) == 1
+    revision_before = conn.execute(
+        "SELECT revision FROM execution_bindings WHERE task_id=?", (task_id,)
+    ).fetchone()[0]
 
     result = plan_tool.plan_tool(worker, "advance", summary="second summary", step=1)
 
-    assert "already awaiting review" in result.lower()
+    assert "pause" in result.lower()
+    assert "wait for verification" in result.lower()
+    assert "ERROR" not in result
+    assert len(sent) == 2, "the repeat must re-send the review request"
+    assert sent[1][:4] == ["hermes", "send", "-u", "neo"]
+    assert sent[1][4] == sent[0][4], "the re-notify is the same review request"
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_events WHERE task_id=? "
+        "AND kind='plan-step-review-pending'",
+        (task_id,),
+    ).fetchone()[0] == 1
     assert _stepno(conn, task_id) == 1
-    assert len(sent) == 1
+    revision_after = conn.execute(
+        "SELECT revision FROM execution_bindings WHERE task_id=?", (task_id,)
+    ).fetchone()[0]
+    assert revision_after == revision_before, "a re-notify must not bump the revision"
+    summaries = conn.execute(
+        "SELECT body FROM task_comments WHERE task_id=? "
+        "AND body LIKE '[plan-step-summary:1]%'",
+        (task_id,),
+    ).fetchall()
+    assert [row[0] for row in summaries] == ["[plan-step-summary:1] first summary"], (
+        "a repeat advance must not overwrite the held summary"
+    )
+    assert bindings.pending_step_review(conn, task_id).summary == "first summary"
 
 
 def test_approved_review_advances_and_notifies_worker(monkeypatch):
