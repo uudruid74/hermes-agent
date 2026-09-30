@@ -1333,7 +1333,9 @@ def _handle_create(args: dict, **kw) -> str:
                 session_id=session_id,
             )
             new_task = kb.get_task(conn, new_tid)
-            subscribed = _maybe_auto_subscribe(conn, new_tid)
+            subscribed = _maybe_auto_subscribe(
+                conn, new_tid, origin_session_id=session_id
+            )
             return _ok(
                 task_id=new_tid,
                 status=new_task.status if new_task else None,
@@ -1351,7 +1353,9 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(f"kanban_create: {e}")
 
 
-def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
+def _maybe_auto_subscribe(
+    conn: Any, task_id: str, *, origin_session_id: str | None
+) -> bool:
     """Auto-subscribe the calling session to task completion / block events.
 
     Returns True if a subscription row was written, False otherwise (no
@@ -1462,11 +1466,10 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
         # later lost/overwritten, the origin comment survives as the
         # source of truth. Origin routing is session-addressed; the delivery
         # channel above remains a separate subscription concern.
-        session_id = get_session_env("HERMES_SESSION_ID", "") or ""
         try:
             _kb.store_origin_routing(
                 conn, task_id=task_id,
-                platform="session", chat_id=session_id,
+                platform="session", chat_id=origin_session_id or "",
                 profile=notifier_profile or "",
                 overwrite=True,
             )

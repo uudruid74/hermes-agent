@@ -840,16 +840,29 @@ def test_create_auto_subscribe_uses_username_only(monkeypatch, worker_env):
 
 
 def test_auto_subscribe_retargets_existing_origin(monkeypatch, worker_env):
-    """An idempotent re-dispatch must route lifecycle notices to its caller."""
+    """An idempotent re-dispatch must route notices to its request origin."""
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
     monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-42")
-    monkeypatch.setenv("HERMES_SESSION_ID", "20260929_010203_f00d00")
+    monkeypatch.setenv("HERMES_SESSION_ID", "internal-child-session")
 
     from hermes_cli import kanban_db as kb
+    from tools import async_delegation
     from tools import kanban_tools as kt
 
+    request_origin = "20260929_010203_f00d00"
+    monkeypatch.setattr(
+        async_delegation,
+        "_current_origin_session_id",
+        lambda: request_origin,
+    )
+
     with kb.connect() as conn:
-        task_id = kb.create_task(conn, title="existing bug", assignee="peer")
+        task_id = kb.create_task(
+            conn,
+            title="existing bug",
+            assignee="peer",
+            idempotency_key="existing-bug",
+        )
         kb.store_origin_routing(
             conn,
             task_id,
@@ -858,10 +871,18 @@ def test_auto_subscribe_retargets_existing_origin(monkeypatch, worker_env):
             profile="original-reporter",
         )
 
-        assert kt._maybe_auto_subscribe(conn, task_id) is True
+    result = json.loads(kt._handle_create({
+        "title": "existing bug",
+        "assignee": "peer",
+        "idempotency_key": "existing-bug",
+    }))
+
+    assert result["ok"] is True
+    assert result["task_id"] == task_id
+    with kb.connect() as conn:
         assert kb.get_origin_routing(conn, task_id) == {
             "platform": "session",
-            "chat_id": "20260929_010203_f00d00",
+            "chat_id": request_origin,
             "thread_id": "",
             "chat_type": "",
             "profile": "test-worker",
