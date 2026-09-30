@@ -379,7 +379,7 @@ def _create_plan(
             response = json.loads(
                 _legacy().clarify_tool(
                     f"Approve plan {task_id}?\n\n{plan_body}",
-                    choices=["Approve", "Deny"],
+                    choices=["Approve", "Deny", "Yolo"],
                     callback=callback,
                     agent=agent,
                     task_id=task_id,
@@ -395,9 +395,22 @@ def _create_plan(
         if timed_out:
             agent._plan_approval_timed_out = task_id
             return f"Plan awaiting approval ({task_id}): no user response was received."
+        # Three answers: Approve, Deny, Yolo. Evan's rule: yolo is a property
+        # of the HUMAN's answer, never something an agent specifies. Order
+        # matters — "Yolo" contains no "appr", so testing plain-approve first
+        # would fall through to the deny branch and ARCHIVE the plan. Match
+        # the stop-asking form first, then plain approve, else deny.
+        _answer = str(response).strip().lower()
+        _yolo = _answer.startswith("yolo")
+        _approve = _answer.startswith("appr")
         try:
             with write_txn(conn):
-                if "appr" in str(response).lower():
+                if _yolo or _approve:
+                    if _yolo:
+                        conn.execute(
+                            "UPDATE tasks SET plan_auto_approve = 1 WHERE id = ?",
+                            (task_id,),
+                        )
                     if delegated:
                         # Delegated plan: approve the authorization so the
                         # worker's `plan continue` binds cleanly, but do NOT
@@ -689,10 +702,16 @@ def cmd_advance(agent, summary: str, step: Optional[int] = None) -> str:
         return f"ERROR: Plan {result.task_id} did not create a pending review"
     task = conn.execute("SELECT * FROM tasks WHERE id=?", (result.task_id,)).fetchone()
     dispatcher = _dispatcher_for_task(conn, result.task_id)
+    # A SELF-CREATED plan (creator IS assignee) has no AI dispatcher — the HUMAN
+    # is the reviewer. Yolo must still work there: the answer is given by the
+    # human, so the human satisfies the requirement that someone be able to
+    # receive the step notice. Gating only on the dispatcher made yolo
+    # impossible on exactly the plans the human runs by hand.
+    _human_gate = bool(getattr(agent, "clarify_callback", None))
     if bool(task["plan_auto_approve"]):
-        if not dispatcher:
+        if not dispatcher and not _human_gate:
             return (
-                f"ERROR: Plan {result.task_id} has YOLO enabled but no dispatcher "
+                f"ERROR: Plan {result.task_id} has YOLO enabled but no reviewer "
                 "is available for the required step notification. Review remains pending."
             )
         message, reviewed = _resolve_review(
@@ -707,7 +726,9 @@ def cmd_advance(agent, summary: str, step: Optional[int] = None) -> str:
         if reviewed is None:
             return message
         request = _review_request_text(task, pending, auto_approved=True)
-        failure = _send_user(dispatcher, request)
+        # No dispatcher means the human is the reviewer (self-created plan) —
+        # they already answered yolo, so there is no one to notify.
+        failure = _send_user(dispatcher, request) if dispatcher else None
         suffix = f" Dispatcher notification failed: {failure}" if failure else ""
         if reviewed.closed:
             return (
@@ -741,7 +762,7 @@ def cmd_advance(agent, summary: str, step: Optional[int] = None) -> str:
         response = json.loads(
             _legacy().clarify_tool(
                 request,
-                choices=["Approve", "Deny", "Approve and stop asking"],
+                choices=["Approve", "Deny", "Yolo"],
                 callback=callback,
                 agent=agent,
                 task_id=result.task_id,
@@ -758,11 +779,12 @@ def cmd_advance(agent, summary: str, step: Optional[int] = None) -> str:
             "verification. User review is pending."
         )
     _answer = str(response).strip().lower()
-    # "Approve and stop asking" approves this step AND enables auto-approve for
-    # the remainder of the plan, so the reviewer is never asked again. Evan's
-    # rule: yolo is a property of the human's answer, never something an agent
-    # specifies. Order matters — test the yolo form before the plain approve.
-    if _answer.startswith("appr") and "stop" in _answer:
+    # "Yolo" approves this step AND enables auto-approve for the remainder of
+    # the plan, so the reviewer is never asked again. Evan's rule: yolo is a
+    # property of the human's answer, never something an agent specifies.
+    # Order matters — "Yolo" contains no "appr", so test it before the plain
+    # approve.
+    if _answer.startswith("yolo"):
         decision = "yolo"
     else:
         decision = "approved" if _answer.startswith("appr") else "denied"
@@ -1383,15 +1405,16 @@ def cmd_approve(agent, task_id: str) -> str:
         return f"ERROR: No clarify callback available. Cannot present plan {task_id} for approval."
     response = callback(
         f"Approve plan {task_id}?\n\n{task['body']}",
-        ["Approve", "Deny", "Approve and stop asking"],
+        ["Approve", "Deny", "Yolo"],
     )
     _answer = str(response or "").strip().lower()
-    if not _answer or not _answer.startswith("appr"):
+    _stop_asking = _answer.startswith("yolo")
+    if not _answer or not (_stop_asking or _answer.startswith("appr")):
         return f"Plan awaiting approval ({task_id}): no approval was recorded."
-    # "Approve and stop asking" also enables auto-approve for the whole plan, so
-    # the reviewer is not asked again at each step. Evan's rule: yolo is a
-    # property of the human's answer, never something an agent specifies.
-    _stop_asking = _answer.startswith("appr") and "stop" in _answer
+    # "Yolo" also enables auto-approve for the whole plan, so the reviewer is
+    # not asked again at each step. Evan's rule: yolo is a property of the
+    # human's answer, never something an agent specifies. "Yolo" contains no
+    # "appr", so it must be matched before the plain-approve test above.
     try:
         key = _identity(agent)
         current = bindings.get_binding(conn, key)

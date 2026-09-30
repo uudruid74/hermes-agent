@@ -357,13 +357,13 @@ def test_self_created_plan_uses_clarify_approve_deny_gate(monkeypatch):
 
     assert "Approved" in result
     assert _stepno(conn, task_id) == 2
-    assert questions[-1][1] == ["Approve", "Deny", "Approve and stop asking"]
+    assert questions[-1][1] == ["Approve", "Deny", "Yolo"]
     assert "ornith has completed step 1" in questions[-1][0]
     assert sent == []
 
 
-def test_approve_and_stop_asking_enables_auto_approve(monkeypatch):
-    """"Approve and stop asking" approves the step AND auto-approves the rest.
+def test_yolo_answer_enables_auto_approve(monkeypatch):
+    """"Yolo" approves the step AND auto-approves the rest.
 
     The reviewer is the human here (self-created plan, no AI dispatcher), so the
     clarify gate is the only place the choice can be made — yolo is a property of
@@ -374,7 +374,7 @@ def test_approve_and_stop_asking_enables_auto_approve(monkeypatch):
 
     def clarify(question, choices=None, **_kwargs):
         questions.append((question, choices))
-        return json.dumps({"user_response": "Approve and stop asking"})
+        return json.dumps({"user_response": "Yolo"})
 
     monkeypatch.setattr(plan_tool, "clarify_tool", clarify)
     worker = _Agent("ornith", "20260923_010107_abcdef")
@@ -389,13 +389,13 @@ def test_approve_and_stop_asking_enables_auto_approve(monkeypatch):
 
     result = plan_tool.plan_tool(worker, "advance", summary="inspection complete", step=1)
 
-    assert "Approved" in result
+    assert "auto-approved" in result
     assert _stepno(conn, task_id) == 2
     row = conn.execute(
         "SELECT plan_auto_approve FROM tasks WHERE id=?", (task_id,)
     ).fetchone()
     assert row[0] == 1, "yolo answer must enable plan_auto_approve"
-    assert questions[-1][1] == ["Approve", "Deny", "Approve and stop asking"]
+    assert questions[-1][1] == ["Approve", "Deny", "Yolo"]
     assert sent == []
 
 
