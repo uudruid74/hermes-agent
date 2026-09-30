@@ -691,6 +691,7 @@ def _cmd_dispatch(agent, title: str, goal: str, project: str, assignee: str,
                     conn, task_id,
                     platform="session", chat_id=session_id,
                     profile=profile,
+                    overwrite=True,
                 )
     except (OSError, ValueError, sqlite3.Error) as exc:
         import logging

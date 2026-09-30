@@ -1468,6 +1468,7 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
                 conn, task_id=task_id,
                 platform="session", chat_id=session_id,
                 profile=notifier_profile or "",
+                overwrite=True,
             )
         except ValueError as exc:
             logger.warning(

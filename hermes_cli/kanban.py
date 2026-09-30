@@ -1963,7 +1963,9 @@ def _store_cli_origin_routing(conn, task_id: str, channel_flag: str) -> None:
         print(f"kanban: failed to store origin routing: {exc}", file=sys.stderr)
 
 
-def _store_cli_implicit_origin(conn, task_id: str) -> None:
+def _store_cli_implicit_origin(
+    conn, task_id: str, *, overwrite: bool = False
+) -> None:
     """Store an implicit CLI origin from the session env.
 
     Preference order:
@@ -1973,6 +1975,9 @@ def _store_cli_implicit_origin(conn, task_id: str) -> None:
        worked and was silently lost when the session-id requirement made
        origin storage impossible in those shells)
     Neither present → nothing to store; exit quietly.
+
+    ``overwrite`` is reserved for assignment/reassignment paths. Create-time
+    callers keep the idempotent first-writer-wins default.
     """
     session_id = os.environ.get("HERMES_SESSION_ID", "").strip()
     if session_id:
@@ -1983,6 +1988,7 @@ def _store_cli_implicit_origin(conn, task_id: str) -> None:
                 platform="session",
                 chat_id=session_id,
                 profile=(os.environ.get("USERNAME") or "").strip(),
+                overwrite=overwrite,
             )
         except ValueError as exc:
             print(f"kanban: refusing invalid implicit session origin: {exc}", file=sys.stderr)
@@ -2005,6 +2011,7 @@ def _store_cli_implicit_origin(conn, task_id: str) -> None:
                 chat_type=os.environ.get("HERMES_SESSION_CHAT_TYPE", "").strip(),
                 profile=(os.environ.get("USERNAME") or "").strip(),
                 allow_non_session=True,
+                overwrite=overwrite,
             )
         except Exception as exc:
             print(f"kanban: failed to store origin routing from env: {exc}", file=sys.stderr)
@@ -2465,6 +2472,8 @@ def _cmd_assign(args: argparse.Namespace) -> int:
     profile = None if args.profile.lower() in {"none", "-", "null"} else args.profile
     with kb.connect_closing() as conn:
         ok = kb.assign_task(conn, args.task_id, profile)
+        if ok:
+            _store_cli_implicit_origin(conn, args.task_id, overwrite=True)
     if not ok:
         print(f"no such task: {args.task_id}", file=sys.stderr)
         return 1
@@ -2520,6 +2529,8 @@ def _cmd_reassign(args: argparse.Namespace) -> int:
             reclaim_first=bool(getattr(args, "reclaim", False)),
             reason=getattr(args, "reason", None),
         )
+        if ok:
+            _store_cli_implicit_origin(conn, args.task_id, overwrite=True)
     if not ok:
         print(
             f"cannot reassign {args.task_id} "

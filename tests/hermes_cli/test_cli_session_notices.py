@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -134,7 +135,34 @@ def test_cli_implicit_origin_uses_durable_session_id(monkeypatch):
         "platform": "session",
         "chat_id": "20260921_010203_abcdef",
         "profile": "neo",
+        "overwrite": False,
     }
+
+
+@pytest.mark.parametrize("command", ["assign", "reassign"])
+def test_cli_reassignment_retargets_origin(monkeypatch, command):
+    conn = object()
+    captured = []
+    monkeypatch.setattr(kanban.kb, "connect_closing", lambda: nullcontext(conn))
+    monkeypatch.setattr(kanban.kb, "assign_task", lambda *_args: True)
+    monkeypatch.setattr(kanban.kb, "reassign_task", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        kanban,
+        "_store_cli_implicit_origin",
+        lambda actual_conn, task_id, *, overwrite=False: captured.append(
+            (actual_conn, task_id, overwrite)
+        ),
+    )
+    args = argparse.Namespace(
+        task_id="t_existing",
+        profile="neo",
+        reclaim=False,
+        reason=None,
+    )
+
+    handler = kanban._cmd_assign if command == "assign" else kanban._cmd_reassign
+    assert handler(args) == 0
+    assert captured == [(conn, "t_existing", True)]
 
 
 def test_kanban_cli_origin_queues_session_notice(tmp_path, monkeypatch):

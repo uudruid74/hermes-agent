@@ -1041,6 +1041,7 @@ def test_cli_create_env_origin_uses_durable_session_id(
         "platform": "session",
         "chat_id": "20260921_012345_abcdef",
         "profile": (os.environ.get("USERNAME") or "").strip(),
+        "overwrite": False,
     }
 
 

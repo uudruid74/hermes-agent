@@ -839,6 +839,35 @@ def test_create_auto_subscribe_uses_username_only(monkeypatch, worker_env):
     assert created_origin["chat_id"] == "20260921_010203_abcdef"
 
 
+def test_auto_subscribe_retargets_existing_origin(monkeypatch, worker_env):
+    """An idempotent re-dispatch must route lifecycle notices to its caller."""
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-42")
+    monkeypatch.setenv("HERMES_SESSION_ID", "20260929_010203_f00d00")
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="existing bug", assignee="peer")
+        kb.store_origin_routing(
+            conn,
+            task_id,
+            platform="session",
+            chat_id="20260921_010203_abcdef",
+            profile="original-reporter",
+        )
+
+        assert kt._maybe_auto_subscribe(conn, task_id) is True
+        assert kb.get_origin_routing(conn, task_id) == {
+            "platform": "session",
+            "chat_id": "20260929_010203_f00d00",
+            "thread_id": "",
+            "chat_type": "",
+            "profile": "test-worker",
+        }
+
+
 def test_create_respects_auto_subscribe_on_create_false(monkeypatch, worker_env, tmp_path):
     """The config gate kanban.auto_subscribe_on_create=false must
     suppress auto-subscription even when the session has a delivery

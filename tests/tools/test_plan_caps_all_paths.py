@@ -181,6 +181,7 @@ def test_dispatch_origin_routing_uses_username_only(board, monkeypatch):
     assert captured["profile"] == "neo"
     assert captured["platform"] == "session"
     assert captured["chat_id"] == "20260921_010203_abcdef"
+    assert captured["overwrite"] is True
 
 
 def test_dispatch_refuses_more_than_twelve_steps(board):
