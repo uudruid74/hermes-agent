@@ -574,7 +574,9 @@ def _review_request_text(task, pending, *, auto_approved: bool = False) -> str:
         lines.append(
             "Please make sure this step is completed correctly and approve or deny "
             "this step using 'plan_tool review'. Pass the task id and decision "
-            "'approved' or 'denied'. A denial must include a reason."
+            "'approved', 'denied', or 'yolo' — 'yolo' approves this step AND "
+            "auto-approves the remaining steps of this plan, so you will not be "
+            "asked again for this plan. A denial must include a reason."
         )
     return "\n".join(lines)
 
