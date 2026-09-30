@@ -129,12 +129,12 @@ def test_handoff_in_protected_head_is_replaced_not_duplicated():
 def test_recompression_of_current_merged_handoff_preserves_prior_tail_once():
     """Current merged handoffs lose only stale summary data on recompression.
 
-    Composed contract after #57835 (restart head-protection decay): the
-    merged handoff's genuine prior-tail content must be RECOVERED — either
-    verbatim in the output (pre-decay head protection) or by entering the
-    summarizer input so the fresh summary folds it in (post-decay). It must
-    never be silently deleted, and the stale summary body must never be
-    re-emitted verbatim.
+    Composed contract after #57835: the merged handoff's genuine prior-tail
+    content must be RECOVERED — either verbatim in the output (raw head
+    protection) or by entering the summarizer input so the fresh summary
+    folds it in (once the handoff is re-summarised). It must never be
+    silently deleted, and the stale summary body must never be re-emitted
+    verbatim.
     """
     compressor = _compressor()
     old_summary = "CURRENT-MERGED-OLD-SUMMARY unique continuity facts"

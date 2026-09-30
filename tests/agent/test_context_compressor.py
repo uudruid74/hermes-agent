@@ -2476,14 +2476,17 @@ class TestDoubleCompactionSummaryRole:
     system as a separate param, so the summary is the first visible message)."""
 
     def test_double_compaction_summary_must_be_user_when_only_system_protected(self):
-        """After the first compression, protect_first_n decays to 0.
+        """When the only protected head message is the system prompt.
 
-        On the second compression the only protected head message is the
-        system prompt (role=system).  The summary becomes the first
-        *visible* message in the API request because adapters like
-        Anthropic and Bedrock send the system prompt as a separate
-        ``system`` parameter.  The summary MUST be role=user or the
-        provider rejects with HTTP 400 (#52160).
+        ``protect_first_n=0`` leaves the system prompt as the entire
+        protected head, so the summary becomes the first *visible* message
+        in the API request — adapters like Anthropic and Bedrock send the
+        system prompt as a separate ``system`` parameter.  The summary MUST
+        be role=user or the provider rejects with HTTP 400 (#52160).
+
+        (Before step5 this state was reached on the *second* compaction via
+        #11996 head decay.  That decay is gone, so the state is configured
+        directly rather than simulated by a compression count.)
         """
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]
@@ -2491,10 +2494,8 @@ class TestDoubleCompactionSummaryRole:
 
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
             c = ContextCompressor(
-                model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2,
+                model="test", quiet_mode=True, protect_first_n=0, protect_last_n=2,
             )
-        # Simulate second compression: protect_first_n decays to 0.
-        c.compression_count = 1
 
         # compress_start will be 1 (system only), last_head_role = "system".
         # Without the fix, summary_role would be "assistant".
@@ -2521,8 +2522,13 @@ class TestDoubleCompactionSummaryRole:
         )
 
     def test_restart_handoff_without_system_still_starts_with_user(self):
-        """When decayed head protection leaves no head, the visible transcript
-        must still begin with a user role for Anthropic/Bedrock compatibility.
+        """When the protected head holds only a persisted-summary turn, the
+        visible transcript must still begin with a user role for
+        Anthropic/Bedrock compatibility.
+
+        (Named for the pre-step5 decay path that produced a system-only head
+        after a restart; with no decay the head is whatever the transcript
+        actually starts with, and the role guarantee must still hold.)
         """
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]
@@ -2560,9 +2566,8 @@ class TestDoubleCompactionSummaryRole:
 
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
             c = ContextCompressor(
-                model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2,
+                model="test", quiet_mode=True, protect_first_n=0, protect_last_n=2,
             )
-        c.compression_count = 1  # decay protect_first_n
 
         # tail starts with user → would collide with forced summary_role=user.
         # The fix should merge into tail instead of flipping to assistant.
