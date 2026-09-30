@@ -2938,13 +2938,23 @@ def _cmd_block(args: argparse.Namespace) -> int:
         for tid in ids:
             if reason:
                 kb.add_comment(conn, tid, author, f"BLOCKED: {reason}")
-            if not kb.block_task(
-                conn,
-                tid,
-                reason=reason,
-                kind=kind,
-                expected_run_id=_worker_run_id_for(tid),
-            ):
+            worker_run_id = _worker_run_id_for(tid)
+            if worker_run_id is not None:
+                blocked = kb.block_task(
+                    conn,
+                    tid,
+                    reason=reason,
+                    kind=kind,
+                    expected_run_id=worker_run_id,
+                )
+            else:
+                blocked = kb.block_task_and_terminate(
+                    conn,
+                    tid,
+                    reason=reason,
+                    kind=kind,
+                )
+            if not blocked:
                 failed.append(tid)
                 print(f"cannot block {tid}", file=sys.stderr)
             else:

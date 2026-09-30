@@ -4951,8 +4951,10 @@ def reclaim_task(
     ).fetchone()
     if not row:
         return False
-    if row["status"] != "running" and row["claim_lock"] is None:
-        # Nothing to reclaim — already ready / blocked / done.
+    if row["status"] != "running":
+        # Reclaim is a running-worker recovery operation. In particular, it
+        # must never double as an implicit unblock for a deliberately blocked
+        # task, even if a stale claim is still present on that row.
         return False
     prev_lock = row["claim_lock"]
     termination = _terminate_reclaimed_worker(
@@ -4962,7 +4964,7 @@ def reclaim_task(
         cur = conn.execute(
             "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL "
-            "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
+            "WHERE id = ? AND status = 'running' "
             "AND claim_lock IS ?",
             (task_id, prev_lock),
         )
@@ -6395,6 +6397,61 @@ def block_task(
         )
     except Exception:
         _log.exception("kanban blocked notification failed for task=%s", task_id)
+    return True
+
+
+def block_task_and_terminate(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: Optional[str] = None,
+    kind: Optional[str] = None,
+    signal_fn=None,
+) -> bool:
+    """Operator block: make the task non-runnable, then stop its worker.
+
+    Worker-originated ``kanban_block`` calls use :func:`block_task` directly
+    so the worker can return its tool result normally. Operator surfaces use
+    this wrapper: it pins the transition to the active run, commits the sticky
+    status first, and only then signals that run's host-local process. Keeping
+    the transition first ensures the worker's exit cannot be classified as a
+    crash and re-queued by the dispatcher.
+    """
+    row = conn.execute(
+        "SELECT status, current_run_id, claim_lock, worker_pid "
+        "FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return False
+
+    run_id = (
+        int(row["current_run_id"])
+        if row["status"] == "running" and row["current_run_id"] is not None
+        else None
+    )
+    if not block_task(
+        conn,
+        task_id,
+        reason=reason,
+        kind=kind,
+        expected_run_id=run_id,
+    ):
+        return False
+
+    if row["status"] == "running":
+        termination = _terminate_reclaimed_worker(
+            row["worker_pid"], row["claim_lock"], signal_fn=signal_fn,
+        )
+        if termination.get("prev_pid") is not None:
+            with write_txn(conn):
+                _append_event(
+                    conn,
+                    task_id,
+                    "block_worker_termination",
+                    termination,
+                    run_id=run_id,
+                )
     return True
 
 
@@ -8579,7 +8636,14 @@ def _record_spawn_failure(
     )
 
 
-def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
+def _set_worker_pid(
+    conn: sqlite3.Connection,
+    task_id: str,
+    pid: int,
+    *,
+    expected_claim_lock: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+) -> bool:
     """Record the spawned child's pid + emit a ``spawned`` event.
 
     The event's payload carries the pid so a human reading ``hermes kanban
@@ -8587,17 +8651,58 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
     the drawer.
     """
     with write_txn(conn):
-        conn.execute(
-            "UPDATE tasks SET worker_pid = ? WHERE id = ?",
-            (int(pid), task_id),
-        )
+        sql = "UPDATE tasks SET worker_pid = ? WHERE id = ? AND status = 'running'"
+        params: list[Any] = [int(pid), task_id]
+        if expected_claim_lock is not None:
+            sql += " AND claim_lock IS ?"
+            params.append(expected_claim_lock)
+        if expected_run_id is not None:
+            sql += " AND current_run_id = ?"
+            params.append(int(expected_run_id))
+        cur = conn.execute(sql, tuple(params))
+        if cur.rowcount != 1:
+            return False
         run_id = _current_run_id(conn, task_id)
         if run_id is not None:
             conn.execute(
-                "UPDATE task_runs SET worker_pid = ? WHERE id = ?",
+                "UPDATE task_runs SET worker_pid = ? "
+                "WHERE id = ? AND status = 'running'",
                 (int(pid), run_id),
             )
         _append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
+    return True
+
+
+def _attach_or_stop_spawned_worker(
+    conn: sqlite3.Connection,
+    claimed: Task,
+    pid: int,
+) -> bool:
+    """Attach ``pid`` only while ``claimed`` still owns the running task."""
+    if _set_worker_pid(
+        conn,
+        claimed.id,
+        pid,
+        expected_claim_lock=claimed.claim_lock,
+        expected_run_id=claimed.current_run_id,
+    ):
+        return True
+
+    termination = _terminate_reclaimed_worker(pid, claimed.claim_lock)
+    payload = {
+        "pid": int(pid),
+        "reason": "task left its claimed run before worker attachment",
+    }
+    payload.update(termination)
+    with write_txn(conn):
+        _append_event(
+            conn,
+            claimed.id,
+            "spawn_cancelled",
+            payload,
+            run_id=claimed.current_run_id,
+        )
+    return False
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -9235,8 +9340,8 @@ def _dispatch_once_locked(
                     pid = _spawn(claimed, str(workspace))
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
-            if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+            if pid and not _attach_or_stop_spawned_worker(conn, claimed, int(pid)):
+                continue
             # NOTE: we intentionally do NOT reset consecutive_failures
             # here. A successful spawn proves the worker can start but
             # doesn't prove the run will succeed. Under unified
@@ -9330,8 +9435,8 @@ def _dispatch_once_locked(
                     pid = _spawn(claimed, str(workspace))
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
-            if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+            if pid and not _attach_or_stop_spawned_worker(conn, claimed, int(pid)):
+                continue
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
         except Exception as exc:

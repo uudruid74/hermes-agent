@@ -883,7 +883,9 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     metadata=payload.metadata,
                 )
             elif s == "blocked":
-                ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
+                ok = kanban_db.block_task_and_terminate(
+                    conn, task_id, reason=payload.block_reason,
+                )
             elif s == "scheduled":
                 ok = kanban_db.schedule_task(conn, task_id, reason=payload.block_reason)
             elif s == "ready":
@@ -1262,7 +1264,7 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                             metadata=payload.metadata,
                         )
                     elif s == "blocked":
-                        ok = kanban_db.block_task(conn, tid)
+                        ok = kanban_db.block_task_and_terminate(conn, tid)
                     elif s == "ready":
                         cur = kanban_db.get_task(conn, tid)
                         if cur and cur.status in ("blocked", "scheduled"):
