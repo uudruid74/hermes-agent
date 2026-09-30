@@ -244,29 +244,59 @@ class TestCompress:
             "terminal sweep must strip _db_persisted even when a copy site leaks"
         )
 
-    def test_protect_first_n_decays_after_first_compression(self):
-        """Regression for #11996: protect_first_n must protect early turns on
-        the FIRST compaction but DECAY afterwards, so the same early user
-        messages don't get re-copied verbatim into every child session and
-        fossilize (grow immortal) across a long, repeatedly-compressed
-        session. The system prompt is always protected separately."""
+    def test_protect_first_n_persists_across_repeated_compactions(self):
+        """step5.md item 3, reversing #11996: the Protected head must
+        NOT decay to 0 after the first compression. The Protected area is
+        what a heap (small) compaction must not flush; only a full
+        compaction (subject change) rebuilds it, so the head budget
+        persists across repeated heap compactions.
+        """
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
-            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=3)
+            c = ContextCompressor(
+                model="test", quiet_mode=True, protect_first_n=3, protect_last_n=4
+            )
 
         msgs = [{"role": "system", "content": "sys"}] + [
             {"role": "user" if i % 2 == 0 else "assistant", "content": f"m{i}"}
             for i in range(10)
         ]
 
-        # First compaction: protect system + first 3 non-system.
+        expected_first_n = 3
         assert c.compression_count == 0
-        assert c._effective_protect_first_n() == 3
-        assert c._protect_head_size(msgs) == 1 + 3
+        assert c._effective_protect_first_n() == expected_first_n
+        assert c._protect_head_size(msgs) == 1 + expected_first_n
+        # After 1, 2, 3 compressions the protection must NOT decay, even with
+        # a previous summary in memory (both decay triggers of #11996 gone).
+        for count in (1, 2, 3):
+            c.compression_count = count
+            c._previous_summary = f"summary after compaction {count}"
+            assert c._effective_protect_first_n() == expected_first_n, (
+                f"protect_first_n decayed at compression_count={count}"
+            )
+            assert c._protect_head_size(msgs) == 1 + expected_first_n
 
-        # Simulate having compressed once — early turns now live in the summary.
-        c.compression_count = 1
-        assert c._effective_protect_first_n() == 0
-        assert c._protect_head_size(msgs) == 1  # system prompt only
+    def test_restart_handoff_no_longer_decays_head_protection(self):
+        """step5.md item 3: the #57814 restart probe decay is also gone.
+
+        A fresh compressor over a resumed transcript protects
+        protect_first_n again — live and restarted processes now agree on
+        the head boundary at the FULL protect_first_n, not the decayed one.
+        """
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            live = ContextCompressor(
+                model="test", quiet_mode=True, protect_first_n=3, protect_last_n=4
+            )
+        live.compression_count = 1
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            restarted = ContextCompressor(
+                model="test", quiet_mode=True, protect_first_n=3, protect_last_n=4
+            )
+        msgs = [{"role": "system", "content": "sys"}] + [
+            {"role": "user" if i % 2 == 0 else "assistant", "content": f"m{i}"}
+            for i in range(10)
+        ]
+        assert restarted._effective_protect_first_n(msgs) == 3
+        assert restarted._protect_head_size(msgs) == live._protect_head_size(msgs) == 4
 
 
 

@@ -174,8 +174,8 @@ def test_recompression_of_current_merged_handoff_preserves_prior_tail_once():
 
 
 
-def test_resume_handoff_after_default_protected_head_decays_initial_turns():
-    """Default protect_first_n=3 should not fossilize old protected head turns."""
+def test_resume_handoff_preserves_raw_head_without_duplicating_handoff():
+    """step5 no-decay keeps raw head turns while replacing the old handoff."""
     compressor = _compressor(protect_first_n=3)
     old_summary = "DEFAULT-RESTART-SUMMARY durable facts from before restart"
 
@@ -185,36 +185,30 @@ def test_resume_handoff_after_default_protected_head_decays_initial_turns():
     prompt = mock_call.call_args.kwargs["messages"][0]["content"]
     assert "PREVIOUS SUMMARY:" in prompt
     assert prompt.count(old_summary) == 1
-    assert "original task before first compaction" in prompt
-    assert "original answer before first compaction" in prompt
-    assert "original follow-up before first compaction" in prompt
+    # Raw protected turns stay outside the summarizer input and survive
+    # verbatim in the output; only the synthetic handoff is folded/replaced.
+    assert "original task before first compaction" not in prompt
+    assert "original answer before first compaction" not in prompt
+    assert "original follow-up before first compaction" not in prompt
     assert f"[ASSISTANT]: {SUMMARY_PREFIX}" not in prompt
     # Grounding (761a0b124e) may prepend a deterministic task-snapshot
     # section — pin the contract, not the exact stored string.
     stored_summary = compressor._previous_summary or ""
     assert stored_summary.endswith("fresh summary")
     assert old_summary not in stored_summary
-    assert all(
-        "original task before first compaction" not in str(msg.get("content", ""))
-        for msg in result
-    )
-    assert all(
-        "original answer before first compaction" not in str(msg.get("content", ""))
-        for msg in result
-    )
+    result_text = "\n".join(str(msg.get("content", "")) for msg in result)
+    assert result_text.count("original task before first compaction") == 1
+    assert result_text.count("original answer before first compaction") == 1
+    assert result_text.count("original follow-up before first compaction") == 1
     assert all(
         old_summary not in str(msg.get("content", ""))
         for msg in result
     )
 
 
-def test_restart_simulation_fresh_compressor_does_not_reprotect_head():
-    """Gateway-restart simulation: a FRESH ContextCompressor (in-memory decay
-    state reset — compression_count == 0, _previous_summary is None) over a
-    transcript that contains a persisted handoff summary must NOT re-protect
-    the head. compress_start must reflect decayed protection exactly as a
-    live (non-restarted) process would compute it (#57814)."""
-    # Live process: has already compacted once, decay is in-memory.
+def test_restart_simulation_fresh_compressor_preserves_head_without_decay():
+    """Fresh and live compressors use the same persistent head boundary."""
+    # Live process: has already compacted once; step5 says protection persists.
     live = _compressor(protect_first_n=3)
     live.compression_count = 1
 
@@ -227,23 +221,22 @@ def test_restart_simulation_fresh_compressor_does_not_reprotect_head():
         "PERSISTED-HANDOFF durable facts from before restart"
     )
 
-    # The protected-head boundary the compressor uses for compress_start
-    # must be identical for both: system prompt only (decayed protection).
-    assert restarted._effective_protect_first_n(msgs) == 0
-    assert restarted._protect_head_size(msgs) == live._protect_head_size(msgs) == 1
+    # The configured raw head remains protected in both processes.
+    assert restarted._effective_protect_first_n(msgs) == 3
+    assert restarted._protect_head_size(msgs) == live._protect_head_size(msgs) == 4
     restarted_start = restarted._align_boundary_forward(
         msgs, restarted._protect_head_size(msgs)
     )
-    assert restarted_start == 1
+    assert restarted_start == 4
 
-    # End-to-end: the first post-restart compaction must not preserve the
-    # pre-restart head turns or the old handoff verbatim.
+    # End-to-end: the first post-restart compaction keeps the raw head but
+    # replaces the synthetic old handoff.
     with patch("agent.context_compressor.call_llm", return_value=_response("fresh summary")):
         result = restarted.compress(msgs)
     result_text = "\n".join(str(msg.get("content", "")) for msg in result)
     assert "PERSISTED-HANDOFF durable facts" not in result_text
-    assert "original task before first compaction" not in result_text
-    assert "original answer before first compaction" not in result_text
+    assert result_text.count("original task before first compaction") == 1
+    assert result_text.count("original answer before first compaction") == 1
 
 
 
@@ -307,7 +300,10 @@ def test_restart_fossil_is_folded_into_internal_fallback_state():
     assert compressor._last_summary_fallback_used is True
     assert compressor.compression_count == 1
     assert old_summary in (compressor._previous_summary or "")
-    assert "filler 1" in (compressor._previous_summary or "")
+    # filler 1 is the configured raw protected head under step5 no-decay.  It
+    # may remain verbatim instead of being duplicated into the fallback body.
+    result_text = "\n".join(str(message.get("content", "")) for message in result)
+    assert "filler 1" in (compressor._previous_summary or "") or "filler 1" in result_text
     assert any(old_summary in str(msg.get("content", "")) for msg in result)
     assert sum(
         1 for msg in result if ContextCompressor._is_context_summary_message(msg)

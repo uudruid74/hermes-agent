@@ -2006,9 +2006,23 @@ def init_agent(
     compression_abort_on_summary_failure = str(
         _compression_cfg.get("abort_on_summary_failure", False)
     ).lower() in {"true", "1", "yes"}
-    compression_internal_only = is_truthy_value(
-        _compression_cfg.get("internal_only"), default=False
-    )
+    # internal_only is THREE-valued (Evan spec, step 5 §4, 2026-09-30):
+    #   False          — LLM summary providers allowed, local fallback last resort
+    #   True           — skip the LLM, deterministic local selector only
+    #   explicit null  — skip the LLM AND the Heap: scoop the middle out and
+    #                    leave an omission marker.  A control baseline so the
+    #                    Heap's cost can be measured against a floor.
+    # Only a literal null selects the null mode; an absent key, blank string,
+    # or string spelling such as "null" stays False.  This is why the value is
+    # read from the raw config here before applying is_truthy_value(None),
+    # which would map null and absent to the same False.
+    _raw_internal_only = _compression_cfg.get("internal_only", False)
+    if _raw_internal_only is None:
+        # A literal YAML null that survived the config merge (the deep merge
+        # keeps a user null for scalar leaves): the third mode.
+        compression_internal_only: bool | None = None
+    else:
+        compression_internal_only = is_truthy_value(_raw_internal_only, default=False)
     # Per-model threshold overrides: keys are substring-matched against the
     # model name (longest match wins). Empty dict = use the global threshold
     # for all models (backward compatible).

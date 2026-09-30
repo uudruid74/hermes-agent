@@ -205,12 +205,11 @@ class TestSummaryRoleAlternatesAgainstVisibleNeighbours:
 
 
 class TestForcedUserGuardsStillWin:
-    def test_zero_user_guard_still_forces_user(self, compressor):
-        """#58753: when no genuine user turn survives, the summary must
-        still be pinned to role=user (and that shape is alternation-safe
-        because everything after it is template-exempt)."""
+    def test_no_decay_keeps_worker_seed_as_user_anchor(self, compressor):
+        """step5 no-decay keeps the worker seed as the surviving user query,
+        so the summary alternates after it as assistant."""
         c = compressor
-        c.compression_count = 1  # protect_first_n decays -> no head
+        c.compression_count = 1
         messages = [{"role": "user", "content": "work kanban task 42"}]
         messages += _tool_turns(0, 12)
 
@@ -220,7 +219,9 @@ class TestForcedUserGuardsStillWin:
 
         rows = _summary_rows(out)
         assert len(rows) == 1
-        assert rows[0].get("role") == "user"
+        assert out[0].get("role") == "user"
+        assert out[0].get("content") == "work kanban task 42"
+        assert rows[0].get("role") == "assistant"
         assert _mistral_alternation_ok(out)
 
     def test_no_literal_consecutive_user_roles(self, compressor):

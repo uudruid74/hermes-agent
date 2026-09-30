@@ -1866,7 +1866,15 @@ class ContextCompressor(ContextEngine):
         # streak exactly like a successful LLM summary does.
         # Evan directive 2026-09-14: "I don't want our fallback tripping
         # that."  Do NOT re-add a strike here without an explicit instruction.
-        if used_fallback and not getattr(self, "internal_only", False):
+        # internal_only covers BOTH non-LLM modes: True (deterministic
+        # selector) and None (the null mode — omission marker only).  On
+        # either, used_fallback=True is the intended compressor doing its
+        # job, not a degradation, so it clears the streak like a healthy
+        # summary would.
+        _internal_only_mode = getattr(self, "internal_only", False)
+        if used_fallback and not (
+            _internal_only_mode is True or _internal_only_mode is None
+        ):
             self._fallback_compression_streak += 1
             if not self.quiet_mode:
                 logger.warning(
@@ -2280,7 +2288,7 @@ class ContextCompressor(ContextEngine):
         provider: str = "",
         api_mode: str = "",
         abort_on_summary_failure: bool = False,
-        internal_only: bool = False,
+        internal_only: bool | None = False,
         max_tokens: int | None = None,
         model_thresholds: dict[str, float] | None = None,
         threshold_tokens_cap: Any = None,
@@ -2356,7 +2364,12 @@ class ContextCompressor(ContextEngine):
         # tries the deterministic internal compressor; abort is reserved for an
         # internal result that cannot fit even its minimal recovery form.
         self.abort_on_summary_failure = abort_on_summary_failure
-        self.internal_only = bool(internal_only)
+        # Three-valued (Evan spec, step 5 §4): False = LLM summaries allowed,
+        # True = deterministic selector only, None = the null mode — no LLM
+        # AND no Heap, just an omission marker (a measurement baseline).
+        # Only a literal None means the null mode; every other value is
+        # normalised to bool so pre-existing callers are unaffected.
+        self.internal_only = None if internal_only is None else bool(internal_only)
 
         # ── Micro-compaction (per-turn rolling compaction) ─────────
         # Default: OFF. Each pass rewrites already-sent history, so it breaks
@@ -2725,7 +2738,12 @@ class ContextCompressor(ContextEngine):
         # Evan directive 2026-09-14: "This compression was supposed to bypass
         # that circuit breaker. I want it to fire often."  Do NOT re-arm this
         # gate for internal_only without an explicit instruction.
-        if getattr(self, "internal_only", False):
+        # The null mode (internal_only is None) makes even fewer provider
+        # calls than True — it never summons the selector — so it bypasses
+        # the gate for the same reason.  Note a plain truthiness test would
+        # NOT catch None; the None check is load-bearing.
+        _internal_only_mode = getattr(self, "internal_only", False)
+        if _internal_only_mode is True or _internal_only_mode is None:
             return False
         # Do not trigger compression while the summary LLM is in cooldown.
         # On a 429/transient failure _generate_summary() sets a cooldown and
@@ -4814,35 +4832,21 @@ This compaction should PRIORITISE preserving all information related to the focu
         self,
         messages: Optional[List[Dict[str, Any]]] = None,
     ) -> int:
-        """``protect_first_n`` decayed across compression cycles.
+        """``protect_first_n`` with NO decay (step5.md item 3, reversing
+        #11996).
 
-        ``protect_first_n`` keeps the first N non-system messages verbatim so
-        the original task framing survives the FIRST compaction. But applying
-        it on every subsequent pass fossilizes those early turns — they're
-        re-copied into each child session and never summarized away, so old
-        user messages become immortal and grow the head unboundedly across a
-        long session (#11996). Once the session has been compressed at least
-        once, the early turns are already captured in the handoff summary, so
-        there's no need to keep re-protecting them: decay to 0 (the system
-        prompt is still always protected separately by _protect_head_size).
-        After a restart, infer that decayed state from handoff summaries in the
-        resumed-head region; disk-persisted restarts rely on the content prefix,
-        while the metadata branch covers in-process handoff messages.
+        The Protected area is what a heap (small) compaction must not
+        flush — only a full compaction (subject change) rebuilds it — so
+        the head protection must persist across repeated compactions.
+        The former behaviour (decay to 0 after the first compression,
+        plus the #57814 restart probe) fossilised the *opposite* risk
+        the spec now owns: after step5, the Protected area's stability
+        across heap compactions is the cacheability contract, and the
+        raw head is bounded by ``protect_first_n`` — it cannot grow.
+
+        The ``messages`` parameter is retained for call-site
+        compatibility.
         """
-        if self.compression_count >= 1 or self._previous_summary:
-            return 0
-        if messages and self.protect_first_n > 0:
-            # Probe only the early handoff shape created by a resumed compacted
-            # session. Summary-looking tail content should keep normal tail
-            # semantics and not decay the initial first-compaction protection.
-            first_non_system, restart_probe_end = self._restart_handoff_probe_bounds(
-                messages
-            )
-            if any(
-                self._is_context_summary_message(msg)
-                for msg in messages[first_non_system:restart_probe_end]
-            ):
-                return 0
         return self.protect_first_n
 
     def _protect_head_size(self, messages: List[Dict[str, Any]]) -> int:
@@ -4856,14 +4860,18 @@ This compaction should PRIORITISE preserving all information related to the focu
         the ``messages`` list (e.g. the gateway ``/compress`` handler
         strips it before calling compress()).
 
-        The ``protect_first_n`` portion DECAYS after the first compression
-        (see _effective_protect_first_n) so early user turns don't fossilize
-        across repeated compactions (#11996).
+        No decay (step5.md item 3, reversing #11996): the head is
+        ``system + protect_first_n`` on every compaction, so the early
+        turns survive repeated heap compactions.  The Protected *area*
+        budget ``protect_first_n + ceil(protect_last_n / 2)`` is enforced
+        in the fallback's protected selection
+        (``_persistent_protected``), not here — growing the raw head by
+        ceil(protect_last_n/2) would fossilise extra raw early turns,
+        which the spec explicitly forbids.
 
-        Examples (first compaction):
+        Examples (every compaction):
           protect_first_n=0 → system prompt only (or nothing if no system msg)
           protect_first_n=3 → system + first 3 non-system messages
-        After the first compaction: system prompt only.
         """
         head = 0
         if messages and messages[0].get("role") == "system":
@@ -6145,6 +6153,23 @@ This compaction should PRIORITISE preserving all information related to the focu
         if force:
             self._clear_compression_failure_cooldown()
         n_messages = len(messages)
+        _pre_rehydrated_summary = False
+        # step5.md no-decay interplay: with the head protected again, a
+        # restarted session's handoff summary can sit in the protected head
+        # of a DEGENERATE window (compress_start >= compress_end), where the
+        # early returns below would skip the self-heal scan and strand the
+        # fossil — the next real compression would then summarise without
+        # the prior context (#59496 contract).  Rehydrate before gating.
+        if self.compression_count < 1 and not self._previous_summary:
+            _prehits = self._find_context_summaries(
+                messages,
+                1 if messages and messages[0].get("role") == "system" else 0,
+                len(messages),
+            )
+            _prebodies = [body for _, body in _prehits if body]
+            if _prebodies:
+                self._previous_summary = "\n\n".join(_prebodies)
+                _pre_rehydrated_summary = True
         # Only need head + 3 tail messages minimum (token budget decides the real tail size)
         _min_for_compress = self._protect_head_size(messages) + 3 + 1
         if n_messages <= _min_for_compress:
@@ -6217,6 +6242,22 @@ This compaction should PRIORITISE preserving all information related to the focu
 
         # Phase 2: Determine boundaries
         compress_start = self._protect_head_size(messages)
+        # A persisted handoff is synthetic continuity state, not one of the
+        # raw turns protected by protect_first_n.  If one sits in the nominal
+        # head after restart, reopen the window at that handoff so it and its
+        # acknowledgement are replaced by the fresh summary.  Otherwise the
+        # handoff strips out during assembly and can leave an assistant row as
+        # the first visible message on no-system providers.
+        first_non_system = (
+            1 if messages and messages[0].get("role") == "system" else 0
+        )
+        protected_handoffs = self._find_context_summaries(
+            messages,
+            first_non_system,
+            min(compress_start, len(messages)),
+        )
+        if protected_handoffs:
+            compress_start = protected_handoffs[0][0]
         compress_start = self._align_boundary_forward(messages, compress_start)
 
         # Use token-budget tail protection instead of fixed message count
@@ -6282,7 +6323,9 @@ This compaction should PRIORITISE preserving all information related to the focu
         # copied forward as stacked fossils.
         summary_search_start = 1 if messages and messages[0].get("role") == "system" else 0
         summary_search_end = compress_end
-        if self.compression_count < 1 and not self._previous_summary:
+        if self.compression_count < 1 and (
+            not self._previous_summary or _pre_rehydrated_summary
+        ):
             summary_search_end = len(messages)
         summary_search_end = min(len(messages), summary_search_end)
         summary_indices: set[int] = set()
@@ -6353,7 +6396,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                 )
             if summary_idx >= compress_end:
                 tail_start = summary_idx + 1
-        elif self._previous_summary:
+        elif self._previous_summary and not _pre_rehydrated_summary:
             # No handoff summary found in the current messages, but
             # _previous_summary is non-empty — it was set by a different
             # (now-ended) session (e.g., a cron job, a prior /new).  Discard
@@ -6475,10 +6518,15 @@ This compaction should PRIORITISE preserving all information related to the focu
                         self.threshold_tokens, self._prellm_skip_count,
                     )
 
-        internal_only = bool(getattr(self, "internal_only", False))
-        if internal_only:
+        # Three-valued (Evan spec, step 5 §4): True skips the LLM and runs the
+        # deterministic selector; None (the null mode) skips the LLM AND the
+        # Heap — build_internal_fallback then emits an omission marker only.
+        internal_only = getattr(self, "internal_only", False)
+        if internal_only is not False:
             summary = None
-            telemetry["failure_class"] = "internal_only"
+            telemetry["failure_class"] = (
+                "internal_only_null" if internal_only is None else "internal_only"
+            )
         elif feasibility_skip:
             summary = None  # No LLM call; Phase 4 inserts the deterministic fallback
         else:
@@ -6520,6 +6568,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                 protected_memory=self._protected_memory,
                 session_subject=self._session_subject(),
                 marker_recent_count=self.protect_last_n,
+                null_mode=(internal_only is None),
             )
             # Carry the Protected area's state to the next compaction.  The
             # returned value is immutable; we only ever replace the
@@ -6538,8 +6587,10 @@ This compaction should PRIORITISE preserving all information related to the focu
             telemetry["fallback_used"] = True
             telemetry["fallback_mode"] = fallback.mode
             telemetry["fallback_selection"] = dict(fallback.selection_telemetry)
-            if internal_only:
-                telemetry["failure_class"] = "internal_only"
+            if internal_only is not False:
+                telemetry["failure_class"] = (
+                    "internal_only_null" if internal_only is None else "internal_only"
+                )
             elif feasibility_skip:
                 telemetry["failure_class"] = (
                     telemetry.get("failure_class") or "feasibility_skip"
@@ -6549,11 +6600,12 @@ This compaction should PRIORITISE preserving all information related to the focu
                     telemetry.get("failure_class") or "summary_generation_failed"
                 )
             if not self.quiet_mode:
-                reason = (
-                    "by configuration"
-                    if internal_only
-                    else "after summary provider failure"
-                )
+                if internal_only is None:
+                    reason = "by configuration (null mode: middle omitted)"
+                elif internal_only:
+                    reason = "by configuration"
+                else:
+                    reason = "after summary provider failure"
                 logger.warning(
                     "Using internal %s compression fallback %s; "
                     "dropping %d message(s).",

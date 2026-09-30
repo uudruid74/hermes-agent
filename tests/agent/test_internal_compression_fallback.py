@@ -48,9 +48,15 @@ def test_active_plan_fallback_keeps_continue_context_and_fixed_tail():
 
     assert fallback is not None
     assert fallback.mode == "plan"
-    assert fallback.head_count == 2
+    # The active Plan replaces raw early-turn protection.  Only the system
+    # prompt remains as a positional head; the Plan and globally ranked units
+    # occupy the reserved Protected area in the summary.
+    assert fallback.head_count == 1
     assert fallback.tail_start == len(messages) - 2
     assert plan in fallback.summary
+    assert "opening request" not in "\n".join(
+        str(message.get("content", "")) for message in messages[: fallback.head_count]
+    )
     assert "verbatim" in fallback.summary.lower()
 
 
@@ -376,6 +382,117 @@ def test_internal_only_never_calls_summary_provider():
 
     assert result is not messages
     assert compressor._last_summary_fallback_used is True
+
+
+def test_null_mode_skips_heap_and_emits_omission_marker_only():
+    """step5.md item 4: internal_only=null is the three-mode table's control
+    baseline — no LLM, no Heap, no LexRank, nothing.  The middle is scooped
+    out and the payload carries only an omission marker; the head and the
+    verbatim tail survive untouched.
+    """
+    compressor = ContextCompressor(
+        model="test/model",
+        config_context_length=64_000,
+        protect_first_n=1,
+        protect_last_n=2,
+        summary_target_ratio=0.2,
+        internal_only=None,
+        quiet_mode=True,
+    )
+    messages = [
+        _message("system", "system prompt"),
+        _message("user", "opening"),
+        *[
+            _message("assistant", f"Dax heap candidate {index} " + ("x" * 500))
+            for index in range(10)
+        ],
+        _message("user", "current request"),
+        _message("assistant", "current result"),
+    ]
+
+    ranking_spy = patch(
+        "agent.internal_compression_fallback._rank_units",
+        side_effect=AssertionError("null mode must not rank (Heap/LexRank skipped)"),
+    )
+    summary_spy = patch.object(
+        compressor,
+        "_generate_summary",
+        side_effect=AssertionError("null mode must not call the summary provider"),
+    )
+    with summary_spy, ranking_spy:
+        result = compressor.compress(messages)
+
+    combined = "\n".join(str(m.get("content", "")) for m in result)
+    # The middle is gone: no Heap-selected candidate text survives.
+    assert all(f"Dax heap candidate {index}" not in combined for index in range(10))
+    # Head and tail survive verbatim.  (The system row gains the standard
+    # compression note that EVERY mode's assembly appends — that is not
+    # mode-specific, so only the prefix is pinned here.)
+    assert result[0]["role"] == "system"
+    assert str(result[0]["content"]).startswith("system prompt")
+    assert result[1]["content"] == "opening"
+    assert result[-2]["content"] == "current request"
+    assert result[-1]["content"] == "current result"
+    # Only an omission marker stands in for the middle.
+    assert compressor._last_summary_fallback_used is True
+    telemetry = compressor._last_compression_telemetry or {}
+    assert telemetry.get("failure_class") == "internal_only_null"
+    assert compressor._last_summary_dropped_count > 0
+
+
+def test_internal_only_three_mode_table():
+    """step5.md item 4, the three-mode contract:
+
+      false → LLM summary, Heap runs  (production)
+      true  → no LLM, Heap runs       (deterministic selector alone)
+      null  → no LLM, no Heap         (omission marker — the floor)
+    """
+    messages = [
+        _message("system", "system prompt"),
+        _message("user", "opening"),
+        *[
+            _message("assistant", f"middle {index} " + ("x" * 400))
+            for index in range(8)
+        ],
+        _message("user", "current request"),
+        _message("assistant", "current result"),
+    ]
+
+    def _compress(internal_only):
+        with patch(
+            "agent.context_compressor.get_model_context_length",
+            return_value=100_000,
+        ):
+            compressor = ContextCompressor(
+                model="test/model",
+                protect_first_n=1,
+                protect_last_n=2,
+                summary_target_ratio=0.2,
+                internal_only=internal_only,
+                quiet_mode=True,
+            )
+        with patch.object(
+            compressor, "_generate_summary", return_value=None
+        ) as llm_spy:
+            result = compressor.compress(messages)
+        telemetry = compressor._last_compression_telemetry or {}
+        return llm_spy, telemetry, result
+
+    llm_true, telemetry_true, _ = _compress(True)
+    llm_true.assert_not_called()
+    assert telemetry_true["failure_class"] == "internal_only"
+    assert telemetry_true["fallback_mode"] != "null"  # Heap ran
+
+    llm_null, telemetry_null, _ = _compress(None)
+    llm_null.assert_not_called()
+    assert telemetry_null["failure_class"] == "internal_only_null"
+    assert telemetry_null["fallback_mode"] == "null"  # Heap skipped
+
+    llm_false, telemetry_false, _ = _compress(False)
+    # false attempts the LLM (spy returns None = provider failure) then
+    # runs the deterministic fallback — the production path.
+    llm_false.assert_called_once()
+    assert "internal_only" not in str(telemetry_false.get("failure_class"))
 
 
 def _compressor_messages() -> list[dict]:

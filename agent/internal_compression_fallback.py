@@ -514,6 +514,7 @@ def _persistent_protected(
     memory: ProtectedMemory,
     *,
     top_k: int = _PROTECTED_TOP_K,
+    area_budget: int | None = None,
 ) -> tuple[list[_Unit], ProtectedMemory]:
     """Select the globally-central units worth carrying in Protected.
 
@@ -533,6 +534,11 @@ def _persistent_protected(
     third compaction, and a full compaction with no Protected area is
     exactly the case that must not happen (Evan, 2026-09-18: *"you can't
     full compact without a protected area"*).
+
+    ``area_budget`` (step5.md item 3) bounds the ranked portion of the
+    Protected area.  The caller reserves the other slots for raw head turns
+    (without a Plan) or the Plan description (with a Plan).  The
+    highest-ranked units win; ``None`` keeps the legacy uncapped behaviour.
     """
     if not units:
         return [], memory
@@ -560,6 +566,12 @@ def _persistent_protected(
     chosen = [
         unit for unit in top if counts[_canonical_form(unit.text)] >= needed
     ]
+    if area_budget is not None and area_budget >= 0:
+        # step5.md item 3: the Protected area's size budget.  `top` is in
+        # rank order, so the highest-ranked units win the cap; a unit that
+        # loses its slot is recorded in memory history as before (a later
+        # compaction can re-elect it if its rank recovers).
+        chosen = chosen[:area_budget]
     return chosen, ProtectedMemory(recent=recent, subject=memory.subject)
 
 
@@ -2156,6 +2168,28 @@ def _with_prior_summary(summary: str, previous_summary: str) -> str:
     return summary.rstrip() + "\n\n" + block
 
 
+_OMISSION_MARKER_PREFIX = (
+    "[CONTEXT WINDOW COMPRESSED — middle omitted for length (null mode)]"
+)
+
+
+def _omission_marker_summary(dropped: int) -> str:
+    """step5.md item 4: the null-mode payload — an omission marker, only.
+
+    ``dropped`` is the count of middle messages scooped out.  The marker
+    rides ``make_result``'s standard assembly (a real compaction: the
+    middle leaves the transcript), so downstream persistence and pruning
+    see the same shape as every other mode — the payload is just empty
+    of selected content by design.
+    """
+    return (
+        f"{_OMISSION_MARKER_PREFIX}\n"
+        f"Context omitted for length: {max(dropped, 0)} middle message(s) "
+        "were removed without summarisation (internal_only=null control "
+        "baseline). Head and verbatim tail are unchanged."
+    )
+
+
 def build_internal_fallback(
     messages: list[dict[str, Any]],
     *,
@@ -2169,6 +2203,7 @@ def build_internal_fallback(
     protected_memory: "ProtectedMemory | None" = None,
     session_subject: str = "",
     marker_recent_count: int = 0,
+    null_mode: bool = False,
 ) -> InternalFallback:
     """Build the last-resort local compression payload within ``target_tokens``.
 
@@ -2184,8 +2219,21 @@ def build_internal_fallback(
     the subject unchanged only the Heap is rebuilt, which is the *heap*
     compaction that leaves the cacheable prefix byte-stable (Evan,
     2026-09-18).
+
+    ``null_mode`` (step5.md item 4): the control baseline.  Skip the Heap,
+    the LexRank selection and the Protected selection entirely — scoop the
+    middle out and emit only an omission marker.  Nothing else.  This is
+    the floor the Heap must beat to earn its cost.
     """
-    head_count = min(max(protect_head_count, 0), len(messages))
+    raw_head_count = min(max(protect_head_count, 0), len(messages))
+    system_head = 1 if messages and messages[0].get("role") == "system" else 0
+    protected_first_n = max(0, raw_head_count - system_head)
+    protected_area_size = protected_first_n + (-(-max(protect_last_n, 0) // 2))
+    plan_active = bool(plan_context.strip())
+    # Without a Plan, the area's first protect_first_n slots are the raw head.
+    # With a Plan, the Plan description replaces those raw early turns and
+    # occupies one reserved slot; globally ranked units fill the rest.
+    head_count = system_head if plan_active and not null_mode else raw_head_count
     tail_start = _verbatim_tail_start(messages, head_count, protect_last_n)
     selection_telemetry = _blank_selection_telemetry()
 
@@ -2194,6 +2242,26 @@ def build_internal_fallback(
         memory = ProtectedMemory(subject=session_subject)
     elif session_subject:
         memory = ProtectedMemory(recent=memory.recent, subject=session_subject)
+
+    if null_mode:
+        # step5.md item 4: scoop the middle out, leave only the omission
+        # marker.  No ranking, no Protected selection, no prior-summary
+        # folding beyond the marker itself — this payload exists to be the
+        # floor, so it must never do more work than it must.
+        marker = _omission_marker_summary(len(messages[head_count:tail_start]))
+        selection_telemetry["selected_count"] = 0
+        selection_telemetry["no_op_reason"] = "null_mode"
+        # The Protected area is untouched in null mode: carrying state
+        # forward would re-introduce a selection the mode must not do, and
+        # an area that never changes is the cacheable baseline.
+        return InternalFallback(
+            marker,
+            head_count,
+            tail_start,
+            "null",
+            memory,
+            dict(selection_telemetry),
+        )
 
     # Emergency rung (Evan, 2026-09-14): when the verbatim tail itself cannot
     # fit, mask its observations back to the last turn BEFORE shrinking the
@@ -2214,7 +2282,17 @@ def build_internal_fallback(
     # already does for the Heap, with `_rank_units` selecting the top-K of
     # however many units the window holds.
     window_units = _message_units(messages[head_count:tail_start], start_index=head_count)
-    protected, memory = _persistent_protected(window_units, memory)
+    # step5.md item 3: the *whole* Protected area is
+    # ``protect_first_n + ceil(protect_last_n / 2)`` slots.  A planless run
+    # spends protect_first_n of them on raw head turns.  An active Plan replaces
+    # those raw turns and spends one slot on the Plan description.  Ranked
+    # global units may use only the remaining slots — they are not an extra
+    # area layered on top of the formula.
+    reserved_slots = 1 if plan_active else protected_first_n
+    protected_area_budget = max(0, protected_area_size - reserved_slots)
+    protected, memory = _persistent_protected(
+        window_units, memory, area_budget=protected_area_budget
+    )
 
     def make_result(
         summary: str,

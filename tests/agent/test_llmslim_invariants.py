@@ -208,3 +208,87 @@ def test_protected_area_does_not_duplicate_units_in_semantic_middle() -> None:
     protected_lines = [line for line in protected_body.splitlines() if line.startswith("[")]
     assert protected_lines
     assert all(result.summary.count(line) == 1 for line in protected_lines)
+
+
+def test_protected_area_respects_step5_size_budget() -> None:
+    """step5.md item 3: the Protected area's size is bounded by
+    ``protect_first_n + ceil(protect_last_n / 2)``.  Without a Plan,
+    protect_first_n slots ride as the verbatim head, so the ranked block may
+    use only the ceil(protect_last_n / 2) remainder.
+
+    Selector-level probe: a window whose top-K yields 12 persistent
+    Protected units against a ranked remainder of 2
+    (area size 1 + ceil(4 / 2) = 3, less one raw head slot).
+    """
+    messages = [
+        _message("system", "system prompt"),
+        _message("user", "opening request"),
+        *[
+            _message(
+                "user" if i % 2 else "assistant",
+                f"Topic {i}: the {['build', 'deploy', 'test', 'cache', 'auth', 'api', 'db', 'ui'][i % 8]} "
+                f"subsystem uses configuration flag F{i} with retry policy "
+                f"P{i % 5} and endpoint /srv/{i}/path.",
+            )
+            for i in range(300)
+        ],
+        _message("user", "Continue the migration."),
+        _message("assistant", "Keep the stable prefix."),
+    ]
+
+    result = build_internal_fallback(
+        messages,
+        protect_head_count=2,
+        protect_last_n=4,
+        target_tokens=4_000,
+        session_subject="Dax",
+    )
+
+    assert "## Protected Context" in result.summary
+    protected_body = result.summary.split("## Protected Context", 1)[1].split(
+        "## Relevant Earlier Context", 1
+    )[0]
+    protected_lines = [line for line in protected_body.splitlines() if line.startswith("[")]
+    assert protected_lines
+    assert len(protected_lines) <= 2, (
+        f"Ranked Protected remainder exceeded step5 budget: {len(protected_lines)} "
+        f"units > ceil(last_n(4)/2) = 2"
+    )
+
+
+def test_active_plan_replaces_raw_head_and_fills_protected_remainder() -> None:
+    """With a Plan, the Plan description replaces raw early turns and ranked
+    global units fill the rest of the same reserved area."""
+    messages = [
+        _message("system", "system prompt"),
+        _message("user", "RAW OPENING MUST NOT BE POSITIONALLY PROTECTED"),
+        *[
+            _message(
+                "user" if i % 2 else "assistant",
+                f"Topic {i}: subsystem F{i} uses endpoint /srv/{i}/path and policy P{i % 5}.",
+            )
+            for i in range(300)
+        ],
+        _message("user", "Continue the migration."),
+        _message("assistant", "Keep the stable prefix."),
+    ]
+    plan = "Task: migrate\nGoal: preserve state\nStep 1/1: implement"
+
+    result = build_internal_fallback(
+        messages,
+        protect_head_count=2,
+        protect_last_n=4,
+        target_tokens=4_000,
+        plan_context=plan,
+        minimal_plan_context=plan,
+        session_subject="migrate: implement",
+    )
+
+    assert result.head_count == 1
+    assert plan in result.summary
+    protected_body = result.summary.split("## Protected Context", 1)[1].split(
+        "## Relevant Earlier Context", 1
+    )[0]
+    protected_lines = [line for line in protected_body.splitlines() if line.startswith("[")]
+    # Total area size is 1 + ceil(4/2) = 3; the Plan occupies one slot.
+    assert 0 < len(protected_lines) <= 2
