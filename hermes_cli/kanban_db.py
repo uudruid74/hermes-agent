@@ -8732,12 +8732,12 @@ def _quota_reset_deadline() -> Optional[float]:
 
     Reads ``rate_limits/openai.json`` for the current HERMES_HOME AND every
     profile under ``~/.hermes/profiles/*`` and returns the furthest-future
-    ``quota_reset_at`` found. The OpenAI usage limit is ACCOUNT-level — one
-    account, shared by every profile (and every kanban worker) — so whichever
-    profile's throttle process recorded the provider's ``resets_at`` first is
-    the deadline for all of them. The dispatcher usually runs under a
-    different profile than the worker that hit the 429, so scanning is
-    required for the guard to see the wall at all.
+    provider quota or token-capacity reset found. The OpenAI limits are
+    ACCOUNT-level — one account, shared by every profile (and every kanban
+    worker) — so whichever profile's throttle process recorded the deadline
+    first is the deadline for all of them. The dispatcher usually runs under a
+    different profile than the worker that hit the wall, so scanning is
+    required for the guard to see it at all.
     2026-09-14 (Evan): persist + honor the provider's own reset deadline.
     """
     candidates: list[float] = []
@@ -8761,9 +8761,10 @@ def _quota_reset_deadline() -> Optional[float]:
             state = json.loads(raw)
             if not isinstance(state, dict):
                 continue
-            deadline = state.get("quota_reset_at")
-            if isinstance(deadline, (int, float)) and float(deadline) > 0:
-                candidates.append(float(deadline))
+            for key in ("quota_reset_at", "reset_at"):
+                deadline = state.get(key)
+                if isinstance(deadline, (int, float)) and float(deadline) > 0:
+                    candidates.append(float(deadline))
         except (OSError, ValueError, TypeError):
             continue
     return max(candidates) if candidates else None

@@ -7,9 +7,11 @@ from types import SimpleNamespace
 import pytest
 
 import agent.openai_rate_limit_throttle as throttle_module
+from agent.error_classifier import FailoverReason, classify_api_error
 from agent.openai_rate_limit_throttle import (
     DEFAULT_OPENAI_CODEX_RATE_LIMIT_POLICY,
     OpenAIRateLimitThrottle,
+    OpenAIRateLimitWaitExceeded,
     OpenAIRateLimitPolicy,
     install_openai_rate_limit_throttle,
 )
@@ -136,7 +138,7 @@ def test_503_and_402_do_not_create_rate_limit_cooldown(
     assert not limiter.state_path.exists()
 
 
-def test_next_request_waits_for_token_reset_when_remaining_is_insufficient(throttle):
+def test_next_request_above_wait_cap_raises_rate_limit_without_sleeping(throttle):
     limiter, clock = throttle
     limiter.after_response(
         _response(
@@ -149,10 +151,33 @@ def test_next_request_waits_for_token_reset_when_remaining_is_insufficient(throt
         )
     )
 
-    limiter.before_request(_request(800))  # ~200 tokens, greater than 100 remaining
+    with pytest.raises(OpenAIRateLimitWaitExceeded) as raised:
+        limiter.before_request(_request(800))
 
-    assert clock.sleeps
-    assert sum(clock.sleeps) >= 360.0
+    error = raised.value
+    assert error.wait_seconds == pytest.approx(360.0)
+    assert error.reset_at == pytest.approx(clock.time() + 360.0)
+    assert error.maximum == pytest.approx(60.0)
+    assert classify_api_error(error).reason is FailoverReason.rate_limit
+    assert clock.sleeps == []
+
+
+def test_next_request_at_wait_cap_still_waits(throttle):
+    limiter, clock = throttle
+    limiter.after_response(
+        _response(
+            200,
+            {
+                "x-ratelimit-limit-tokens": "1000",
+                "x-ratelimit-remaining-tokens": "100",
+                "x-ratelimit-reset-tokens": "60s",
+            },
+        )
+    )
+
+    limiter.before_request(_request(800))
+
+    assert sum(clock.sleeps) == pytest.approx(60.0)
 
 
 def test_ramp_grows_by_at_most_fifty_percent_after_fifteen_active_minutes(throttle):
@@ -196,6 +221,7 @@ def test_default_config_exposes_current_codex_throttle_policy():
         "ramp_interval_seconds": 900,
         "ramp_multiplier": 1.5,
         "retry_after_cap_seconds": 600,
+        "max_blocking_wait_seconds": 60,
     }
 
 
@@ -205,6 +231,8 @@ def test_policy_is_immutable_and_rejects_invalid_values():
 
     with pytest.raises(ValueError, match="backdown_factor"):
         OpenAIRateLimitPolicy.from_config({"backdown_factor": 0})
+    with pytest.raises(ValueError, match="max_blocking_wait_seconds"):
+        OpenAIRateLimitPolicy.from_config({"max_blocking_wait_seconds": 0})
     with pytest.raises(ValueError, match="unknown"):
         OpenAIRateLimitPolicy.from_config({"unknown": 1})
 
@@ -223,6 +251,7 @@ def test_custom_policy_controls_pacing_backdown_and_retry_cap(tmp_path, monkeypa
             "ramp_interval_seconds": 20,
             "ramp_multiplier": 1.25,
             "retry_after_cap_seconds": 7,
+            "max_blocking_wait_seconds": 8,
         }
     )
     limiter = OpenAIRateLimitThrottle(
@@ -271,6 +300,7 @@ def test_install_loads_one_policy_from_config(monkeypatch):
         ramp_interval_seconds=900,
         ramp_multiplier=1.25,
         retry_after_cap_seconds=600,
+        max_blocking_wait_seconds=60,
     )
     assert agent._openai_codex_rate_limit_policy is limiter.policy
 

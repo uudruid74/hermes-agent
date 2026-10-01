@@ -766,6 +766,17 @@ def test_respawn_guard_defers_rate_limited_within_cooldown(
         assert kb.check_respawn_guard(conn, tid) is None
 
 
+def test_quota_reset_deadline_includes_preflight_token_reset(kanban_home):
+    state_dir = kanban_home / "rate_limits"
+    state_dir.mkdir()
+    (state_dir / "openai.json").write_text(
+        '{"quota_reset_at": 100, "blocked_until": 400, "reset_at": 300}',
+        encoding="utf-8",
+    )
+
+    assert kb._quota_reset_deadline() == 300.0
+
+
 def test_check_respawn_guard_defers_until_quota_reset_deadline(
     kanban_home, monkeypatch,
 ):

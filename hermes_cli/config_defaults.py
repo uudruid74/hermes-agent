@@ -22,6 +22,7 @@ DEFAULT_CONFIG = {
             "ramp_interval_seconds": 900,
             "ramp_multiplier": 1.5,
             "retry_after_cap_seconds": 600,
+            "max_blocking_wait_seconds": 60,
         },
     },
     # SQLite journal mode used by every Hermes database opener. WAL is the

@@ -32,6 +32,7 @@ class OpenAIRateLimitPolicy:
     ramp_interval_seconds: float = 15 * 60.0
     ramp_multiplier: float = 1.5
     retry_after_cap_seconds: float = 600.0
+    max_blocking_wait_seconds: float = 60.0
 
     @classmethod
     def from_config(cls, config: Mapping[str, Any] | None) -> "OpenAIRateLimitPolicy":
@@ -70,6 +71,7 @@ class OpenAIRateLimitPolicy:
             "idle_reset_seconds",
             "ramp_interval_seconds",
             "retry_after_cap_seconds",
+            "max_blocking_wait_seconds",
         ):
             if values[name] <= 0:
                 raise ValueError(f"rate_limits.openai_codex.{name} must be greater than 0")
@@ -85,6 +87,20 @@ class OpenAIRateLimitPolicy:
 
 
 DEFAULT_OPENAI_CODEX_RATE_LIMIT_POLICY = OpenAIRateLimitPolicy()
+
+
+class OpenAIRateLimitWaitExceeded(RuntimeError):
+    """A preflight throttle delay exceeded the configured blocking budget."""
+
+    def __init__(self, *, wait_seconds: float, reset_at: float, maximum: float) -> None:
+        self.wait_seconds = wait_seconds
+        self.reset_at = reset_at
+        self.maximum = maximum
+        super().__init__(
+            "OpenAI rate limit throttle requires "
+            f"{wait_seconds:.1f}s wait (maximum {maximum:.1f}s); "
+            f"reset_at={reset_at:.3f}"
+        )
 
 
 def _default_state_path() -> Path:
@@ -271,6 +287,17 @@ class OpenAIRateLimitThrottle:
             delay = self.reserve(estimated_tokens)
             if delay <= 0:
                 return
+            if delay > self.policy.max_blocking_wait_seconds:
+                reset_at = self._clock() + delay
+                error = OpenAIRateLimitWaitExceeded(
+                    wait_seconds=delay,
+                    reset_at=reset_at,
+                    maximum=self.policy.max_blocking_wait_seconds,
+                )
+                logger.warning("%s", error)
+                if self._status_callback is not None:
+                    self._status_callback(str(error))
+                raise error
             message = (
                 f"OpenAI token throttle active — waiting {delay:.1f}s before request"
             )
