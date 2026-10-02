@@ -87,6 +87,17 @@ def test_pruned_skill_marker_is_rankable_without_being_inviolable():
     assert ranked == [(unit, _NOTE_SCORE_FLOOR)]
 
 
+def test_pruned_skill_marker_does_not_mask_genuine_path_lock():
+    text = (
+        "[SKILL_PRUNED: reload with skill_view(name='kanban')] "
+        "artifact: /home/ekl/vault/Projects/Hermes-Agent/plan.md"
+    )
+    unit = _u(text, 0)
+
+    assert _carries_inviolable(text)
+    assert _is_inviolable(unit)
+
+
 # --- the length gate is the price of the lock ----------------------------
 
 def test_short_artifact_unit_is_inviolable():

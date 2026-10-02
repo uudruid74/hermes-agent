@@ -639,17 +639,16 @@ _INVIOLABLE_MAX_TOKENS = 60
 def _carries_inviolable(text: str) -> bool:
     """True when a unit carries a path or an identifier worth preserving.
 
-    Pruned-skill reload markers keep their documented ranking floor, but never
-    consume an artifact-lock slot merely because ``SKILL_PRUNED`` looks like a
-    screaming-snake identifier.
+    Pruned-skill reload markers keep their documented ranking floor, but the
+    marker's own ``SKILL_PRUNED`` identifier does not consume an artifact-lock
+    slot.  Any genuine path or identifier beside the marker still does.
 
     Both patterns are anchored on word boundaries and are deliberately narrow;
     widening them is the way this degrades into "keep everything", which is the
     failure the length gate exists to prevent.
     """
-    if _PRUNED_SKILL_RE.search(text):
-        return False
-    return bool(_PATH_RE.search(text) or _IDENTIFIER_RE.search(text))
+    stripped = _PRUNED_SKILL_RE.sub("", text)
+    return bool(_PATH_RE.search(stripped) or _IDENTIFIER_RE.search(stripped))
 
 
 def _is_inviolable(unit: "_Unit") -> bool:
