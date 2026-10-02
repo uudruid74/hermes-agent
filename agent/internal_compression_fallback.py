@@ -186,8 +186,9 @@ _BOILERPLATE_RES = (
         re.IGNORECASE,
     ),
     re.compile(
-        r"#{1,6}\s*(?:Active Plan|Relevant Earlier Context|"
-        r"Verbatim Recent Context|Session Notes|Context Summary)\b\s*:?",
+        r"#{1,6}\s*(?:Active Plan|Protected Context|Prior Context Summary|"
+        r"Relevant Earlier Context|Verbatim Recent Context|Session Notes|"
+        r"Context Summary)\b\s*:?",
         re.IGNORECASE,
     ),
     re.compile(
