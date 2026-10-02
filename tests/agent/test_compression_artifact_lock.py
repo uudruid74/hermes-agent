@@ -19,6 +19,7 @@ from agent.internal_compression_fallback import (
     _inviolable_missing,
     _MAX_INVIOLABLE_UNITS,
     _INVIOLABLE_MAX_TOKENS,
+    _NOTE_SCORE_FLOOR,
 )
 from agent.model_metadata import estimate_tokens_rough
 
@@ -71,6 +72,19 @@ def test_bare_numbers_are_deliberately_not_locked():
     """Numbers are the common case in tool output; locking them is noise."""
     assert not _carries_inviolable("37 rows, min=5 max=42")
     assert not _carries_inviolable("step 3 of 12")
+
+
+def test_pruned_skill_marker_is_rankable_without_being_inviolable():
+    marker = (
+        "[SKILL_PRUNED: content lost in compression; "
+        "reload with skill_view(name='kanban-worker-troubleshooting')]"
+    )
+    unit = _u(marker, 0)
+
+    assert not _carries_inviolable(marker)
+    assert not _is_inviolable(unit)
+    ranked = _rank_units([unit], [], [])
+    assert ranked == [(unit, _NOTE_SCORE_FLOOR)]
 
 
 # --- the length gate is the price of the lock ----------------------------
