@@ -6,6 +6,8 @@ from unittest.mock import patch
 from agent.context_compressor import ContextCompressor
 from agent.internal_compression_fallback import (
     InternalFallback,
+    _MAX_UNIT_CHARS,
+    _chunks,
     _lexrank,
     _session_notes,
     _tfidf_vectors,
@@ -15,6 +17,74 @@ from agent.internal_compression_fallback import (
 
 def _message(role: str, content: str) -> dict:
     return {"role": role, "content": content}
+
+
+def test_chunks_wraps_long_sentence_at_words_and_marks_each_segment():
+    sentence = ("alpha beta gamma delta " * 60).strip()
+
+    chunks = _chunks(sentence)
+
+    assert len(chunks) == 2
+    assert all(len(chunk) <= _MAX_UNIT_CHARS for chunk in chunks)
+    assert chunks[0].endswith("…")
+    assert chunks[1].startswith("…")
+    assert chunks[0].removesuffix("…").split()[-1] in {
+        "alpha",
+        "beta",
+        "gamma",
+        "delta",
+    }
+    assert chunks[1].removeprefix("…").split()[0] in {
+        "alpha",
+        "beta",
+        "gamma",
+        "delta",
+    }
+    assert " ".join(chunk.strip("…") for chunk in chunks) == sentence
+
+
+def test_chunks_only_hard_splits_a_single_over_cap_token():
+    token = "x" * (_MAX_UNIT_CHARS + 50)
+
+    chunks = _chunks(token)
+
+    assert len(chunks) == 2
+    assert all(len(chunk) <= _MAX_UNIT_CHARS for chunk in chunks)
+    assert chunks[0].endswith("…")
+    assert chunks[1].startswith("…")
+    assert "".join(chunk.strip("…") for chunk in chunks) == token
+
+
+def test_real_fallback_payload_never_emits_unmarked_mid_word_fragment():
+    sentence = " ".join(f"identifierx_{index:04d}" for index in range(120))
+    source_tokens = set(sentence.split())
+    messages = [
+        _message("system", "system prompt"),
+        _message("user", "opening request"),
+        _message("assistant", sentence),
+        _message("user", "Preserve the identifier evidence from the migration."),
+        _message("assistant", "The recent migration result is complete."),
+    ]
+
+    fallback = build_internal_fallback(
+        messages,
+        protect_head_count=2,
+        protect_last_n=2,
+        target_tokens=2_000,
+    )
+
+    assert fallback is not None
+    emitted_middle = fallback.summary.partition("## Relevant Earlier Context")[2].partition(
+        "## Verbatim Recent Context"
+    )[0]
+    emitted_tokens = [
+        token.strip("…")
+        for token in emitted_middle.split()
+        if token != "[ASSISTANT]:"
+    ]
+    assert emitted_tokens
+    assert set(emitted_tokens) <= source_tokens
+    assert "…" in emitted_middle
 
 
 def test_active_plan_fallback_keeps_continue_context_and_fixed_tail():

@@ -891,17 +891,37 @@ def _heap_repeat_covered(
     return False
 
 
+def _split_oversized_unit(text: str) -> list[str]:
+    """Split text at word boundaries, marking artificial continuations."""
+    chunks: list[str] = []
+    remaining = text
+    continued = False
+    while remaining:
+        prefix = "…" if continued else ""
+        if len(prefix) + len(remaining) <= _MAX_UNIT_CHARS:
+            chunks.append(f"{prefix}{remaining}")
+            break
+
+        # Reserve space for the trailing marker.  A positional split is only
+        # valid when the current token alone exceeds the available payload.
+        payload_limit = _MAX_UNIT_CHARS - len(prefix) - 1
+        cut = remaining.rfind(" ", 0, payload_limit + 1)
+        if cut <= 0:
+            cut = payload_limit
+        piece = remaining[:cut].rstrip()
+        remaining = remaining[cut:].lstrip()
+        chunks.append(f"{prefix}{piece}…")
+        continued = True
+    return chunks
+
+
 def _chunks(text: str) -> list[str]:
     text = _strip_boilerplate(text)
     chunks: list[str] = []
     for sentence in split_sentences(text):
         sentence = re.sub(r"\s+", " ", sentence).strip()
-        if not sentence:
-            continue
-        for start in range(0, len(sentence), _MAX_UNIT_CHARS):
-            chunk = sentence[start : start + _MAX_UNIT_CHARS].strip()
-            if chunk:
-                chunks.append(chunk)
+        if sentence:
+            chunks.extend(_split_oversized_unit(sentence))
     return chunks
 
 
