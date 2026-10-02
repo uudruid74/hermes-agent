@@ -23,6 +23,7 @@ keep the exact logger name (``"agent.conversation_loop"``).
 from __future__ import annotations
 
 import os
+import sqlite3
 from typing import Any, Callable
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
@@ -323,6 +324,31 @@ def finalize_turn(
                     _kanban_task,
                     exc_info=True,
                 )
+
+        # Manual Plan tasks have no dispatcher-owned worker process or claim
+        # lifecycle, so the Kanban timeout bridge above cannot see them. Resolve
+        # the active execution binding and use the same durable block/notifier
+        # path when this step never reached ``plan_tool advance``.
+        try:
+            from tools.plan_binding_adapter import block_active_plan_at_iteration_limit
+
+            if block_active_plan_at_iteration_limit(
+                agent,
+                used=api_call_count,
+                maximum=agent.max_iterations,
+            ):
+                logger.info(
+                    "blocked active Plan after iteration limit (%d/%d)",
+                    api_call_count,
+                    agent.max_iterations,
+                )
+        except (ImportError, OSError, RuntimeError, ValueError, sqlite3.Error):
+            logger.warning(
+                "Failed to block active Plan after iteration limit (%d/%d)",
+                api_call_count,
+                agent.max_iterations,
+                exc_info=True,
+            )
 
     # Determine if conversation completed successfully
     normal_text_response = str(_turn_exit_reason).startswith("text_response(")

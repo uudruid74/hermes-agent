@@ -525,6 +525,42 @@ def _current(conn, agent):
     return key, binding, None
 
 
+def block_active_plan_at_iteration_limit(agent, *, used: int, maximum: int) -> bool:
+    """Block an unsubmitted active Plan step after its turn budget is exhausted.
+
+    A pending step review proves that ``plan_tool advance`` already submitted
+    the step, so that state must remain with the reviewer. Otherwise the bound
+    Plan has no live worker after this turn and must use the same durable block
+    and notification path as a Kanban worker.
+    """
+    from hermes_cli import execution_bindings as bindings
+    from hermes_cli import kanban_db
+
+    conn = _legacy()._get_kanban_db()
+    _key, binding, error = _current(conn, agent)
+    if error or binding is None:
+        return False
+    if bindings.pending_step_review(conn, binding.task_id) is not None:
+        return False
+    task = conn.execute(
+        "SELECT status, task_stepno FROM tasks WHERE id = ?",
+        (binding.task_id,),
+    ).fetchone()
+    if task is None or task["status"] not in {"manual", "running"}:
+        return False
+    step_no = int(task["task_stepno"] or 1)
+    reason = (
+        f"Step {step_no} ended at the tool-call limit "
+        f"({used}/{maximum}) with no submission"
+    )
+    return kanban_db.block_task(
+        conn,
+        binding.task_id,
+        reason=reason,
+        kind="needs_input",
+    )
+
+
 def _dispatcher_for_task(conn, task_id: str) -> Optional[str]:
     """Resolve the AI dispatcher that reviews this Plan's steps.
 

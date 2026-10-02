@@ -196,6 +196,25 @@ def test_pending_response_records_kanban_timeout(monkeypatch):
     )
 
 
+def test_iteration_limit_blocks_active_plan_with_budget_counts(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    blocked = MagicMock(name="block_active_plan_at_iteration_limit")
+    monkeypatch.setattr(
+        "tools.plan_binding_adapter.block_active_plan_at_iteration_limit",
+        blocked,
+    )
+    agent = _LimitAgent()
+
+    result = _finalize(
+        agent,
+        final_response=None,
+        exit_reason="unknown",
+    )
+
+    assert result["turn_exit_reason"] == "max_iterations_reached(60/60)"
+    blocked.assert_called_once_with(agent, used=60, maximum=60)
+
+
 def test_published_pending_candidate_is_not_duplicated_by_finalizer(monkeypatch):
     """When budget exhaustion preserves a verification candidate that is
     already the tail assistant message, the finalizer must NOT append a

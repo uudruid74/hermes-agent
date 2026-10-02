@@ -7,7 +7,7 @@ import time
 from types import SimpleNamespace
 
 from hermes_cli.kanban_db import SCHEMA_SQL
-from tools import plan_tool
+from tools import plan_binding_adapter, plan_tool
 
 
 class _SessionDB:
@@ -85,6 +85,104 @@ def test_new_approval_question_contains_full_plan(monkeypatch):
     assert "**Goal:** Keep the full plan visible" in seen["question"]
     assert "1. Inspect the prompt" in seen["question"]
     assert "2. Render every step" in seen["question"]
+
+
+def test_iteration_limit_blocks_manual_plan_and_notifies_origin(monkeypatch):
+    conn = _db()
+    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    monkeypatch.setattr(
+        plan_tool, "clarify_tool", lambda *_args, **_kwargs: '{"user_response":"Approve"}'
+    )
+    notified = []
+    monkeypatch.setattr(
+        "hermes_cli.kanban._notify_kanban_status_change",
+        lambda task_id, status, **kwargs: notified.append((task_id, status, kwargs)),
+    )
+    agent = _Agent()
+    plan_tool.plan_tool(
+        agent,
+        "new",
+        title="Long step",
+        goal="finish despite a turn boundary",
+        steps=["work until complete"],
+    )
+    task_id = conn.execute("SELECT task_id FROM execution_bindings").fetchone()[0]
+
+    blocked = plan_binding_adapter.block_active_plan_at_iteration_limit(
+        agent,
+        used=200,
+        maximum=200,
+    )
+
+    task = conn.execute(
+        "SELECT status, block_kind, task_stepno FROM tasks WHERE id=?",
+        (task_id,),
+    ).fetchone()
+    assert blocked is True
+    assert tuple(task) == ("blocked", "needs_input", 1)
+    assert conn.execute(
+        "SELECT task_id FROM execution_bindings"
+    ).fetchone()[0] == task_id
+    event = conn.execute(
+        "SELECT kind, payload FROM task_events WHERE task_id=? ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    assert event["kind"] == "blocked"
+    assert "Step 1 ended at the tool-call limit (200/200) with no submission" in event["payload"]
+    assert notified == [
+        (
+            task_id,
+            "blocked",
+            {
+                "summary": "Step 1 ended at the tool-call limit (200/200) with no submission",
+                "title": "Long step",
+                "assignee": "neo",
+            },
+        )
+    ]
+
+
+def test_iteration_limit_does_not_block_plan_with_pending_review(monkeypatch):
+    from hermes_cli import execution_bindings
+
+    conn = _db()
+    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    monkeypatch.setattr(
+        plan_tool, "clarify_tool", lambda *_args, **_kwargs: '{"user_response":"Approve"}'
+    )
+    agent = _Agent()
+    plan_tool.plan_tool(
+        agent,
+        "new",
+        title="Submitted step",
+        goal="wait for review",
+        steps=["submit this step", "finish later"],
+    )
+    key = execution_bindings.identity_for_agent(agent)
+    binding = execution_bindings.get_binding(conn, key)
+    assert binding is not None
+    execution_bindings.advance_plan(
+        conn,
+        key,
+        expected_task_id=binding.task_id,
+        expected_revision=binding.revision,
+        summary="submitted before the limit",
+        actor="neo",
+        step=1,
+    )
+
+    blocked = plan_binding_adapter.block_active_plan_at_iteration_limit(
+        agent,
+        used=200,
+        maximum=200,
+    )
+
+    assert blocked is False
+    task = conn.execute(
+        "SELECT status, block_kind, task_stepno FROM tasks WHERE id=?",
+        (binding.task_id,),
+    ).fetchone()
+    assert tuple(task) == ("manual", None, 1)
 
 
 def test_approve_question_contains_full_plan(monkeypatch):
