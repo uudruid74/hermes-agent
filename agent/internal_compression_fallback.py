@@ -1296,7 +1296,7 @@ def _session_notes(
     for candidate in prioritized:
         normalized = re.sub(r"\s+", " ", candidate).strip()
         if len(normalized) > _MAX_UNIT_CHARS:
-            normalized = normalized[:_MAX_UNIT_CHARS].rstrip() + "…"
+            normalized = _split_oversized_unit(normalized)[0]
         if normalized and normalized not in seen:
             seen.add(normalized)
             notes.append(normalized)

@@ -352,7 +352,32 @@ def test_session_note_collection_is_bounded():
     notes = _session_notes(messages, "m" * 2_400, "")
 
     assert len(notes) == 256
-    assert max(map(len, notes)) <= 1_201
+    assert max(map(len, notes)) <= _MAX_UNIT_CHARS
+
+
+def test_overlong_session_note_truncates_at_word_boundary():
+    words = ("alpha bravo charlie delta " * 200).strip()
+    messages = [_message("assistant", f"## Session Notes\n- {words}")]
+
+    notes = _session_notes(messages, "", "")
+
+    assert len(notes) == 1
+    assert notes[0].endswith("…")
+    assert len(notes[0]) <= _MAX_UNIT_CHARS
+    assert notes[0].removesuffix("…").split()[-1] in {
+        "alpha",
+        "bravo",
+        "charlie",
+        "delta",
+    }
+
+
+def test_overlong_single_token_session_note_uses_hard_split_convention():
+    token = "x" * (_MAX_UNIT_CHARS + 50)
+
+    notes = _session_notes([], token, "")
+
+    assert notes == ["x" * (_MAX_UNIT_CHARS - 1) + "…"]
 
 
 def test_tfidf_document_frequency_counts_documents_not_occurrences():
