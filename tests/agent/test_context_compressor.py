@@ -2334,8 +2334,10 @@ class TestSanitizerStripsOrphanedToolCalls:
         assert not asst.get("tool_calls"), "orphaned tool_calls should be stripped"
         # No stub tool messages should be added
         assert not any(m.get("role") == "tool" for m in sanitized)
-        # Empty assistant should get placeholder content
-        assert asst.get("content") == "(tool call removed)"
+        # Empty assistant should explain what was removed and why.
+        assert asst.get("content") == (
+            "[tool call removed: its tool result was missing after compression]"
+        )
 
     def test_sanitizer_strips_orphaned_keeps_valid(self, compressor):
         """When an assistant has both valid and orphaned tool_calls, only
@@ -2383,6 +2385,99 @@ class TestSanitizerStripsOrphanedToolCalls:
         assert not asst.get("tool_calls")
         # The placeholder must NOT overwrite existing text content.
         assert asst["content"] != "(tool call removed)"
+
+    def test_sanitizer_does_not_strip_calls_in_protected_tail(
+        self, compressor, caplog
+    ):
+        compressor.quiet_mode = False
+        messages = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "prefix_orphan"}],
+            },
+            {"role": "user", "content": "boundary"},
+            {
+                "role": "assistant",
+                "content": "tail bytes",
+                "tool_calls": [{"id": "tail_orphan"}],
+            },
+        ]
+        protected_tail = json.loads(json.dumps(messages[2:]))
+
+        with caplog.at_level("INFO", logger="agent.context_compressor"):
+            sanitized = compressor._sanitize_tool_pairs(
+                messages,
+                protected_tail_start=2,
+            )
+
+        assert sanitized[0]["content"] == (
+            "[tool call removed: its tool result was missing after compression]"
+        )
+        assert not sanitized[0].get("tool_calls")
+        assert sanitized[2:] == protected_tail
+        assert "stripped 1 orphaned tool_call(s)" in caplog.text
+
+    def test_sanitizer_does_not_remove_results_in_protected_tail(
+        self, compressor, caplog
+    ):
+        compressor.quiet_mode = False
+        messages = [
+            {"role": "tool", "tool_call_id": "prefix_orphan", "content": "old"},
+            {"role": "user", "content": "boundary"},
+            {"role": "tool", "tool_call_id": "tail_orphan", "content": "tail bytes"},
+        ]
+        protected_tail = json.loads(json.dumps(messages[2:]))
+
+        with caplog.at_level("INFO", logger="agent.context_compressor"):
+            sanitized = compressor._sanitize_tool_pairs(
+                messages,
+                protected_tail_start=2,
+            )
+
+        assert sanitized == [messages[1], *protected_tail]
+        assert "removed 1 orphaned tool result(s)" in caplog.text
+
+    def test_compress_passes_assembled_protected_tail_to_sanitizer(self, compressor):
+        messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "head request"},
+            {"role": "assistant", "content": "head reply"},
+            {"role": "user", "content": "middle request"},
+            {"role": "assistant", "content": "middle reply"},
+            {"role": "assistant", "content": "tail request sentinel"},
+            {"role": "assistant", "content": "tail reply sentinel"},
+            {"role": "user", "content": "latest request sentinel"},
+            {"role": "assistant", "content": "latest reply sentinel"},
+        ]
+        observed = {}
+        sanitizer = compressor._sanitize_tool_pairs
+
+        def capture_sanitizer(assembled, **kwargs):
+            observed["messages"] = json.loads(json.dumps(assembled))
+            observed["protected_tail_start"] = kwargs.get("protected_tail_start")
+            return sanitizer(assembled, **kwargs)
+
+        with (
+            patch.object(compressor, "_find_tail_cut_by_tokens", return_value=5),
+            patch.object(compressor, "_generate_summary", return_value="summary"),
+            patch.object(
+                compressor,
+                "_sanitize_tool_pairs",
+                side_effect=capture_sanitizer,
+            ),
+        ):
+            compressor.compress(messages, current_tokens=90_000, force=True)
+
+        tail_start = observed["protected_tail_start"]
+        assert isinstance(tail_start, int)
+        observed_tail = observed["messages"][tail_start:]
+        assert [message["content"] for message in observed_tail] == [
+            "tail request sentinel",
+            "tail reply sentinel",
+            "latest request sentinel",
+            "latest reply sentinel",
+        ]
 
     def test_sanitizer_strips_orphaned_with_call_id_mismatch(self, compressor):
         """Stubs with call_id != id used to be dropped by downstream

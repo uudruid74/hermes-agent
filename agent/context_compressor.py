@@ -4725,7 +4725,12 @@ This compaction should PRIORITISE preserving all information related to the focu
             return tc.get("call_id", "") or tc.get("id", "") or ""
         return getattr(tc, "call_id", "") or getattr(tc, "id", "") or ""
 
-    def _sanitize_tool_pairs(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _sanitize_tool_pairs(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        protected_tail_start: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
         """Fix orphaned tool_call / tool_result pairs after compression.
 
         Two failure modes:
@@ -4746,7 +4751,20 @@ This compaction should PRIORITISE preserving all information related to the focu
         disagree (Codex Responses API format: ``id != call_id``), stubs get
         silently dropped by the repair pass, re-exposing the original orphans.
         Stripping at the source avoids this entire class of mismatch.
+
+        ``protected_tail_start`` bounds every removal to the assembled prefix.
+        Pair IDs are still collected from the full list so valid pairs spanning
+        the boundary remain valid, but protected-tail messages are never
+        removed or rewritten here.
         """
+        sanitize_end = (
+            len(messages) if protected_tail_start is None else protected_tail_start
+        )
+        if not 0 <= sanitize_end <= len(messages):
+            raise ValueError("protected_tail_start is outside the message list")
+        mutable_messages = messages[:sanitize_end]
+        protected_tail = messages[sanitize_end:]
+
         surviving_call_ids: set = set()
         for msg in messages:
             if msg.get("role") == "assistant":
@@ -4764,27 +4782,39 @@ This compaction should PRIORITISE preserving all information related to the focu
 
         # 1. Remove tool results whose call_id has no matching assistant tool_call
         orphaned_results = result_call_ids - surviving_call_ids
+        removed_result_count = 0
         if orphaned_results:
-            messages = [
-                m for m in messages
-                if not (m.get("role") == "tool" and m.get("tool_call_id") in orphaned_results)
+            kept_messages = [
+                message
+                for message in mutable_messages
+                if not (
+                    message.get("role") == "tool"
+                    and message.get("tool_call_id") in orphaned_results
+                )
             ]
-            if not self.quiet_mode:
-                logger.info("Compression sanitizer: removed %d orphaned tool result(s)", len(orphaned_results))
+            removed_result_count = len(mutable_messages) - len(kept_messages)
+            mutable_messages = kept_messages
+        if removed_result_count and not self.quiet_mode:
+            logger.info(
+                "Compression sanitizer: removed %d orphaned tool result(s)",
+                removed_result_count,
+            )
 
         # 2. Strip orphaned tool_calls from assistant messages whose results
         #    were dropped.  Stripping is preferred over inserting stub results
         #    because stubs can be dropped by downstream repair_message_sequence
         #    when call_id != id (Codex Responses API format), re-exposing orphans.
         missing_results = surviving_call_ids - result_call_ids
+        removed_tool_call_count = 0
         if missing_results:
-            for msg in messages:
+            for msg in mutable_messages:
                 if msg.get("role") != "assistant":
                     continue
                 tcs = msg.get("tool_calls")
                 if not tcs:
                     continue
                 kept = [tc for tc in tcs if self._get_tool_call_id(tc) not in missing_results]
+                removed_tool_call_count += len(tcs) - len(kept)
                 if len(kept) != len(tcs):
                     if kept:
                         msg["tool_calls"] = kept
@@ -4794,14 +4824,17 @@ This compaction should PRIORITISE preserving all information related to the focu
                         # content so the API does not reject an empty turn.
                         content = msg.get("content")
                         if not content or (isinstance(content, str) and not content.strip()):
-                            msg["content"] = "(tool call removed)"
-            if not self.quiet_mode:
-                logger.info(
-                    "Compression sanitizer: stripped %d orphaned tool_call(s) from assistant messages",
-                    len(missing_results),
-                )
+                            msg["content"] = (
+                                "[tool call removed: its tool result was missing "
+                                "after compression]"
+                            )
+        if removed_tool_call_count and not self.quiet_mode:
+            logger.info(
+                "Compression sanitizer: stripped %d orphaned tool_call(s) from assistant messages",
+                removed_tool_call_count,
+            )
 
-        return messages
+        return mutable_messages + protected_tail
 
     def _align_boundary_forward(self, messages: List[Dict[str, Any]], idx: int) -> int:
         """Push a compress-start boundary forward past any orphan tool results.
@@ -6838,6 +6871,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         _merge_target_idx = 0
         if _force_user_leading and first_tail_visible_idx is not None:
             _merge_target_idx = first_tail_visible_idx
+        protected_tail_start = len(compressed)
         for tail_idx, msg in enumerate(tail_messages):
             if _merge_summary_into_tail and tail_idx == _merge_target_idx:
                 # Merge the summary into the tail message that collided.
@@ -6886,7 +6920,10 @@ This compaction should PRIORITISE preserving all information related to the focu
                 _merge_summary_into_tail = False
             compressed.append(msg)
 
-        compressed = self._sanitize_tool_pairs(compressed)
+        compressed = self._sanitize_tool_pairs(
+            compressed,
+            protected_tail_start=protected_tail_start,
+        )
 
         # Replace image parts in all compressed messages before the newest
         # image-bearing user turn with a short text placeholder. Without
