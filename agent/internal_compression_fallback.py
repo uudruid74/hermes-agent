@@ -564,9 +564,14 @@ def _persistent_protected(
     recent = (*memory.recent, keys)[-_PROTECTED_PERSIST_RUNS:]
     needed = _PROTECTED_PERSIST_MIN if len(recent) >= _PROTECTED_PERSIST_MIN else 1
     counts: Counter[str] = Counter(key for run in recent for key in run)
-    chosen = [
-        unit for unit in top if counts[_canonical_form(unit.text)] >= needed
-    ]
+    chosen: list[_Unit] = []
+    seen: set[str] = set()
+    for unit in top:
+        key = _canonical_form(unit.text)
+        if counts[key] < needed or key in seen:
+            continue
+        seen.add(key)
+        chosen.append(unit)
     if area_budget is not None and area_budget >= 0:
         # step5.md item 3: the Protected area's size budget.  `top` is in
         # rank order, so the highest-ranked units win the cap; a unit that
