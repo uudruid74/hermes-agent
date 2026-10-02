@@ -291,6 +291,12 @@ def test_tfidf_document_frequency_counts_documents_not_occurrences():
     assert vector["alpha"] > 0.93
 
 
+def test_tfidf_splits_underscored_identifiers_into_words():
+    vector = _tfidf_vectors(["context_window_compressed"])[0]
+
+    assert set(vector) == {"context", "window", "compressed"}
+
+
 def test_lexrank_pairwise_work_is_bounded(monkeypatch):
     calls = 0
 

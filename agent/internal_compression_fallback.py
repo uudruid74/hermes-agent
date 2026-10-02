@@ -41,7 +41,8 @@ VERBATIM_CONTEXT_MARKER = (
     "## Verbatim Recent Context\n"
     "The messages after this summary marker are preserved verbatim."
 )
-_TOKEN_RE = re.compile(r"[\w'-]{2,}", re.UNICODE)
+# Underscores delimit identifier components for lexical scoring.
+_TOKEN_RE = re.compile(r"(?:[^\W_]|['-]){2,}", re.UNICODE)
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|\n{2,}")
 _SESSION_NOTE_RE = re.compile(
     r"(?ims)^#{1,6}\s*session notes?\s*$\n(.*?)(?=^#{1,6}\s|\Z)"
@@ -319,8 +320,8 @@ def _strip_boilerplate(text: str) -> str:
     headers and ``--- END OF CONTEXT SUMMARY`` rule recur in EVERY earlier
     payload, so they score as maximally "central" under LexRank while
     carrying no information at all.  Measured on a live session: 2 of the
-    top-5 ranked units were pure wrapper.  ``_TOKEN_RE`` also counts
-    underscore/bracket tokens like ``context_window_compressed`` as content
+    top-5 ranked units were pure wrapper.  ``_TOKEN_RE`` also splits
+    underscore identifiers like ``context_window_compressed`` into content
     words, so the junk survives vectorization unless it is removed first.
     """
     cleaned = text
