@@ -2092,6 +2092,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
     _notify_kanban_status_change(
         task.id, task.status,
         title=task.title,
+        assignee=task.assignee,
     )
     return 0
 
