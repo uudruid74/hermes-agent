@@ -2331,6 +2331,21 @@ def _with_prior_summary(
     if not prior:
         return summary
     block = f"## Prior Context Summary\n{prior}"
+    # Header replacement (t_57cb0d4e convergence guard): a summary that
+    # already carries a Prior Context Summary section is being re-folded —
+    # the incoming canonical prior is the fresher, deduped form, so replace
+    # the stale section wholesale instead of nesting a second header (two
+    # `## Prior Context Summary` sections in one payload was measured on the
+    # ornith chain). Keeps the fold idempotent w.r.t. headers.
+    _PCS_HEADER = "## Prior Context Summary"
+    if _PCS_HEADER in summary:
+        head = summary.partition(_PCS_HEADER)[0]
+        tail_part = summary.partition(_PCS_HEADER)[2]
+        # Cut the stale section: everything up to the next section header or
+        # the verbatim marker, whichever comes first.
+        next_header = re.search(r"^## .+$", tail_part, re.M)
+        cut_at = next_header.start() if next_header else len(tail_part)
+        summary = (head.rstrip() + "\n\n" + tail_part[cut_at:].lstrip()).strip()
     if VERBATIM_CONTEXT_MARKER in summary:
         head, _, rest = summary.partition(VERBATIM_CONTEXT_MARKER)
         return head.rstrip() + "\n\n" + block + "\n\n" + VERBATIM_CONTEXT_MARKER + rest
@@ -2392,6 +2407,8 @@ def _carry_marker_spine(
     summary: str,
     spine: list[_Unit],
     budget_tokens: int,
+    *,
+    previous_summary: str = "",
 ) -> str:
     """Insert the spine block into ``summary`` under its ceiling.
 
@@ -2399,18 +2416,30 @@ def _carry_marker_spine(
     short, the OLDEST decision marks cut first, mirroring how the tail keeps
     the newest work. The block rides below the Plan/Protected headers and
     above the verbatim marker, outside the heap's budget entirely.
+
+    ``previous_summary`` dedupe (convergence guard, t_57cb0d4e): labels still
+    carried inside the prior payload's fold are already in the emitted text,
+    so re-admitting them here just regrows the block every cycle (measured:
+    6 -> 12 markers across chained iterations). A marker earns spine seats
+    only while it is NEW information.
     """
     if not spine or budget_tokens <= 0:
         return summary
+    carried = {
+        line.strip()
+        for line in (previous_summary or "").splitlines()
+        if line.strip().startswith("===") and line.strip().endswith("===")
+    }
     kept: list[_Unit] = []
     spent = 0
     seen_lines: set[str] = set()
     for unit in sorted(spine, key=lambda item: item.order):
         line = unit.text.splitlines()[0].strip() if unit.text else ""
-        if not line or line in seen_lines:
+        if not line or line in seen_lines or line in carried:
             # Identical repeated labels (e.g. `=== EXIT $? ===` fired once per
             # pipeline stage) carry no additional decision information; the
             # exit context lives in the already-fused tombstone of the first.
+            # Labels already folded in from the previous payload: same rule.
             continue
         if kept and spent + unit.token_count > budget_tokens:
             break
@@ -2632,9 +2661,16 @@ def build_internal_fallback(
     if plan_context.strip():
         # Spine source (Stage 1): markers bypass the ranker entirely — selected
         # from the pre-tail middle via the production extractor, no 256 cap.
-        spine_units = _terminal_marker_units(
+        # Recency-bound (§11 part 2, "dedicated, recency-bounded spine"): the
+        # spine carries the most recent ``marker_recent_count`` markers; the
+        # ceiling cuts oldest-first on top of that bound. Without the recency
+        # bound the spine source grows with the window while the dedupe only
+        # sees the capped fold, and cross-cycle re-admission ratchets the
+        # block upward (measured: 6 -> 38 markers over chained folds).
+        all_spine_units = _terminal_marker_units(
             messages[head_count:tail_start], start_index=head_count
         )
+        spine_units = all_spine_units[-marker_recent_count:] if marker_recent_count > 0 else []
         # Gate measures the summary WITH the capped fold (Stage 0.3): plan +
         # notes compete against the folded summary's real weight. Tail-shrink
         # fallback is unchanged (Stage 0.2: _fit_tail_start works once the
@@ -2653,19 +2689,21 @@ def build_internal_fallback(
                 messages,
                 head_count=head_count,
                 tail_start=fitted_tail_start,
-                summary=summary,
+                summary=gated_summary,
                 notes=notes,
                 target_tokens=target_tokens,
                 protected=protected,
                 selection_telemetry=selection_telemetry,
                 marker_recent_count=marker_recent_count,
             )
-            # Spine emission: the fold is applied here (not only inside
-            # make_result) so the gate's `gated_summary` estimate and the
-            # returned payload carry the same folded text; the spine then
-            # rides outside the heap budget under its own ceiling.
+            # Stage 0.3: the fold is applied ONCE — `gated_summary` above — and
+            # the heap's budget math (`_fits` inside
+            # `_add_plan_lexrank_area`) runs against that same folded text via
+            # `summary`. make_result folds no-ops (canonical dedup) because
+            # the summary already carries the fold.
             summary = _carry_marker_spine(
-                summary, spine_units, _marker_spine_budget(target_tokens)
+                summary, spine_units, _marker_spine_budget(target_tokens),
+                previous_summary=previous_summary,
             )
             return make_result(summary, head_count, fitted_tail_start, "plan")
 
@@ -2697,13 +2735,16 @@ def build_internal_fallback(
             selection_telemetry=selection_telemetry,
             marker_recent_count=marker_recent_count,
         )
-        # Spine rides the minimal branch too (§11 part 2: both branches).
+        # Spine rides the minimal branch too (§11 part 2: both branches),
+        # recency-bounded the same as the primary path.
+        _all_spine = _terminal_marker_units(
+            messages[system_head:tail_start], start_index=system_head
+        )
         summary = _carry_marker_spine(
             _with_prior_summary(summary, previous_summary, target_tokens),
-            _terminal_marker_units(
-                messages[system_head:tail_start], start_index=system_head
-            ),
+            _all_spine[-marker_recent_count:] if marker_recent_count > 0 else [],
             _marker_spine_budget(target_tokens),
+            previous_summary=previous_summary,
         )
         return make_result(
             summary,
@@ -2724,7 +2765,11 @@ def build_internal_fallback(
     # Stage 1 (t_57cb0d4e): markers bypass the ranker entirely — the spine is
     # their ONLY selection path, under its own ceiling. Nothing enters the
     # 256-cap / score≈0 funnel, and nothing is double-emitted.
-    spine_units = _terminal_marker_units(middle_messages, start_index=rank_start)
+    # Recency-bound the spine source (§11 part 2), same as the plan path.
+    all_spine_units = _terminal_marker_units(middle_messages, start_index=rank_start)
+    spine_units = (
+        all_spine_units[-marker_recent_count:] if marker_recent_count > 0 else []
+    )
     marker_notes = {note for note in notes if _PRUNED_SKILL_RE.fullmatch(note)}
     if marker_notes:
         middle_units = [
@@ -2789,7 +2834,8 @@ def build_internal_fallback(
     # forbids. Emitted before make_result folds and accounts the result.
     summary = _with_prior_summary(summary, previous_summary, target_tokens)
     summary = _carry_marker_spine(
-        summary, spine_units, _marker_spine_budget(target_tokens)
+        summary, spine_units, _marker_spine_budget(target_tokens),
+        previous_summary=previous_summary,
     )
     _record_selected_units(selection_telemetry, selected)
     _log_inviolable_dropout(summary, ranked)

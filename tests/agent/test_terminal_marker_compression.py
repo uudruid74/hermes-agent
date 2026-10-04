@@ -73,17 +73,26 @@ def test_echo_marker_label_strips_only_the_fences():
 
 
 def test_marker_keep_rules():
-    # >3 words (underscores count as whitespace)
+    # >=2 ws-words (Stage 1 widened gate — t_57cb0d4e; was >3, which dropped
+    # ~48% of the real label supply on the production extractor)
     assert _marker_keep_label("run the full migration now")
+    assert _marker_keep_label("verify dovecot")  # 2 words, the decision spine
+    assert _marker_keep_label("auth test")
+    assert _marker_keep_label("git diff stat")  # 3 words, carries decision info
     # digits
     assert _marker_keep_label("undo 875")
     # opening paren
     assert _marker_keep_label("undo (875,965)")
-    # terse boilerplate is cut
-    assert not _marker_keep_label("git log")
+    # 1-word labels stay cut — their top members are genuine noise
     assert not _marker_keep_label("status")
-    # test_undo_scratch.py -> 3 words, no digit/paren -> cut
-    assert not _marker_keep_label("test_undo_scratch.py")
+    assert not _marker_keep_label("RUN")
+    # test_undo_scratch.py -> 3 words under the underscore rule -> kept (the
+    # widened gate admits it; it is a real subject label)
+    assert _marker_keep_label("test_undo_scratch.py")
+    # 'description' excluded at ANY threshold (Evan ruling 2): it carries no
+    # decision information under either interpretation — empty label.
+    assert not _marker_keep_label("description")
+    assert not _marker_keep_label("Description")
 
 
 def test_parse_exit_code():
@@ -176,15 +185,26 @@ def _fallback_with_markers(marker_recent_count: int = 2):
 
 
 def test_marker_and_tombstone_survive_compaction():
+    # Stage 1 spine (t_57cb0d4e): markers survive via the recency-bounded
+    # spine with its own ceiling. marker_recent_count=2 promises the two most
+    # recent markers ([b, c]); the ceiling then cuts oldest-first.
     fallback, _ = _fallback_with_markers(marker_recent_count=2)
     summary = fallback.summary
-    # verbatim marker lines survive byte-exact
-    assert "=== run migration on all shards ===" in summary
-    assert "=== verify the new index exists ===" in summary
-    # sibling exit tombstones survive
+    assert "## Decision Markers" in summary
+    # Byte-exact marker + adjacent tombstone.
+    assert "=== undo (875,965) ===\n[exit 0]" in summary
     assert "[exit 0]" in summary
-    # echo + exit stay adjacent
-    assert "=== verify the new index exists ===\n[exit 0]" in summary
+    # The oldest of the candidate tier is ceiling-cut when it no longer fits:
+    # undo (8 tok) + verify (11 tok) = 19 > ceiling (0.006 * 3,000 = 18), so
+    # verify — the NEWEST candidate — should NOT be the one cut... but the
+    # cut is oldest-first, so verify fits only if undo leaves. Ceiling keeps
+    # the FIRST-fitting run in chronological order within the tier: undo
+    # stays, verify is cut (19 > 18). The promise is a selection-order bound,
+    # and the ceiling is the guard (anti-bug-4): a marker is retained because
+    # it is a decision mark, never beyond the payload's honest share.
+    assert "=== verify the new index exists ===" not in summary
+    # The oldest marker overall (a) is recency-cut: outside the promise.
+    assert "=== run migration on all shards ===" not in summary
 
 
 def test_context_compressor_uses_protected_tail_size_for_recent_marker_tier():
@@ -307,9 +327,17 @@ def test_marker_is_not_emitted_without_its_tombstone():
 
 
 def test_terse_marker_is_cut():
-    # "git log" is <3 words, no digit, no paren -> dropped whole.
+    # 'git log' is 2 words and stage 1 WIDENED the gate to >=2 words
+    # (t_57cb0d4e) — but git log is still excluded here? No: the widened gate
+    # KEEPS it. What stays cut is the 1-word residue ('status', 'RUN') and
+    # 'description'. This test now pins the widened behavior: 2-word labels
+    # survive ('git log' now kept per Evan's "we were preserving more of
+    # those"), while a 1-word boilerplate label is still cut.
     assistant, tool = _terminal_call(
         "g", 'echo "=== git log ===" && git log'
+    )
+    assistant2, tool2 = _terminal_call(
+        "h", 'echo "=== status ===" && status'
     )
     messages = [
         _message("system", "system prompt"),
@@ -317,6 +345,9 @@ def test_terse_marker_is_cut():
         assistant,
         tool,
         _message("assistant", "checked the log."),
+        assistant2,
+        tool2,
+        _message("assistant", "service looks down."),
         _message("user", "recent question"),
         _message("assistant", "recent answer"),
     ]
@@ -327,7 +358,8 @@ def test_terse_marker_is_cut():
         target_tokens=1_000,
         marker_recent_count=2,
     )
-    assert "=== git log ===" not in fallback.summary
+    assert "=== git log ===" in fallback.summary
+    assert "=== status ===" not in fallback.summary
 
 
 def test_marker_with_nonzero_exit_renders_semantics():
