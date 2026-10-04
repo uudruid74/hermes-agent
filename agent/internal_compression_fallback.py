@@ -750,6 +750,82 @@ def _log_inviolable_dropout(
 _MAX_INVIOLABLE_UNITS = 12
 
 
+
+# --- Stage 2 tier (t_57cb0d4e sweep; promote-then-bound) ---------------------
+# Artifact-dedup PRIMARY key (Zephyr measured 18 distinct / 622 tok / 6.73% of
+# target); canonical stays a redundancy diagnostic, never a tier-membership
+# rule - "a blob that MENTIONS a path is not a path". Representative = newest
+# occurrence of each distinct artifact.
+# Sweep config is set POST-IMPORT by the driver (sweep_driver.py) via _configure_tier -
+# no env reading in the production module, no new imports.
+_TIER_SHARE_S: float = 0.0            # tier promote is OFF by default (production:
+                                      # pass-through). The ordering fix (lock before
+                                      # cap) below is ACTIVE regardless of S.
+_TIER_CANDIDATE_UNITS: int = _MAX_CANDIDATE_UNITS
+
+def _configure_tier(share: float, cap_units: int | None = None) -> None:
+    global _TIER_SHARE_S, _TIER_CANDIDATE_UNITS
+    _TIER_SHARE_S = share
+    if cap_units is not None:
+        _TIER_CANDIDATE_UNITS = cap_units
+
+def _artifact_key(unit: "_Unit") -> str | None:
+    """Distinct-artifact key: the matched path or identifier, else None."""
+    stripped = _PRUNED_SKILL_RE.sub("", unit.text)
+    m = _PATH_RE.search(stripped) or _IDENTIFIER_RE.search(stripped)
+    return m.group(0) if m else None
+
+def _tier_promote(ordered: list[tuple["_Unit", float]]) -> list[tuple["_Unit", float]]:
+    """Promote a bounded artifact tier to the front of the ordered list.
+
+    Newest occurrence representative per distinct artifact; tier ceiling =
+    _TIER_SHARE_S * target fraction is enforced by the CALLER budget, so here
+    the tier is deduped and ordered; the SHARE backstop applies via token mass
+    check against _TIER_TOKEN_CEILING computed from target.
+    """
+    if _TIER_SHARE_S <= 0:
+        _TIER_DIAG['calls'] += 1
+        return ordered
+    _TIER_DIAG['calls'] += 1
+    _TIER_DIAG['input_units'] = len(ordered)
+    _TIER_DIAG['input_inviolable'] = sum(1 for pair in ordered if _is_inviolable(pair[0]))
+    tier_budget = _TIER_TOKEN_CEILING  # None = no backstop (S=inf): promote all distinct artifacts
+    tier: list[tuple[_Unit, float]] = []
+    tier_tokens = 0
+    seen: set[str] = set()
+    rest: list[tuple[_Unit, float]] = []
+    for pair in ordered:
+        key = _artifact_key(pair[0])
+        if key is None or key in seen:
+            rest.append(pair)
+            continue
+        if tier_budget is not None and tier_tokens + pair[0].token_count > tier_budget:
+            rest.append(pair)
+            continue
+        seen.add(key)
+        tier_tokens += pair[0].token_count
+        tier.append(pair)
+    _TIER_DIAG['promoted'] = len(tier)
+    _TIER_DIAG['promoted_tokens'] = tier_tokens
+    _TIER_DIAG['distinct_keys'] = len(seen)
+    return tier + rest
+
+_TIER_TOKEN_CEILING: int | None = None
+_TIER_DIAG: dict = {'calls': 0, 'input_units': 0, 'input_inviolable': 0,
+                    'promoted': 0, 'promoted_tokens': 0, 'distinct_keys': 0}
+
+def _set_tier_ceiling(target_tokens: int) -> None:
+    """Compute the tier backstop from target_tokens and the sweep share S."""
+    global _TIER_TOKEN_CEILING
+    if _TIER_SHARE_S == float("inf"):
+        _TIER_TOKEN_CEILING = None  # no backstop
+    elif _TIER_SHARE_S <= 0:
+        _TIER_TOKEN_CEILING = None  # sweep-off: current behavior
+    else:
+        _TIER_TOKEN_CEILING = max(1, int(_TIER_SHARE_S * target_tokens))
+
+# --- end Stage 2 tier ---------------------------------------------------------
+
 def _lock_first(
     ranked: list[tuple["_Unit", float]],
 ) -> list[tuple["_Unit", float]]:
@@ -1780,12 +1856,13 @@ def _semantic_rank_candidates(
     ordered = sorted(
         ranked,
         key=lambda pair: (-pair[1], pair[0].order),
-    )[:_MAX_CANDIDATE_UNITS]
-    # Semantic chunk coverage is the new diversity mechanism. Applying legacy
-    # sentence-level MMR again can promote an otherwise low-value isolated
-    # identifier solely because it is lexically unique, making the artifact
-    # lock impossible to verify. Keep the lock as the explicit mechanism.
-    return _lock_first(ordered)
+    )
+    # Stage 2 (t_57cb0d4e sweep): promote-then-bound. The lock must see the FULL
+    # ranked list before the [:256] cap, else 416/442 inviolables die unseen
+    # (measured on the production anchor window). Promote the artifact tier
+    # (distinct artifacts only, newest occurrence representative), bound it by
+    # the _TIER_SHARE ceiling, then cap the non-locked remainder.
+    return _lock_first(_tier_promote(ordered))[:_TIER_CANDIDATE_UNITS]
 
 
 def _rank_units(
@@ -1969,12 +2046,9 @@ def _rank_units(
     ordered = sorted(
         zip(candidates, scores),
         key=lambda item: (-item[1], item[0].order),
-    )[:_MAX_CANDIDATE_UNITS]
-    # Artifact lock LAST, after MMR has had its say: MMR reorders to push
-    # near-duplicates down, and it would happily demote a file path for sharing
-    # vocabulary with another path.  Locking here — immediately before the
-    # callers pack the budget — is what actually decides priority.
-    return _lock_first(_mmr_order(ordered))
+    )
+    # Stage 2 (t_57cb0d4e sweep): promote-then-bound, as site 1.
+    return _lock_first(_mmr_order(_tier_promote(ordered)))[:_TIER_CANDIDATE_UNITS]
 
 
 def _mmr_order(
@@ -2531,6 +2605,12 @@ def build_internal_fallback(
         memory = ProtectedMemory(subject=session_subject)
     elif session_subject:
         memory = ProtectedMemory(recent=memory.recent, subject=session_subject)
+
+    # Stage 2 sweep: size the tier backstop BEFORE any ranked arm runs. The
+    # plan arm's _rank_units (:2229 region) executes ahead of the planless arm,
+    # so sizing at :2874 leaves the plan path reading a stale ceiling from the
+    # previous build call (None on gen0) — measured: S=0.05 == S=inf payloads.
+    _set_tier_ceiling(target_tokens)
 
     if null_mode:
         # step5.md item 4: scoop the middle out, leave only the omission
