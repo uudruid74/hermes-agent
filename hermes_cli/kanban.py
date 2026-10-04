@@ -1449,6 +1449,131 @@ def _resolve_session_chat(
         return None
 
 
+_WAKE_SELF_ACTOR_VARS = (
+    "HERMES_SESSION_ID",
+    "HERMES_SESSION_PLATFORM",
+    "HERMES_SESSION_CHAT_ID",
+    "HERMES_SESSION_THREAD_ID",
+    "HERMES_SESSION_PROFILE",
+)
+
+
+def _acting_session_identity() -> dict[str, str]:
+    """Best-effort session identity of whatever process/coroutine is driving
+    a kanban action, used to suppress self-wakes (t_0bae723b).
+
+    Reads the session ContextVars (gateway-authoritative) with an
+    ``os.environ`` fallback for plain CLI processes. When the session-context
+    machinery is engaged but a var is ``_UNSET`` — the background dispatcher
+    tick inside the gateway, or any concurrent-host task that never bound —
+    the process-global ``os.environ`` mirror is stale, so that identity is
+    treated as UNKNOWN instead of trusted. Same leak-guard rule as
+    ``tools/environments/local.py::_inject_session_context_env``.
+    """
+    identity: dict[str, str] = {}
+    try:
+        from gateway.session_context import (
+            _UNSET,
+            _VAR_MAP,
+            session_context_engaged,
+        )
+        engaged = bool(session_context_engaged())
+    except ImportError:
+        # No session-context module (unit tests, stripped env): pure
+        # os.environ fallback — the legacy single-process CLI case.
+        engaged = False
+        _VAR_MAP = None
+        _UNSET = object()
+    for name in _WAKE_SELF_ACTOR_VARS:
+        value = None
+        var = _VAR_MAP.get(name) if _VAR_MAP else None
+        if var is not None:
+            value = var.get()
+        if value is not None and value is not _UNSET:
+            identity[name] = "" if value is None else str(value)
+        elif engaged:
+            # Engaged but unbound for THIS task: the os.environ mirror
+            # belongs to whichever turn wrote it last — unreadable here.
+            identity[name] = ""
+        else:
+            identity[name] = os.environ.get(name, "")
+    return identity
+
+
+def _wake_targets_acting_session(
+    origin: Optional[dict],
+    platform: str,
+    chat_id: str,
+    thread_id: str,
+    task: Any,
+) -> bool:
+    """Whether the wake target resolves to the session performing the action.
+
+    A kanban notification wake is injected through the origin profile's
+    bridge as a synthetic inbound user message, which STARTS AN AGENT TURN
+    in the target session. When the actor and the target are the same
+    session, that injection is a self-echo: the agent receives wake events
+    for its own claims/comments/completions and can spiral into
+    self-reply loops (t_0bae723b). Exact-match only — an unknown actor
+    (dispatcher-spawned worker, dispatcher tick) suppresses nothing.
+    """
+    actor = _acting_session_identity()
+    actor_session = actor["HERMES_SESSION_ID"].strip()
+    actor_chat = actor["HERMES_SESSION_CHAT_ID"].strip()
+    if not actor_session and not actor_chat:
+        return False  # unknown actor → never suppress
+
+    origin_platform = str((origin or {}).get("platform") or "").strip().lower()
+    origin_session = str((origin or {}).get("chat_id") or "").strip()
+    origin_profile = str((origin or {}).get("profile") or "").strip()
+
+    # (a) Session-origin task whose origin session IS the acting session
+    # (worker-/CLI-created tasks stamp HERMES_SESSION_ID as the origin).
+    if origin_platform == "session" and actor_session and origin_session:
+        if actor_session == origin_session:
+            return True
+
+    # (a2) The tasks.session_id column stamps the originating session that
+    # created the task. Acting from that same session is self-authored,
+    # regardless of what the origin comment says (it can be overwritten on
+    # re-dispatch while the creation stamp stays put).
+    if actor_session and task is not None:
+        task_session = str(getattr(task, "session_id", None) or "").strip()
+        if task_session and actor_session == task_session:
+            return True
+
+    # (b) Actor bound to the exact delivery destination of the wake.
+    actor_platform = actor["HERMES_SESSION_PLATFORM"].strip().lower()
+    if actor_platform and actor_chat and (
+        actor_platform == str(platform or "").strip().lower()
+        and actor_chat == str(chat_id or "").strip()
+        and (actor["HERMES_SESSION_THREAD_ID"].strip() or "") == (thread_id or "").strip()
+    ):
+        # Same chat across profiles must still wake: the bridge delivers on
+        # the ORIGIN profile's adapter, so a different profile acting in a
+        # shared group chat is not the wake target. Empty origin profile
+        # (legacy rows) keeps the chat match authoritative.
+        if not origin_profile or (
+            actor["HERMES_SESSION_PROFILE"].strip() or ""
+        ) == origin_profile:
+            return True
+
+    # (c) api_server sessions bind chat_id to the RAW session id (see
+    # tools/async_delegation.py::_current_origin_session_id), so the
+    # actor's chat binding doubles as its session id there.
+    actor_profile = actor["HERMES_SESSION_PROFILE"].strip()
+    if actor_platform == "api_server" and actor_chat:
+        if origin_platform == "session" and actor_chat == origin_session:
+            return True
+        task_session = str(getattr(task, "session_id", None) or "").strip()
+        if task_session and actor_chat == task_session and (
+            not origin_profile or actor_profile == origin_profile
+        ):
+            return True
+
+    return False
+
+
 def _notify_kanban_status_change(
     task_id: str,
     new_status: str,
@@ -1583,6 +1708,18 @@ def _notify_kanban_status_change(
         )
 
     try:
+        if _wake_targets_acting_session(origin, platform, chat_id, thread_id, task):
+            # The wake would inject a synthetic user message into the very
+            # session that authored this action (its own claim/comment/
+            # completion) — a self-echo that starts a wasted agent turn and
+            # risks a self-reply loop (t_0bae723b). The human notice above
+            # already went out; drop only the wake.
+            logger.info(
+                "kanban notify task=%s status=%s target=%s suppressed "
+                "self-wake (actor session authored this event)",
+                task_id, new_status, target,
+            )
+            return
         adapter, wake_result = _send_kanban_wake(
             target=target,
             platform=platform,
