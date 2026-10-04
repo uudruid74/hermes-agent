@@ -2457,8 +2457,8 @@ def _reset_for_tests() -> None:
     - ``_proxy_nonce`` — the strong-proof token written by ``start_proxy``
       and read by ``_pid_alive`` to defeat PID recycling.
 
-    Today the repo's tests run each file in its own subprocess (per
-    AGENTS.md) so leakage is bounded, but any in-process caller
+    Today the repo's tests run each file in its own subprocess (per the
+    contributor guide) so leakage is bounded, but any in-process caller
     (notebooks, ad-hoc scripts, ``pytest -p no:xdist``) would otherwise
     see whichever values were probed first regardless of subsequent
     ``install_iron_proxy(force=True)`` or ``start_proxy`` calls.

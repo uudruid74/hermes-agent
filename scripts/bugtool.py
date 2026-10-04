@@ -485,6 +485,15 @@ def task_body(path: Path, text: str, directive: Optional[str] = None) -> str:
             # Optional grouping metadata: omit the heading entirely when absent
             # so every pre-existing bug body keeps its exact old shape.
             continue
+        if section == ASSIGNEE_SECTION and not value:
+            # Frontmatter `assignee:` is canonical (assigned_worker reads it
+            # first, section second); `## Assignee` is the legacy location.
+            # Without this fallback, a frontmatter-only bug renders "(none)"
+            # here even though dispatch resolved a real worker — the task
+            # body then misreports the assignee to every downstream reader
+            # (e.g. `assignee: unassigned` in a kanban completion notice for
+            # a task that is plainly assigned).
+            value = assigned_worker(text) or ""
         parts.extend((f"## {section}", value or "(none)"))
     if directive:
         parts.extend(("## Redispatch directive", directive))

@@ -3287,6 +3287,79 @@ def repair_empty_non_final_messages(
     return messages
 
 
+def drop_no_payload_non_final(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Drop poisoned no-payload assistant rows from a model-fed replay list.
+
+    Poison rows: ``role == "assistant"`` rows that fail :func:`_msg_has_payload`
+    (empty content, no tool_calls, no reasoning carriers) and are NOT the final
+    row — an empty final assistant turn is legal (:meth:`repair_empty_non_final_messages`
+    leaves it). Companion to that repair pass: the repair substitutes placeholder
+    content on the wire copy per call; this drop removes the same rows ONCE at a
+    live-replay/turn-entry boundary, so the wire stops carrying them at all and
+    the heal count stops growing.
+
+    Where it runs (all surfaces verified 2026-10-04):
+    - ``build_turn_context`` on the model-fed list (covers the cached-agent live
+      in-memory transcript — the accumulator bypasses all load-time filters);
+    - session-restore paths feeding live replay (gateway reload already drops
+      these rows in ``_build_gateway_agent_history``; this helper covers the CLI
+      and any surface that does not).
+
+    Never runs on stored-persist paths and never mutates the DB: this only
+    prevents REPLAYING poisoned rows into the wire.
+    """
+    if not messages or len(messages) < 2:
+        return messages
+    out: List[Dict[str, Any]] = []
+    dropped = 0
+    last_idx = len(messages) - 1
+    for idx, msg in enumerate(messages):
+        if (
+            idx != last_idx
+            and isinstance(msg, dict)
+            and msg.get("role") == "assistant"
+            and not _msg_has_payload(msg)
+        ):
+            dropped += 1
+            continue
+        out.append(msg)
+    if dropped == 0:
+        return messages
+    _ra().logger.warning(
+        "Replay drop: removed %d no-payload assistant row(s) at a "
+        "live-replay boundary (poisoned empty rows that the per-call "
+        "sanitizer had been re-healing every request).",
+        dropped,
+    )
+    # Dropping a bridging poison row can leave two user rows adjacent
+    # (measured geometry: poison row sat between user turns). Merge them —
+    # same drop-and-merge contract as :meth:`drop_thinking_only_and_merge_users`,
+    # on copies so the caller's input dicts are never mutated.
+    merged: List[Dict[str, Any]] = []
+    for m in out:
+        prev = merged[-1] if merged else None
+        if (
+            prev is not None
+            and prev.get("role") == "user"
+            and m.get("role") == "user"
+        ):
+            prev_content = prev.get("content", "")
+            cur_content = m.get("content", "")
+            prev_copy = dict(prev)
+            if isinstance(prev_content, str) and isinstance(cur_content, str):
+                sep = "\n\n" if prev_content and cur_content else ""
+                prev_copy["content"] = prev_content + sep + cur_content
+            else:
+                # Multimodal or non-string either side: leave adjacent; the
+                # per-request alternation repair handles the residual.
+                merged.append(m)
+                continue
+            merged[-1] = prev_copy
+        else:
+            merged.append(m)
+    return merged
+
+
 def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Fix orphaned tool_call / tool_result pairs before every LLM call.
 
@@ -4091,6 +4164,8 @@ __all__ = [
     "invoke_tool",
     "repair_tool_call",
     "sanitize_api_messages",
+    "_msg_has_payload",
+    "drop_no_payload_non_final",
     "looks_like_codex_intermediate_ack",
     "copy_reasoning_content_for_api",
     "cleanup_dead_connections",

@@ -657,6 +657,16 @@ def finalize_turn(
     #     an empty response, the "(empty)" terminal sentinel, or a
     #     suspiciously short partial fragment with no terminating
     #     punctuation (e.g. "The").  A real short answer keeps its text.
+    # Recovery signal for the empty-turn spiral reset (t_d9fd3ab9 item 2).
+    # Captured BEFORE the transform hook below (:722-726 ``final_response =
+    # _hook_result``): that hook only fires when the response was truthy, so
+    # without the pre-capture a transform-laundered reply would read as
+    # recovery. The explainer at :695/:700 is NOT the reason — the reset
+    # (:895) reads only this captured value and never ``final_response``, so
+    # the explainer's substituted text is unreadable by the reset by
+    # construction; the capture exists for the transform hook.
+    _pre_explainer_response = final_response
+
     if not interrupted:
         try:
             if agent._turn_completion_explainer_enabled():
@@ -862,6 +872,47 @@ def finalize_turn(
             and "skill_manage" in agent.valid_tool_names):
         _should_review_skills = True
         agent._iters_since_skill = 0
+
+    # Empty-turn spiral counter reset (corrective pass, t_d9fd3ab9 item 2,
+    # recovery-keyed per Wintermute/Zephyr). This point is reached by every
+    # turn EXCEPT the ones that tripped the spiral bound (that path
+    # early-returns before finalization). But reaching finalization is NOT
+    # the recovery signal — a turn can finalize with a zero-length response
+    # (the observed degenerate shape), and a sick turn must not flush the
+    # counter. Reset ONLY when the turn produced a real final response,
+    # classified by the SAME predicate the healer/bound use
+    # (_msg_has_payload on an assistant-shaped wrapper of the captured
+    # _pre_explainer_response): the bound, the heal, and this reset gate
+    # stay one classifier with no drift. Recovery-keyed over cumulative:
+    # cumulative's false positive bricks a healthy SESSION-scoped cached
+    # gateway agent (session-scoped per _agent_cache keyed on session_key,
+    # not process-wide, but real and permanent for that session — on a
+    # one-row margin: worst measured exposure 11 vs limit 10);
+    # recovery-keyed's false negative is a bounded per-turn leak that the
+    # load-time drop already removes at replay. Take the leak. The runaway
+    # spiral (146 rows within ONE turn, session 20260930_232921_07ffc6ac) is
+    # still caught: it never reaches finalization, so nothing resets while
+    # it runs. INTENT (do not invert on refactor): the reset reads
+    # _pre_explainer_response — captured BEFORE the transform hook — so a
+    # transform-laundered reply does NOT count as recovery. A
+    # transform-recovered answer deliberately does not reset the counter;
+    # moving the capture below the transforms would reintroduce the launder
+    # path. When the bound trips, the counter intentionally STAYS at or over
+    # the limit and every later turn on this session trips at the loop head
+    # until the agent is evicted or a new session opens — that is by design,
+    # not a bug; the escape is session eviction, not a reset.
+    try:
+        from agent.agent_runtime_helpers import _msg_has_payload as _recovery_check
+
+        _recovered = _recovery_check(
+            {"role": "assistant", "content": _pre_explainer_response}
+        )
+    except Exception:
+        _recovered = bool(_pre_explainer_response) and bool(
+            str(_pre_explainer_response).strip()
+        )
+    if _recovered and not interrupted:
+        agent._poison_row_appends_session = 0
 
     # External memory provider: sync the completed turn + queue next prefetch.
     agent._sync_external_memory_for_turn(

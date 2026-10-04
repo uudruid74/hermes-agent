@@ -738,6 +738,39 @@ def _get_continuation_prompt(is_partial_stub: bool, dropped_tools: Optional[List
         )
 
 
+def _empty_turn_spiral_limit() -> int:
+    """Bound on no-payload assistant-row appends between recoveries (empty-turn spiral).
+
+    Config: ``agent.empty_turn_spiral_limit`` in ``config.yaml`` (default 10).
+    No environment fallback — per AGENTS.md, behavioral settings live in
+    config.yaml only (``.env`` is for secrets).
+
+    The counter increments on every no-payload interim-assistant append and
+    resets in ``finalize_turn`` whenever a turn produces a real response
+    (recovery-keyed, t_d9fd3ab9 item 2), so the bound counts appends
+    accumulated across consecutive non-recovering turns.
+
+    The observed failure (2026-10-01, session 20260930_232921_07ffc6ac): 135 API
+    calls over 92.7 minutes in ONE turn, 146 no-payload assistant rows on the
+    session, and a turn "completing" with a zero-length response. Sourced: 10 is
+    ~2x the per-turn bound the length-continuation counter already implies (4)
+    and far below the observed runaway (146); a run of 10 poison
+    rows without an intervening recovery is already degenerate under any
+    healthy regime (typical clean sessions accumulate 0-2 from rare stream
+    drops, healed and never re-encountered).
+    """
+    try:
+        from hermes_cli.config import cfg_get, load_config_readonly
+
+        _raw = cfg_get(load_config_readonly(), "agent", "empty_turn_spiral_limit")
+        if _raw is None:
+            return 10
+        _val = int(_raw)
+        return _val if _val > 0 else 10
+    except (ImportError, TypeError, ValueError):
+        return 10
+
+
 # Continuation nudge for Codex/Responses turns that came back with only
 # internal reasoning (no visible content, no tool calls).  When the interim
 # assistant message also carries no encrypted reasoning items and no
@@ -1448,7 +1481,63 @@ def run_conversation(
             if not agent.quiet_mode:
                 agent._safe_print("\n⚡ Breaking out of tool loop due to interrupt...")
             break
-        
+
+        # ── Empty-turn spiral bound (recovery-keyed) ─────────────────────
+        # Poison rows (assistant rows carrying no payload — empty content,
+        # no tool_calls, no reasoning carriers) re-enter every subsequent
+        # request and are healed in memory per call without ever persisting.
+        # The counter (agent-scoped) accumulates poison-row appends and
+        # RESETS in finalize_turn whenever a turn produces a real response,
+        # so the bound counts appends across consecutive non-recovering
+        # turns. Past agent.empty_turn_spiral_limit (config.yaml, default
+        # 10) such appends, end the turn with an explicit error instead of
+        # issuing another call. One-time prefix change at most; no wire
+        # mutation; the transcript is never rewritten here.
+        _spiral_limit = _empty_turn_spiral_limit()
+        _poison_appends = getattr(agent, "_poison_row_appends_session", 0)
+        if _poison_appends >= _spiral_limit:
+            _spiral_msg = (
+                f"⛔ Empty-turn spiral bound: {_poison_appends} empty "
+                f"(no-payload) assistant rows appended since the last "
+                f"recovery (limit {_spiral_limit}). The model is repeatedly returning "
+                "empty content with finish_reason=length; each retry heals "
+                "the transcript in memory but persists another empty row. "
+                "Ending the turn to stop the spiral. Check the provider/model "
+                "output token limit (max_tokens) or restart the session."
+            )
+            logger.error(
+                "Empty-turn spiral bound hit: %d poison-row appends since "
+                "last recovery (limit %d) — failing the turn explicitly",
+                _poison_appends, _spiral_limit,
+            )
+            agent._flush_status_buffer()
+            for _idx in range(len(messages) - 1, -1, -1):
+                if messages[_idx].get("role") == "tool":
+                    break
+                if (
+                    messages[_idx].get("role") == "assistant"
+                    and not messages[_idx].get("tool_calls")
+                ):
+                    from agent.agent_runtime_helpers import (
+                        _msg_has_payload as _spiral_payload_check,
+                    )
+                    if _spiral_payload_check(messages[_idx]):
+                        break
+                    messages.pop()
+                elif messages[_idx].get("role") == "user" and messages[_idx].get("_empty_recovery_synthetic"):
+                    messages.pop()
+                else:
+                    break
+            agent._persist_session(messages, conversation_history)
+            return {
+                "final_response": _spiral_msg,
+                "messages": messages,
+                "api_calls": api_call_count,
+                "completed": False,
+                "partial": True,
+                "error": _spiral_msg,
+            }
+
         api_call_count += 1
         agent._api_call_count = api_call_count
         agent._touch_activity(f"starting API call #{api_call_count}")
@@ -3080,6 +3169,22 @@ def run_conversation(
                             if not _is_empty_partial_stub:
                                 interim_msg = agent._build_assistant_message(assistant_message, finish_reason)
                                 messages.append(interim_msg)
+                                # Poison-row accounting (empty-turn spiral bound):
+                                # an interim assistant row carrying no payload is a poison row —
+                                # the persisted transcript keeps it (the wire copy is healed per
+                                # call by the pre-call sanitizer), so it re-enters every subsequent
+                                # request. Counter is agent-scoped and RESET on recovery
+                                # (finalize_turn resets it when a turn produces a real response),
+                                # so the bound counts appends across consecutive non-recovering
+                                # turns. See the loop-head bound below and the reset in
+                                # turn_finalizer.py.
+                                from agent.agent_runtime_helpers import (
+                                    _msg_has_payload as _poison_row_check,
+                                )
+                                if not _poison_row_check(interim_msg):
+                                    agent._poison_row_appends_session = (
+                                        getattr(agent, "_poison_row_appends_session", 0) + 1
+                                    )
                                 if assistant_message.content:
                                     truncated_response_parts.append(assistant_message.content)
 

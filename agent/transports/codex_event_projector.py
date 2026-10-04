@@ -39,8 +39,8 @@ def _deterministic_call_id(item_type: str, item_id: str) -> str:
 
     Uses the codex item id directly when present (already a uuid); falls back
     to a content hash so replay produces the same id across sessions and
-    prefix caches stay valid. See AGENTS.md Pitfall #16 (deterministic IDs in
-    tool call history)."""
+    prefix caches stay valid. See the contributor guide, Pitfall #16
+    (deterministic IDs in tool call history)."""
     if item_id:
         return f"codex_{item_type}_{item_id}"
     digest = hashlib.sha256(f"{item_type}".encode()).hexdigest()[:16]

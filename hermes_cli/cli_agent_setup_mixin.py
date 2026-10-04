@@ -409,6 +409,12 @@ class CLIAgentSetupMixin:
             )
             if restored:
                 restored = [m for m in restored if m.get("role") != "session_meta"]
+                # Empty-turn spiral companion: drop poisoned no-payload assistant
+                # rows at the live-replay boundary (same contract as the gateway
+                # history builder's empty-row filter) so a resumed session stops
+                # re-healing them on every request.
+                from agent.agent_runtime_helpers import drop_no_payload_non_final as _drop_poison_rows
+                restored = _drop_poison_rows(restored)
                 self.conversation_history = restored
                 msg_count = len([m for m in restored if m.get("role") == "user"])
                 title_part = ""

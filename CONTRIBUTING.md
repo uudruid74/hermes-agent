@@ -202,7 +202,7 @@ ln -sf "$(pwd)/venv/bin/hermes" ~/.local/bin/hermes
 
 ```bash
 # Preferred — matches CI (hermetic `env -i`, per-file subprocess isolation
-# via run_tests_parallel.py, worker count auto-scaled); see AGENTS.md
+# via run_tests_parallel.py, worker count auto-scaled); see CONTRIBUTOR-NOTES.md
 scripts/run_tests.sh
 
 # Alternative (activate the venv first). The wrapper is still recommended
@@ -278,7 +278,7 @@ hermes-agent/
 ├── website/                  # Documentation site (hermes-agent.nousresearch.com)
 │
 ├── cli-config.yaml.example   # Example configuration (copied to ~/.hermes/config.yaml)
-└── AGENTS.md                 # Development guide for AI coding assistants
+└── docs/development/         # Contributor guides (not auto-loaded context)
 ```
 
 ### User configuration (stored in `~/.hermes/`)
@@ -396,8 +396,8 @@ You must still add the tool name to the appropriate list in `toolsets.py`
 registers but is never exposed to the agent. If you introduce a new toolset,
 add it in `toolsets.py` and wire it into the relevant platform presets.
 
-See `AGENTS.md` (section **Adding New Tools**) for profile-aware paths and
-plugin vs core guidance.
+See `docs/development/CONTRIBUTOR-NOTES.md` (section **Adding New Tools**) for
+profile-aware paths and plugin vs core guidance.
 
 ---
 

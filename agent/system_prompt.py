@@ -511,7 +511,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         # user's shell cwd, so an in-tree fallback is a deliberate choice
         # (developing Hermes). Every other surface (desktop chat panel,
         # gateway daemons) self-spawns into the install tree, where the
-        # fallback would inject this repo's contributor AGENTS.md (#64590).
+        # fallback would inject this repo's contributor guide context file (#64590).
         context_files_prompt = _r.build_context_files_prompt(
             cwd=resolve_context_cwd(), skip_soul=_soul_loaded,
             context_length=_ctx_len,

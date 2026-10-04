@@ -634,6 +634,14 @@ def build_turn_context(
 
     # Initialize conversation (copy to avoid mutating the caller's list).
     messages = list(conversation_history) if conversation_history else []
+    # Empty-turn spiral companion: drop no-payload assistant rows ONCE at the
+    # live-replay boundary. The cached-agent live transcript bypasses every
+    # load-time filter (gateway/run.py _select_cached_agent_history prefers the
+    # longer live list), so poisoned rows accumulated within previous turns
+    # would otherwise be re-healed by the per-call sanitizer on every request.
+    # Model-fed list only; the stored transcript is never rewritten here.
+    from agent.agent_runtime_helpers import drop_no_payload_non_final as _drop_poison_rows
+    messages = _drop_poison_rows(messages)
 
     # The CLI may already have staged this input outside the history passed to
     # ``run_conversation``. Reuse it only when its clean transcript text matches
