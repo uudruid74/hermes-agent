@@ -1127,7 +1127,11 @@ def continue_plan(
     now = int(time.time())
     with write_txn(conn):
         task = _task_row(conn, plan_id)
-        if task["status"] not in ("manual", "archived", "blocked"):
+        # ``attention`` is the parked state for a plan task whose turn ended
+        # at the tool-call limit with no submission (park_plan_task). It is
+        # the state this function restores: continue re-binds the plan and
+        # lands the task back in ``manual``.
+        if task["status"] not in ("manual", "archived", "blocked", "attention"):
             raise InvalidTaskState(
                 f"plan {plan_id} cannot continue from status {task['status']}"
             )
@@ -1152,7 +1156,7 @@ def continue_plan(
         )
         changed = conn.execute(
             "UPDATE tasks SET assignee = ?, session_id = ?, status = 'manual' "
-            "WHERE id = ? AND status IN ('manual', 'archived', 'blocked')",
+            "WHERE id = ? AND status IN ('manual', 'archived', 'blocked', 'attention')",
             (actor, session_id, plan_id),
         ).rowcount
         if changed != 1:

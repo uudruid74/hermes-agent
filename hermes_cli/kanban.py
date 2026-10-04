@@ -44,6 +44,7 @@ _STATUS_ICONS = {
     "running":  "●",
     "scheduled":"⏱",
     "blocked":  "⊘",
+    "attention":"⚑",
     "done":     "✓",
     "archived": "—",
 }
@@ -1255,6 +1256,7 @@ _NOTIFY_EMOJI = {
     "running":  "🔄",
     "scheduled":"⏳",
     "blocked":  "🔴",
+    "attention":"⚠️",
     "done":     "✅",
     "archived": "📦",
 }
@@ -1485,6 +1487,13 @@ def _notify_kanban_status_change(
         human_parts.append(f" — {summary_line}")
     if new_status == "blocked":
         human_parts.append(" — Investigate this blocked task")
+    elif new_status == "attention":
+        # Parked plan task. The detailed prompt (goal / plan / resume steps)
+        # goes to the plan's dispatcher agent from the park site; this line is
+        # the human-visible notification that steers any reader to plan_tool.
+        human_parts.append(
+            " — Plan-bound task: investigate with plan_tool, not kanban tools"
+        )
     human_msg = "".join(human_parts)
 
     json_payload = json.dumps({
@@ -3432,7 +3441,7 @@ def _cmd_stats(args: argparse.Namespace) -> int:
         print(json.dumps(stats, indent=2, ensure_ascii=False))
         return 0
     print("By status:")
-    for k in ("triage", "todo", "scheduled", "ready", "running", "blocked", "done"):
+    for k in ("triage", "todo", "scheduled", "ready", "running", "blocked", "attention", "done"):
         print(f"  {k:8s}  {stats['by_status'].get(k, 0)}")
     if stats["by_assignee"]:
         print("\nBy assignee:")

@@ -87,7 +87,7 @@ def test_new_approval_question_contains_full_plan(monkeypatch):
     assert "2. Render every step" in seen["question"]
 
 
-def test_iteration_limit_blocks_manual_plan_and_notifies_origin(monkeypatch):
+def test_iteration_limit_parks_manual_plan_in_attention(monkeypatch):
     conn = _db()
     monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
     monkeypatch.setattr(
@@ -108,18 +108,21 @@ def test_iteration_limit_blocks_manual_plan_and_notifies_origin(monkeypatch):
     )
     task_id = conn.execute("SELECT task_id FROM execution_bindings").fetchone()[0]
 
-    blocked = plan_binding_adapter.block_active_plan_at_iteration_limit(
+    parked = plan_binding_adapter.block_active_plan_at_iteration_limit(
         agent,
         used=200,
         maximum=200,
     )
 
+    # The park must never route through ``blocked``: status is the dedicated
+    # state, block_kind is untouched, and the binding survives.
     task = conn.execute(
-        "SELECT status, block_kind, task_stepno FROM tasks WHERE id=?",
+        "SELECT status, block_kind, block_recurrences, task_stepno "
+        "FROM tasks WHERE id=?",
         (task_id,),
     ).fetchone()
-    assert blocked is True
-    assert tuple(task) == ("blocked", "needs_input", 1)
+    assert parked is True
+    assert tuple(task) == ("attention", None, 0, 1)
     assert conn.execute(
         "SELECT task_id FROM execution_bindings"
     ).fetchone()[0] == task_id
@@ -127,14 +130,15 @@ def test_iteration_limit_blocks_manual_plan_and_notifies_origin(monkeypatch):
         "SELECT kind, payload FROM task_events WHERE task_id=? ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
-    assert event["kind"] == "blocked"
+    assert event["kind"] == "plan-parked"
     assert "Step 1 ended at the tool-call limit (200/200) with no submission" in event["payload"]
+    # Notification carries the fixed, greppable summary (Evan, 2026-10-03).
     assert notified == [
         (
             task_id,
-            "blocked",
+            "attention",
             {
-                "summary": "Step 1 ended at the tool-call limit (200/200) with no submission",
+                "summary": "exceeded tool call limit",
                 "title": "Long step",
                 "assignee": "neo",
             },

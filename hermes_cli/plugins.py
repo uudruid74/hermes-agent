@@ -212,6 +212,12 @@ VALID_HOOKS: Set[str] = {
     "kanban_task_claimed",
     "kanban_task_completed",
     "kanban_task_blocked",
+    # Fired when a plan-bound task parks in ``attention`` after its turn
+    # ended at the tool-call limit with no submission. Same kwargs as
+    # kanban_task_blocked (task_id, board, assignee, run_id, profile_name,
+    # reason). Deliberately a separate event from ``blocked``: the parked
+    # state never enters the block/unblock/recurrence machinery.
+    "kanban_task_parked",
 }
 
 ENTRY_POINTS_GROUP = "hermes_agent.plugins"

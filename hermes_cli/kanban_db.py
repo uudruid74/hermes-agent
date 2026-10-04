@@ -99,7 +99,7 @@ _log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "manual", "blocked", "review", "done", "archived"}
+VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "manual", "blocked", "attention", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
@@ -133,6 +133,28 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient", "ap
 # not dispatcher spawn/crash/timeout failures.
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
+
+# Parked plan tasks. A plan-bound task whose turn ends at the tool-call limit
+# with no submitted step must never enter ``blocked``: that status carries
+# dispatcher semantics (``unblock_task`` restores to ``ready``/``todo``,
+# ``recompute_ready`` promotes ``blocked`` -> ``ready``, and the unblock-loop
+# breaker routes re-blocks to ``triage``), any of which spawns a second worker
+# on a task whose binding and measuring session are still live.
+#
+# ``attention`` ("Needs Attention") is built the same way ``manual`` was: it is
+# in ``VALID_STATUSES`` but in no claimable or promotable set, so the invariant
+# holds by construction — the dispatcher cannot claim it (``claim_task`` only
+# transitions ``ready``), ``recompute_ready`` only promotes ``blocked``/``todo``
+# and never sees it, and ``park_plan_task`` touches no recurrence counter so
+# the loop breaker is unreachable for this class. Restore is ``plan_tool
+# continue``, which re-binds the plan and lands the task back in ``manual``.
+PLAN_PARK_STATUS = "attention"
+# Fixed, greppable notification summary for the park transition (Evan,
+# 2026-10-03). Deliberately not the long human-readable reason — that stays on
+# the run row and in the task event as diagnostic detail. The point of the
+# fixed string is that a test can assert it and a human can tell why a task
+# parked from the notification line alone.
+PLAN_PARK_SUMMARY = "exceeded tool call limit"
 
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
@@ -6534,6 +6556,95 @@ def promote_task(
     return True, None
 
 
+def park_plan_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    detail: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+) -> bool:
+    """Park a plan-bound task in ``attention`` (never ``blocked``).
+
+    Called when a plan-bound worker's turn ends at the tool-call limit with no
+    submitted step. ``blocked`` would carry dispatcher semantics this state
+    must never have — ``unblock_task`` would restore the task to ``ready`` for
+    a duplicate worker spawn, ``recompute_ready`` would promote it, and a
+    re-block would advance ``block_recurrences`` toward ``triage``. Parking in
+    ``attention`` avoids all three by construction: no claim/promotion set
+    contains this status and no recurrence counter is touched.
+
+    ``detail`` is the long human-readable diagnostic (step number, budget
+    counts). It is preserved on the run row and in the task event; the
+    *notification* summary for this transition is the fixed
+    :data:`PLAN_PARK_SUMMARY` string. Returns True on success, False when the
+    task was not in a parkable state (or the expected run pointer moved).
+    """
+    now = int(time.time())
+    if expected_run_id is None:
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status        = 'attention',
+                   claim_lock    = NULL,
+                   claim_expires = NULL,
+                   worker_pid    = NULL
+             WHERE id = ?
+               AND status IN ('manual', 'running')
+            """,
+            (task_id,),
+        )
+    else:
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status        = 'attention',
+                   claim_lock    = NULL,
+                   claim_expires = NULL,
+                   worker_pid    = NULL
+             WHERE id = ?
+               AND status IN ('manual', 'running')
+               AND current_run_id = ?
+            """,
+            (task_id, int(expected_run_id)),
+        )
+    if cur.rowcount != 1:
+        return False
+    run_id = _end_run(
+        conn, task_id,
+        outcome="blocked", status="attention",
+        summary=detail,
+    )
+    if run_id is None and detail:
+        run_id = _synthesize_ended_run(
+            conn, task_id, outcome="blocked", summary=detail,
+        )
+    _append_event(
+        conn, task_id, "plan-parked",
+        {"reason": detail, "summary": PLAN_PARK_SUMMARY},
+        run_id=run_id,
+    )
+    _fire_kanban_lifecycle_hook(
+        "kanban_task_parked",
+        task_id,
+        board=get_current_board(),
+        assignee=None,
+        run_id=run_id,
+        reason=detail,
+    )
+    try:
+        from hermes_cli.kanban import _notify_kanban_status_change
+        _parked_task = get_task(conn, task_id)
+        _notify_kanban_status_change(
+            task_id, PLAN_PARK_STATUS,
+            summary=PLAN_PARK_SUMMARY,
+            title=_parked_task.title if _parked_task else None,
+            assignee=_parked_task.assignee if _parked_task else None,
+        )
+    except Exception:
+        _log.exception("kanban parked notification failed for task=%s", task_id)
+    return True
+
+
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Transition ``blocked``/``scheduled`` -> ready or todo.
 
@@ -6546,8 +6657,18 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """
     now = int(time.time())
     with write_txn(conn):
+        # Restore target for this row. A parked plan task (``attention``)
+        # restores to ``manual`` — never ``ready`` — so an operator unblock
+        # cannot hand a still-bound plan task to the dispatcher.
+        row_status = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row_status is None:
+            return False
+        attention = row_status["status"] == PLAN_PARK_STATUS
         stale = conn.execute(
-            "SELECT current_run_id FROM tasks WHERE id = ? AND status IN ('blocked', 'scheduled')",
+            "SELECT current_run_id FROM tasks WHERE id = ? "
+            "AND status IN ('blocked', 'scheduled', 'attention')",
             (task_id,),
         ).fetchone()
         if stale and stale["current_run_id"]:
@@ -6580,7 +6701,16 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             "SELECT assignee FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
         _has_assignee = bool((_a["assignee"] or "").strip()) if _a else False
-        new_status = "ready" if (not undone_parents and _has_assignee) else "todo"
+        # A parked plan task (``attention``) must never be handed to the
+        # dispatcher — its binding and measuring session are still live. Its
+        # only restore path is ``plan_tool continue``, which re-binds the plan
+        # and lands the task back in ``manual``. ``unblock_task`` can still
+        # reach an ``attention`` row (raw CLI / operator), so its restore
+        # target is ``manual`` too — never ``ready``.
+        if attention:
+            new_status = "manual"
+        else:
+            new_status = "ready" if (not undone_parents and _has_assignee) else "todo"
         # NOTE: deliberately does NOT touch ``block_recurrences`` or
         # ``block_kind``. Resetting the recurrence counter on unblock is exactly
         # the amnesia that let a cron unblock → worker re-block loop run
@@ -6594,7 +6724,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
             "consecutive_failures = 0, last_failure_error = NULL "
-            "WHERE id = ? AND status IN ('blocked', 'scheduled')",
+            "WHERE id = ? AND status IN ('blocked', 'scheduled', 'attention')",
             (new_status, task_id),
         )
         if cur.rowcount != 1:

@@ -526,12 +526,13 @@ def _current(conn, agent):
 
 
 def block_active_plan_at_iteration_limit(agent, *, used: int, maximum: int) -> bool:
-    """Block an unsubmitted active Plan step after its turn budget is exhausted.
+    """Park an unsubmitted active Plan step after its turn budget is exhausted.
 
     A pending step review proves that ``plan_tool advance`` already submitted
     the step, so that state must remain with the reviewer. Otherwise the bound
-    Plan has no live worker after this turn and must use the same durable block
-    and notification path as a Kanban worker.
+    Plan has no live worker after this turn and the task parks in the
+    dedicated ``attention`` state (park_plan_task) — never ``blocked``, which
+    would expose a still-bound task to the dispatcher.
     """
     from hermes_cli import execution_bindings as bindings
     from hermes_cli import kanban_db
@@ -549,16 +550,32 @@ def block_active_plan_at_iteration_limit(agent, *, used: int, maximum: int) -> b
     if task is None or task["status"] not in {"manual", "running"}:
         return False
     step_no = int(task["task_stepno"] or 1)
-    reason = (
+    detail = (
         f"Step {step_no} ended at the tool-call limit "
         f"({used}/{maximum}) with no submission"
     )
-    return kanban_db.block_task(
-        conn,
-        binding.task_id,
-        reason=reason,
-        kind="needs_input",
-    )
+    parked = kanban_db.park_plan_task(conn, binding.task_id, detail=detail)
+    if not parked:
+        return False
+    # The parked-state prompt goes to the plan's dispatcher (an agent), not
+    # through the generic kanban notification — this is the "separate prompt"
+    # Evan specified. Best-effort: parking itself has already succeeded.
+    try:
+        full_task = conn.execute(
+            "SELECT * FROM tasks WHERE id = ?", (binding.task_id,)
+        ).fetchone()
+        if full_task is not None:
+            message = _attention_request_text(
+                full_task, full_task, used=used, maximum=maximum
+            )
+            _deliver_attention_request(binding.task_id, message)
+    except (OSError, ValueError, KeyError):
+        logger.warning(
+            "attention request for task %s could not be delivered",
+            binding.task_id,
+            exc_info=True,
+        )
+    return True
 
 
 def _dispatcher_for_task(conn, task_id: str) -> Optional[str]:
@@ -627,6 +644,99 @@ def _review_request_text(task, pending, *, auto_approved: bool = False) -> str:
             "auto-approves the remaining steps of this plan, so you will not be "
             "asked again for this plan. A denial must include a reason."
         )
+    return "\n".join(lines)
+
+
+def _last_step_summary(task_id: str, step_no: int) -> str:
+    """Return the stored summary for *step_no*, or "" when none exists."""
+    from hermes_cli import execution_bindings as bindings
+
+    conn = _legacy()._get_kanban_db()
+    summaries = bindings.plan_step_summaries(conn, task_id)
+    return summaries.get(step_no, "")
+
+
+def _deliver_attention_request(task_id: str, message: str) -> None:
+    """Send the parked-state prompt to the plan's dispatcher, best-effort.
+
+    A parked plan task's dispatcher is the AI that created the plan (the
+    creator when it differs from the assignee), resolved the same way the
+    review path resolves its reviewer. The assignee profile is notified as a
+    fallback for self-created plans, which have no distinct dispatcher.
+    Spawn failure or missing origin is logged and surfaced in the return
+    value rather than raised — parking itself has already succeeded.
+    """
+    conn = _legacy()._get_kanban_db()
+    recipient = _dispatcher_for_task(conn, task_id)
+    if not recipient:
+        row = conn.execute(
+            "SELECT assignee FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        recipient = (
+            str(row["assignee"]).strip()
+            if row and (row["assignee"] or "").strip()
+            else None
+        )
+    if recipient:
+        error = _send_user(recipient, message)
+        if error:
+            logger.warning("attention request delivery: %s", error)
+    else:
+        logger.warning(
+            "attention request for task %s has no dispatcher or assignee to notify",
+            task_id,
+        )
+
+
+def _attention_request_text(task, pending, *, used: int, maximum: int) -> str:
+    """Compose the parked-state prompt for the plan's dispatcher.
+
+    A parked plan task's dispatcher is an agent (the plan's creator), not a
+    human operator, so this is built as a sibling of
+    :func:`_review_request_text` — same preamble, same goal/plan/summary
+    blocks — with the request line steering that agent to ``plan_tool``.
+    Kanban routes (dispatch, specify, unblock, archive) are named as "do
+    not": on a machine where the assignee's model cannot hold two workers,
+    any of them spawns a duplicate worker and the run's measurement is lost.
+    """
+    steps = json.loads(task["task_steps"] or "[]")
+    step_no = int(pending["task_stepno"] or 1)
+    last_summary = _last_step_summary(task["id"], step_no)
+    lines = [
+        f"{task['id']} → Needs Attention — exceeded tool call limit",
+        "",
+        f"Step {step_no} ended at the tool-call limit ({used}/{maximum}) "
+        f"with no submission, task id {task['id']}",
+        "",
+        f"Goal: {task['task_goal'] or ''}",
+        "",
+        "Plan:",
+    ]
+    for index, step_text in enumerate(steps, 1):
+        marker = "[X]" if index < step_no else "[-]" if index == step_no else "[ ]"
+        lines.append(f"{marker} Step {index}: {step_text}")
+    lines.extend(["", "Summary:", last_summary or "none", ""])
+    lines.append(
+        "---\n"
+        "\n"
+        "Investigate with plan_tool. This is a plan-bound task — nothing here "
+        "is a kanban problem.\n"
+        "\n"
+        "- The worker's session is still live and still holds the binding. "
+        "Do NOT dispatch, re-specify, unblock, or archive. A state change "
+        "here spawns a second worker on a machine that cannot hold one, and "
+        "the run's measurement is lost.\n"
+        "- Inspect the current step: 'plan_tool remind "
+        f"{task['id']}' shows the active step and whether a review is "
+        "pending.\n"
+        "- When you are ready to resume, re-bind with 'plan_tool continue "
+        f"{task['id']}'. That restores the task to 'manual' and wakes the "
+        "worker.\n"
+        "- If you need to end the step, use 'plan_tool' — not a kanban "
+        "command.\n"
+        "\n"
+        "No reply is required to this notification."
+    )
     return "\n".join(lines)
 
 
