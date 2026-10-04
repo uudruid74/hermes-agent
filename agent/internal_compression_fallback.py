@@ -263,9 +263,43 @@ def _content_text(content: Any) -> str:
     return ""
 
 
+def _is_payload_message(message: dict[str, Any]) -> bool:
+    """True when a message IS a stored compaction payload row.
+
+    Detection is text-marker-based (``_PAYLOAD_MARKERS`` prefix test) because
+    the stored row keeps no metadata — every non-content field is NULL except
+    ``compacted=1`` (role flip is Phase 4 of ``compress()``, which stores the
+    payload under ``role="user"`` without any marker key).
+
+    A payload is the *previous* compressor's output folded forward. It is not a
+    conversation turn, and protecting it verbatim via ``protect_last_n`` is
+    what built the fossil chain: prior payload -> visible turn -> protected
+    tail -> ``_fits`` unpassable -> output = plan + folded prior -> next
+    fossil, pinning every payload at ~59K chars regardless of target.
+    """
+    text = message.get("content")
+    if not isinstance(text, str):
+        return False
+    stripped = text.lstrip()
+    return any(stripped.startswith(marker) for marker in _PAYLOAD_MARKERS)
+
+
 def _template_visible_role(message: dict[str, Any]) -> str | None:
+    """Role as the fall back counts it for ``protect_last_n`` sizing.
+
+    Invisible: ``tool`` rows, assistant ``tool_calls`` rows (chat-template
+    alternation exempts both), and — Stage 0.1 (t_57cb0d4e) — stored
+    compaction payloads. A payload is a prior compressor output, not a
+    conversation turn; counting it as a "visible turn" both spends the whole
+    ``protect_last_n`` budget on a fossil and (via ``_fit_tail_start``) drags
+    a 59K-char row into the verbatim tail, which alone exceeds the target.
+    Excluded payloads flow into the middle, where
+    ``_prune_reingested_payload`` already drops their ranking weight.
+    """
     role = message.get("role")
     if role == "tool" or (role == "assistant" and message.get("tool_calls")):
+        return None
+    if isinstance(role, str) and _is_payload_message(message):
         return None
     return role if isinstance(role, str) else None
 
@@ -939,6 +973,39 @@ def _chunks(text: str) -> list[str]:
 _MASKED_OBSERVATION = "[observation omitted — outside the last turn]"
 
 
+def _strip_tail_tool_rows(
+    messages: list[dict[str, Any]], tail_start: int
+) -> tuple[list[dict[str, Any]], int]:
+    """Tail promise rung (Evan, 2026-10-04 — t_57cb0d4e): keep the last turn
+    whole, strip tool calls and observations from all earlier turns.
+
+    Fires only when the masked tail is still over budget. Tool rows and
+    tool-call rows are scaffolding — the reasoning around them is what
+    carries context — so the promise keeps every user/assistant prose turn
+    and drops only the heavy mechanical half. Tool-call assistants are
+    dropped whole (their prose lives in the following assistant turn when
+    there is one); observations drop likewise. Returns ``(messages, dropped)``;
+    the input list is never mutated.
+    """
+    tail = messages[tail_start:]
+    keep_from = len(tail)
+    for offset in range(len(tail) - 1, -1, -1):
+        if _template_visible_role(tail[offset]) is not None:
+            keep_from = offset
+            break
+    out = list(messages[:tail_start])
+    dropped = 0
+    for offset, message in enumerate(tail):
+        if offset < keep_from and (
+            message.get("role") == "tool"
+            or (message.get("role") == "assistant" and message.get("tool_calls"))
+        ):
+            dropped += 1
+            continue
+        out.append(message)
+    return out, dropped
+
+
 def _is_observation(message: dict[str, Any]) -> bool:
     """True for environment observations (tool results).
 
@@ -1038,14 +1105,30 @@ def _echo_marker_label(marker: str) -> str:
 
 
 def _marker_keep_label(label: str) -> bool:
-    """Apply the keep rules: >3 ws-words, or a digit, or an opening paren.
+    """Apply the keep rules: >=2 ws-words, or a digit, or an opening paren.
+
+    Stage 1 (t_57cb0d4e, Evan ruling 2026-10-04): the word threshold is
+    lowered from ``>3`` to ``>=2`` — the KISS form (Wintermute): not a new
+    detector, the same rule with one number changed. Measured on the real
+    supply (report §5a): the old threshold dropped ~48% of labels on the
+    production extractor, and the dropped class is the decision spine
+    ('Verify Dovecot' 283x, 'Auth test' 227x). 1-word residuals stay cut —
+    their top members are genuine noise ('Status' 212x, 'RUN' 138x).
+    ``description`` is excluded at any threshold (Evan ruling 2, Wintermute's
+    information test): it carries no decision information regardless of how
+    many words it has.
 
     Underscores count as whitespace so ``test_undo_scratch.py`` is 3 words,
-    not 1.  Terse boilerplate (``git log``, ``HEAD``, ``status``) is cut;
-    descriptive labels and line-refs (``undo (875,965)``) survive.
+    not 1.  Line-refs (``undo (875,965)``) survive via the digit/paren rules.
     """
     words = [word for word in re.split(r"[\s_]+", label) if word]
-    if len(words) > 3:
+    # ``description`` excluded at any threshold (Evan ruling 2): it marks
+    # nothing specific — 'Verify Dovecot' says what was done; 'description'
+    # says only "this is a description". Case-folded: wrappers emit it in
+    # several spellings.
+    if label.strip().casefold() == "description":
+        return False
+    if len(words) >= 2:
         return True
     if _ECHO_LABEL_DIGIT_RE.search(label):
         return True
@@ -2055,11 +2138,14 @@ def _add_plan_lexrank_area(
             selection_telemetry["no_op_reason"] = "no_candidates"
         return summary, tail_start
     middle_units = _message_units(middle_messages, start_index=rank_start)
-    marker_units = _terminal_marker_units(middle_messages, start_index=rank_start)
-    recent_markers, rank_markers = _split_marker_tiers(
-        marker_units, marker_recent_count
-    )
-    middle_units = middle_units + rank_markers
+    # Stage 1 (t_57cb0d4e): markers do NOT enter the ranked heap — the spine
+    # (see _carry_marker_spine) is their selection path, under its own
+    # ceiling. Feeding them here re-coupled retention to the heap's leftover
+    # budget and ran them through the score≈0 / 256-cap funnel (4-of-37
+    # survived); the double-entry also duplicated marker lines across the
+    # spine block and the heap block. Recent-tier locking
+    # (``_recent_markers_first``) is superseded by the spine's ceiling, which
+    # cuts oldest-first — the newest decision marks are exactly what survives.
     marker_notes = {note for note in notes if _PRUNED_SKILL_RE.fullmatch(note)}
     if marker_notes:
         middle_units = [
@@ -2076,13 +2162,12 @@ def _add_plan_lexrank_area(
         semantic=True,
         selection_telemetry=selection_telemetry,
     )
-    if not ranked and not recent_markers:
+    if not ranked:
         if selection_telemetry is not None:
             selection_telemetry["no_op_reason"] = (
                 selection_telemetry.get("no_op_reason") or "no_ranked_candidates"
             )
         return summary, tail_start
-    ranked = _recent_markers_first(ranked, recent_markers)
 
     # Do not spend heap budget re-stating the verbatim tail — it is already in
     # the window.  The plan/summary text is deliberately NOT a tier: it stands
@@ -2188,9 +2273,61 @@ def _canonical_prior_summary(previous_summary: str, current_summary: str) -> str
     return "\n\n".join(blocks)
 
 
-def _with_prior_summary(summary: str, previous_summary: str) -> str:
-    """Fold recovered prior context into one canonical fallback block."""
+# Stage 0.3 (t_57cb0d4e): the prior-summary fold is capped to a share of
+# ``target_tokens`` and counted pre-gate. Measured floor: the uncapped fold of
+# a saturated fossil is ~14,758 tok against a 9,241 target — accounting alone
+# would make ``_fits`` permanently unpassable (the fixed point survives), so
+# the cap is mandatory and must leave real tail room. The cap is a SHARE, not
+# a constant: it scales with the payload. A/B (ornith 20261002_141842_0ea896a6
+# replay, target 9,241): with the tail promise active the gate first passes at
+# a cap share ~= the 0.14-0.16 band and the fold converges from 59K to under
+# 10K within two iterations; shares >=0.20 re-close the gate on dense tails.
+# 0.16 sits above the pass line with margin while keeping the fold a minority
+# of the budget.
+_FOLD_CAP_SHARE = 0.16
+
+
+def _cap_prior_tokens(prior: str, cap_tokens: int) -> str:
+    """Trim a canonical prior to ``cap_tokens`` at whole-paragraph boundaries.
+
+    Paragraph-wise so the fold carries whole blocks (a half paragraph is
+    noise); at least one block is always kept when any prior exists at all,
+    so the fold degrades to "newest paragraph" rather than vanishing.
+    """
+    if cap_tokens <= 0 or not prior:
+        return ""
+    blocks = prior.split("\n\n")
+    keeps: list[str] = []
+    tok = 0
+    for block in blocks:
+        t = estimate_tokens_rough(block)
+        if keeps and tok + t > cap_tokens:
+            break
+        keeps.append(block)
+        tok += t
+    return "\n\n".join(keeps)
+
+
+def _with_prior_summary(
+    summary: str,
+    previous_summary: str,
+    target_tokens: int | None = None,
+) -> str:
+    """Fold recovered prior context into one canonical fallback block.
+
+    Stage 0.3 (t_57cb0d4e): when ``target_tokens`` is given, the canonical
+    prior is capped at ``_FOLD_CAP_SHARE`` of it before folding. Callers that
+    pass a target account the capped fold pre-gate; the legacy two-arg form
+    (uncapped, post-gate) is kept for callers outside the budget loop.
+    """
     prior = _canonical_prior_summary(previous_summary, summary)
+    if not prior:
+        return summary
+    if target_tokens is not None:
+        capped = _cap_prior_tokens(
+            prior, int(target_tokens * _FOLD_CAP_SHARE)
+        )
+        prior = capped  # cap applies even when empty: an over-cap fold folds nothing
     if not prior:
         return summary
     block = f"## Prior Context Summary\n{prior}"
@@ -2198,6 +2335,97 @@ def _with_prior_summary(summary: str, previous_summary: str) -> str:
         head, _, rest = summary.partition(VERBATIM_CONTEXT_MARKER)
         return head.rstrip() + "\n\n" + block + "\n\n" + VERBATIM_CONTEXT_MARKER + rest
     return summary.rstrip() + "\n\n" + block
+
+
+# ---------------------------------------------------------------- Stage 1
+# Marker spine (Wintermute design, canonical-inputs §11; t_57cb0d4e).
+#
+# INVARIANT: marker retention must not depend on which regime the budget
+# happens to land in. A marker that passes the keep gate is retained because
+# it is a decision mark — never because the heap had leftover budget. Before
+# this spine, markers rode `_allocate_two_pass` (the heap's leftover), so the
+# plan-only regime dropped them wholesale (measured: target=15000 → 0 markers)
+# and `_MAX_CANDIDATE_UNITS`' score≈0 funnel let 4-of-37 survive.
+#
+# Three parts, all bounded:
+#   1. SEPARATE FROM SCORE — spine units bypass `_rank_units` and the 256 cap.
+#   2. OWN EMISSION PATH — a fixed small reserve carved from target BEFORE
+#      tail measurement; callable from both branches (plan and planless).
+#   3. HARD CEILING — a TOKEN SHARE, not a count, so a 20-marker spine is not
+#      a rounding error on a 15K-token payload and a 6.7% grab on a 3K one.
+#      The ceiling is the anti-bug-4 guard: markers must never outrank real
+#      content; boundedness is what prevents the 578c48e436 failure class.
+#
+# Reserve/ceiling sizing — A/B'd on the ornith replay (target=9,241; the
+# task's harness comments carry the tables; do not guess these). The anchor
+# run (LLM t_e147304f) kept 1.2 markers/payload at a 0.20% token share — that
+# is the FLOOR on the goal ("pass line: >= the anchor's density, with
+# evidence", §12), not the ceiling. First cut: reserve 0.25% (~23 tok ≈ 2-3
+# markers at the observed ~9 tok/unit) — above the anchor with margin; ceiling
+# 0.60% (~55 tok ≈ 6 markers) — bounded ~5x anchor, far below the 6.7% grab
+# the share-form exists to prevent. A/B upward from here; the kill criterion
+# is marker/content share drifting past the ceiling's own accounting.
+_MARK_SPINE_SHARE = 0.0025  # reserved spine budget carved before tail sizing
+_MARK_SPINE_CEILING_SHARE = 0.0060  # hard ceiling: the anti-bug-4 guard
+
+
+def _marker_spine_reserve(target_tokens: int) -> int:
+    """Fixed token reserve for the marker spine, carved before tail sizing."""
+    return max(0, int(target_tokens * _MARK_SPINE_SHARE))
+
+
+def _marker_spine_budget(target_tokens: int) -> int:
+    """Hard ceiling for the emitted spine, in tokens (the anti-bug-4 guard)."""
+    return max(_marker_spine_reserve(target_tokens),
+               int(target_tokens * _MARK_SPINE_CEILING_SHARE))
+
+
+def _marker_spine_block(units: list[_Unit]) -> str:
+    """Render the spine block: verbatim markers, chronological, one per line."""
+    if not units:
+        return ""
+    lines = [unit.text for unit in sorted(units, key=lambda item: item.order)]
+    return "## Decision Markers\n" + "\n".join(lines)
+
+
+def _carry_marker_spine(
+    summary: str,
+    spine: list[_Unit],
+    budget_tokens: int,
+) -> str:
+    """Insert the spine block into ``summary`` under its ceiling.
+
+    Units are added oldest-first while the ceiling holds — when the budget is
+    short, the OLDEST decision marks cut first, mirroring how the tail keeps
+    the newest work. The block rides below the Plan/Protected headers and
+    above the verbatim marker, outside the heap's budget entirely.
+    """
+    if not spine or budget_tokens <= 0:
+        return summary
+    kept: list[_Unit] = []
+    spent = 0
+    seen_lines: set[str] = set()
+    for unit in sorted(spine, key=lambda item: item.order):
+        line = unit.text.splitlines()[0].strip() if unit.text else ""
+        if not line or line in seen_lines:
+            # Identical repeated labels (e.g. `=== EXIT $? ===` fired once per
+            # pipeline stage) carry no additional decision information; the
+            # exit context lives in the already-fused tombstone of the first.
+            continue
+        if kept and spent + unit.token_count > budget_tokens:
+            break
+        seen_lines.add(line)
+        kept.append(unit)
+        spent += unit.token_count
+    block = _marker_spine_block(kept)
+    if not block:
+        return summary
+    if VERBATIM_CONTEXT_MARKER in summary:
+        head, _, rest = summary.partition(VERBATIM_CONTEXT_MARKER)
+        return head.rstrip() + "\n\n" + block + "\n\n" + VERBATIM_CONTEXT_MARKER + rest
+    return summary.rstrip() + "\n\n" + block
+# ``description`` excluded from the widened keep gate (Evan ruling 2,
+# Wintermute's information test): see _marker_keep_label (t_57cb0d4e).
 
 
 _OMISSION_MARKER_PREFIX = (
@@ -2301,9 +2529,24 @@ def build_internal_fallback(
     # tail shrinking would summarise away) and sheds the bulky, disposable
     # half of the turn instead.  `_fit_tail_start` then re-measures the
     # lightened tail and usually succeeds without advancing the boundary.
+    #
+    # Tail promise (Evan ruling, 2026-10-04 — t_57cb0d4e): masking sheds only
+    # ~16% on a tool-dense tail because the bulky rows are the tool RESULTS
+    # below the mask floor and the payload-augmented user turns. When the
+    # visible-turn keep is still over budget after masking, strip tool calls
+    # and observations from all but the LAST turn (the active-work request
+    # stays verbatim), then let `_fit_tail_start` bound whatever remains.
+    #
+    # Stage 1 carve (§11): the spine reserve is subtracted from the tail's
+    # budget BEFORE tail measurement, so a 32K tail cannot size it to zero.
     tail_tokens = estimate_messages_tokens_rough(messages[tail_start:])
-    if tail_tokens > target_tokens:
+    tail_target = max(0, target_tokens - _marker_spine_reserve(target_tokens))
+    if tail_tokens > tail_target:
         messages = _mask_tail_observations(messages, tail_start)
+        tail_tokens = estimate_messages_tokens_rough(messages[tail_start:])
+        if tail_tokens > tail_target:
+            messages, _dropped = _strip_tail_tool_rows(messages, tail_start)
+            tail_tokens = estimate_messages_tokens_rough(messages[tail_start:])
 
     notes = _session_notes(messages, memory_context, previous_summary)
 
@@ -2332,7 +2575,14 @@ def build_internal_fallback(
         result_tail_start: int,
         mode: str,
     ) -> InternalFallback:
-        summary = _with_prior_summary(summary, previous_summary)
+        # Stage 0.3 (t_57cb0d4e): the folded summary is capped (share of
+        # target) and ACCOUNTED here, before the result is returned, and the
+        # tail boundary is re-fit at the real target if the folded payload
+        # breaks it. Previously the fold landed entirely post-gate and was
+        # only logged as `over_budget` — the loop that pinned every payload
+        # at ~59K chars. The capped fold shrinks each cycle (smaller payload
+        # -> smaller next fold), which is the convergence the report demands.
+        summary = _with_prior_summary(summary, previous_summary, target_tokens)
         assembled_tokens = (
             estimate_messages_tokens_rough(
                 [
@@ -2343,6 +2593,22 @@ def build_internal_fallback(
             )
             + _ASSEMBLY_RESERVE_TOKENS
         )
+        if assembled_tokens > target_tokens:
+            refit = _fit_tail_start(
+                messages, result_head_count, result_tail_start, summary, target_tokens
+            )
+            if refit != result_tail_start:
+                result_tail_start = refit
+                assembled_tokens = (
+                    estimate_messages_tokens_rough(
+                        [
+                            *messages[:result_head_count],
+                            {"role": "assistant", "content": summary},
+                            *messages[result_tail_start:],
+                        ]
+                    )
+                    + _ASSEMBLY_RESERVE_TOKENS
+                )
         selection_telemetry["assembled_tokens"] = assembled_tokens
         selection_telemetry["over_budget"] = assembled_tokens > target_tokens
         if (
@@ -2359,7 +2625,20 @@ def build_internal_fallback(
             dict(selection_telemetry),
         )
 
+    # Stage 0.3 pre-gate accounting is inline in the plan path below (the
+    # gate measures the summary WITH its capped fold); the planless path
+    # accounts the fold in make_result and re-fits the tail there.
+
     if plan_context.strip():
+        # Spine source (Stage 1): markers bypass the ranker entirely — selected
+        # from the pre-tail middle via the production extractor, no 256 cap.
+        spine_units = _terminal_marker_units(
+            messages[head_count:tail_start], start_index=head_count
+        )
+        # Gate measures the summary WITH the capped fold (Stage 0.3): plan +
+        # notes compete against the folded summary's real weight. Tail-shrink
+        # fallback is unchanged (Stage 0.2: _fit_tail_start works once the
+        # payload stops protecting the fossil).
         summary, fitted_tail_start = _fitted_plan_summary(
             messages,
             head_count=head_count,
@@ -2368,7 +2647,8 @@ def build_internal_fallback(
             notes=notes,
             target_tokens=target_tokens,
         )
-        if _fits(messages, head_count, fitted_tail_start, summary, target_tokens):
+        gated_summary = _with_prior_summary(summary, previous_summary, target_tokens)
+        if _fits(messages, head_count, fitted_tail_start, gated_summary, target_tokens):
             summary, fitted_tail_start = _add_plan_lexrank_area(
                 messages,
                 head_count=head_count,
@@ -2379,6 +2659,13 @@ def build_internal_fallback(
                 protected=protected,
                 selection_telemetry=selection_telemetry,
                 marker_recent_count=marker_recent_count,
+            )
+            # Spine emission: the fold is applied here (not only inside
+            # make_result) so the gate's `gated_summary` estimate and the
+            # returned payload carry the same folded text; the spine then
+            # rides outside the heap budget under its own ceiling.
+            summary = _carry_marker_spine(
+                summary, spine_units, _marker_spine_budget(target_tokens)
             )
             return make_result(summary, head_count, fitted_tail_start, "plan")
 
@@ -2410,6 +2697,14 @@ def build_internal_fallback(
             selection_telemetry=selection_telemetry,
             marker_recent_count=marker_recent_count,
         )
+        # Spine rides the minimal branch too (§11 part 2: both branches).
+        summary = _carry_marker_spine(
+            _with_prior_summary(summary, previous_summary, target_tokens),
+            _terminal_marker_units(
+                messages[system_head:tail_start], start_index=system_head
+            ),
+            _marker_spine_budget(target_tokens),
+        )
         return make_result(
             summary,
             system_head,
@@ -2426,11 +2721,10 @@ def build_internal_fallback(
     rank_start = _plan_step_change_index(messages, head_count, tail_start)
     middle_messages = messages[rank_start:tail_start]
     middle_units = _message_units(middle_messages, start_index=rank_start)
-    marker_units = _terminal_marker_units(middle_messages, start_index=rank_start)
-    recent_markers, rank_markers = _split_marker_tiers(
-        marker_units, marker_recent_count
-    )
-    middle_units = middle_units + rank_markers
+    # Stage 1 (t_57cb0d4e): markers bypass the ranker entirely — the spine is
+    # their ONLY selection path, under its own ceiling. Nothing enters the
+    # 256-cap / score≈0 funnel, and nothing is double-emitted.
+    spine_units = _terminal_marker_units(middle_messages, start_index=rank_start)
     marker_notes = {note for note in notes if _PRUNED_SKILL_RE.fullmatch(note)}
     if marker_notes:
         middle_units = [
@@ -2449,7 +2743,7 @@ def build_internal_fallback(
         )
         for index, note in enumerate(notes)
     ]
-    candidates = middle_units + note_units + recent_markers
+    candidates = middle_units + note_units
     if not candidates:
         selection_telemetry["no_op_reason"] = "no_candidates"
         summary = _lexrank_summary([], protected)
@@ -2468,7 +2762,6 @@ def build_internal_fallback(
         semantic=True,
         selection_telemetry=selection_telemetry,
     )
-    ranked = _recent_markers_first(ranked, recent_markers)
     # Same gate as the plan path: only the verbatim tail counts as a repeat
     # source.  Notes are exempt (they route separately below).
     # _content_text, not a raw join: multimodal messages carry `content` as a
@@ -2490,6 +2783,13 @@ def build_internal_fallback(
         accept=lambda unit: unit.is_note
         or unit.is_marker
         or not _heap_repeat_covered(unit.text, outside_tiers),
+    )
+    # Spine emission (planless branch, §11 part 2): the markers' guaranteed
+    # seat, outside the heap's leftover — the exact coupling the invariant
+    # forbids. Emitted before make_result folds and accounts the result.
+    summary = _with_prior_summary(summary, previous_summary, target_tokens)
+    summary = _carry_marker_spine(
+        summary, spine_units, _marker_spine_budget(target_tokens)
     )
     _record_selected_units(selection_telemetry, selected)
     _log_inviolable_dropout(summary, ranked)
