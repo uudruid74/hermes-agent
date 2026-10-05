@@ -1269,6 +1269,39 @@ def _agent_identity_names(agent) -> set[str]:
     return names
 
 
+def _unclaimed_plan_for_agent(conn, agent, *, exclude_task_id: Optional[str] = None):
+    """Return ``(task_id, title, stepno)`` for a plan awaiting this agent's claim.
+
+    Covers every waiting state a freshly-dispatched plan sits in before the
+    receiver runs ``continue``.  Unlike ``_find_orphaned_plan_id`` this neither
+    archives nor re-binds anything — it only reports, so ``remind`` can warn
+    about the claim without performing it.
+    """
+    names = _agent_identity_names(agent)
+    if not names:
+        return None
+    placeholders = ",".join("?" for _ in names)
+    params = list(names)
+    where = (
+        f"lower(assignee) IN ({placeholders}) "
+        f"AND status IN ('blocked','review','ready','triage','todo')"
+    )
+    if exclude_task_id:
+        where += " AND id != ?"
+        params.append(exclude_task_id)
+    row = conn.execute(
+        f"SELECT id, title, task_stepno FROM tasks WHERE {where} "
+        f"ORDER BY created_at DESC LIMIT 1",
+        tuple(params),
+    ).fetchone()
+    if row is None:
+        return None
+    tid = row["id"] if not isinstance(row, tuple) else row[0]
+    title = (row["title"] if not isinstance(row, tuple) else row[1]) or tid
+    stepno = (row["task_stepno"] if not isinstance(row, tuple) else row[2]) or 1
+    return tid, title, stepno
+
+
 def _find_orphaned_plan_id(conn, agent) -> Optional[str]:
     """Return the most recent open manual plan owned by this agent, or None.
 
@@ -1487,12 +1520,23 @@ def cmd_remind(agent, task_id: Optional[str] = None) -> str:
         )
         return "\n".join(lines)
     stepno = task["task_stepno"] or 1
+    claim_warning = _unclaimed_plan_for_agent(conn, agent, exclude_task_id=task_id)
     if not steps:
         lines.append("Active Step: (no steps defined)")
     elif 0 < stepno <= len(steps):
         lines.append(f"Active Step {stepno} of {len(steps)}: {steps[stepno - 1]}")
     else:
         lines.append(f"Active Step: (out of range: {stepno} of {len(steps)})")
+    if claim_warning is not None:
+        wtid, wtitle, wstepno = claim_warning
+        lines.append("")
+        lines.append(
+            f"UNCLAIMED: task {wtid} ({wtitle}) is also assigned to you and "
+            f"has not been claimed — its row sits at step {wstepno}. Any step "
+            f"position shown above comes from a stored row, which an earlier "
+            f"session may have advanced. Confirm which plan you mean by "
+            f"claiming it: `plan_tool continue {wtid}`."
+        )
     lines.append("")
     lines.append(
         "If this step is complete, call `plan_tool advance` with a summary "
@@ -1503,9 +1547,14 @@ def cmd_remind(agent, task_id: Optional[str] = None) -> str:
         _sync_subject_from_binding(agent)
         lines.append("")
         lines.append(
-            "NOTE: This plan was reclaimed from a previous session. If it is "
-            "not the plan you intend, call `plan_tool archive` (no task_id) "
-            "to delete it."
+            "NOTE: This plan was reclaimed from a previous session, so this "
+            "session has not claimed it yet. A step position is stored on the "
+            "task row and an EARLIER session may have advanced it — confirm "
+            f"you intend this plan by claiming it: `plan_tool continue {task_id}`."
+        )
+        lines.append(
+            "If it is not the plan you intend, call `plan_tool archive` "
+            "(no task_id) to delete it."
         )
     return "\n".join(lines)
 

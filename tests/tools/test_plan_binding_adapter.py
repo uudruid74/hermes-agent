@@ -933,3 +933,62 @@ def test_archive_without_task_id_and_no_plan_is_an_error(monkeypatch):
 
     assert result.startswith("ERROR: 'archive' requires task_id")
 
+
+
+# ---------------------------------------------------------------------------
+# remind must surface a claim that is still owed, and must never let a stored
+# step position stand alone as "the current step".
+# (bug 2026-10-05: fresh worker handed "Active Step 3" from a prior run)
+# ---------------------------------------------------------------------------
+
+
+def test_remind_warns_that_a_reclaimed_plan_is_not_yet_claimed(monkeypatch):
+    """The reclaim path must say the session has NOT claimed the plan.
+
+    Reproduces the 2026-10-05 incident exactly: the assignee had an UNCLAIMED
+    plan (status 'manual', step 3) and no binding.  `remind` reclaimed it,
+    printed "Active Step 3 of 12", and the note said only that it came "from a
+    previous session" — so the worker read step 3 as its own current step and
+    resumed mid-plan.
+    """
+    conn = _db()
+    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    now = int(time.time())
+    _plan_task(conn, "t_await", created_at=now, status="manual", title="New plan")
+    # A 12-step plan sitting at step 3 — the real shape (t_1f4a22ee).
+    import json as _json
+
+    conn.execute(
+        "UPDATE tasks SET task_steps = ?, task_stepno = 3 WHERE id = 't_await'",
+        (_json.dumps([f"step {i}" for i in range(1, 13)]),),
+    )
+
+    agent = _SubjectAgent()
+    agent.session_id = "new-session"
+
+    result = plan_tool.plan_tool(agent, "remind")
+
+    assert "Task: New plan" in result
+    assert "reclaimed from a previous session" in result
+    assert "has not claimed it yet" in result
+    assert "plan_tool continue t_await" in result
+    # The step is still shown (it is real row data) but never unqualified.
+    assert "EARLIER session may have advanced it" in result
+
+
+def test_remind_flags_a_separate_plan_awaiting_claim(monkeypatch):
+    """A claim owed on another row must be surfaced alongside the active step."""
+    conn = _db()
+    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    now = int(time.time())
+    _plan_task(conn, "t_active", created_at=now - 100, status="manual", title="Active plan")
+    _plan_task(conn, "t_wait", created_at=now, status="ready", title="Waiting plan")
+
+    agent = _SubjectAgent()
+    agent.session_id = "new-session"
+
+    result = plan_tool.plan_tool(agent, "remind")
+
+    assert "t_wait" in result
+    assert "UNCLAIMED" in result
+    assert "plan_tool continue t_wait" in result
