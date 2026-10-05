@@ -1250,16 +1250,12 @@ def active_plan_compression_context(agent) -> Optional[tuple[str, str]]:
     )
 
 
-_STALE_PLAN_AGE_SECONDS = 15 * 24 * 3600
-_DELETE_PLAN_AGE_SECONDS = 30 * 24 * 3600
-
-
 def _agent_identity_names(agent) -> set[str]:
     """Return the casefolded names this agent may own tasks under.
 
     Tasks record ``assignee`` from ``agent_name`` (USERNAME), while the
     execution binding records ``profile`` from ``profile_name``.  They are
-    usually equal but not guaranteed, so an orphan search must match either.
+    usually equal but not guaranteed, so a claim search must match either.
     """
     names: set[str] = set()
     for attr in ("agent_name", "profile_name"):
@@ -1273,9 +1269,8 @@ def _unclaimed_plan_for_agent(conn, agent, *, exclude_task_id: Optional[str] = N
     """Return ``(task_id, title, stepno)`` for a plan awaiting this agent's claim.
 
     Covers every waiting state a freshly-dispatched plan sits in before the
-    receiver runs ``continue``.  Unlike ``_find_orphaned_plan_id`` this neither
-    archives nor re-binds anything — it only reports, so ``remind`` can warn
-    about the claim without performing it.
+    receiver runs ``continue``.  It only reports — ``remind`` uses it to warn
+    about an unclaimed task without claiming it.
     """
     names = _agent_identity_names(agent)
     if not names:
@@ -1302,104 +1297,21 @@ def _unclaimed_plan_for_agent(conn, agent, *, exclude_task_id: Optional[str] = N
     return tid, title, stepno
 
 
-def _find_orphaned_plan_id(conn, agent) -> Optional[str]:
-    """Return the most recent open manual plan owned by this agent, or None.
-
-    A ``/new`` session keeps the plan row open as ``status='manual'`` but
-    loses its execution binding, so ``_current`` cannot see it.  This search
-    keys on the agent's identity names instead of the session lineage.
-
-    Stale plans are cleaned up as a side effect (bug spec 2026-09-10): plans
-    older than 15 days are archived, and plans older than 30 days are hard
-    deleted, so a long-dead plan is never resurrected or re-claimed.
-    """
-    from hermes_cli.kanban_db import delete_task, write_txn
-
-    names = _agent_identity_names(agent)
-    if not names:
-        return None
-    now = int(time.time())
-    stale_cutoff = now - _STALE_PLAN_AGE_SECONDS
-    delete_cutoff = now - _DELETE_PLAN_AGE_SECONDS
-    placeholders = ",".join("?" for _ in names)
-    with write_txn(conn):
-        rows = conn.execute(
-            f"SELECT id, created_at FROM tasks WHERE status = 'manual' "
-            f"AND lower(assignee) IN ({placeholders}) AND created_at < ?",
-            tuple(names) + (stale_cutoff,),
-        ).fetchall()
-        for row in rows:
-            task_id = row["id"]
-            if row["created_at"] < delete_cutoff:
-                # Hard delete (cascades child rows, clears the binding FK).
-                delete_task(conn, task_id)
-            else:
-                conn.execute(
-                    "DELETE FROM execution_bindings WHERE task_id = ?", (task_id,)
-                )
-                conn.execute(
-                    "UPDATE tasks SET status = 'archived', completed_at = ? "
-                    "WHERE id = ?",
-                    (now, task_id),
-                )
-        candidate = conn.execute(
-            f"SELECT id FROM tasks WHERE status = 'manual' "
-            f"AND lower(assignee) IN ({placeholders}) ORDER BY created_at DESC LIMIT 1",
-            tuple(names),
-        ).fetchone()
-        return candidate["id"] if candidate is not None else None
-
-
-def _reclaim_orphaned_plan(conn, agent) -> Optional[str]:
-    """Reattach the most recent orphaned open plan to the current session.
-
-    Returns the re-attached plan id, or None if there is nothing to reclaim.
-    """
-    from hermes_cli import execution_bindings as bindings
-    from hermes_cli.kanban_db import write_txn
-
-    task_id = _find_orphaned_plan_id(conn, agent)
-    if task_id is None:
-        return None
-    try:
-        key = _identity(agent)
-    except bindings.PlanStateUnavailable:
-        return None
-    session_id = getattr(agent, "session_id", None)
-    if not isinstance(session_id, str) or not session_id:
-        return None
-    try:
-        with write_txn(conn):
-            bindings.continue_plan(
-                conn,
-                key,
-                task_id,
-                actor=_legacy()._get_agent_name(agent),
-                session_id=session_id,
-            )
-    except (bindings.ExecutionBindingError, ValueError):
-        return None
-    return task_id
-
-
 def resolve_plan_id_for_archive(agent) -> Optional[str]:
-    """Resolve the plan id that ``archive`` (no task_id) should close.
-
-    Prefers the active binding; falls back to the most recent orphaned open
-    manual plan (without re-attaching it — archiving it needs no binding).
+    """Resolve the plan id that ``archive`` (no task_id) should close: the
+    ACTIVE binding only. There is no orphan fallback — an unbound plan is not
+    this session's plan, and archive must never guess.
     """
     conn = _legacy()._get_kanban_db()
     _key, binding, error = _current(conn, agent)
     if binding is not None:
         return binding.task_id
-    return _find_orphaned_plan_id(conn, agent)
+    return None
 
 
 def cmd_archive(agent, task_id: Optional[str] = None) -> str:
-    """Archive the resolved plan (active binding or orphaned manual plan).
-
-    The no-task_id form is the escape hatch the reclaim note points at: close
-    the plan that was just (possibly wrongly) re-attached.  Runs against the
+    """Archive the resolved plan (the ACTIVE binding only; pass task_id to
+    archive a specific plan).  Runs against the
     consolidated ``_get_kanban_db()`` connection so it shares the board
     resolution of every other live plan command (unlike the legacy
     ``_cmd_archive`` which enumerates board files).
@@ -1412,8 +1324,8 @@ def cmd_archive(agent, task_id: Optional[str] = None) -> str:
         task_id = resolve_plan_id_for_archive(agent)
         if not task_id:
             return (
-                "ERROR: 'archive' requires task_id, and no active or orphaned "
-                "plan was found for this agent"
+                "ERROR: 'archive' requires task_id, and no active plan was "
+                "found for this agent"
             )
     now = int(time.time())
     with write_txn(conn):
@@ -1458,20 +1370,13 @@ def cmd_remind(agent, task_id: Optional[str] = None) -> str:
     first-turn context restoration.
     """
     conn = _legacy()._get_kanban_db()
-    reclaimed = False
     if task_id is None:
         _key, binding, error = _current(conn, agent)
         if binding is None:
-            # A /new session lost its execution binding while its plan stayed
-            # open as 'manual'.  Reclaim the most recent orphaned plan so the
-            # work is not silently dropped (2026-09-10 bug).
-            task_id = _reclaim_orphaned_plan(conn, agent)
-            if task_id is not None:
-                reclaimed = True
-            elif error and error.startswith("PLAN_STATE_UNAVAILABLE:"):
+            if error and error.startswith("PLAN_STATE_UNAVAILABLE:"):
                 return error
             else:
-                # No active or orphaned plan. Before giving a dead-end, check
+                # No active binding. Before failing, check
                 # whether a plan is assigned to this agent but not yet claimed
                 # (still in a waiting state: blocked/review/ready/triage/todo),
                 # and steer the worker to `continue` to claim it. This is the
@@ -1494,7 +1399,7 @@ def cmd_remind(agent, task_id: Optional[str] = None) -> str:
                             f"You are assigned to task {tid} ({title}) but have not "
                             f"claimed it yet. Run `plan_tool continue {tid}` to claim it."
                         )
-                return "No active plan."
+                return "ERROR: No active task"
         else:
             task_id = binding.task_id
     task = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
@@ -1542,20 +1447,6 @@ def cmd_remind(agent, task_id: Optional[str] = None) -> str:
         "If this step is complete, call `plan_tool advance` with a summary "
         "to get the next step."
     )
-    if reclaimed:
-        # Re-point the session subject at the recovered plan (full compaction).
-        _sync_subject_from_binding(agent)
-        lines.append("")
-        lines.append(
-            "NOTE: This plan was reclaimed from a previous session, so this "
-            "session has not claimed it yet. A step position is stored on the "
-            "task row and an EARLIER session may have advanced it — confirm "
-            f"you intend this plan by claiming it: `plan_tool continue {task_id}`."
-        )
-        lines.append(
-            "If it is not the plan you intend, call `plan_tool archive` "
-            "(no task_id) to delete it."
-        )
     return "\n".join(lines)
 
 

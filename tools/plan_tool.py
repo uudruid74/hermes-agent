@@ -1419,7 +1419,7 @@ PLAN_TOOL_SCHEMA = {
             },
             "task_id": {
                 "type": "string",
-                "description": "Task ID for 'continue', 'remind', 'review', 'approve', 'block', or 'archive' command. Optional for 'remind' and 'archive': when omitted, remind reclaims the most recent orphaned manual plan for this agent and archive closes the active (or orphaned) plan.",
+                "description": "Task ID for 'continue', 'remind', 'review', 'approve', 'block', or 'archive' command. Optional for 'remind' and 'archive': when omitted, remind shows the ACTIVE plan and archive closes the ACTIVE plan. With neither a task_id nor an active plan, both fail — run 'continue <task_id>' to claim an assigned plan.",
             },
             "board": {
                 "type": "string",

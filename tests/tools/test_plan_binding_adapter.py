@@ -768,7 +768,7 @@ def test_final_advance_clears_session_task_and_remind_has_no_active_plan(monkeyp
 
     assert result == f"Task {task_id} Step 1 Approved by user. Plan complete."
     assert agent.task_ids[-1] is None
-    assert plan_tool.plan_tool(agent, "remind") == "No active plan."
+    assert plan_tool.plan_tool(agent, "remind") == "ERROR: No active task"
 
 
 def test_archiving_the_active_plan_requests_completion_compression(monkeypatch):
@@ -785,8 +785,10 @@ def test_archiving_the_active_plan_requests_completion_compression(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# plan remind reclaims an orphaned open manual plan after /new
-# (bug 2026-09-10-plan-remind-reclaim-manual-task)
+# remind (no task_id) must NEVER auto-attach a plan this session did not
+# claim: no binding means no active plan, full stop. It steers the worker to
+# `plan_tool continue <task_id>` when an assigned task is waiting, and fails
+# otherwise. There is no reclaim and no fallback (Evan directive 2026-10-05).
 # ---------------------------------------------------------------------------
 
 
@@ -798,12 +800,14 @@ def _plan_task(conn, task_id, *, assignee="neo", created_at, status="manual", ti
     )
 
 
-def test_remind_reclaims_orphaned_manual_plan_after_new_session(monkeypatch):
+def test_remind_without_task_id_and_no_active_plan_fails(monkeypatch):
+    """No binding + no waiting task = plain failure. Never auto-attach."""
     from tools import plan_binding_adapter
 
     conn = _db()
     monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
-    # A plan left open as 'manual' with NO execution binding (the /new case).
+    # An open plan row exists but belongs to no live binding: it must stay
+    # untouched — remind has no reclaim path.
     _plan_task(conn, "t_orphan", created_at=int(time.time()))
 
     resumed = _SubjectAgent()
@@ -811,14 +815,11 @@ def test_remind_reclaims_orphaned_manual_plan_after_new_session(monkeypatch):
 
     result = plan_tool.plan_tool(resumed, "remind")
 
-    assert "Task: Orphaned plan" in result
-    assert "reclaimed from a previous session" in result
-    binding = conn.execute(
-        "SELECT profile, root_session_id, task_id FROM execution_bindings"
-    ).fetchone()
-    assert tuple(binding) == ("neo", "root:new-session", "t_orphan")
-    # The agent was told how to delete the wrong plan.
-    assert "plan_tool archive" in result
+    assert result == "ERROR: No active task"
+    assert conn.execute("SELECT 1 FROM execution_bindings").fetchone() is None
+    assert conn.execute(
+        "SELECT status FROM tasks WHERE id='t_orphan'"
+    ).fetchone()[0] == "manual"
 
 
 def test_remind_steers_to_continue_for_unclaimed_dispatched_task(monkeypatch):
@@ -838,76 +839,14 @@ def test_remind_steers_to_continue_for_unclaimed_dispatched_task(monkeypatch):
     # It steers the worker to `continue`, it does NOT say "no plan / not real".
     assert "t_await" in result
     assert "plan_tool continue t_await" in result
-    assert "No active plan." not in result
+    assert "ERROR" not in result
 
 
-def test_remind_reclaims_the_most_recent_of_several_orphans(monkeypatch):
+def test_archive_without_task_id_and_no_active_plan_is_an_error(monkeypatch):
+    """archive (no task_id) closes the ACTIVE plan only — never an orphan."""
     conn = _db()
     monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
-    now = int(time.time())
-    _plan_task(conn, "t_old", created_at=now - 100, title="Older plan")
-    _plan_task(conn, "t_new", created_at=now, title="Newer plan")
-
-    resumed = _SubjectAgent()
-    resumed.session_id = "new-session"
-
-    result = plan_tool.plan_tool(resumed, "remind")
-
-    assert "Task: Newer plan" in result
-    assert conn.execute(
-        "SELECT task_id FROM execution_bindings"
-    ).fetchone()[0] == "t_new"
-
-
-def test_remind_archives_plans_older_than_15_days(monkeypatch):
-    conn = _db()
-    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
-    now = int(time.time())
-    # 16-day-old plan: must be archived, never reclaimed.
-    _plan_task(conn, "t_stale", created_at=now - 16 * 24 * 3600, title="Stale plan")
-    # 1-day-old plan: the one that should be reclaimed.
-    _plan_task(conn, "t_fresh", created_at=now - 1 * 24 * 3600, title="Fresh plan")
-
-    resumed = _SubjectAgent()
-    resumed.session_id = "new-session"
-
-    result = plan_tool.plan_tool(resumed, "remind")
-
-    assert "Task: Fresh plan" in result
-    assert conn.execute(
-        "SELECT status FROM tasks WHERE id='t_stale'"
-    ).fetchone()[0] == "archived"
-    assert conn.execute(
-        "SELECT task_id FROM execution_bindings"
-    ).fetchone()[0] == "t_fresh"
-
-
-def test_remind_deletes_plans_older_than_30_days(monkeypatch):
-    conn = _db()
-    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
-    now = int(time.time())
-    # 31-day-old plan: must be hard deleted, not just archived.
-    _plan_task(conn, "t_ancient", created_at=now - 31 * 24 * 3600, title="Ancient plan")
-    # 20-day-old plan: archived, not deleted.
-    _plan_task(conn, "t_mid", created_at=now - 20 * 24 * 3600, title="Middle plan")
-    # 1-day-old plan: reclaimed.
-    _plan_task(conn, "t_fresh", created_at=now - 1 * 24 * 3600, title="Fresh plan")
-
-    resumed = _SubjectAgent()
-    resumed.session_id = "new-session"
-
-    result = plan_tool.plan_tool(resumed, "remind")
-
-    assert "Task: Fresh plan" in result
-    assert conn.execute("SELECT 1 FROM tasks WHERE id='t_ancient'").fetchone() is None
-    assert conn.execute(
-        "SELECT status FROM tasks WHERE id='t_mid'"
-    ).fetchone()[0] == "archived"
-
-
-def test_archive_without_task_id_archives_orphaned_plan(monkeypatch):
-    conn = _db()
-    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    # An orphaned open plan exists, but archive must NOT reach it.
     now = int(time.time())
     _plan_task(conn, "t_orphan", created_at=now, title="Wrong plan")
 
@@ -916,22 +855,10 @@ def test_archive_without_task_id_archives_orphaned_plan(monkeypatch):
 
     result = plan_tool.plan_tool(resumed, "archive")
 
-    assert "ARCHIVED: t_orphan" in result
+    assert result.startswith("ERROR: 'archive' requires task_id")
     assert conn.execute(
         "SELECT status FROM tasks WHERE id='t_orphan'"
-    ).fetchone()[0] == "archived"
-
-
-def test_archive_without_task_id_and_no_plan_is_an_error(monkeypatch):
-    conn = _db()
-    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
-
-    resumed = _SubjectAgent()
-    resumed.session_id = "new-session"
-
-    result = plan_tool.plan_tool(resumed, "archive")
-
-    assert result.startswith("ERROR: 'archive' requires task_id")
+    ).fetchone()[0] == "manual"
 
 
 
@@ -942,46 +869,32 @@ def test_archive_without_task_id_and_no_plan_is_an_error(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_remind_warns_that_a_reclaimed_plan_is_not_yet_claimed(monkeypatch):
-    """The reclaim path must say the session has NOT claimed the plan.
+def test_remind_flags_a_separate_plan_awaiting_claim(monkeypatch):
+    """A claim owed on another row must be surfaced alongside the active step.
 
-    Reproduces the 2026-10-05 incident exactly: the assignee had an UNCLAIMED
-    plan (status 'manual', step 3) and no binding.  `remind` reclaimed it,
-    printed "Active Step 3 of 12", and the note said only that it came "from a
-    previous session" — so the worker read step 3 as its own current step and
-    resumed mid-plan.
+    The incident shape: an EARLIER session advanced the bound plan to step 3,
+    and a second dispatched plan sits unclaimed. The stored step is shown, but
+    the UNCLAIMED warning names `plan_tool continue` as the only way to claim
+    the waiting row (and confirms which plan is intended).
     """
     conn = _db()
     monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
     now = int(time.time())
-    _plan_task(conn, "t_await", created_at=now, status="manual", title="New plan")
-    # A 12-step plan sitting at step 3 — the real shape (t_1f4a22ee).
+    # The ACTIVE plan, bound to this session (claimed by `continue`), with a
+    # step position an earlier session advanced.
+    _plan_task(conn, "t_active", created_at=now - 100, status="manual", title="Active plan")
     import json as _json
 
     conn.execute(
-        "UPDATE tasks SET task_steps = ?, task_stepno = 3 WHERE id = 't_await'",
+        "UPDATE tasks SET task_steps = ?, task_stepno = 3 WHERE id = 't_active'",
         (_json.dumps([f"step {i}" for i in range(1, 13)]),),
     )
-
-    agent = _SubjectAgent()
-    agent.session_id = "new-session"
-
-    result = plan_tool.plan_tool(agent, "remind")
-
-    assert "Task: New plan" in result
-    assert "reclaimed from a previous session" in result
-    assert "has not claimed it yet" in result
-    assert "plan_tool continue t_await" in result
-    # The step is still shown (it is real row data) but never unqualified.
-    assert "EARLIER session may have advanced it" in result
-
-
-def test_remind_flags_a_separate_plan_awaiting_claim(monkeypatch):
-    """A claim owed on another row must be surfaced alongside the active step."""
-    conn = _db()
-    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
-    now = int(time.time())
-    _plan_task(conn, "t_active", created_at=now - 100, status="manual", title="Active plan")
+    conn.execute(
+        "INSERT INTO execution_bindings (profile, root_session_id, task_id, "
+        "bound_at, updated_at) VALUES ('neo', 'root:new-session', 't_active', ?, ?)",
+        (now, now),
+    )
+    # A second dispatched plan, still waiting to be claimed.
     _plan_task(conn, "t_wait", created_at=now, status="ready", title="Waiting plan")
 
     agent = _SubjectAgent()
@@ -989,6 +902,7 @@ def test_remind_flags_a_separate_plan_awaiting_claim(monkeypatch):
 
     result = plan_tool.plan_tool(agent, "remind")
 
+    assert "Active Step 3 of 12" in result
     assert "t_wait" in result
     assert "UNCLAIMED" in result
     assert "plan_tool continue t_wait" in result
