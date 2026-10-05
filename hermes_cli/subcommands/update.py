@@ -2,6 +2,14 @@
 
 Extracted verbatim from ``hermes_cli/main.py:main()`` (god-file Phase 2).
 Handler injected to avoid importing ``main``.
+
+DISABLED 2026-10-05 (Evan, standing order): this fleet never updates with
+upstream. The subcommand is hard-disabled — it registers a stub that
+refuses to run. History: update tests that escaped their sandbox invoked
+the real autostash path against the live repo mid-test-run
+(hermes-update-autostash-20261005-*), nearly trashing in-flight work.
+Updating upstream is not a supported operation here; see the wiki before
+reconsidering this block.
 """
 
 from __future__ import annotations
@@ -9,16 +17,26 @@ from __future__ import annotations
 from typing import Callable
 
 
+def _update_disabled(_args) -> int:
+    """Stub handler: refuse to run, point at the standing order."""
+    print("hermes update is DISABLED on this fleet (standing order, 2026-10-05).")
+    print("This tree never syncs with upstream; updates are not performed")
+    print("via this command. If an update is ever truly required, it must be")
+    print("done deliberately by hand with the fleet fully stopped.")
+    return 1
+
+
 def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
-    """Attach the ``update`` subcommand to ``subparsers``."""
+    """Attach a hard-disabled ``update`` stub to ``subparsers``."""
     # =========================================================================
-    # update command
+    # update command — DISABLED (never update with upstream on this fleet)
     # =========================================================================
     update_parser = subparsers.add_parser(
         "update",
-        help="Update Hermes Agent to the latest version",
-        description="Pull the latest changes from git and reinstall dependencies",
+        help="DISABLED: this fleet never updates with upstream",
+        description="DISABLED — updates from upstream are not performed on this fleet.",
     )
+    update_parser.set_defaults(func=_update_disabled)
     update_parser.add_argument(
         "--gateway",
         action="store_true",
