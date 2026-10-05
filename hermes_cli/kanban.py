@@ -437,7 +437,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
 
     # --- list ---
     p_list = sub.add_parser("list", aliases=["ls"], help="List tasks")
-    p_list.add_argument("--board", default=None, metavar="<slug|all>",
+    # default=argparse.SUPPRESS: the kanban-level --board flag (line ~246)
+    # already parsed a global value into this dest. A subparser default of
+    # None would CLOBBER it (argparse applies subparser defaults after the
+    # parent parse) — the classic argparse double-definition trap. SUPPRESS
+    # leaves the parent value untouched when the subcommand's own flag is
+    # absent. <slug|all> 'all' routing lives in kanban_command.
+    p_list.add_argument("--board", default=argparse.SUPPRESS, metavar="<slug|all>",
                         help="Board slug, or 'all' to search across all boards")
     p_list.add_argument("--mine", action="store_true",
                         help="Filter by $USERNAME as assignee")
@@ -476,7 +482,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     # --- show ---
     p_show = sub.add_parser("show", help="Show a task with comments + events")
     p_show.add_argument("task_id")
-    p_show.add_argument("--board", default=None, metavar="<slug|all>",
+    # default=argparse.SUPPRESS — same clobber guard as list's --board above.
+    p_show.add_argument("--board", default=argparse.SUPPRESS, metavar="<slug|all>",
                         help="Board slug, or 'all' to search across all boards")
     p_show.add_argument("--json", action="store_true")
     p_show.add_argument(
@@ -2518,6 +2525,11 @@ def _cmd_list(args: argparse.Namespace) -> int:
             status=args.status,
             tenant=args.tenant,
             session_id=args.session,
+            # --board resolves through the scoped pin (get_current_board
+            # returns the --board slug for this call); without --board it
+            # is the active board. Tasks live on one shared DB, so the
+            # board column is what scopes the list.
+            board=kb.get_current_board(),
             include_archived=args.archived,
             order_by=getattr(args, "sort", None),
             workflow_template_id=args.workflow_template_id,

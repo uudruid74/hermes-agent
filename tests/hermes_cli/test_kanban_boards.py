@@ -1,16 +1,20 @@
 """Tests for the multi-board kanban layer (``hermes kanban boards …``).
 
-Covers the pieces added when boards became a first-class concept:
+Covers the post-consolidation boards-table design (one DB, board as a
+field, registry in the ``boards`` table):
 
 * Slug validation and normalisation.
-* Path resolution for ``default`` (legacy ``<root>/kanban.db``) vs
-  named boards (``<root>/kanban/boards/<slug>/kanban.db``).
-* Current-board persistence via ``<root>/kanban/current`` and
+* Single consolidated DB path — the ``board=`` argument never selects a
+  per-board file (``HERMES_KANBAN_DB`` still pins the file).
+* Current-board persistence via the ``board_state`` table and the
   ``HERMES_KANBAN_BOARD`` env var.
-* ``connect(board=)`` isolation — writes on one board don't leak.
-* ``create_board`` / ``list_boards`` / ``remove_board`` round trip.
+* Board isolation through the ``tasks.board`` column — writes on one
+  board don't leak into another.
+* ``create_board`` / ``list_boards`` / ``remove_board`` round trip on the
+  registry table (legacy board.json / current file are import-only).
 * CLI surface: ``hermes kanban boards list/create/switch/rm``.
-* ``_default_spawn`` injects ``HERMES_KANBAN_BOARD`` into worker env.
+* ``_default_spawn`` injects ``HERMES_KANBAN_BOARD`` + the single DB path
+  into worker env.
 """
 
 from __future__ import annotations
@@ -84,18 +88,16 @@ class TestSlugValidation:
 
 
 # ---------------------------------------------------------------------------
-# Path resolution
+# Path resolution — single consolidated DB, board never selects a file
 # ---------------------------------------------------------------------------
 
 class TestPathResolution:
-    def test_default_board_legacy_path(self, fresh_home):
-        """The default board's DB lives at ``<root>/kanban.db`` for back-compat."""
-        assert kb.kanban_db_path() == fresh_home / "kanban.db"
-        assert kb.kanban_db_path(board="default") == fresh_home / "kanban.db"
-
-    def test_named_board_under_boards_dir(self, fresh_home):
-        p = kb.kanban_db_path(board="atm10-server")
-        assert p == fresh_home / "kanban" / "boards" / "atm10-server" / "kanban.db"
+    def test_all_boards_share_one_db(self, fresh_home):
+        """Every board resolves to the same consolidated kanban.db."""
+        expected = fresh_home / "kanban" / "kanban.db"
+        assert kb.kanban_db_path() == expected
+        assert kb.kanban_db_path(board="default") == expected
+        assert kb.kanban_db_path(board="atm10-server") == expected
 
 
     def test_env_var_db_override_still_wins(self, fresh_home, tmp_path, monkeypatch):
@@ -111,69 +113,116 @@ class TestPathResolution:
 # ---------------------------------------------------------------------------
 
 class TestCurrentBoard:
-
-
-
-    def test_stale_file_pointer_falls_back_to_default(self, fresh_home):
-        current = fresh_home / "kanban" / "current"
-        current.parent.mkdir(parents=True, exist_ok=True)
-        current.write_text("missing-board\n", encoding="utf-8")
-
-        assert kb.get_current_board() == "default"
-        assert not kb.board_exists("missing-board")
-        assert [b["slug"] for b in kb.list_boards()] == ["default"]
-
-
-
-    def test_kanban_db_path_reads_current(self, fresh_home):
-        """kanban_db_path() with no args respects the on-disk pointer."""
+    def test_current_board_persists_in_board_state(self, fresh_home):
+        """``set_current_board`` writes the ``board_state`` table, not a file."""
         kb.create_board("my-proj")
         kb.set_current_board("my-proj")
-        expected = fresh_home / "kanban" / "boards" / "my-proj" / "kanban.db"
-        assert kb.kanban_db_path() == expected
+        # No legacy current file involved.
+        assert not (fresh_home / "kanban" / "current").exists()
+        conn = kb.connect()
+        row = conn.execute(
+            "SELECT value FROM board_state WHERE key = 'current_board'"
+        ).fetchone()
+        assert row is not None and row["value"] == "my-proj"
+        assert kb.get_current_board() == "my-proj"
+
+
+    def test_stale_pointer_falls_back_to_default(self, fresh_home):
+        """A current_board value naming a removed/unknown slug → default."""
+        kb.set_current_board("ghost-board")
+        # Simulate the removal path: the row exists but the board doesn't.
+        conn = kb.connect()
+        conn.execute(
+            "UPDATE board_state SET value='ghost-board' WHERE key='current_board'"
+        )
+        assert not kb.board_exists("ghost-board")
+        assert kb.get_current_board() == "default"
+
+
+    def test_legacy_current_file_imported_once(self, fresh_home):
+        """Pre-existing <root>/kanban/current is imported into board_state."""
+        current = fresh_home / "kanban" / "current"
+        current.parent.mkdir(parents=True, exist_ok=True)
+        # The board must exist before the file points at it (board_exists
+        # gate on import) and the file must predate the first connect
+        # (the import runs once on schema init).
+        kb.create_board("imported-board")
+        current.write_text("imported-board\n", encoding="utf-8")
+        # Force a fresh init pass so the import sees the file, the way a
+        # real first-boot-after-upgrade does.
+        kb._INITIALIZED_PATHS.clear()
+        conn = kb.connect()
+        row = conn.execute(
+            "SELECT value FROM board_state WHERE key = 'current_board'"
+        ).fetchone()
+        assert row is not None and row["value"] == "imported-board"
+
+
+    def test_legacy_board_json_imported(self, fresh_home):
+        """Pre-existing boards/<slug>/board.json feeds the boards table."""
+        bdir = fresh_home / "kanban" / "boards" / "legacy-meta"
+        bdir.mkdir(parents=True)
+        (bdir / "board.json").write_text(
+            json.dumps({"name": "Legacy Meta", "color": "#ff0000"}),
+            encoding="utf-8",
+        )
+        conn = kb.connect()
+        row = conn.execute(
+            "SELECT name, color FROM boards WHERE slug = 'legacy-meta'"
+        ).fetchone()
+        assert row is not None
+        assert row["name"] == "Legacy Meta"
+        assert row["color"] == "#ff0000"
 
 
 # ---------------------------------------------------------------------------
-# Board CRUD
+# Board CRUD on the registry table
 # ---------------------------------------------------------------------------
 
 class TestBoardCRUD:
+    def test_create_list_roundtrip(self, fresh_home):
+        meta = kb.create_board("roundtrip", name="Round Trip", color="#00ff00")
+        assert meta["slug"] == "roundtrip"
+        slugs = [b["slug"] for b in kb.list_boards()]
+        assert "default" in slugs
+        assert "roundtrip" in slugs
+        assert kb.board_exists("roundtrip")
 
 
-
-
-
-
-    @pytest.mark.parametrize("archive", [True, False])
-    def test_remove_clears_init_cache_for_recreated_db(self, fresh_home, archive):
-        # Regression for #23833: poll loops that call connect(board=slug) right
-        # after remove_board() recreate an empty kanban.db at the same path
-        # (connect() does mkdir(exist_ok=True)). If _INITIALIZED_PATHS still
-        # contains the resolved path, the CREATE TABLE pass is skipped and
-        # downstream readers hit `no such table: task_events`.
+    def test_remove_archives_row_not_files(self, fresh_home):
         kb.create_board("recycle")
-        # First connect populates _INITIALIZED_PATHS for this DB.
-        with kb.connect(board="recycle") as conn:
-            kb.create_task(conn, title="t1", assignee="dev")
-        db_path = kb.board_dir("recycle") / "kanban.db"
-        assert str(db_path.resolve()) in kb._INITIALIZED_PATHS
+        kb.remove_board("recycle", archive=True)
+        # Archived boards keep their row, flagged.
+        assert kb.board_exists("recycle")
+        conn = kb.connect()
+        row = conn.execute(
+            "SELECT archived FROM boards WHERE slug = 'recycle'"
+        ).fetchone()
+        assert row is not None and row["archived"] == 1
+        # Excluded from the active list, present with include_archived.
+        assert "recycle" not in [b["slug"] for b in kb.list_boards(include_archived=False)]
+        assert "recycle" in [b["slug"] for b in kb.list_boards(include_archived=True)]
 
-        kb.remove_board("recycle", archive=archive)
-        # remove_board must drop the cache entry so a re-create through
-        # connect() gets a fresh schema-init pass.
-        assert str(db_path.resolve()) not in kb._INITIALIZED_PATHS
 
-        # Simulate the event-stream poll: re-open the same slug. connect()
-        # recreates the directory + empty .db; the schema must be re-applied.
-        with kb.connect(board="recycle") as conn:
-            tables = {
-                row[0]
-                for row in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table'"
-                )
-            }
-        assert "task_events" in tables
-        assert "tasks" in tables
+    def test_remove_delete_drops_row(self, fresh_home):
+        kb.create_board("gone")
+        kb.remove_board("gone", archive=False)
+        assert not kb.board_exists("gone")
+        slugs = [b["slug"] for b in kb.list_boards()]
+        assert "gone" not in slugs
+
+
+    def test_remove_current_board_reverts_to_default(self, fresh_home):
+        kb.create_board("active")
+        kb.set_current_board("active")
+        kb.remove_board("active", archive=False)
+        assert kb.get_current_board() == "default"
+
+
+    def test_default_board_cannot_be_removed(self, fresh_home):
+        with pytest.raises(ValueError, match="cannot be removed"):
+            kb.remove_board("default")
+
 
     def test_rename_updates_metadata(self, fresh_home):
         kb.create_board("slug-immutable")
@@ -184,7 +233,7 @@ class TestBoardCRUD:
 
 
 # ---------------------------------------------------------------------------
-# Connection isolation
+# Board isolation — via the tasks.board column, one shared DB
 # ---------------------------------------------------------------------------
 
 class TestConnectionIsolation:
@@ -192,44 +241,57 @@ class TestConnectionIsolation:
         kb.create_board("alpha")
         kb.create_board("beta")
 
-        with kb.connect(board="alpha") as conn:
-            kb.create_task(conn, title="alpha-task-1", assignee="dev")
-            kb.create_task(conn, title="alpha-task-2", assignee="dev")
+        with kb.connect() as conn:
+            kb.create_task(conn, title="alpha-task-1", assignee="dev", board="alpha")
+            kb.create_task(conn, title="alpha-task-2", assignee="dev", board="alpha")
+            kb.create_task(conn, title="beta-only", assignee="dev", board="beta")
 
-        with kb.connect(board="beta") as conn:
-            kb.create_task(conn, title="beta-only", assignee="dev")
-
-        with kb.connect(board="alpha") as conn:
-            a = kb.list_tasks(conn)
-        with kb.connect(board="beta") as conn:
-            b = kb.list_tasks(conn)
-        with kb.connect(board="default") as conn:
-            d = kb.list_tasks(conn)
+        with kb.connect() as conn:
+            a = kb.list_tasks(conn, board="alpha")
+            b = kb.list_tasks(conn, board="beta")
+            d = kb.list_tasks(conn, board="default")
 
         assert {t.title for t in a} == {"alpha-task-1", "alpha-task-2"}
         assert {t.title for t in b} == {"beta-only"}
         assert d == []
 
-    def test_connect_without_args_uses_current(self, fresh_home):
+
+    def test_board_column_written_on_create(self, fresh_home):
+        """The board= param is persisted, not dropped (the DEFAULT fill bug)."""
+        kb.create_board("pinned")
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="on-pinned", assignee="x", board="pinned")
+            row = conn.execute(
+                "SELECT board FROM tasks WHERE id = ?", (tid,)
+            ).fetchone()
+        assert row["board"] == "pinned"
+
+
+    def test_create_without_board_uses_current(self, fresh_home):
         kb.create_board("curr")
         kb.set_current_board("curr")
         with kb.connect() as conn:
-            kb.create_task(conn, title="implicit", assignee="x")
-        with kb.connect(board="curr") as conn:
-            tasks = kb.list_tasks(conn)
+            tid = kb.create_task(conn, title="implicit", assignee="x")
+            row = conn.execute(
+                "SELECT board FROM tasks WHERE id = ?", (tid,)
+            ).fetchone()
+        assert row["board"] == "curr"
+        with kb.connect() as conn:
+            tasks = kb.list_tasks(conn, board="curr")
         assert [t.title for t in tasks] == ["implicit"]
 
-    def test_connect_env_var_overrides_current(self, fresh_home, monkeypatch):
+
+    def test_env_var_overrides_current(self, fresh_home, monkeypatch):
         kb.create_board("persist")
         kb.create_board("envwin")
         kb.set_current_board("persist")
         monkeypatch.setenv("HERMES_KANBAN_BOARD", "envwin")
         with kb.connect() as conn:
-            kb.create_task(conn, title="via-env", assignee="x")
-        with kb.connect(board="envwin") as conn:
-            assert [t.title for t in kb.list_tasks(conn)] == ["via-env"]
-        with kb.connect(board="persist") as conn:
-            assert kb.list_tasks(conn) == []
+            tid = kb.create_task(conn, title="via-env", assignee="x")
+            row = conn.execute(
+                "SELECT board FROM tasks WHERE id = ?", (tid,)
+            ).fetchone()
+        assert row["board"] == "envwin"
 
 
 # ---------------------------------------------------------------------------
@@ -280,11 +342,9 @@ class TestWorkerSpawnEnv:
         env = captured["env"]
         assert env["HERMES_KANBAN_BOARD"] == "spawntest"
         assert env["HERMES_KANBAN_TASK"] == "t_abc"
-        # DB path should match the per-board DB, not the legacy default.
-        expected_db = fresh_home / "kanban" / "boards" / "spawntest" / "kanban.db"
+        # One consolidated DB for every board.
+        expected_db = fresh_home / "kanban" / "kanban.db"
         assert env["HERMES_KANBAN_DB"] == str(expected_db)
-        expected_ws = fresh_home / "kanban" / "boards" / "spawntest" / "workspaces"
-        assert env["HERMES_KANBAN_WORKSPACES_ROOT"] == str(expected_ws)
 
 
 # ---------------------------------------------------------------------------
@@ -342,6 +402,7 @@ class TestCLI:
         assert titlesB == ["Task B"]
         assert titlesD == []
 
+
     def test_boards_list_counts_are_scoped_by_slug(self, fresh_home):
         env = {"HERMES_HOME": str(fresh_home)}
         for slug in ("alpha", "beta"):
@@ -377,6 +438,3 @@ class TestCLI:
 
         assert counts["alpha"] == {"blocked": 1, "todo": 1}
         assert counts["beta"] == {"blocked": 1}
-
-
-

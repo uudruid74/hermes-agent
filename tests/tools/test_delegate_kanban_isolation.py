@@ -205,8 +205,8 @@ def test_delegate_child_kanban_cli_cannot_delete_parent_board(
 
     assert result["returncode"] == 1
     assert "delegate_task child contexts cannot mutate Kanban tasks" in result["output"]
+    # Board row must survive: the guard fired before any registry mutation.
     assert kb.board_exists("victim")
-    assert kb.board_dir("victim").is_dir()
 
 
 def test_delegate_child_attach_url_guard_leaves_no_row_or_file(monkeypatch, tmp_path):
@@ -333,8 +333,8 @@ def test_stale_env_marker_does_not_block_kanban_in_gateway(monkeypatch, tmp_path
         new_tid = kb.create_task(conn, title="gateway-mutation-test")
         assert new_tid.startswith("t_")
 
-        kb.add_comment(conn, new_tid, "gateway comment should succeed")
-        comments = kb.get_comments(conn, new_tid)
+        kb.add_comment(conn, new_tid, "test-suite", "gateway comment should succeed")
+        comments = kb.list_comments(conn, new_tid)
         assert len(comments) == 1
         assert comments[0].body == "gateway comment should succeed"
     finally:

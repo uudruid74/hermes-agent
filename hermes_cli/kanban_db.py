@@ -495,8 +495,8 @@ def get_current_board() -> str:
 
     1. ``HERMES_KANBAN_BOARD`` env var (set by the dispatcher on worker
        spawn, or manually for ad-hoc overrides).
-    2. ``<root>/kanban/current`` on disk (set by ``hermes kanban boards
-       switch``), but only when that board still exists.
+    2. the ``board_state`` table (``current_board`` key) — set by
+       ``hermes kanban boards switch``.
     3. ``DEFAULT_BOARD`` (``"default"``).
 
     A malformed or stale slug at any step falls through to the next layer
@@ -521,9 +521,12 @@ def get_current_board() -> str:
         except ValueError:
             pass
     try:
-        f = current_board_path()
-        if f.exists():
-            val = f.read_text(encoding="utf-8").strip()
+        conn = connect()
+        row = conn.execute(
+            "SELECT value FROM board_state WHERE key = 'current_board'"
+        ).fetchone()
+        if row is not None:
+            val = (row["value"] or "").strip()
             if val:
                 try:
                     normed = _normalize_board_slug(val)
@@ -531,36 +534,34 @@ def get_current_board() -> str:
                         return normed
                 except ValueError:
                     pass
-    except OSError:
+    except sqlite3.Error:
         pass
     return DEFAULT_BOARD
 
 
-def set_current_board(slug: str) -> Path:
-    """Persist ``slug`` as the active board. Returns the file written.
+def set_current_board(slug: str) -> str:
+    """Persist ``slug`` as the active board. Returns the slug written.
 
-    Writes ``<root>/kanban/current``. The caller should validate the slug
-    exists first (via :func:`board_exists`) — this function does not —
-    so that ``hermes kanban boards switch <typo>`` returns an error
-    instead of silently pointing at nothing.
+    Writes the ``board_state`` table (``current_board`` key). The caller
+    should validate the slug exists first (via :func:`board_exists`) —
+    this function does not — so that ``hermes kanban boards switch
+    <typo>`` returns an error instead of silently pointing at nothing.
     """
-    _assert_not_delegated_child_mutation()
-    normed = _normalize_board_slug(slug)
-    if not normed:
-        raise ValueError("board slug is required")
-    path = current_board_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(normed + "\n", encoding="utf-8")
-    return path
+    normed = _normalize_board_slug(slug) or DEFAULT_BOARD
+    conn = connect()
+    conn.execute(
+        "INSERT INTO board_state (key, value) VALUES ('current_board', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (normed,),
+    )
+    return normed
 
 
 def clear_current_board() -> None:
-    """Remove ``<root>/kanban/current`` so the active board reverts to ``default``."""
+    """Remove the active-board setting so the board reverts to ``default``."""
     _assert_not_delegated_child_mutation()
-    try:
-        current_board_path().unlink()
-    except FileNotFoundError:
-        pass
+    conn = connect()
+    conn.execute("DELETE FROM board_state WHERE key = 'current_board'")
 
 
 def board_dir(board: Optional[str] = None) -> Path:
@@ -578,7 +579,7 @@ def board_dir(board: Optional[str] = None) -> Path:
 
 
 def board_exists(board: Optional[str] = None) -> bool:
-    """Return True if the board has persisted ``board.json`` metadata.
+    """Return True if the board is registered in the ``boards`` table.
 
     ``default`` is considered to always exist — its DB is created
     on first :func:`connect` and there's no way for it to be missing
@@ -587,7 +588,11 @@ def board_exists(board: Optional[str] = None) -> bool:
     slug = _normalize_board_slug(board) or DEFAULT_BOARD
     if slug == DEFAULT_BOARD:
         return True
-    return (board_dir(slug) / "board.json").exists()
+    conn = connect()
+    row = conn.execute(
+        "SELECT 1 FROM boards WHERE slug = ?", (slug,)
+    ).fetchone()
+    return row is not None
 
 
 def kanban_db_path(board: Optional[str] = None) -> Path:
@@ -704,12 +709,13 @@ def _default_board_display_name(slug: str) -> str:
 
 
 def read_board_metadata(board: Optional[str] = None) -> dict:
-    """Return ``board.json`` contents (or synthesized defaults).
+    """Return board metadata (or synthesized defaults).
 
-    Never raises — a missing / malformed ``board.json`` falls back to a
-    synthesised entry so the dashboard always has something to render.
-    Includes the canonical ``slug`` and ``db_path`` so the caller
-    doesn't need to reconstruct them.
+    Reads from the ``boards`` table (single source of truth). Never
+    raises — an unknown slug falls back to a synthesised entry so the
+    dashboard always has something to render. Includes the canonical
+    ``slug`` and ``db_path`` so the caller doesn't need to reconstruct
+    them.
     """
     slug = _normalize_board_slug(board) or DEFAULT_BOARD
     meta: dict[str, Any] = {
@@ -728,15 +734,27 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
         "archived": False,
     }
     try:
-        p = board_metadata_path(slug)
-        if p.exists():
-            raw = json.loads(p.read_text(encoding="utf-8"))
-            if isinstance(raw, dict):
-                # Never let the metadata file claim a different slug than
-                # its directory — trust the filesystem.
-                raw["slug"] = slug
-                meta.update(raw)
-    except (OSError, json.JSONDecodeError):
+        conn = connect()
+        row = conn.execute(
+            "SELECT name, description, icon, color, archived,"
+            " default_workdir, project_id, created_at"
+            " FROM boards WHERE slug = ?",
+            (slug,),
+        ).fetchone()
+        if row is not None:
+            meta.update(
+                {
+                    "name": row["name"] or meta["name"],
+                    "description": row["description"] or "",
+                    "icon": row["icon"] or "",
+                    "color": row["color"] or "",
+                    "archived": bool(row["archived"]),
+                    "default_workdir": row["default_workdir"],
+                    "project_id": row["project_id"],
+                    "created_at": row["created_at"],
+                }
+            )
+    except sqlite3.Error:
         pass
     meta["db_path"] = str(kanban_db_path(slug))
     return meta
@@ -753,7 +771,7 @@ def write_board_metadata(
     default_workdir: Optional[str] = None,
     project_id: Optional[str] = None,
 ) -> dict:
-    """Create / update ``board.json`` for ``board``.
+    """Create / update board metadata in the ``boards`` table.
 
     Preserves any existing fields not mentioned in the call. Sets
     ``created_at`` on first write. Returns the resulting metadata dict.
@@ -784,11 +802,34 @@ def write_board_metadata(
         meta["project_id"] = str(project_id) if project_id else None
     if not meta.get("created_at"):
         meta["created_at"] = int(time.time())
-    path = board_metadata_path(slug)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(meta, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
+    conn = connect()
+    conn.execute(
+        """
+        INSERT INTO boards (
+            slug, name, description, icon, color, archived,
+            default_workdir, project_id, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(slug) DO UPDATE SET
+            name            = excluded.name,
+            description     = excluded.description,
+            icon            = excluded.icon,
+            color           = excluded.color,
+            archived        = excluded.archived,
+            default_workdir = excluded.default_workdir,
+            project_id      = excluded.project_id,
+            created_at      = COALESCE(boards.created_at, excluded.created_at)
+        """,
+        (
+            slug,
+            meta["name"],
+            meta["description"],
+            meta["icon"],
+            meta["color"],
+            1 if meta["archived"] else 0,
+            meta["default_workdir"],
+            meta["project_id"],
+            meta["created_at"],
+        ),
     )
     meta["db_path"] = str(kanban_db_path(slug))
     return meta
@@ -804,11 +845,15 @@ def create_board(
     default_workdir: Optional[str] = None,
     project_id: Optional[str] = None,
 ) -> dict:
-    """Create a new board directory + DB + metadata. Idempotent.
+    """Create a new board (registry row + metadata). Idempotent.
 
     Returns the resulting metadata. Raises :class:`ValueError` for a
     malformed slug; returns the existing metadata (not an error) if the
     board already exists — matching ``mkdir -p`` semantics.
+
+    The board lives entirely in the DB: a ``boards`` row is the board
+    (tasks already carry their ``board`` slug). No per-board directory is
+    created; workspaces anchor to ``<root>/kanban/workspaces/``.
     """
     normed = _normalize_board_slug(slug)
     if not normed:
@@ -822,56 +867,62 @@ def create_board(
         default_workdir=default_workdir,
         project_id=project_id,
     )
-    # Touch the DB so list_boards() sees it immediately.
-    init_db(board=normed)
     return meta
 
 
 def list_boards(*, include_archived: bool = True) -> list[dict]:
-    """Enumerate all boards that have persisted ``board.json`` metadata.
+    """Enumerate all boards registered in the ``boards`` table.
 
     Always includes ``default`` first, then the rest alphabetically.
-    Board slugs are discovered by scanning ``boards/`` for ``board.json``
-    files (the per-board ``kanban.db`` files are gone post-consolidation;
-    task data lives in the single consolidated DB).
+    Board slugs come from a query (the per-board ``board.json`` file scan
+    is retired; the boards registry lives in the single consolidated DB).
 
     Returns a list of metadata dicts.
     """
+    conn = connect()
+    rows = conn.execute(
+        "SELECT slug, name, description, icon, color, archived,"
+        " default_workdir, project_id, created_at"
+        " FROM boards"
+        + ("" if include_archived else " WHERE archived = 0")
+        + " ORDER BY slug = 'default' DESC, slug COLLATE NOCASE"
+    ).fetchall()
+
     entries: list[dict] = []
     seen: set[str] = set()
+    for row in rows:
+        slug = row["slug"]
+        if slug in seen:
+            continue
+        seen.add(slug)
+        meta = {
+            "slug": slug,
+            "name": row["name"] or _default_board_display_name(slug),
+            "description": row["description"] or "",
+            "icon": row["icon"] or "",
+            "color": row["color"] or "",
+            "archived": bool(row["archived"]),
+            "default_workdir": row["default_workdir"],
+            "project_id": row["project_id"],
+            "created_at": row["created_at"],
+            "db_path": str(kanban_db_path(slug)),
+        }
+        entries.append(meta)
 
-    # Default board is always first.
-    entries.append(read_board_metadata(DEFAULT_BOARD))
-    seen.add(DEFAULT_BOARD)
-
-    root = boards_root()
-    if root.is_dir():
-        for child in sorted(root.iterdir(), key=lambda p: p.name.lower()):
-            if not child.is_dir():
-                continue
-            slug = child.name
-            try:
-                normed = _normalize_board_slug(slug)
-            except ValueError:
-                continue
-            if not normed or normed in seen:
-                continue
-            if not (child / "board.json").exists():
-                continue
-            meta = read_board_metadata(normed)
-            if meta.get("archived") and not include_archived:
-                continue
-            entries.append(meta)
-            seen.add(normed)
+    # The default board always exists, even in a registry that predates it.
+    if DEFAULT_BOARD not in seen:
+        entries.insert(0, read_board_metadata(DEFAULT_BOARD))
     return entries
 
 
 def remove_board(slug: str, *, archive: bool = True) -> dict:
     """Remove or archive a board.
 
-    ``archive=True`` (default) moves the board's directory to
-    ``<root>/kanban/boards/_archived/<slug>-<timestamp>/`` so the data
-    is recoverable. ``archive=False`` deletes the directory outright.
+    ``archive=True`` (default) moves the board's legacy directory to
+    ``<root>/kanban/boards/_archived/<slug>-<timestamp>/`` so any remnant
+    files (workspaces, logs) stay recoverable; ``archive=False`` deletes
+    it outright. The board's registry row follows the same flag: archived
+    boards keep the row with ``archived=1``, deleted boards drop it.
 
     The ``default`` board cannot be removed — raises :class:`ValueError`.
     Returns a summary dict describing what happened (``{"slug", "action",
@@ -883,34 +934,47 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
         raise ValueError("board slug is required")
     if normed == DEFAULT_BOARD:
         raise ValueError("the 'default' board cannot be removed")
-    d = board_dir(normed)
-    if not d.exists():
+    conn = connect()
+    row = conn.execute(
+        "SELECT 1 FROM boards WHERE slug = ?", (normed,)
+    ).fetchone()
+    if row is None:
         raise ValueError(f"board {normed!r} does not exist")
 
     # If the user removed the currently-active board, revert to default.
     if get_current_board() == normed:
         clear_current_board()
 
-    # A concurrent connect(board=normed) after the rename/delete recreates
-    # an empty sqlite file via mkdir(exist_ok=True); the cache entry must be
-    # dropped first so the schema init pass re-runs on that fresh file.
-    _INITIALIZED_PATHS.discard(str((d / "kanban.db").resolve()))
+    # Tasks are NOT deleted — they keep their historical board slug so old
+    # rows remain attributable. list_tasks(--board <slug>) simply stops
+    # returning active work once the board row is archived/removed.
 
     if archive:
-        archive_root = boards_root() / "_archived"
-        archive_root.mkdir(parents=True, exist_ok=True)
-        ts = int(time.time())
-        target = archive_root / f"{normed}-{ts}"
-        # Avoid collision on rapid double-archives.
-        suffix = 1
-        while target.exists():
-            target = archive_root / f"{normed}-{ts}-{suffix}"
-            suffix += 1
-        d.rename(target)
-        return {"slug": normed, "action": "archived", "new_path": str(target)}
+        conn.execute(
+            "UPDATE boards SET archived = 1 WHERE slug = ?", (normed,)
+        )
+        d = board_dir(normed)
+        action = "archived"
+        new_path = str(d)
+        if d.exists():
+            archive_root = boards_root() / "_archived"
+            archive_root.mkdir(parents=True, exist_ok=True)
+            ts = int(time.time())
+            target = archive_root / f"{normed}-{ts}"
+            # Avoid collision on rapid double-archives.
+            suffix = 1
+            while target.exists():
+                target = archive_root / f"{normed}-{ts}-{suffix}"
+                suffix += 1
+            d.rename(target)
+            new_path = str(target)
+        return {"slug": normed, "action": action, "new_path": new_path}
     else:
+        conn.execute("DELETE FROM boards WHERE slug = ?", (normed,))
         import shutil
-        shutil.rmtree(d)
+        d = board_dir(normed)
+        if d.exists():
+            shutil.rmtree(d)
         return {"slug": normed, "action": "deleted", "new_path": ""}
 
 
@@ -1308,6 +1372,31 @@ CREATE TABLE IF NOT EXISTS tasks (
     board                TEXT NOT NULL DEFAULT 'default',
     root                 TEXT,
     cron                 TEXT
+);
+
+-- Boards registry — single source of truth for board identity and metadata.
+-- Replaces the per-board board.json files (the pre-consolidation design kept
+-- board discovery on a file scan of <root>/kanban/boards/; that file system
+-- is now derived-at-migration only and no longer read at runtime).
+CREATE TABLE IF NOT EXISTS boards (
+    slug             TEXT PRIMARY KEY,
+    name             TEXT,
+    description      TEXT,
+    icon             TEXT,
+    color            TEXT,
+    archived         INTEGER NOT NULL DEFAULT 0,
+    default_workdir  TEXT,
+    project_id       TEXT,
+    created_at       INTEGER
+);
+
+-- Key/value state for kanban-level settings that have exactly one value.
+-- Currently: 'current_board' — the active board slug. Replaces the legacy
+-- <root>/kanban/current one-line file (a global singleton that two chat
+-- sessions could race — the reason this table exists).
+CREATE TABLE IF NOT EXISTS board_state (
+    key   TEXT PRIMARY KEY,
+    value TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2363,6 +2452,7 @@ def connect(
                     # stale PRAGMA snapshots during gateway startup.
                     conn.executescript(SCHEMA_SQL)
                     _migrate_add_optional_columns(conn)
+                    _import_legacy_board_files(conn)
                     _INITIALIZED_PATHS.add(resolved)
         except Exception:
             conn.close()
@@ -2433,6 +2523,90 @@ def init_db(
     with contextlib.closing(connect(path)):
         pass
     return path
+
+
+def _import_legacy_board_files(conn: sqlite3.Connection) -> None:
+    """One-time import of pre-boards-table state from the legacy files.
+
+    Idempotent and additive: rows are inserted with INSERT OR IGNORE, so an
+    already-populated ``boards`` table is never clobbered by stale file
+    data. Called from ``connect()`` init; after a successful import the
+    legacy files are dead weight and safe to delete (see
+    ``_LEGACY_BOARD_FILES`` cleanup in ``remove_board`` history).
+    """
+    # --- 1. board.json files -> boards rows -------------------------------
+    imported = 0
+    root = boards_root()
+    if root.is_dir():
+        for child in sorted(root.iterdir(), key=lambda p: p.name.lower()):
+            if not child.is_dir():
+                continue
+            try:
+                slug = _normalize_board_slug(child.name)
+            except ValueError:
+                continue
+            if not slug:
+                continue
+            meta_path = child / "board.json"
+            if not meta_path.exists():
+                continue
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO boards (
+                    slug, name, description, icon, color, archived,
+                    default_workdir, project_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    slug,
+                    meta.get("name"),
+                    meta.get("description"),
+                    meta.get("icon"),
+                    meta.get("color"),
+                    1 if meta.get("archived") else 0,
+                    meta.get("default_workdir"),
+                    meta.get("project_id"),
+                    meta.get("created_at"),
+                ),
+            )
+            imported += 1
+
+    # --- 2. legacy current-file -> board_state ----------------------------
+    cur_path = current_board_path()
+    if cur_path.exists():
+        try:
+            val = cur_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            val = ""
+        if val:
+            try:
+                normed = _normalize_board_slug(val)
+            except ValueError:
+                normed = None
+            if normed:
+                # Check the registry on THIS connection — calling
+                # board_exists() here would re-enter connect() while
+                # _INIT_LOCK is held (non-reentrant) and deadlock first
+                # init. The board row was just imported in step 1.
+                row = conn.execute(
+                    "SELECT 1 FROM boards WHERE slug = ?", (normed,)
+                ).fetchone()
+                if row is not None:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO board_state (key, value) "
+                        "VALUES ('current_board', ?)",
+                        (normed,),
+                    )
+
+    # --- 3. default board always registered -------------------------------
+    conn.execute(
+        "INSERT OR IGNORE INTO boards (slug, name, archived) VALUES (?, ?, 0)",
+        (DEFAULT_BOARD, _default_board_display_name(DEFAULT_BOARD)),
+    )
 
 
 def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
@@ -3386,6 +3560,12 @@ def create_task(
                         except Exception:
                             branch_name = None
 
+                # Board resolution single source: the explicit param, else the
+                # active board. Written explicitly into the row (the column
+                # DEFAULT 'default' fired instead when this was omitted).
+                if not board:
+                    board = get_current_board()
+
                 conn.execute(
                     """
                     INSERT INTO tasks (
@@ -3395,8 +3575,8 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, board
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3422,6 +3602,7 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        board,
                     ),
                 )
                 for pid in parents:
