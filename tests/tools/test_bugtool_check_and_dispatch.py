@@ -89,6 +89,10 @@ def mock_kanban(monkeypatch, bugtool, record_bodies=False):
             return subprocess.CompletedProcess(args, 0, "status: ready\n", "")
         if args[:3] == ["hermes", "kanban", "comment"]:
             return subprocess.CompletedProcess(args, 0, "", "")
+        # Per-agent cap board query (t_cd44bbde, Phase B): an empty board list
+        # means no live tasks, so the cap defers nothing in these tests.
+        if args[:3] == ["hermes", "kanban", "list"]:
+            return subprocess.CompletedProcess(args, 0, "[]", "")
         raise AssertionError(f"unexpected subprocess: {args}")
 
     monkeypatch.setattr(bugtool.subprocess, "run", run)

@@ -1,0 +1,31 @@
+# bugtoold systemd USER unit (t_cd44bbde, Phase C2).
+#
+# Install (as ekl):
+#   mkdir -p ~/.config/systemd/user
+#   cp /home/ekl/.hermes/hermes-agent/scripts/bugtoold.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now bugtoold
+#   loginctl enable-linger ekl      # start at BOOT without an active login
+#
+# Logs:  journalctl --user -u bugtoold -f
+# Bounds: kill switch  -> touch ~/.local/state/bugtoold/KILLSWITCH   (remove to re-enable)
+#         decision log -> ~/.local/state/bugtoold/decision-log.jsonl
+#         hourly cap   -> config.yaml [bugtoold] max_dispatches_per_hour
+
+[Unit]
+Description=bugtoold — vault bug-file watcher and dispatch daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /home/ekl/.hermes/hermes-agent/scripts/bugtoold.py
+Restart=on-failure
+RestartSec=10
+# Hard resource ceiling: this daemon spawns paid workers, so even a runaway
+# loop dies before it can do unbounded damage.
+MemoryMax=256M
+Nice=10
+
+[Install]
+WantedBy=default.target

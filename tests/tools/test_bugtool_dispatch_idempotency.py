@@ -62,6 +62,10 @@ def mock_kanban(monkeypatch, bugtool, create_delay=0.0):
             return subprocess.CompletedProcess(args, 0, "Status: ready\n", "")
         if args[:3] == ["hermes", "kanban", "comment"]:
             return subprocess.CompletedProcess(args, 0, "", "")
+        # Per-agent cap board query (t_cd44bbde, Phase B): empty board = no
+        # live tasks, so the cap defers nothing in these tests.
+        if args[:3] == ["hermes", "kanban", "list"]:
+            return subprocess.CompletedProcess(args, 0, "[]", "")
         raise AssertionError(f"unexpected subprocess: {args}")
 
     monkeypatch.setattr(bugtool.subprocess, "run", run)
@@ -145,6 +149,9 @@ def test_ambiguous_create_failure_is_not_retried(monkeypatch, tmp_path):
         if args[:3] == ["hermes", "kanban", "create"]:
             create_calls.append(args)
             return subprocess.CompletedProcess(args, 1, "", "connection lost after request")
+        # Per-agent cap board query (t_cd44bbde, Phase B): empty board here.
+        if args[:3] == ["hermes", "kanban", "list"]:
+            return subprocess.CompletedProcess(args, 0, "[]", "")
         raise AssertionError(f"unexpected subprocess: {args}")
 
     monkeypatch.setattr(bugtool.subprocess, "run", run)
@@ -171,6 +178,9 @@ def test_create_task_uses_json_id_instead_of_body_task_id(monkeypatch, tmp_path)
             return subprocess.CompletedProcess(args, 0, stdout, "")
         if args[:3] == ["hermes", "kanban", "comment"]:
             return subprocess.CompletedProcess(args, 0, "", "")
+        # Per-agent cap board query (t_cd44bbde, Phase B): empty board here.
+        if args[:3] == ["hermes", "kanban", "list"]:
+            return subprocess.CompletedProcess(args, 0, "[]", "")
         raise AssertionError(f"unexpected subprocess: {args}")
 
     monkeypatch.setattr(bugtool.subprocess, "run", run)

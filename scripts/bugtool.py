@@ -29,6 +29,11 @@ def tags_from_args(args: argparse.Namespace) -> list[str]:
 REQUIRED_SECTIONS = ("Description", "How To Reproduce", "Actual Behavior")
 ASSIGNEE_SECTION = "Assignee"
 APPROVED_SECTION = "Approved to run"
+# Dependency metadata (t_cd44bbde, Phase A1): a `## Depends on` section lists
+# bug slugs this bug cannot dispatch before they RESOLVE (i.e. the slugs no
+# longer live in bugs/pending/). Resolution is itself a watched change, so the
+# daemon's next scan picks the dependent up without a second mechanism.
+DEPENDS_SECTION = "Depends on"
 # Valid fleet workers a bug can be assigned to. Dispatch requires an assignee
 # from this set AND an explicit human-checked approval box (see approved_to_run).
 VALID_ASSIGNEES = {"neo", "ornith", "gopher", "wintermute", "zephyr"}
@@ -49,6 +54,11 @@ SECTION_ALIASES = {
     # multi-file `check` sweep, which created one task per bug.
     "related-bugs": "Related bugs",
     "related bugs": "Related bugs",
+    # Dependency metadata (t_cd44bbde, Phase A1): a `## Depends on` section lists
+    # bug slugs this bug cannot dispatch before they RESOLVE. `bugtool set`
+    # accepts the alias forms; the canonical heading is DEPENDS_SECTION.
+    "depends-on": DEPENDS_SECTION,
+    "depends on": DEPENDS_SECTION,
 }
 RELATED_SECTION = "Related bugs"
 
@@ -405,6 +415,97 @@ def failure_count(text: str) -> int:
     return len(re.findall(r"^### Failure Report \(task t_[A-Za-z0-9]+\)", text, flags=re.MULTILINE))
 
 
+def bug_slug_from_path(path: Path) -> str:
+    """Slug portion of a bug filename (create_task uses the same derivation)."""
+    return path.stem.split("-", 3)[-1]
+
+
+def _bugs_dir(status: str) -> list[Path]:
+    if not PROJECTS_ROOT.exists():
+        return []
+    dirs = []
+    for project_dir in sorted(p for p in PROJECTS_ROOT.iterdir() if p.is_dir()):
+        directory = project_dir / "bugs" / status
+        if directory.is_dir():
+            dirs.extend(sorted(directory.glob("*.md")))
+    return dirs
+
+
+def _parse_dependency_slugs(section: str) -> list[str]:
+    """Comma/whitespace-separated slugs; optional date prefix stripped.
+
+    Anything that is not a plain lowercase-hyphen slug after normalization is a
+    hard refusal — a malformed `Depends on` entry can never silently pass.
+    """
+    slugs: list[str] = []
+    for raw in re.split(r"[,\s]+", section):
+        token = raw.strip().strip("`'\"")
+        if not token:
+            continue
+        token = re.sub(r"^\d{4}-\d{2}-\d{2}-", "", token)
+        if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", token):
+            die(f"invalid dependency slug '{token}' in {DEPENDS_SECTION} (expected a bug slug)")
+        slugs.append(token)
+    return slugs
+
+
+def dependency_gate(text: str) -> list[str]:
+    """Dependency slugs from `## Depends on` that are STILL pending.
+
+    Returns the unresolved slugs (dispatch blockers). Hard refusals, never
+    silent passes (t_cd44bbde): a slug matching NO known bug file (typo or
+    deleted file) dies with a distinct message — otherwise a typo would block
+    the bug forever with no signal. A dependency cycle among pending bugs dies
+    loudly with the cycle spelled out; it must never loop.
+
+    Resolution is the release: when a dependency's file leaves bugs/pending/
+    (moved to resolved/), the slug drops out of the returned list and the next
+    dispatch pass picks the dependent up — no second mechanism needed.
+    """
+    slugs = _parse_dependency_slugs(section_value(text, DEPENDS_SECTION))
+    if not slugs:
+        return []
+    pending = {bug_slug_from_path(p) for p in _bugs_dir("pending")}
+    known = pending | {bug_slug_from_path(p) for p in _bugs_dir("resolved")}
+    unknown = [slug for slug in slugs if slug not in known]
+    if unknown:
+        die(
+            f"dependency '{unknown[0]}' does not match any bug file under "
+            f"{PROJECTS_ROOT} — refusing to dispatch on a missing dependency"
+        )
+    _die_on_dependency_cycle()
+    return [slug for slug in slugs if slug in pending]
+
+
+def _die_on_dependency_cycle() -> None:
+    """DFS over the pending-bug dependency graph; die() naming the cycle."""
+    graph: dict[str, list[str]] = {}
+    for path in _bugs_dir("pending"):
+        deps = _parse_dependency_slugs(section_value(path.read_text(encoding="utf-8"), DEPENDS_SECTION))
+        if deps:
+            graph[bug_slug_from_path(path)] = deps
+    WHITE, GRAY, BLACK = 0, 1, 2
+    color = dict.fromkeys(graph, WHITE)
+
+    def visit(node: str, stack: list[str]) -> None:
+        color[node] = GRAY
+        stack.append(node)
+        for dep in graph.get(node, []):
+            if dep not in graph:
+                continue  # resolved or unknown: unknown dies in dependency_gate
+            if color[dep] == GRAY:
+                cycle = stack[stack.index(dep):] + [dep]
+                die("dependency cycle detected: " + " -> ".join(cycle))
+            if color[dep] == WHITE:
+                visit(dep, stack)
+        stack.pop()
+        color[node] = BLACK
+
+    for slug in sorted(graph):
+        if color[slug] == WHITE:
+            visit(slug, [])
+
+
 def status_for_task(task_id: str) -> Optional[str]:
     result = subprocess.run(
         [HERMES, "kanban", "show", task_id], text=True, capture_output=True, check=False,
@@ -445,6 +546,11 @@ def owned_live_task_ids(text: str) -> list[str]:
 
 DISPATCHED_STATUS = "dispatched"
 
+# Per-agent cap (t_cd44bbde, Phase B): at most this many LIVE tasks per assignee
+# before further dispatches for that agent are DEFERRED (never dropped — the
+# bug stays pending+checked and the next pass retries).
+MAX_LIVE_TASKS_PER_AGENT = 1
+
 
 def bug_status(text: str) -> str:
     """Return the bug file's own frontmatter status ('' when absent)."""
@@ -475,6 +581,48 @@ def is_dispatched_marker(text: str, path: Path) -> bool:
 def set_bug_status(text: str, status: str) -> str:
     """Rewrite the frontmatter `status:` line, leaving the rest untouched."""
     return re.sub(r"(?m)^status:.*$", f"status: {status}", text, count=1)
+
+
+def live_task_count_by_agent(assignee: str) -> int:
+    """How many LIVE kanban tasks the agent currently holds (Phase B cap).
+
+    Queries the real board via `hermes kanban list --assignee <agent> --json`
+    and counts tasks in LIVE_STATUSES. "Busy" means ANY live task from any
+    source (t_cd44bbde design call): a task occupies the agent equally whether
+    this tool dispatched it or a human did, and the cap exists to stop one
+    agent from drowning in concurrent work.
+
+    Fails OPEN with a loud stderr warning: the cap is overload protection,
+    not a correctness gate (correctness = dispatch log + owned_live_task_ids +
+    is_dispatched_marker). A transient board-query failure must not wedge
+    every dispatch forever — it is logged and the dispatch proceeds.
+    """
+    result = subprocess.run(
+        [HERMES, "kanban", "list", "--assignee", assignee, "--json"],
+        text=True, capture_output=True, check=False,
+    )
+    output = result.stdout if result.returncode == 0 else ""
+    if not output.strip():
+        if result.returncode:
+            print(
+                f"bugtool: per-agent cap unavailable (kanban list exit "
+                f"{result.returncode}: {(result.stderr or '').strip()[:200]}); "
+                f"cap bypassed this pass",
+                file=sys.stderr,
+            )
+        return 0
+    try:
+        records = json.loads(output)
+    except json.JSONDecodeError:
+        print(
+            "bugtool: per-agent cap unavailable (kanban list returned invalid "
+            "JSON); cap bypassed this pass",
+            file=sys.stderr,
+        )
+        return 0
+    if not isinstance(records, list):
+        return 0
+    return sum(1 for record in records if record.get("status") in LIVE_STATUSES)
 
 
 def task_body(path: Path, text: str, directive: Optional[str] = None) -> str:
@@ -576,6 +724,26 @@ def maybe_dispatch_locked(path: Path, text: str, directive: Optional[str] = None
     if not approved_to_run(text):
         return None  # human approval checkbox unchecked: never dispatch
     if failure_count(text) >= 4 and not force:
+        return None
+    # Dependency gate (t_cd44bbde, Phase A2): a `## Depends on` section must be
+    # fully resolved (no listed slug still in bugs/pending/) before dispatch.
+    # Sits after approved_to_run / the escalation check and before the spew
+    # guard, so a 4-failure bug still escalates to Evan instead of silently
+    # sitting behind a dependency. Missing slug / cycle die loudly inside
+    # dependency_gate — never a silent pass.
+    unresolved_deps = dependency_gate(text)
+    if unresolved_deps:
+        print(f"nothing to dispatch for {path.name}: blocked by {', '.join(unresolved_deps)}")
+        return None
+    # Per-agent cap (t_cd44bbde, Phase B): defer, never drop. The bug file is
+    # deliberately left untouched — still pending + checked — so the next
+    # dispatch pass (daemon scan or manual) picks it up when the agent frees
+    # up. force=True (bugtool redispatch) bypasses: the human asked for it.
+    if not force and worker and live_task_count_by_agent(worker) >= MAX_LIVE_TASKS_PER_AGENT:
+        print(
+            f"nothing to dispatch for {path.name}: deferred, {worker} already "
+            f"has {MAX_LIVE_TASKS_PER_AGENT} live task(s) (cap)"
+        )
         return None
     # The board is the second durable marker (with the file's own status):
     # a bug that already OWNS a live task must never get a second one. This is

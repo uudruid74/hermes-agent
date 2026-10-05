@@ -254,10 +254,13 @@ async def _handle_inject(runner, cmd: dict, writer: asyncio.StreamWriter) -> Non
         from gateway.platforms.base import MessageEvent, MessageType
         from datetime import datetime
 
-        # Resolve chat_type: prefer the explicit field (set by
+        # Resolve chat_type dynamically: prefer the explicit field (set by
         # kanban/cron notification hooks via bridge payload),
+        # then ask the live adapter (cached from real messages),
         # then HomeChannel config, fall back to "group".
         _chat_type = cmd.get("chat_type")
+        if not _chat_type and hasattr(adapter, "get_chat_type"):
+            _chat_type = adapter.get_chat_type(chat_id)
         if not _chat_type:
             home = runner.config.get_home_channel(platform) if runner.config else None
             _chat_type = home.chat_type if home else "group"
