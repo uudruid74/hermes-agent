@@ -193,6 +193,10 @@ def normalize_slug(value: str) -> str:
 def normalize_project(value: str) -> str:
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", value):
         die("project must be a single safe directory name")
+    root = PROJECTS_ROOT / value
+    if not root.is_dir():
+        known = sorted(p.name for p in PROJECTS_ROOT.iterdir() if p.is_dir()) if PROJECTS_ROOT.exists() else []
+        die(f"project does not exist: {value} (known project dirs: {', '.join(known) or 'none'})")
     return value
 
 
