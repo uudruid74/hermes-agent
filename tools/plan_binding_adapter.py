@@ -1374,32 +1374,33 @@ def cmd_remind(agent, task_id: Optional[str] = None) -> str:
         _key, binding, error = _current(conn, agent)
         if binding is None:
             if error and error.startswith("PLAN_STATE_UNAVAILABLE:"):
+                # The identity checks (profile/session/db) gate the BINDING
+                # lookup only. With no task_id there is nothing else to show,
+                # so surface the unavailable-state message — but never let it
+                # mask a resolvable explicit task lookup below.
                 return error
-            else:
-                # No active binding. Before failing, check
-                # whether a plan is assigned to this agent but not yet claimed
-                # (still in a waiting state: blocked/review/ready/triage/todo),
-                # and steer the worker to `continue` to claim it. This is the
-                # case a freshly-dispatched plan sits in before the receiver
-                # runs `plan continue <id>` — and it is NOT a "not real task".
-                names = list({n.casefold() for n in _agent_identity_names(agent) if n})
-                if names:
-                    ph = ",".join("?" for _ in names)
-                    waiting = conn.execute(
-                        f"SELECT id, title FROM tasks "
-                        f"WHERE lower(assignee) IN ({ph}) "
-                        f"AND status IN ('blocked','review','ready','triage','todo') "
-                        f"ORDER BY created_at DESC LIMIT 1",
-                        names,
-                    ).fetchone()
-                    if waiting is not None:
-                        tid = waiting["id"]
-                        title = waiting["title"] or tid
-                        return (
-                            f"You are assigned to task {tid} ({title}) but have not "
-                            f"claimed it yet. Run `plan_tool continue {tid}` to claim it."
-                        )
-                return "ERROR: No active task"
+            # No active binding. Say the plan is not active and steer the
+            # worker to claim semantics (Evan, 2026-10-06): with an assigned
+            # unclaimed task, name it; otherwise a plain "no active plan".
+            names = list({n.casefold() for n in _agent_identity_names(agent) if n})
+            if names:
+                ph = ",".join("?" for _ in names)
+                waiting = conn.execute(
+                    f"SELECT id, title FROM tasks "
+                    f"WHERE lower(assignee) IN ({ph}) "
+                    f"AND status IN ('blocked','review','ready','triage','todo') "
+                    f"ORDER BY created_at DESC LIMIT 1",
+                    names,
+                ).fetchone()
+                if waiting is not None:
+                    tid = waiting["id"]
+                    title = waiting["title"] or tid
+                    return (
+                        f"No active plan in this session. You are assigned to "
+                        f"task {tid} ({title}) but have not claimed it yet. "
+                        f"Run `plan_tool continue {tid}` to claim it."
+                    )
+            return "ERROR: No active plan in this session. Run `plan_tool continue <task_id>` with a valid task id to claim the task."
         else:
             task_id = binding.task_id
     task = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()

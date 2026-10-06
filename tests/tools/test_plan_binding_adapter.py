@@ -768,7 +768,12 @@ def test_final_advance_clears_session_task_and_remind_has_no_active_plan(monkeyp
 
     assert result == f"Task {task_id} Step 1 Approved by user. Plan complete."
     assert agent.task_ids[-1] is None
-    assert plan_tool.plan_tool(agent, "remind") == "ERROR: No active task"
+    # The steering message is the point: no plan is active, so remind must
+    # tell the caller how to claim one rather than just saying "no".
+    assert plan_tool.plan_tool(agent, "remind") == (
+        "ERROR: No active plan in this session. Run `plan_tool continue <task_id>` "
+        "with a valid task id to claim the task."
+    )
 
 
 def test_archiving_the_active_plan_requests_completion_compression(monkeypatch):
@@ -815,7 +820,8 @@ def test_remind_without_task_id_and_no_active_plan_fails(monkeypatch):
 
     result = plan_tool.plan_tool(resumed, "remind")
 
-    assert result == "ERROR: No active task"
+    assert "No active plan in this session" in result
+    assert "plan_tool continue <task_id>" in result
     assert conn.execute("SELECT 1 FROM execution_bindings").fetchone() is None
     assert conn.execute(
         "SELECT status FROM tasks WHERE id='t_orphan'"

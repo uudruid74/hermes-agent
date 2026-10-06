@@ -150,7 +150,9 @@ def test_new_links_approval_prompt_to_its_new_plan(monkeypatch):
     task_id = conn.execute("SELECT id FROM tasks").fetchone()[0]
     assert result.startswith("TASK APPROVED (")
     assert seen["task_id"] == task_id
-    assert seen["choices"] == ["Approve", "Deny"]
+    # 0dd92db5fd added Yolo to the initial-approval prompt (Evan's rule:
+    # yolo is a property of the human's answer, offered at first approval).
+    assert seen["choices"] == ["Approve", "Deny", "Yolo"]
     assert seen["callback"] == agent.clarify_callback
     assert seen["agent"] is agent
 

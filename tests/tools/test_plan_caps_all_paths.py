@@ -296,6 +296,16 @@ def bound_plan(board):
     Reuses a real binding row so the identity/resolution path is the
     production one; only ``status``/``task_steps`` are forced into a clean,
     claimable state.
+
+    2026-10-06: the fixture must also clear any REAL pending step-review
+    events for the chosen task on the COPY. The newest live binding is often
+    an agent's ACTIVE plan (e.g. t_d1bc7e42 mid-plan with a pending step-2
+    review); without this cleanup, ``advance_plan`` hits the pending-review
+    early-return (execution_bindings.py:835) and returns the live summary,
+    and ``review_plan_step`` derives its binding key from the stale event's
+    root_session_id, which may no longer exist (BindingNotFound). The temp
+    copy is a sandbox — event cleanup here is fixture prep, never a
+    live-board write.
     """
     conn, _plan_tool = board
     from hermes_cli import execution_bindings as B
@@ -312,6 +322,12 @@ def bound_plan(board):
         "UPDATE tasks SET status='manual', task_steps=?, task_stepno=1, "
         "task_goal='advance gate fixture', plan_kind='normal' WHERE id=?",
         (json.dumps([STEP_TEXT]), task_id),
+    )
+    conn.execute(
+        "DELETE FROM task_events WHERE task_id=? "
+        "AND kind IN ('plan-step-review-pending', 'plan-step-review-approved', "
+        "'plan-step-review-denied')",
+        (task_id,),
     )
     conn.commit()
     row = conn.execute(
