@@ -3571,7 +3571,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 ),
             )
             total_messages, total_tool_calls = self._insert_message_rows(
-                conn, child_session_id, messages
+                conn, child_session_id, messages,
+                _ts_harvest=self._ts_harvest(conn, parent_session_id),
             )
             conn.execute(
                 "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
@@ -6876,7 +6877,90 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return row[0] if row else None
 
-    def _insert_message_rows(self, conn, session_id: str, messages: List[Dict[str, Any]]) -> tuple[int, int]:
+    def _ts_harvest(self, conn, session_id: str) -> Dict[Any, float]:
+        """Harvest (real timestamp, keyed by stored-content shape) from rows.
+
+        Used by the transcript REWRITE flows (archive_and_compact,
+        replace_messages, publish_compression_child) so re-inserted copies of
+        existing content keep their original clock instead of being stamped
+        with the compaction/flush clock by :meth:`_insert_message_rows` — the
+        ghost-twin / fabricated-timeline bug (t_4b1721cb).
+
+        Keys:
+        - Exact form: the stored (encoded) content bytes. Rows of user/
+          assistant roles get sanitize_context applied on LOAD only, not on
+          store, so stored bytes are what was sent — exact matching is safe.
+        - Prefix form (first 64 stored chars, only for stored bodies ≥64
+          chars): covers merge-into-tail rewrites whose inserted content
+          STARTS with the stored body (old content kept verbatim before the
+          summary delimiters). Gated on ≥64 so short bodies can't hand their
+          clock to unrelated content.
+        - Call-id forms (the ones that catch summary-form rewrites):
+          ``ts_by_call_id`` maps every tool row's ``tool_call_id`` and every
+          assistant row's embedded tool_calls ids to that row's real
+          timestamp. A rewritten tool stub (`[patch] replace in ... (N chars
+          result)`) shares NO byte prefix with the stored raw JSON but keeps
+          the SAME tool_call_id, so this is the identity that survives
+          compaction rewriting (the class-1 ghost-twin signature,
+          t_4b1721cb). Returned as the second dict.
+        - Collisions: the MOST RECENT row wins (later rows overwrite), and the
+          consumer's own ``timestamp`` key always wins over the harvest.
+
+        Returns ``(ts_by_content, ts_by_call_id)``.
+
+        Callers must read the harvest inside the same transaction that will
+        archive/delete the old rows, i.e. before the archiving UPDATE runs.
+        """
+        ts_by_content: Dict[Any, float] = {}
+        ts_by_call_id: Dict[str, float] = {}
+        active_rows = conn.execute(
+            "SELECT content, tool_call_id, tool_calls, timestamp FROM messages "
+            "WHERE session_id = ? AND active = 1 AND timestamp IS NOT NULL",
+            (session_id,),
+        ).fetchall()
+        for row in active_rows:
+            stored = row["content"]
+            ts = row["timestamp"]
+            if ts is None:
+                continue
+            try:
+                ts = float(ts)
+            except (TypeError, ValueError):
+                continue
+            if stored is not None:
+                # Exact form; later rows overwrite earlier ones.
+                ts_by_content[stored] = ts
+                if isinstance(stored, str) and len(stored) >= 64:
+                    ts_by_content[stored[:64]] = ts
+            # Call-id keys: a tool row's own tool_call_id…
+            cid = row["tool_call_id"]
+            if cid:
+                ts_by_call_id[str(cid)] = ts
+            # …and every id embedded in an assistant carrier's tool_calls.
+            raw_calls = row["tool_calls"]
+            if raw_calls:
+                if isinstance(raw_calls, str):
+                    try:
+                        calls = json.loads(raw_calls)
+                    except (json.JSONDecodeError, TypeError):
+                        calls = []
+                else:
+                    calls = raw_calls
+                if isinstance(calls, list):
+                    for tc in calls:
+                        if isinstance(tc, dict) and tc.get("id"):
+                            ts_by_call_id[str(tc["id"])] = ts
+        return ts_by_content, ts_by_call_id
+
+    def _insert_message_rows(
+        self,
+        conn,
+        session_id: str,
+        messages: List[Dict[str, Any]],
+        _ts_harvest: Optional[
+            tuple[Dict[Any, float], Dict[str, float]]
+        ] = None,
+    ) -> tuple[int, int]:
         """Insert *messages* as fresh active rows for *session_id*.
 
         Shared by :meth:`replace_messages` (delete-then-insert) and
@@ -6884,6 +6968,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         caller's write transaction (takes the live ``conn``). Returns
         ``(inserted_count, tool_call_count)``. Does NOT touch sessions.* counters
         — the caller owns that, since the two flows reconcile counts differently.
+
+        ``_ts_harvest`` (transcript REWRITE flows,see :meth:`_ts_harvest`):
+        ``(ts_by_content, ts_by_call_id)`` — stored-content keys for verbatim
+        and prefix-preserving copies, and tool_call_id keys for summary-form
+        rewrites that share no byte prefix with the original. A message
+        without its own ``timestamp`` key looks the row up there before
+        falling back to ``now_ts``, so a compaction re-insert never fabricates
+        a fresh-looking timestamp for content that already has a true one
+        (ghost-twin / fabricated-timeline bug, t_4b1721cb).
         """
         now_ts = time.time()
         inserted = 0
@@ -6901,6 +6994,36 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         message_timestamp = float(ts_value)
                 except (TypeError, ValueError):
                     logger.debug("Ignoring invalid explicit message timestamp: %r", msg.get("timestamp"))
+            else:
+                # Ghost-twin guard (t_4b1721cb): a row with no timestamp of
+                # its own inherits the original row's real clock from the
+                # harvest instead of the compaction/flush clock. Content keys
+                # cover verbatim and prefix-preserving copies; call-id keys
+                # cover summary-form rewrites sharing no byte prefix
+                # (`[patch] replace in ... (N chars result)` keeps only the
+                # tool_call_id). (No match → now_ts, which stays correct for
+                # genuinely brand-new content.)
+                if _ts_harvest:
+                    _ts_by_content, _ts_by_call = _ts_harvest
+                    _encoded = self._encode_content(msg.get("content"))
+                    if _encoded in _ts_by_content:
+                        message_timestamp = _ts_by_content[_encoded]
+                    elif isinstance(_encoded, str) and len(_encoded) >= 64:
+                        # Prefix keys are only minted for stored bodies ≥64
+                        # chars (see _ts_harvest), so a shorter inserted body
+                        # can never match one — gate symmetrically.
+                        _prefix_ts = _ts_by_content.get(_encoded[:64])
+                        if _prefix_ts is not None:
+                            message_timestamp = _prefix_ts
+                    _call_id = msg.get("tool_call_id")
+                    if _call_id and str(_call_id) in _ts_by_call:
+                        # Tool-row identity wins over content keys: a
+                        # rewritten stub has a SHORT new body whose prefix
+                        # gate can't fire, so the call-id map is the only
+                        # form that catches it — but check it AFTER content
+                        # keys anyway so a verbatim copy of a DIFFERENT
+                        # longer row's text keeps that row's exact clock.
+                        message_timestamp = _ts_by_call[str(_call_id)]
             reasoning_details = msg.get("reasoning_details") if role == "assistant" else None
             codex_reasoning_items = (
                 msg.get("codex_reasoning_items") if role == "assistant" else None
@@ -7013,6 +7136,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 and session["end_reason"] == "compression"
             ):
                 raise CompressionSessionClosedError(session_id)
+            # Timestamp provenance (t_4b1721cb): harvest BEFORE the delete —
+            # same contract as archive_and_compact, so /retry, /undo and
+            # /compress transcript rewrites keep each row's real clock.
+            _ts_content, _ts_calls = self._ts_harvest(conn, session_id)
             conn.execute(
                 f"DELETE FROM messages WHERE session_id = ?{active_clause}",
                 (session_id,),
@@ -7022,7 +7149,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (session_id,),
             )
             total_messages, total_tool_calls = self._insert_message_rows(
-                conn, session_id, messages
+                conn, session_id, messages,
+                _ts_harvest=(_ts_content, _ts_calls),
             )
             conn.execute(
                 "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
@@ -7073,6 +7201,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
 
         def _do(conn):
+            # Timestamp provenance (t_4b1721cb): harvest every currently-active
+            # row's real timestamp BEFORE soft-archiving, keyed on its stored
+            # shape, so re-inserted copies that lack a ``timestamp`` key (live
+            # tool rows never carry one; summarizer stubs/rewritten dicts lose
+            # it) keep the time their content was actually produced instead of
+            # being stamped with the compaction clock by _insert_message_rows
+            # (the "ghost twin" / fabricated-timeline bug).
+            _ts_content, _ts_calls = self._ts_harvest(conn, session_id)
+
             # Soft-archive the live turns: active=0 hides them from the live
             # context load, compacted=1 marks them as "summarized away" (vs
             # rewind/undo's active=0+compacted=0, which means "user took it
@@ -7085,7 +7222,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (session_id,),
             )
             inserted, tool_calls_total = self._insert_message_rows(
-                conn, session_id, compacted_messages
+                conn, session_id, compacted_messages,
+                _ts_harvest=(_ts_content, _ts_calls),
             )
             # message_count / tool_call_count reflect the LIVE (active) set —
             # the archived rows are still on disk but not part of the live count.

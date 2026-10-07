@@ -29,6 +29,7 @@ import json
 import logging
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -563,6 +564,15 @@ def make_tool_result_message(
         "tool_name": name,
         "content": wrapped,
         "tool_call_id": tool_call_id,
+        # Time the tool actually ran (t_4b1721cb). Live assistant/user dicts
+        # get their timestamp at flush-time from _insert_message_rows, which
+        # is close to true; a tool dict never carried one, so its first flush
+        # stamps it with the (later) flush clock and every compaction
+        # re-insert then re-stamps the same content with each new pass's
+        # clock — the fabricated-timeline / ghost-twin signature. Stamping at
+        # build time gives the row a real clock that survives every later
+        # rewrite verbatim.
+        "timestamp": time.time(),
     }
     try:
         risk_metadata = _tool_output_risk_metadata(name, content)
