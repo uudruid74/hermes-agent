@@ -1382,7 +1382,7 @@ PLAN_TOOL_SCHEMA = {
             "steps": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Ordered step list (required for new; optional for dispatch). For 'repeat': the corrective child plan's steps — `repeat` without steps only tells you what to fix, it does not re-open the step.",
+                "description": "Ordered step list (required for new; optional for dispatch). Do NOT number the steps — no 'Step 1:', '1.' prefixes. The tool numbers and tracks steps itself; caller-supplied numbers are redundant variance that drifts from the tool's real position. Write each step as a self-contained instruction. For 'repeat': the corrective child plan's steps — `repeat` without steps only tells you what to fix, it does not re-open the step.",
             },
             "temp": {
                 "type": "string",

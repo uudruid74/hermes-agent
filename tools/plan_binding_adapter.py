@@ -1369,6 +1369,27 @@ def cmd_archive(agent, task_id: Optional[str] = None) -> str:
     return f"ARCHIVED: {task_id}"
 
 
+def _identity_task_is_unbound(conn, agent, task_id: str, task) -> Optional[str]:
+    """When rendering an explicitly-named task, is it unbound in this session?
+
+    Returns the plan body (via _format_plan) if the current session has no
+    execution binding for ``task_id`` — i.e. the agent is looking at a plan
+    that is not running here. Returns None when the caller's session holds
+    the live binding (or identity can't be resolved — defer to the caller's
+    existing error paths).
+    """
+    from hermes_cli import execution_bindings as bindings
+
+    try:
+        key = _identity(agent)
+    except bindings.PlanStateUnavailable:
+        return None  # identity unavailable: let existing paths handle it
+    binding = bindings.get_binding(conn, key)
+    if binding is not None and binding.task_id == task_id:
+        return None  # genuinely active here — render normally
+    return _format_plan(conn, task, include_summaries=False)
+
+
 def cmd_remind(agent, task_id: Optional[str] = None) -> str:
     """Show the plan goal and the ACTIVE step only.
 
@@ -1437,11 +1458,25 @@ def cmd_remind(agent, task_id: Optional[str] = None) -> str:
             "step=1 plus a corrective plan, or `plan_tool archive` to close it."
         )
         return "\n".join(lines)
-    stepno = task["task_stepno"] or 1
+    stepno = task["task_stepno"]
+    unbound = _identity_task_is_unbound(conn, agent, task_id, task)
+    if unbound is not None:
+        # Unclaimed-in-this-session plan asked about by explicit task_id
+        # (t_a63a4220, 2026-10-09): `task_stepno or 1` made a reset/unclaimed
+        # manual plan render as "Active Step 1 of N", so a fresh worker
+        # believed the plan was running and burned advances against
+        # "No active task". Say where things actually stand instead.
+        return (
+            f"Task {task_id} is assigned to you but NOT ACTIVE in this session "
+            f"(no execution binding — maybe the gateway restarted or the plan "
+            f"was reset). Run `plan_tool continue {task_id}` to claim it, "
+            f"then implement Step {task['task_stepno'] or 1}.\n\n"
+            f"{unbound}"
+        )
     claim_warning = _unclaimed_plan_for_agent(conn, agent, exclude_task_id=task_id)
     if not steps:
         lines.append("Active Step: (no steps defined)")
-    elif 0 < stepno <= len(steps):
+    elif stepno is not None and 0 < stepno <= len(steps):
         lines.append(f"Active Step {stepno} of {len(steps)}: {steps[stepno - 1]}")
     else:
         lines.append(f"Active Step: (out of range: {stepno} of {len(steps)})")
