@@ -282,6 +282,83 @@ def plan_step_summaries(conn: sqlite3.Connection, task_id: str) -> dict[int, str
     return summaries
 
 
+def plan_step_denials(conn: sqlite3.Connection, task_id: str) -> dict[int, str]:
+    """Return the latest denial reason for each Plan step, keyed by step no.
+
+    Denials are stored as ``[plan-step-denial:N] <reason>`` task comments —
+    the same durable channel step summaries ride (Evan, 2026-10-09): an
+    unanswered "why was my step rejected" must survive the full-compaction
+    rewrite, and the plan block is the Protected region that does.
+    """
+    denials: dict[int, str] = {}
+    rows = conn.execute(
+        "SELECT body FROM task_comments WHERE task_id = ? "
+        "AND body LIKE '[plan-step-denial:%' ORDER BY id",
+        (task_id,),
+    ).fetchall()
+    prefix = "[plan-step-denial:"
+    for row in rows:
+        marker, separator, reason = row["body"].partition("] ")
+        step = marker.removeprefix(prefix)
+        if separator and step.isdigit():
+            denials[int(step)] = reason  # later rows win: latest denial
+    return denials
+
+
+def _set_step_denial(
+    conn: sqlite3.Connection,
+    task_id: str,
+    step_no: int,
+    reason: str,
+    *,
+    actor: str,
+    now: int,
+) -> None:
+    """Replace the stored denial reason for one Plan step.
+
+    Mirrors ``_set_step_summary`` so a denial rides the same durable channel:
+    a fresh denial REPLACES the previous one for the same step (latest wins),
+    and the reason is capped to its LAST ``PLAN_TEXT_MAX_CHARS`` characters —
+    the reviewer's fix directive is at the end of the reason.
+    """
+    from hermes_cli.plan_limits import cap_summary
+
+    reason = cap_summary(reason)
+    marker = f"[plan-step-denial:{step_no}] "
+    row = conn.execute(
+        "SELECT id FROM task_comments WHERE task_id = ? AND body LIKE ?",
+        (task_id, f"{marker}%"),
+    ).fetchone()
+    body = marker + reason
+    if row is None:
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (task_id, actor, body, now),
+        )
+    else:
+        conn.execute(
+            "UPDATE task_comments SET author = ?, body = ?, created_at = ? "
+            "WHERE id = ?",
+            (actor, body, now, row["id"]),
+        )
+
+
+def _clear_step_denial(
+    conn: sqlite3.Connection, task_id: str, step_no: int
+) -> None:
+    """Drop the stored denial reason for one Plan step.
+
+    Used by the review-approve path: the step passed review, so its denial
+    no longer rides the Protected plan block.
+    """
+    marker = f"[plan-step-denial:{step_no}] "
+    conn.execute(
+        "DELETE FROM task_comments WHERE task_id = ? AND body LIKE ?",
+        (task_id, f"{marker}%"),
+    )
+
+
 def bootstrap_worker_binding(
     conn: sqlite3.Connection,
     key: ExecutionKey,
@@ -949,6 +1026,18 @@ def review_plan_step(
                 },
                 now=now,
             )
+            # Persist the reason as a step denial so it renders in the plan
+            # block (remind/continue/per-turn injection) and survives the
+            # full-compaction rewrite — the event log alone is not rendered
+            # anywhere (Evan, 2026-10-09).
+            _set_step_denial(
+                conn,
+                task_id,
+                step_no,
+                reason or "",
+                actor=reviewer,
+                now=now,
+            )
             return PlanReviewResult(
                 task_id=task_id,
                 reviewed_step=step_no,
@@ -970,6 +1059,9 @@ def review_plan_step(
                 actor=pending.worker,
                 status_note=pending.summary,
             )
+            # The step passed review: its denial no longer rides the
+            # Protected plan block.
+            _clear_step_denial(conn, task_id, step_no)
             _append_event(
                 conn,
                 task_id,
@@ -1003,6 +1095,9 @@ def review_plan_step(
             if changed != 1:
                 raise InvalidTaskState(f"plan {task_id} changed during review")
             new_revision = current.revision + 1
+            # The step passed review: its denial no longer rides the
+            # Protected plan block.
+            _clear_step_denial(conn, task_id, step_no)
             rebound = conn.execute(
                 "UPDATE execution_bindings SET revision = ?, updated_at = ? "
                 "WHERE profile = ? AND root_session_id = ? "

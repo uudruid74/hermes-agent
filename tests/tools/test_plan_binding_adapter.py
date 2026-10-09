@@ -633,6 +633,37 @@ def test_active_plan_compression_context_is_read_only_and_summary_aware(monkeypa
     assert conn.execute("SELECT task_stepno FROM tasks WHERE id=?", (task_id,)).fetchone()[0] == 1
 
 
+def test_continue_on_already_bound_plan_is_noop_and_steers_to_advance(monkeypatch):
+    """Evan 2026-10-05: `continue` on a plan already bound to this session
+    must NOT re-file the binding (no revision bump) and must steer the model
+    to `advance`. Ornith's repeated `continue` calls raced the step-review
+    gate: continue_plan recomputed revision = max(...)+1, so the pending
+    review (filed at binding_revision 3) could never match the binding
+    (revision 4)."""
+    conn = _db()
+    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    monkeypatch.setattr(
+        plan_tool, "clarify_tool", lambda *_args, **_kwargs: '{"user_response":"Approve"}'
+    )
+    agent = _Agent()
+    plan_tool.plan_tool(
+        agent, "new", title="No-op continue", goal="don't rebind", steps=["first", "second"]
+    )
+    task_id = conn.execute("SELECT task_id FROM execution_bindings").fetchone()[0]
+    before = [tuple(row) for row in conn.execute(
+        "SELECT profile, root_session_id, task_id, revision FROM execution_bindings"
+    )]
+
+    result = plan_tool.plan_tool(agent, "continue", task_id=task_id)
+
+    assert "ALREADY ACTIVE" in result
+    assert "advance" in result
+    after = [tuple(row) for row in conn.execute(
+        "SELECT profile, root_session_id, task_id, revision FROM execution_bindings"
+    )]
+    assert after == before  # revision untouched, binding not re-filed
+
+
 def test_schema_replaces_done_and_status_with_advance_summary_handoff_continue():
     properties = plan_tool.PLAN_TOOL_SCHEMA["parameters"]["properties"]
     commands = properties["command"]["enum"]

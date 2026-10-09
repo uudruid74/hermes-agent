@@ -1210,6 +1210,11 @@ def _format_plan(conn, task, *, include_summaries: bool, minimal: bool = False) 
         if include_summaries
         else {}
     )
+    denials = (
+        bindings.plan_step_denials(conn, task["id"])
+        if include_summaries
+        else {}
+    )
     if minimal:
         current_step = steps[stepno - 1] if 0 < stepno <= len(steps) else ""
         lines = [
@@ -1218,6 +1223,8 @@ def _format_plan(conn, task, *, include_summaries: bool, minimal: bool = False) 
         ]
         if stepno in summaries:
             lines.append(f"Summary: {summaries[stepno]}")
+        if stepno in denials:
+            lines.append(f"Denied: {denials[stepno]}")
         return "\n".join(lines)
 
     lines = [
@@ -1231,6 +1238,8 @@ def _format_plan(conn, task, *, include_summaries: bool, minimal: bool = False) 
         lines.append(f"  {'→' if index == stepno else ' '} Step {index}: {step}")
         if index in summaries:
             lines.append(f"      Summary: {summaries[index]}")
+        if index in denials:
+            lines.append(f"      Denied: {denials[index]}")
     return "\n".join(lines)
 
 
@@ -1415,6 +1424,9 @@ def cmd_remind(agent, task_id: Optional[str] = None) -> str:
     # Terminal plans must never render as active (t_b4a93053, 2026-09-22):
     # close_plan NULLs task_stepno, and the old `stepno or 1` fallback made a
     # DONE plan read as "Active Step 1 of 1". Report the real status instead.
+    from hermes_cli import execution_bindings as _eb
+
+    denials = _eb.plan_step_denials(conn, task_id)
     if task["status"] not in {"manual", "running"}:
         lines.append(f"Status: {task['status']} — this plan is closed, not active.")
         if task["status"] == "done" and steps:
@@ -1433,6 +1445,8 @@ def cmd_remind(agent, task_id: Optional[str] = None) -> str:
         lines.append(f"Active Step {stepno} of {len(steps)}: {steps[stepno - 1]}")
     else:
         lines.append(f"Active Step: (out of range: {stepno} of {len(steps)})")
+    if stepno in denials:
+        lines.append(f"Last denial of this step: {denials[stepno]}")
     if claim_warning is not None:
         wtid, wtitle, wstepno = claim_warning
         lines.append("")
@@ -1461,6 +1475,19 @@ def cmd_continue(agent, task_id: str) -> str:
         return "PLAN_STATE_UNAVAILABLE: agent session is unavailable"
     try:
         key = _identity(agent)
+        # Already bound to this exact session? Tell the model the plan is
+        # active and to use `advance` — do NOT re-bind. continue_plan is
+        # now a no-op in this case (revision preserved), so surface the
+        # same steer here instead of a confusing re-bind.
+        current = bindings.get_binding(conn, key)
+        if current is not None and current.task_id == task_id:
+            task = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            return (
+                f"Plan {task_id} is ALREADY ACTIVE in this session. "
+                f"No need to call `continue` — use `plan_tool advance` with a "
+                f"summary to move to the next step.\n\n"
+                f"{_format_plan(conn, task, include_summaries=True)}"
+            )
         bindings.continue_plan(
             conn,
             key,
