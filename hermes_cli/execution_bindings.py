@@ -1232,6 +1232,15 @@ def continue_plan(
             )
         from_status: str = task["status"]
         _steps_for_task(task)
+        # Already bound to this exact session? No-op. Do NOT re-file the
+        # binding — re-computing revision = max(...) + 1 bumps the counter and
+        # races the step-review gate (`_assert_expected_binding` compares the
+        # pending review's binding_revision against current.revision). A worker
+        # that re-runs `continue` on an active plan must not change the
+        # revision; the caller steers it to `advance` instead.
+        already = _get_binding_row(conn, key)
+        if already is not None and already["task_id"] == plan_id:
+            return _binding_from_row(already)
         prior = conn.execute(
             "SELECT revision FROM execution_bindings "
             "WHERE task_id = ? OR (profile = ? AND root_session_id = ?)",
