@@ -260,7 +260,7 @@ def test_yolo_review_persists_and_auto_approves_later_steps(monkeypatch):
     ]
 
 
-def test_denied_review_requires_bounded_reason_and_keeps_step_open(monkeypatch):
+def test_denied_review_requires_bounded_response_and_keeps_step_open(monkeypatch):
     conn, sent, worker, dispatcher, task_id = _delegated_plan(monkeypatch)
     plan_tool.plan_tool(worker, "advance", summary="inspection complete", step=1)
     sent.clear()
@@ -269,18 +269,18 @@ def test_denied_review_requires_bounded_reason_and_keeps_step_open(monkeypatch):
         dispatcher, "review", task_id=task_id, decision="denied"
     )
     too_long = plan_tool.plan_tool(
-        dispatcher, "review", task_id=task_id, decision="denied", reason="x" * 1025
+        dispatcher, "review", task_id=task_id, decision="denied", response="x" * 1025
     )
     denied = plan_tool.plan_tool(
         dispatcher,
         "review",
         task_id=task_id,
         decision="denied",
-        reason="The failure case was not reproduced.",
+        response="The failure case was not reproduced.",
     )
 
-    assert missing == "ERROR: denied review requires reason"
-    assert too_long == "ERROR: review reason must be at most 1024 characters"
+    assert missing == "ERROR: denied review requires a response"
+    assert too_long == "ERROR: review response must be at most 1024 characters"
     assert denied == f"Task {task_id} Step 1 denied. Worker notified."
     assert _stepno(conn, task_id) == 1
     message = sent[-1][4]
@@ -399,7 +399,7 @@ def test_yolo_answer_enables_auto_approve(monkeypatch):
     assert sent == []
 
 
-def test_self_created_denial_prompts_for_reason(monkeypatch):
+def test_self_created_denial_prompts_for_response(monkeypatch):
     conn, _sent = _install(monkeypatch)
     responses = iter(["Approve", "Deny", "Missing regression coverage"])
     questions: list[tuple[str, list[str] | None]] = []
@@ -432,7 +432,7 @@ def test_manifest_exposes_review_and_only_one_advance_summary():
     assert properties["decision"]["enum"] == ["approved", "denied", "yolo"]
     assert "summarize what was done" in properties["summary"]["description"].lower()
     assert "proof" not in properties
-    assert "review" in properties["reason"]["description"].lower()
+    assert "review" in properties["response"]["description"].lower()
 
 
 def test_dispatcher_resolution_prefers_durable_created_by_over_origin_routing(monkeypatch):

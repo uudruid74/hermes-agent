@@ -40,7 +40,7 @@ def test_deny_stores_reason_and_remind_renders_it(monkeypatch):
         "review",
         task_id=task_id,
         decision="denied",
-        reason="Missing game_logic import — NameError on init().",
+        response="Missing game_logic import — NameError on init().",
     )
     assert result == f"Task {task_id} Step 1 denied. Worker notified."
 
@@ -54,7 +54,7 @@ def test_deny_stores_reason_and_remind_renders_it(monkeypatch):
         "[plan-step-denial:1] Missing game_logic import — NameError on init()."
     ]
 
-    # remind carries the reason under the active step
+    # remind carries the denial response under the active step
     remind = plan_tool.plan_tool(worker, "remind")
     assert "Last denial of this step: Missing game_logic import" in remind
 
@@ -76,7 +76,7 @@ def test_active_plan_compression_context_includes_denial(monkeypatch):
     plan_tool.plan_tool(worker, "advance", summary="did the step", step=1)
     plan_tool.plan_tool(
         dispatcher, "review", task_id=task_id, decision="denied",
-        reason="view() shadows builtin list — use fetchall() result directly.",
+        response="view() shadows builtin list — use fetchall() result directly.",
     )
 
     contexts = plan_binding_adapter.active_plan_compression_context(worker)
@@ -91,12 +91,12 @@ def test_repeated_denial_replaces_reason(monkeypatch):
     plan_tool = __import__("tools.plan_tool", fromlist=["plan_tool"])
     plan_tool.plan_tool(worker, "advance", summary="attempt 1", step=1)
     plan_tool.plan_tool(
-        dispatcher, "review", task_id=task_id, decision="denied", reason="first defect"
+        dispatcher, "review", task_id=task_id, decision="denied", response="first defect"
     )
     plan_tool.plan_tool(worker, "advance", summary="attempt 2", step=1)
     sent.clear()
     plan_tool.plan_tool(
-        dispatcher, "review", task_id=task_id, decision="denied", reason="second defect — worse"
+        dispatcher, "review", task_id=task_id, decision="denied", response="second defect — worse"
     )
 
     rows = conn.execute(
@@ -113,7 +113,7 @@ def test_approval_clears_denial(monkeypatch):
     plan_tool = __import__("tools.plan_tool", fromlist=["plan_tool"])
     plan_tool.plan_tool(worker, "advance", summary="first try", step=1)
     plan_tool.plan_tool(
-        dispatcher, "review", task_id=task_id, decision="denied", reason="defect A"
+        dispatcher, "review", task_id=task_id, decision="denied", response="defect A"
     )
     plan_tool.plan_tool(worker, "advance", summary="fixed", step=1)
     sent.clear()
@@ -142,13 +142,13 @@ def test_denial_reason_capped(monkeypatch):
     plan_tool.plan_tool(worker, "advance", summary="try", step=1)
     plan_tool.plan_tool(
         dispatcher, "review", task_id=task_id, decision="denied",
-        reason="x" * 1000 + " THE-END-MARKER",
+        response="x" * 1000 + " THE-END-MARKER",
     )
     row = conn.execute(
         "SELECT body FROM task_comments WHERE task_id=? "
         "AND body LIKE '[plan-step-denial:1] %'",
         (task_id,),
     ).fetchone()
-    reason = row[0].removeprefix("[plan-step-denial:1] ")
-    assert len(reason) <= PLAN_TEXT_MAX_CHARS
-    assert reason.endswith("THE-END-MARKER"), "cap keeps the TAIL (fix directive)"
+    denial = row[0].removeprefix("[plan-step-denial:1] ")
+    assert len(denial) <= PLAN_TEXT_MAX_CHARS
+    assert denial.endswith("THE-END-MARKER"), "cap keeps the TAIL (fix directive)"

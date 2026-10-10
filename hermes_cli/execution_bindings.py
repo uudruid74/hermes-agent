@@ -992,9 +992,14 @@ def review_plan_step(
     task_id: str,
     decision: Literal["approved", "denied", "yolo"],
     reviewer: str,
-    reason: Optional[str] = None,
+    response: Optional[str] = None,
 ) -> PlanReviewResult:
-    """Resolve the current pending review and advance only on approval."""
+    """Resolve the current pending review and advance only on approval.
+
+    ``response`` is dual-use: the denial/changes message for a step review,
+    or the answer delivered to the worker when the plan carries a pending
+    clarify/tool-limit flag (handled by the adapter's review command).
+    """
     if decision not in {"approved", "denied", "yolo"}:
         raise ValueError("decision must be 'approved', 'denied', or 'yolo'")
     with write_txn(conn):
@@ -1030,11 +1035,11 @@ def review_plan_step(
                     "step": step_no,
                     "review_event_id": pending.event_id,
                     "reviewer": reviewer,
-                    "reason": reason or "",
+                    "response": response or "",
                 },
                 now=now,
             )
-            # Persist the reason as a step denial so it renders in the plan
+            # Persist the response as a step denial so it renders in the plan
             # block (remind/continue/per-turn injection) and survives the
             # full-compaction rewrite — the event log alone is not rendered
             # anywhere (Evan, 2026-10-09).
@@ -1042,7 +1047,7 @@ def review_plan_step(
                 conn,
                 task_id,
                 step_no,
-                reason or "",
+                response or "",
                 actor=reviewer,
                 now=now,
             )

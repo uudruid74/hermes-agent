@@ -1237,6 +1237,7 @@ def plan_tool(
     assignee: Optional[str] = None,
     resume: Optional[str] = None,
     reason: Optional[str] = None,
+    response: Optional[str] = None,
     task_id: Optional[str] = None,
     board: Optional[str] = None,
     cron: Optional[str] = None,
@@ -1293,7 +1294,7 @@ def plan_tool(
             return "ERROR: 'review' requires task_id"
         if not decision:
             return "ERROR: 'review' requires decision"
-        return _cmd_review(agent, task_id, decision, reason)
+        return _cmd_review(agent, task_id, decision, response)
 
     elif command == "repeat":
         return _cmd_repeat(
@@ -1415,7 +1416,11 @@ PLAN_TOOL_SCHEMA = {
             },
             "reason": {
                 "type": "string",
-                "description": "Failure reason for 'fail'. For a denied 'review', required and limited to 1024 characters.",
+                "description": "Failure reason for 'fail'. For 'repeat', the step's fix directive context.",
+            },
+            "response": {
+                "type": "string",
+                "description": "Required for a denied 'review', limited to 1024 characters: the denial message, or the answer to a worker's pending clarify/tool-limit ask. Optional for 'approved'.",
             },
             "task_id": {
                 "type": "string",
@@ -1474,6 +1479,7 @@ registry.register(
         assignee=args.get("assignee"),
         resume=args.get("resume"),
         reason=args.get("reason"),
+        response=args.get("response"),
         task_id=args.get("task_id"),
         board=args.get("board"),
         cron=args.get("cron"),

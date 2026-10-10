@@ -642,7 +642,7 @@ def _review_request_text(task, pending, *, auto_approved: bool = False) -> str:
             "this step using 'plan_tool review'. Pass the task id and decision "
             "'approved', 'denied', or 'yolo' — 'yolo' approves this step AND "
             "auto-approves the remaining steps of this plan, so you will not be "
-            "asked again for this plan. A denial must include a reason."
+            "asked again for this plan. A denial must include a response."
         )
     return "\n".join(lines)
 
@@ -740,12 +740,12 @@ def _attention_request_text(task, pending, *, used: int, maximum: int) -> str:
     return "\n".join(lines)
 
 
-def _worker_review_message(task, result, reviewer: str, reason: Optional[str]) -> str:
+def _worker_review_message(task, result, reviewer: str, response: Optional[str]) -> str:
     steps = json.loads(task["task_steps"] or "[]")
     if result.decision == "denied":
         step_text = steps[result.reviewed_step - 1]
         return (
-            f"Advancement has been denied. Reason: {reason}\n\n"
+            f"Advancement has been denied. Reason: {response}\n\n"
             f"Goal: {task['task_goal'] or ''}\n"
             f"Step {result.reviewed_step}: {step_text}\n\n"
             "Please correct before attempting to advance again"
@@ -777,7 +777,7 @@ def _resolve_review(
     task_id: str,
     decision: Literal["approved", "denied", "yolo"],
     reviewer: str,
-    reason: Optional[str],
+    response: Optional[str],
     notify_worker: bool,
 ):
     from hermes_cli import execution_bindings as bindings
@@ -788,7 +788,7 @@ def _resolve_review(
             task_id=task_id,
             decision=cast(Literal["approved", "denied", "yolo"], decision),
             reviewer=reviewer,
-            reason=reason,
+            response=response,
         )
     except bindings.ExecutionBindingError as exc:
         return f"ERROR: {exc}", None
@@ -802,7 +802,7 @@ def _resolve_review(
         session_db = getattr(agent, "_session_db", None)
         if source is not None and session_db is not None:
             session_db.update_agent_rating(source["assignee"], 0.5)
-    message = _worker_review_message(task, result, reviewer, reason)
+    message = _worker_review_message(task, result, reviewer, response)
     if notify_worker:
         failure = _send_user(str(task["assignee"]), message)
         if failure:
@@ -866,7 +866,7 @@ def cmd_advance(agent, summary: str, step: Optional[int] = None) -> str:
             task_id=result.task_id,
             decision="approved",
             reviewer="yolo",
-            reason=None,
+            response=None,
             notify_worker=False,
         )
         if reviewed is None:
@@ -934,10 +934,10 @@ def cmd_advance(agent, summary: str, step: Optional[int] = None) -> str:
         decision = "yolo"
     else:
         decision = "approved" if _answer.startswith("appr") else "denied"
-    reason = None
+    response = None
     if decision == "denied":
         try:
-            reason = str(
+            response = str(
                 json.loads(
                     _legacy().clarify_tool(
                         "Why is this step denied?",
@@ -948,37 +948,42 @@ def cmd_advance(agent, summary: str, step: Optional[int] = None) -> str:
                 ).get("user_response", "")
             ).strip()
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
-            return f"ERROR: Denial reason was not recorded: {exc}"
-        if not reason:
-            return "ERROR: denied review requires reason"
-        if len(reason) > 1024:
-            return "ERROR: review reason must be at most 1024 characters"
+            return f"ERROR: Denial response was not recorded: {exc}"
+        if not response:
+            return "ERROR: denied review requires a response"
+        if len(response) > 1024:
+            return "ERROR: review response must be at most 1024 characters"
     message, _reviewed = _resolve_review(
         agent,
         conn,
         task_id=result.task_id,
         decision=cast(Literal["approved", "denied", "yolo"], decision),
         reviewer="user",
-        reason=reason,
+        response=response,
         notify_worker=False,
     )
     return message
 
 
 def cmd_review(
-    agent, task_id: str, decision: str, reason: Optional[str] = None
+    agent, task_id: str, decision: str, response: Optional[str] = None
 ) -> str:
-    """Approve, deny, or yolo the dispatcher-gated pending step review."""
+    """Approve, deny, or yolo the dispatcher-gated pending step review.
+
+    ``response`` is dual-use (the F2 unification): the denial/request-changes
+    message, or the answer to a worker's clarify/tool-limit ask when the plan
+    carries a pending flag (see ``cmd_review``'s flag handling).
+    """
     from hermes_cli import execution_bindings as bindings
 
     decision = (decision or "").strip().lower()
     if decision not in {"approved", "denied", "yolo"}:
         return "ERROR: 'review' decision must be 'approved', 'denied', or 'yolo'"
-    reason = (reason or "").strip() or None
-    if decision == "denied" and reason is None:
-        return "ERROR: denied review requires reason"
-    if reason is not None and len(reason) > 1024:
-        return "ERROR: review reason must be at most 1024 characters"
+    response = (response or "").strip() or None
+    if decision == "denied" and response is None:
+        return "ERROR: denied review requires a response"
+    if response is not None and len(response) > 1024:
+        return "ERROR: review response must be at most 1024 characters"
 
     conn = _legacy()._get_kanban_db()
     task = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
@@ -1000,7 +1005,7 @@ def cmd_review(
         task_id=task_id,
         decision=cast(Literal["approved", "denied", "yolo"], decision),
         reviewer=reviewer,
-        reason=reason,
+        response=response,
         notify_worker=True,
     )
     if result is None:
