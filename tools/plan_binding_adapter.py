@@ -1615,6 +1615,11 @@ def cmd_approve(agent, task_id: str) -> str:
     callback = getattr(agent, "clarify_callback", None)
     if callback is None:
         return f"ERROR: No clarify callback available. Cannot present plan {task_id} for approval."
+
+    creator_agent_name = _legacy()._get_agent_name(agent)
+    assigned = (task["assignee"] or "").strip()
+    delegated = bool(assigned and assigned != creator_agent_name)
+
     response = callback(
         f"Approve plan {task_id}?\n\n{task['body']}",
         ["Approve", "Deny", "Yolo"],
@@ -1636,21 +1641,60 @@ def cmd_approve(agent, task_id: str) -> str:
                     "UPDATE tasks SET plan_auto_approve = 1 WHERE id = ?",
                     (task_id,),
                 )
-            _activate(
-                conn,
-                agent=agent,
-                key=key,
-                task_id=task_id,
-                parent_task_id=task["previous_task"],
-                revision=current.revision if current is not None else None,
-            )
+            if delegated:
+                # Delegated plan: approve the authorization so the worker's
+                # `plan continue` binds cleanly, but do NOT activate into the
+                # creator's binding and do NOT flip the task to manual — it
+                # stays blocked, which continue_plan accepts (780f7f99cc), so
+                # the WORKER's continue does blocked→manual→bind on their
+                # session. (Mirrors cmd_new's delegated branch — the separate
+                # `approve` command lost this when it was split out, silently
+                # dropping the worker wake, t_ddf573ea.)
+                from hermes_cli import plan_authorizations
+
+                plan_authorizations.resolve_plan_in_txn(
+                    conn, task_id, "approved", _actor(agent)
+                )
+            else:
+                _activate(
+                    conn,
+                    agent=agent,
+                    key=key,
+                    task_id=task_id,
+                    parent_task_id=task["previous_task"],
+                    revision=current.revision if current is not None else None,
+                )
     except bindings.ExecutionBindingError as exc:
         return f"ERROR: {exc}"
-    # Activating a blocked Plan changes the active step — re-point the subject
-    # so the transition triggers a FULL compaction. See
-    # _sync_subject_from_binding.
-    _sync_subject_from_binding(agent)
-    return f"Task {task_id} approved: {task['title']}"
+    if not delegated:
+        # Activating a blocked Plan changes the active step — re-point the subject
+        # so the transition triggers a FULL compaction. See
+        # _sync_subject_from_binding.
+        _sync_subject_from_binding(agent)
+        return f"Task {task_id} approved: {task['title']}"
+    # Delegated: wake the assignee with the continue instruction; the plan
+    # stays bound to their session from here, not ours.
+    # Evan's exact pseudo text (2026-09-22) — verbatim, nothing added:
+    worker_msg = (
+        f"You have been assigned a new task.  Please call "
+        f"'plan continue {task_id}' to begin the new task."
+    )
+    wrapped = (
+        f"Incoming message from {creator_agent_name} follows:\n"
+        "---\n"
+        f"{worker_msg}\n"
+        "---\n"
+        "If a reply is required, use the 'tell' command to reply."
+    )
+    # Fire-and-forget wake: the assignee is notified out-of-band, so the
+    # creator's tool loop never blocks on delivery. Delivery status lives
+    # in the durable task row, not in this synchronous call.
+    from hermes_cli._subprocess_compat import spawn_detached
+
+    spawn_detached(["hermes", "send", "-u", assigned, wrapped])
+    # No binding activation on our side — surface the dispatch notice.
+    # Evan's exact spec (2026-09-22): the creator sees ONLY the notify line.
+    return f"{assigned} has been notified of task {task_id}"
 
 
 def cmd_clarify(agent, question: str) -> str:
