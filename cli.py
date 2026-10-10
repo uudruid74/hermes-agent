@@ -10456,6 +10456,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 _cprint(f"  No agent running; queued as next turn: {payload[:80]}{'...' if len(payload) > 80 else ''}")
         elif canonical == "goal":
             self._handle_goal_command(cmd_original)
+        elif canonical == "review":
+            self._handle_review_command(cmd_original)
+        elif canonical == "plan":
+            # /plan (t_6a55f4d6 step 6): the tool-call surface is `plan`;
+            # the slash command funnels into `plan new` (Manual kanban task,
+            # no markdown).
+            self._handle_plan_command(cmd_original)
         elif canonical == "moa":
             # /moa is one-shot sugar only: run a single prompt through the
             # default MoA preset, then restore the prior model. To *switch* to a

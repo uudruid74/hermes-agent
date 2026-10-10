@@ -2801,12 +2801,159 @@ class GatewaySlashCommandsMixin:
                 logger.debug("goal kickoff enqueue failed: %s", exc)
 
         base = t("gateway.goal.set", budget=state.max_turns, goal=state.goal)
+        # Manual-backend plan row (t_6a55f4d6 step 5, F9): the durable goal
+        # plan is written yolo'd — no approval process. Failure is a notice,
+        # never a /goal failure (goal semantics are unchanged).
+        try:
+            from hermes_cli.plan_slash_helpers import plan_row_for_goal
+
+            agent = getattr(self, "agent", None)
+            wrote, row_msg = plan_row_for_goal(agent, state.goal, args)
+            if wrote:
+                base += (
+                    f"\nPlan row {row_msg} written to the Manual kanban backend "
+                    f"(the worker claims it with `plan continue {row_msg}`)."
+                )
+            else:
+                base += f"\n{row_msg}"
+        except Exception as exc:
+            logger.debug("goal plan-row write failed: %s", exc)
         if state.has_contract():
             return f"{base}\nCompletion contract:\n{state.contract.render_block()}"
         if lower.startswith("draft"):
             # Drafting was requested but the aux model couldn't produce one.
             return f"{base}\n(Couldn't draft a contract — running as a free-form goal.)"
         return base
+
+    async def _handle_review_command(self, event: "MessageEvent") -> str:
+        """/review <task_id> — Manual-backend review surface (t_6a55f4d6).
+
+        In-progress plan: returns the current step + worker summary so the
+        human can reply `plan review`. Completed task: the final result.
+        Read-only; DB work runs off the event loop.
+        """
+        import asyncio
+
+        from hermes_cli.plan_slash_helpers import plan_review_command
+
+        args = (event.get_command_args() or "").strip()
+        if not args:
+            return (
+                "Usage: /review <task_id> — a plan-backed task id "
+                "(`/kanban list` lists ids)."
+            )
+        ok, text = await asyncio.get_running_loop().run_in_executor(
+            None, plan_review_command, args
+        )
+        return text
+
+    async def _handle_plan_command(self, event: "MessageEvent") -> str:
+        """/plan <text> — create a Manual kanban plan task (t_6a55f4d6).
+
+        API-compatible with upstream /plan (F8): same slash surface, but this
+        fork's implementation creates a real Manual-backed plan task — goal =
+        the text, subsequent lines become steps — instead of markdown. The
+        agent executes it with the `plan` tool.
+        """
+        args = (event.get_command_args() or "").strip()
+        if not args:
+            return (
+                "Usage: /plan <goal text> — creates a Manual kanban plan task "
+                "(lines after the first become steps); the agent executes it "
+                "with the `plan` tool."
+            )
+        lines = [ln.strip() for ln in args.splitlines() if ln.strip()]
+        goal_line = lines[0] if lines else args
+        steps = lines[1:] if len(lines) > 1 else [goal_line]
+        try:
+            from hermes_cli.kanban_db import kanban_db_path
+            from hermes_cli import plan_authorizations
+
+            plan_id, body = await asyncio.get_running_loop().run_in_executor(
+                None,
+                self._write_goal_plan_row,
+                goal_line[:80],
+                goal_line,
+                steps,
+            )
+            return (
+                f"Plan created: {plan_id} (Manual kanban backend — no markdown).\n"
+                f"{body}\n\nThe assigned agent claims it with `plan continue {plan_id}`."
+            )
+        except Exception as exc:
+            return f"/plan failed: {exc}"
+
+    def _write_goal_plan_row(self, title: str, goal_text: str, steps: list):
+        """Durably create a blocked Manual plan + yolo'd approval, return (id, body)."""
+        import json as _json
+        import sqlite3 as _sqlite3
+        import time as _time
+        import uuid as _uuid
+
+        from hermes_cli.kanban_db import write_txn, kanban_db_path
+        from hermes_cli import plan_authorizations
+
+        conn = _sqlite3.connect(str(kanban_db_path()))
+        conn.row_factory = _sqlite3.Row
+        task_id = f"t_{_uuid.uuid4().hex[:8]}"
+        body = "\n".join(
+            [
+                f"## Plan: {title}",
+                "**Agent:** user (via /plan)",
+                f"**Goal:** {goal_text}",
+                "",
+                "### Steps",
+                *[f"{i}. {s}" for i, s in enumerate(steps, 1)],
+            ]
+        )
+        try:
+            with write_txn(conn):
+                conn.execute(
+                    """
+                    INSERT INTO tasks (
+                        id, title, body, status, assignee, created_at, task_steps,
+                        task_stepno, task_goal, block_kind, prev_temperature,
+                        previous_task, session_id, board, plan_kind, pre_approved,
+                        created_by
+                    ) VALUES (?, ?, ?, 'blocked', 'user', ?, ?, 1, ?, 'approval', ?, ?, ?, ?, 'normal', 0, 'user')
+                    """,
+                    (
+                        task_id,
+                        title,
+                        body,
+                        int(_time.time()),
+                        _json.dumps(steps),
+                        goal_text,
+                        None,
+                        None,
+                        None,
+                        "default",
+                    ),
+                )
+                plan_authorizations.create_pending_plan(
+                    conn,
+                    plan_authorizations.PlanRequest(
+                        plan_id=task_id,
+                        payload={
+                            "title": title,
+                            "goal": goal_text,
+                            "steps": steps,
+                            "kind": "manual",
+                            "assign": "user",
+                            "board": "default",
+                            "root": None,
+                            "cron": None,
+                            "resume": None,
+                        },
+                        execution_task_id=task_id,
+                        execution_session_id=None,
+                        parent_task_id=None,
+                        origin_session_id=None,
+                    ),
+                )
+            return task_id, body
+        finally:
+            conn.close()
 
     async def _handle_subgoal_command(self, event: "MessageEvent") -> str:
         """Handle /subgoal for gateway platforms (mirror of CLI handler).

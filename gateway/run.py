@@ -14138,6 +14138,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "background": self._handle_background_command,
                 "kanban": self._handle_kanban_command,
                 "subgoal": self._handle_subgoal_command,
+                "review": self._handle_review_command,
+                "plan": self._handle_plan_command,
                 "yolo": self._handle_yolo_command,
                 "verbose": self._handle_verbose_command,
                 "footer": self._handle_footer_command,
@@ -15345,6 +15347,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "goal":
             return await self._handle_goal_command(event)
+
+        if canonical == "review":
+            return await self._handle_review_command(event)
+
+        if canonical == "plan":
+            return await self._handle_plan_command(event)
 
         if canonical == "moa":
             # /moa is one-shot sugar only: run a single prompt through the

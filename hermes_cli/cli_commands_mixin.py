@@ -2407,6 +2407,22 @@ class CLICommandsMixin:
             return
 
         _cprint(f"  ⊙ Goal set ({state.max_turns}-turn budget): {state.goal}")
+        # Manual-backend plan row (t_6a55f4d6 step 5, F9): the durable goal
+        # plan is written yolo'd — no approval process. Failure is a notice,
+        # never a /goal failure (goal semantics are unchanged).
+        try:
+            from hermes_cli.plan_slash_helpers import plan_row_for_goal, _resolve_agent
+
+            wrote, row_msg = plan_row_for_goal(
+                _resolve_agent(self), state.goal, arg
+            )
+            if wrote:
+                _cprint(f"  {_DIM}Plan row {row_msg} written to the Manual kanban backend "
+                        f"(claim with `plan continue {row_msg}`).{_RST}")
+            else:
+                _cprint(f"  {_DIM}{row_msg}{_RST}")
+        except Exception as exc:
+            _cprint(f"  {_DIM}Plan row write skipped: {exc}{_RST}")
         if state.has_contract():
             _cprint(f"  {_DIM}Completion contract:{_RST}")
             for line in state.contract.render_block().splitlines():
@@ -2423,6 +2439,83 @@ class CLICommandsMixin:
             self._pending_input.put(state.goal)
         except Exception:
             pass
+
+    # ------------------------------------------------------------------
+    # /review — plan/clarify/review unification (t_6a55f4d6 step 5)
+    # ------------------------------------------------------------------
+
+    def _handle_review_command(self, cmd: str) -> None:
+        """/review <task_id> — Manual-backend review surface.
+
+        In-progress plan: prints the current step + worker summary so the
+        human can reply `plan review` (the existing cmd_review loop).
+        Completed task: prints the final result. Read-only.
+        """
+        from cli import _DIM, _RST, _cprint
+        from hermes_cli.plan_slash_helpers import plan_review_command
+
+        parts = (cmd or "").strip().split(None, 1)
+        arg = parts[1].strip() if len(parts) > 1 else ""
+        if not arg:
+            _cprint(f"  Usage: /review <task_id>")
+            return
+        ok, text = plan_review_command(arg)
+        _cprint(f"  {text if ok else _DIM + text + _RST}")
+
+    def _handle_review_noarg(self) -> None:
+        """/review with no args — point at the two supported forms."""
+        from cli import _DIM, _RST, _cprint
+
+        _cprint(f"  {_DIM}Usage: /review <task_id> — a plan-backed task id "
+                f"(`plan remind` shows yours; `hermes kanban list` lists ids).{_RST}")
+
+    # ------------------------------------------------------------------
+    # /plan — plan/clarify/review unification (t_6a55f4d6 step 6)
+    # ------------------------------------------------------------------
+
+    def _handle_plan_command(self, cmd: str) -> None:
+        """/plan <text> — create a Manual kanban plan task (no markdown).
+
+        Upstream `/plan [task]` writes a markdown plan to `.hermes/plans/`;
+        this fork's API-compatible surface (F8) instead creates a real
+        Manual-backed plan task: goal = the text, steps = split on blank-line
+        separated lines (or one step when no breakdown is given), presented
+        through the plan tool's approval gate unless yolo'd.
+        """
+        from cli import _DIM, _RST, _cprint
+
+        parts = (cmd or "").strip().split(None, 1)
+        arg = parts[1].strip() if len(parts) > 1 else ""
+        if not arg:
+            _cprint(
+                f"  {_DIM}Usage: /plan <goal text> — creates a Manual kanban "
+                f"plan task (lines after the first become steps); the agent "
+                f"executes it with the `plan` tool. For an execution plan "
+                f"written by the agent itself, just ask it to plan.{_RST}"
+            )
+            return
+        agent = getattr(self, "agent", None)
+        if agent is None:
+            _cprint(f"  {_DIM}/plan needs an active session agent.{_RST}")
+            return
+        lines = [ln.strip() for ln in arg.splitlines() if ln.strip()]
+        goal_line = lines[0] if lines else arg
+        steps = lines[1:] if len(lines) > 1 else [goal_line]
+        try:
+            from tools.plan_tool import plan_tool
+
+            result = plan_tool(
+                agent,
+                "new",
+                title=goal_line[:80],
+                goal=goal_line,
+                steps=steps,
+            )
+        except Exception as exc:
+            result = f"ERROR: /plan failed: {exc}"
+        print(f"  {result}")
+
+    # ------------------------------------------------------------------
 
     def _handle_goal_draft(self, objective: str) -> None:
         """Draft a structured completion contract from a plain objective and
