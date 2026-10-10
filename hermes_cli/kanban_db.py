@@ -3711,6 +3711,95 @@ def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
     return Task.from_row(row) if row else None
 
 
+def _review_ask_target(
+    conn: sqlite3.Connection, task_id: str, *, direction: str
+) -> Optional[str]:
+    """Resolve the profile a review ask should wake for ``direction``.
+
+    ``to-dispatcher`` (a worker handing work off): the AI creator when it
+    differs from the assignee, else the origin-routing profile, else None —
+    the caller falls back to the human (the human is the dispatcher for
+    self-dispatched tasks). ``to-worker`` (a reviewer requesting changes):
+    always the assignee.
+    """
+    row = conn.execute(
+        "SELECT created_by, assignee FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    assignee = str(row["assignee"] or "").strip()
+    if direction == "to-worker":
+        return assignee or None
+    creator = str(row["created_by"] or "").strip()
+    if creator and creator.casefold() != assignee.casefold():
+        return creator
+    origin = get_origin_routing(conn, task_id)
+    if origin:
+        profile = str(origin.get("profile") or "").strip()
+        if profile and profile.casefold() != assignee.casefold():
+            return profile
+    return None
+
+
+def send_dispatcher_message(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    direction: str,
+    kind: str,
+    text: str,
+    actor: str,
+) -> tuple[bool, str]:
+    """One base for every async ask-a-reviewer channel (t_6a55f4d6, F11).
+
+    Writes the durable ask as a ``review-<kind>`` event FIRST (the ask lives
+    on the task row's event log, durable in the same txn), THEN spawns the
+    best-effort ``hermes send -u`` wake-ping to the resolved target. No
+    queue, no retry, NO task-state mutation (HARD RULE): status, steps, and
+    claims are untouched — the response comes back through whichever review
+    channel applies (``plan review`` for plan-bound tasks, the subscriber
+    flow for plain cards).
+
+    Returns ``(ok, detail)``: ok=False means the durable write failed or no
+    wake target exists (human fall-back is the caller's decision).
+    """
+    text = str(text or "").strip()
+    if not text:
+        return False, "message text is required"
+    if direction not in ("to-dispatcher", "to-worker"):
+        return False, f"unknown direction: {direction}"
+    try:
+        with write_txn(conn):
+            row = conn.execute(
+                "SELECT id FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if row is None:
+                return False, f"task {task_id} not found"
+            _append_event(
+                conn,
+                task_id,
+                f"review-{kind}",
+                payload={"text": text, "actor": actor, "direction": direction},
+            )
+    except sqlite3.Error as exc:
+        return False, f"durable ask write failed: {exc}"
+    target = _review_ask_target(conn, task_id, direction=direction)
+    if not target:
+        return True, (
+            "ask recorded; no AI recipient resolves — the human reviewer "
+            "(dashboard) is the fallback"
+        )
+    from hermes_cli._subprocess_compat import spawn_detached
+
+    proc = spawn_detached(["hermes", "send", "-u", target, text])
+    if proc is None:
+        return True, (
+            f"ask recorded; wake-ping to {target} failed to spawn — the ask "
+            "surfaces on the next review/poll"
+        )
+    return True, f"ask recorded and routed to {target}"
+
+
 # Canonical sort-order mappings for ``hermes kanban list --sort``.
 # Each value is a raw SQL fragment appended after ``ORDER BY``.
 VALID_SORT_ORDERS: dict[str, str] = {

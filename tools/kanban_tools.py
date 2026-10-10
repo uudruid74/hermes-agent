@@ -2148,10 +2148,184 @@ KANBAN_LINK_SCHEMA = {
     },
 }
 
+KANBAN_REQUEST_REVIEW_SCHEMA = {
+    "name": "kanban_request_review",
+    "description": (
+        "Hand the task off for review: implementation, self-review, and "
+        "verification are complete and you want the dispatcher (or human) "
+        "to look before it is marked done. Unlike kanban_block this is NOT "
+        "a blocker — it never counts toward block-loop accounting. The ask "
+        "is recorded durably on the task and the dispatcher is woken; the "
+        "dispatcher responds with kanban_request_changes (or, for "
+        "plan-bound tasks, 'plan review'). Falls back to the human "
+        "reviewer when no AI dispatcher resolves."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": _DESC_TASK_ID_DEFAULT,
+            },
+            "summary": {
+                "type": "string",
+                "description": (
+                    "What was implemented and how it was verified, in one "
+                    "or two sentences — shown to the reviewer."
+                ),
+            },
+            "metadata": {
+                "type": "object",
+                "description": (
+                    "Optional structured handoff facts for the reviewer, "
+                    "such as changed_files, tests_run, commit, or decisions."
+                ),
+                "additionalProperties": True,
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["summary"],
+    },
+}
+
+KANBAN_REQUEST_CHANGES_SCHEMA = {
+    "name": "kanban_request_changes",
+    "description": (
+        "Reviewer verdict: return a worker-owned task to its implementer "
+        "with concrete required changes. The ask is recorded durably on "
+        "the task and the worker is woken. Only use from the reviewing "
+        "side after kanban_request_review; use kanban_block only for a "
+        "genuine external blocker."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": _DESC_TASK_ID_DEFAULT,
+            },
+            "reason": {
+                "type": "string",
+                "description": (
+                    "Specific, actionable changes the implementer must "
+                    "make before requesting another review."
+                ),
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["reason"],
+    },
+}
+
 
 # ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
+
+def _handle_request_review(args: dict, **kw) -> str:
+    """Worker hand-off: durable review ask + dispatcher wake (F1 port)."""
+    delegated_err = _reject_delegated_child_mutation("kanban_request_review")
+    if delegated_err:
+        return delegated_err
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error(
+            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
+        )
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    summary = args.get("summary")
+    if not summary or not str(summary).strip():
+        return tool_error(
+            "summary is required — describe what was implemented and how "
+            "it was verified so the reviewer has context"
+        )
+    summary = redact_sensitive_text(str(summary), force=True)
+    metadata = args.get("metadata")
+    if metadata is not None and not isinstance(metadata, dict):
+        return tool_error("metadata must be an object/dict")
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            task = kb.get_task(conn, tid)
+            if task is None:
+                return tool_error(f"task {tid} not found")
+            text = (
+                f"{tid} → review requested\n\n"
+                f"Title: {task.title}\n\n"
+                f"Summary: {summary}\n"
+                + (
+                    f"\nMetadata: {json.dumps(metadata, ensure_ascii=False)}\n"
+                    if metadata else ""
+                )
+                + "\nReply with kanban_request_changes (or 'plan review' for "
+                "plan-bound tasks) to respond."
+            )
+            actor = (
+                os.environ.get("HERMES_KANBAN_TASK") and "worker"
+            ) or "agent"
+            ok, detail = kb.send_dispatcher_message(
+                conn,
+                tid,
+                direction="to-dispatcher",
+                kind="review-requested",
+                text=text,
+                actor=actor,
+            )
+            if not ok:
+                return tool_error(detail)
+            return _ok(task_id=tid, status=task.status, detail=detail)
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.exception("kanban_request_review failed")
+        return tool_error(f"kanban_request_review: {e}")
+
+
+def _handle_request_changes(args: dict, **kw) -> str:
+    """Reviewer verdict: durable changes-ask + worker wake (F1 port)."""
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error(
+            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
+        )
+    reason = args.get("reason")
+    if not reason or not str(reason).strip():
+        return tool_error(
+            "reason is required — describe the changes needed"
+        )
+    reason = redact_sensitive_text(str(reason), force=True)
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            if kb.get_task(conn, tid) is None:
+                return tool_error(f"task {tid} not found")
+            text = (
+                f"{tid} → changes requested\n\n"
+                f"Required changes: {reason}\n\n"
+                "Address these and re-run kanban_request_review."
+            )
+            actor = os.environ.get("HERMES_KANBAN_TASK") or "reviewer"
+            ok, detail = kb.send_dispatcher_message(
+                conn,
+                tid,
+                direction="to-worker",
+                kind="changes-requested",
+                text=text,
+                actor=actor,
+            )
+            if not ok:
+                return tool_error(detail)
+            return _ok(task_id=tid, detail=detail)
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.exception("kanban_request_changes failed")
+        return tool_error(f"kanban_request_changes: {e}")
+
 
 registry.register(
     name="kanban_show",
@@ -2259,4 +2433,22 @@ registry.register(
     handler=_handle_link,
     check_fn=_check_kanban_mode,
     emoji="🔗",
+)
+
+registry.register(
+    name="kanban_request_review",
+    toolset="kanban",
+    schema=KANBAN_REQUEST_REVIEW_SCHEMA,
+    handler=_handle_request_review,
+    check_fn=_check_kanban_mode,
+    emoji="👀",
+)
+
+registry.register(
+    name="kanban_request_changes",
+    toolset="kanban",
+    schema=KANBAN_REQUEST_CHANGES_SCHEMA,
+    handler=_handle_request_changes,
+    check_fn=_check_kanban_mode,
+    emoji="↩",
 )

@@ -681,6 +681,15 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_unblock.add_argument("task_ids", nargs="+")
 
+    p_reopen_review = sub.add_parser(
+        "reopen-review",
+        help="Re-open review on a done/reviewed task — re-wakes the reviewer with the handoff",
+    )
+    p_reopen_review.add_argument("task_id")
+    p_reopen_review.add_argument(
+        "reason", nargs="*", help="Why review must run again (recorded on the ask)"
+    )
+
     p_promote = sub.add_parser(
         "promote",
         help="Manually move one or more todo/blocked tasks to ready (recovery path)",
@@ -1109,6 +1118,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "schedule": _cmd_schedule,
             "unblock":  _cmd_unblock,
             "promote":  _cmd_promote,
+            "reopen-review": _cmd_reopen_review,
             "archive":  _cmd_archive,
             "tail":     _cmd_tail,
             "dispatch": _cmd_dispatch,
@@ -3187,6 +3197,47 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
             else:
                 print(f"Unblocked {tid}" + (f": {reason}" if reason else ""))
     return 0 if not failed else 1
+
+
+def _cmd_reopen_review(args: argparse.Namespace) -> int:
+    """Re-open review on a previously-reviewed task (upstream issue #99577).
+
+    Our loop equivalent of upstream's review→ready flip: record a durable
+    review-reopen ask (who asked and why) and re-wake the resolved reviewer
+    via the one ``send_dispatcher_message`` base. No status change — for a
+    plan-bound task the reviewer answers with 'plan review', for a plain
+    card with kanban_request_changes.
+    """
+    tid = (args.task_id or "").strip()
+    if not tid:
+        print("at least one task_id is required", file=sys.stderr)
+        return 1
+    reason = " ".join(getattr(args, "reason", None) or []).strip()
+    author = _profile_author()
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, tid)
+        if task is None:
+            print(f"kanban: task {tid} not found", file=sys.stderr)
+            return 1
+        text = (
+            f"{tid} → review re-opened by {author}"
+            + (f": {reason}" if reason else "")
+            + "\n\nInspect this task and respond — 'plan review' for "
+            "plan-bound tasks, kanban_request_changes for plain cards."
+        )
+        ok, detail = kb.send_dispatcher_message(
+            conn,
+            tid,
+            direction="to-dispatcher",
+            kind="review-reopened",
+            text=text,
+            actor=author,
+        )
+        if not ok:
+            print(f"kanban: {detail}", file=sys.stderr)
+            return 1
+        print(f"Review re-opened on {tid}: {detail}")
+    return 0
 
 
 def _cmd_promote(args: argparse.Namespace) -> int:
