@@ -587,14 +587,22 @@ def _steps_for_task(task: sqlite3.Row) -> tuple[list[str], int]:
     ):
         raise InvalidTaskState(f"task {task['id']} has no valid steps")
     try:
-        step_no = int(task["task_stepno"])
+        # NULL task_stepno = fresh/unstarted plan (e.g. a reviewer reset that
+        # wiped progress): continue binds it and starts at step 1. The legacy
+        # adapter path (`stepno or 1`) and cmd_remind's unbound message already
+        # assume this semantics; t_a63a4220 (2026-10-09) wedged when the
+        # binding layer instead treated NULL as fatal and the worker could
+        # never claim the plan. A stepno only *ends* NULL via close_plan after
+        # a done/failed/test-complete plan — and those statuses are rejected
+        # by the caller before reaching here.
+        start_at = 1 if task["task_stepno"] is None else int(task["task_stepno"])
     except (TypeError, ValueError) as exc:
-        raise InvalidTaskState(f"task {task['id']} has no active step") from exc
-    if not 1 <= step_no <= len(steps):
+        raise InvalidTaskState(f"task {task['id']} has invalid task_stepno {task['task_stepno']!r}") from exc
+    if not 1 <= start_at <= len(steps):
         raise InvalidTaskState(
-            f"task {task['id']} step {step_no} is outside 1..{len(steps)}"
+            f"task {task['id']} step {start_at} is outside 1..{len(steps)}"
         )
-    return steps, step_no
+    return steps, start_at
 
 
 def _close_plan_in_txn(
