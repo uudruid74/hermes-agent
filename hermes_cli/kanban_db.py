@@ -1368,6 +1368,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Per-plan opt-in: later step summaries are still recorded/notified, then
     -- their pending reviews are resolved automatically.
     plan_auto_approve    INTEGER NOT NULL DEFAULT 0,
+    -- Plan/clarify unification (t_6a55f4d6, F2 core): the worker's durable ask
+    -- to its dispatcher. JSON: {"kind": "needs_clarify"|"tool_limit_hit",
+    -- "question": str, "step": int, "asked_at": int}. The review command
+    -- dual-modes on this flag; cleared when the response is recorded.
+    clarify_flag         TEXT,
     debug_plan_id        TEXT,
     board                TEXT NOT NULL DEFAULT 'default',
     root                 TEXT,
@@ -2811,6 +2816,14 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(conn, "tasks", "root", "root TEXT")
     if "cron" not in cols:
         _add_column_if_missing(conn, "tasks", "cron", "cron TEXT")
+    if "clarify_flag" not in cols:
+        # Plan/clarify unification (t_6a55f4d6, F2 core): the worker's durable
+        # ask to its dispatcher. JSON: {"kind": "needs_clarify"|"tool_limit_hit",
+        # "question": str, "step": int, "asked_at": int}. The review command
+        # dual-modes on this flag (clarify answer/guide vs step review); it is
+        # cleared when the response is recorded. Written through the worker's
+        # plan binding — never mutates task status/steps (HARD RULE).
+        _add_column_if_missing(conn, "tasks", "clarify_flag", "clarify_flag TEXT")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_board ON tasks(board)")
 
     # task_events gained a run_id column; back-fill it as NULL for

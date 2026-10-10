@@ -557,6 +557,24 @@ def block_active_plan_at_iteration_limit(agent, *, used: int, maximum: int) -> b
     parked = kanban_db.park_plan_task(conn, binding.task_id, detail=detail)
     if not parked:
         return False
+    # F2 dual-mode: write the durable tool_limit_hit flag BEFORE the wake-ping
+    # so the dispatcher's 'plan review' command answers as a guide, not a step
+    # review. Annotation-only write; parking has already succeeded.
+    from hermes_cli.execution_bindings import (
+        ExecutionBindingError as _ebb_error,
+        set_clarify_flag as _set_clarify_flag,
+    )
+
+    try:
+        _set_clarify_flag(
+            conn,
+            binding.task_id,
+            kind="tool_limit_hit",
+            question=detail,
+            step_no=step_no,
+        )
+    except _ebb_error as exc:
+        logger.warning("tool-limit flag for task %s failed: %s", binding.task_id, exc)
     # The parked-state prompt goes to the plan's dispatcher (an agent), not
     # through the generic kanban notification — this is the "separate prompt"
     # Evan specified. Best-effort: parking itself has already succeeded.
@@ -995,6 +1013,46 @@ def cmd_review(
     reviewer = _legacy()._get_agent_name(agent)
     if reviewer.casefold() != dispatcher.casefold():
         return f"ERROR: Task {task_id} must be reviewed by dispatcher {dispatcher}"
+
+    # F2 dual-mode: a pending clarify/tool-limit flag turns this review
+    # command into a clarify ANSWER instead of a step review. The flag write
+    # was the durable ask; the response is delivered verbatim to the worker
+    # and the flag cleared. No pending step review is required or touched.
+    flag = bindings.get_clarify_flag(conn, task_id)
+    if flag is not None:
+        if not response:
+            return (
+                f"ERROR: Plan {task_id} has a pending {flag.get('kind', 'clarify')} "
+                "ask from the worker — a response is required to answer it"
+            )
+        bindings.clear_clarify_flag(conn, task_id)
+        kind = str(flag.get("kind") or "needs_clarify")
+        step_no = flag.get("step")
+        if kind == "tool_limit_hit":
+            worker_message = (
+                f"{reviewer} responded to your tool-call-limit ask on "
+                f"{task_id} (Step {step_no}):\n\n{response}"
+            )
+        else:
+            worker_message = (
+                f"{reviewer} answered your clarifying question on "
+                f"{task_id} (Step {step_no}):\n\n{response}"
+            )
+        failure = _send_user(str(task["assignee"]), worker_message)
+        if failure:
+            # The response IS durable (it was the caller's argument); the
+            # worker wake is best-effort in exactly one direction: if it
+            # fails the worker re-reads the flag on its next poll. But the
+            # flag was just cleared, so surface the failure loudly rather
+            # than pretend delivery happened.
+            return (
+                f"Clarify response recorded for {task_id}, but worker "
+                f"notification failed: {failure}"
+            )
+        return (
+            f"Clarify response delivered to worker for {task_id} "
+            f"(Step {step_no}, {kind})."
+        )
 
     pending = bindings.pending_step_review(conn, task_id)
     if pending is None:
@@ -1589,7 +1647,85 @@ def cmd_approve(agent, task_id: str) -> str:
     except bindings.ExecutionBindingError as exc:
         return f"ERROR: {exc}"
     # Activating a blocked Plan changes the active step — re-point the subject
-    # so the transition triggers a FULL compaction.  See
+    # so the transition triggers a FULL compaction. See
     # _sync_subject_from_binding.
     _sync_subject_from_binding(agent)
     return f"Task {task_id} approved: {task['title']}"
+
+
+def cmd_clarify(agent, question: str) -> str:
+    """Ask the plan's dispatcher a clarifying question (F2 channel).
+
+    Routing (hard, in code — never by prompt):
+      1. The active plan has an AI dispatcher → write the durable
+         ``needs_clarify`` flag FIRST, then wake-ping the dispatcher via
+         ``_send_user``. The worker parks its turn on the response arriving
+         through ``plan review`` (the response is delivered verbatim).
+      2. Self-dispatch (creator IS the assignee) or no AI dispatcher → the
+         HUMAN is the dispatcher: the byte-identical legacy clarify_tool path
+         runs (interactive callback), and nothing is written to the flag.
+
+    Returns the dispatcher's/human's answer text on success.
+    """
+    from hermes_cli import execution_bindings as bindings
+
+    if not question or not question.strip():
+        return "ERROR: 'clarify' requires a question"
+    question = question.strip()
+
+    conn = _legacy()._get_kanban_db()
+    key, binding, error = _current(conn, agent)
+    if error:
+        return error
+    if key is None or binding is None:
+        return "ERROR: No active task"
+    task = conn.execute(
+        "SELECT * FROM tasks WHERE id=?", (binding.task_id,)
+    ).fetchone()
+    if task is None:
+        return f"ERROR: Task {binding.task_id} not found"
+    if bindings.get_clarify_flag(conn, binding.task_id) is not None:
+        return (
+            f"ERROR: Plan {binding.task_id} already has a pending clarify ask; "
+            "wait for the dispatcher's review response before asking again"
+        )
+
+    dispatcher = _dispatcher_for_task(conn, binding.task_id)
+    if not dispatcher:
+        # Self-dispatched / human-dispatched plan: the legacy interactive
+        # path, byte-identical. The human IS the dispatcher here.
+        callback = getattr(agent, "clarify_callback", None)
+        if callback is None:
+            return (
+                "ERROR: No dispatcher and no interactive user session "
+                "available to answer the clarifying question."
+            )
+        answer = _legacy().clarify_tool(
+            question, callback=callback, agent=agent, task_id=binding.task_id
+        )
+        try:
+            return str(json.loads(answer).get("user_response", ""))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            return f"ERROR: Clarify answer was not recorded: {exc}"
+
+    # Externally-dispatched plan: flag-first (durable), THEN the wake-ping.
+    bindings.set_clarify_flag(
+        conn,
+        binding.task_id,
+        kind="needs_clarify",
+        question=question,
+        step_no=int(task["task_stepno"] or 1),
+    )
+    ping = (
+        f"{binding.task_id} → your worker is asking for clarification "
+        f"(Step {task['task_stepno'] or 1}).\n\n"
+        f"Question: {question}\n\n"
+        "Reply with 'plan review' — pass the task id, decision 'approved', "
+        "and your answer as the response."
+    )
+    failure = _send_user(dispatcher, ping)
+    suffix = f" Dispatcher notification failed: {failure}" if failure else ""
+    return (
+        f"Clarify ask recorded on plan {binding.task_id} and routed to "
+        f"dispatcher {dispatcher}.{suffix}"
+    )

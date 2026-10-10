@@ -537,7 +537,8 @@ def activate_plan(
             )
 
         changed = conn.execute(
-            "UPDATE tasks SET status = 'manual', block_kind = NULL, previous_task = ? "
+            "UPDATE tasks SET status = 'manual', block_kind = NULL, previous_task = ?, "
+            "clarify_flag = NULL "
             "WHERE id = ? AND status IN ('blocked', 'manual')",
             (expected_parent_task_id, plan_id),
         ).rowcount
@@ -834,6 +835,68 @@ def _notify_root_plan_closed(
         summary=summary_row["body"] if summary_row else None,
         title=task["title"],
     )
+
+
+def set_clarify_flag(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    kind: str,
+    question: str,
+    step_no: int,
+) -> None:
+    """Write the worker's durable ask to its dispatcher on the plan row.
+
+    The F2 core (t_6a55f4d6): the flag IS the ask. It is written BEFORE any
+    wake-ping is sent, so a dropped ping degrades to "the dispatcher sees the
+    flag on next review/poll" instead of a worker deadlock. Touches only this
+    annotation column — never status/steps/claims (HARD RULE).
+
+    Raises ValueError on an unknown flag kind.
+    """
+    import json as _json
+    import time as _time
+
+    if kind not in ("needs_clarify", "tool_limit_hit"):
+        raise ValueError(f"unknown clarify flag kind: {kind}")
+    payload = {
+        "kind": kind,
+        "question": question,
+        "step": int(step_no),
+        "asked_at": int(_time.time()),
+    }
+    with write_txn(conn):
+        changed = conn.execute(
+            "UPDATE tasks SET clarify_flag = ? WHERE id = ?",
+            (_json.dumps(payload, ensure_ascii=False), task_id),
+        ).rowcount
+        if changed != 1:
+            raise InvalidTaskState(f"plan {task_id} not found for clarify flag")
+
+
+def get_clarify_flag(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
+    """Return the plan's pending clarify flag as a dict, or None."""
+    import json as _json
+
+    row = conn.execute(
+        "SELECT clarify_flag FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None or not row["clarify_flag"]:
+        return None
+    try:
+        payload = _json.loads(row["clarify_flag"])
+        return payload if isinstance(payload, dict) else None
+    except (ValueError, TypeError):
+        return None
+
+
+def clear_clarify_flag(conn: sqlite3.Connection, task_id: str) -> None:
+    """Clear the plan's clarify flag once its response has been recorded."""
+
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET clarify_flag = NULL WHERE id = ?", (task_id,)
+        )
 
 
 def _repeat_target(conn: sqlite3.Connection, task_id: str) -> Optional[tuple[str, int]]:
