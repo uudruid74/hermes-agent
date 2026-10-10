@@ -65,8 +65,8 @@ def test_wrapper_is_removed_by_stripping(wrapper: str) -> None:
 def test_stacked_role_prefixes_are_collapsed() -> None:
     # An earlier compaction flattened newlines to spaces, so prefixes repeat
     # mid-string; a ``^``-anchored pattern would only catch the first run.
-    text = "[USER]: [USER]: [ASSISTANT]: Use the plan_tool to create a plan"
-    assert _strip_boilerplate(text) == "Use the plan_tool to create a plan"
+    text = "[USER]: [USER]: [ASSISTANT]: Use the plan to create a plan"
+    assert _strip_boilerplate(text) == "Use the plan to create a plan"
 
 
 def test_real_content_survives_stripping_untouched() -> None:

@@ -37,7 +37,7 @@ from agent.tool_dispatch_helpers import (
     _is_multimodal_tool_result,
     _multimodal_text_summary,
     _append_subdir_hint_to_multimodal,
-    _plan_tool_batch_segments,
+    _plan_batch_segments,
     make_tool_result_message,
 )
 from tools.terminal_tool import (
@@ -1529,7 +1529,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     # session DB, read-only) and accepted by session_search(),
                     # but was missing from this whitelist — so cross-profile
                     # recall silently read the CURRENT profile instead. Same
-                    # class as the plan_tool proof/step drop: present at both
+                    # class as the plan proof/step drop: present at both
                     # ends, dropped in the middle.
                     profile=next_args.get("profile"),
                     db=session_db,
@@ -1609,10 +1609,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('clarify', function_args, tool_duration, result=function_result)}")
-        elif function_name == "plan_tool":
+        elif function_name == "plan":
             def _execute(next_args: dict) -> Any:
-                from tools.plan_tool import plan_tool as _plan_tool
-                return _plan_tool(
+                from tools.plan import plan as _plan
+                return _plan(
                     agent=agent,
                     command=next_args.get("command", ""),
                     title=next_args.get("title"),
@@ -1633,9 +1633,15 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     pre_approved=next_args.get("pre_approved", False),
                     # `decision` and `step` are declared in the tool schema;
                     # keep this explicit forwarding list aligned with the
-                    # registered plan_tool handler.
+                    # registered plan handler.
                     decision=next_args.get("decision"),
                     step=next_args.get("step"),
+                    # `response` (renamed from reason's sibling, t_6a55f4d6
+                    # step 1) and `question` (the F2 clarify channel, step 3)
+                    # are declared in the schema — forward them or a routed
+                    # clarify ask silently loses its question.
+                    response=next_args.get("response"),
+                    question=next_args.get("question"),
                     # Same whitelist gap: `new` accepts a parent_task_id to nest
                     # a sub-plan, and the schema declares it — but it was not
                     # forwarded here, so a nested plan silently became a root
@@ -1654,7 +1660,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             ))
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
-                agent._vprint(f"  {_get_cute_tool_message_impl('plan_tool', function_args, tool_duration, result=function_result)}")
+                agent._vprint(f"  {_get_cute_tool_message_impl('plan', function_args, tool_duration, result=function_result)}")
         elif function_name == "read_terminal":
             def _execute(next_args: dict) -> Any:
                 from tools.read_terminal_tool import read_terminal_tool as _read_terminal_tool
@@ -2116,7 +2122,7 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
     """Execute a mixed tool-call batch as ordered parallel/sequential segments.
 
     ``segments`` is the ``(kind, calls)`` plan from
-    ``_plan_tool_batch_segments``: maximal contiguous runs of parallel-safe
+    ``_plan_batch_segments``: maximal contiguous runs of parallel-safe
     calls execute on the concurrent path, barrier calls on the sequential
     path, strictly in the model's original call order. Because segments are
     contiguous, every tool result is still appended one-per-call in emission
@@ -2140,7 +2146,7 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
     if segments is None:
         _active_env = get_active_env(effective_task_id)
         _exec_cwd = Path(_active_env.cwd) if _active_env is not None and _active_env.cwd else None
-        segments = _plan_tool_batch_segments(assistant_message.tool_calls, execution_cwd=_exec_cwd)
+        segments = _plan_batch_segments(assistant_message.tool_calls, execution_cwd=_exec_cwd)
 
     for kind, calls in segments:
         if getattr(agent, "_incremental_persistence_failed", False):

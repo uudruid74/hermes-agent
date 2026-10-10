@@ -3,7 +3,7 @@
 A model response containing several parallel-safe reads plus one unsafe
 tool used to lose ALL concurrency: `_should_parallelize_tool_batch` was
 all-or-nothing, so one barrier call forced the entire batch onto the
-sequential path.  `_plan_tool_batch_segments` now splits the batch into
+sequential path.  `_plan_batch_segments` now splits the batch into
 ordered segments — maximal contiguous runs of parallel-safe calls execute
 concurrently, barrier calls sequentially — while preserving:
 
@@ -24,7 +24,7 @@ import pytest
 
 from run_agent import AIAgent
 from agent.tool_dispatch_helpers import (
-    _plan_tool_batch_segments,
+    _plan_batch_segments,
     _should_parallelize_tool_batch,
 )
 from agent.prompt_builder import STEER_MARKER_OPEN
@@ -55,7 +55,7 @@ def _flatten_ids(segments):
 class TestPlanToolBatchSegments:
     def test_all_safe_batch_is_single_parallel_segment(self):
         calls = [_tc("web_search"), _tc("read_file", '{"path":"a.py"}'), _tc("web_extract")]
-        segments = _plan_tool_batch_segments(calls)
+        segments = _plan_batch_segments(calls)
         assert _kinds(segments) == ["parallel"]
         assert _flatten_ids(segments) == [c.id for c in calls]
 
@@ -67,7 +67,7 @@ class TestPlanToolBatchSegments:
             _tc("read_file", '{"path":"a.py"}', call_id="r3"),
             _tc("terminal", '{"command":"echo hi"}', call_id="b1"),
         ]
-        segments = _plan_tool_batch_segments(calls)
+        segments = _plan_batch_segments(calls)
         assert _kinds(segments) == ["parallel", "sequential"]
         assert [tc.id for tc in segments[0][1]] == ["r1", "r2", "r3"]
         assert [tc.id for tc in segments[1][1]] == ["b1"]
@@ -80,7 +80,7 @@ class TestPlanToolBatchSegments:
             _tc("web_search", call_id="r3"),
             _tc("web_search", call_id="r4"),
         ]
-        segments = _plan_tool_batch_segments(calls)
+        segments = _plan_batch_segments(calls)
         assert _kinds(segments) == ["parallel", "sequential", "parallel"]
         assert _flatten_ids(segments) == ["r1", "r2", "b1", "r3", "r4"]
 
@@ -93,7 +93,7 @@ class TestPlanToolBatchSegments:
             _tc("terminal", '{"command":"make"}', call_id="b1"),
             _tc("web_search", call_id="r3"),
         ]
-        segments = _plan_tool_batch_segments(calls)
+        segments = _plan_batch_segments(calls)
         assert _kinds(segments) == ["parallel", "sequential"]
         assert [tc.id for tc in segments[1][1]] == ["b1", "r3"]
 
@@ -104,7 +104,7 @@ class TestPlanToolBatchSegments:
             _tc("web_search", call_id="r2"),
             _tc("clarify", '{"question":"?"}', call_id="c1"),
         ]
-        segments = _plan_tool_batch_segments(calls)
+        segments = _plan_batch_segments(calls)
         assert _kinds(segments) == ["parallel", "sequential"]
         assert [tc.id for tc in segments[1][1]] == ["c1"]
 
@@ -118,7 +118,7 @@ class TestPlanToolBatchSegments:
             _tc("write_file", '{"path":"a.py","content":"x"}', call_id="w2"),
             _tc("web_search", call_id="r2"),
         ]
-        segments = _plan_tool_batch_segments(calls)
+        segments = _plan_batch_segments(calls)
         # w2 conflicts with w1 → closes the first run; w2+r2 form the second.
         assert _kinds(segments) == ["parallel", "parallel"]
         assert [tc.id for tc in segments[0][1]] == ["w1", "r1"]
@@ -149,7 +149,7 @@ class TestPlanToolBatchSegments:
             _tc("patch", patch_args, call_id="p1"),
             _tc("write_file", '{"path":"real.py","content":"x"}', call_id="w1"),
         ]
-        segments = _plan_tool_batch_segments(calls, execution_cwd=tmp_path)
+        segments = _plan_batch_segments(calls, execution_cwd=tmp_path)
         assert _flatten_ids(segments) == ["p1", "w1"]
         # Overlap on real.py must prevent a single parallel segment.
         assert not (
@@ -184,7 +184,7 @@ class TestPlanToolBatchSegments:
             _tc("patch", patch_args, call_id="p1"),
             _tc("read_file", '{"path":"b.py"}', call_id="r1"),
         ]
-        segments = _plan_tool_batch_segments(calls, execution_cwd=tmp_path)
+        segments = _plan_batch_segments(calls, execution_cwd=tmp_path)
         assert _flatten_ids(segments) == ["p1", "r1"]
         assert not (
             len(segments) == 1
@@ -211,7 +211,7 @@ class TestPlanToolBatchSegments:
             _tc("write_file", '{"path":"other.py","content":"x"}', call_id="w1"),
             _tc("read_file", '{"path":"real.py"}', call_id="r1"),
         ]
-        segments = _plan_tool_batch_segments(calls, execution_cwd=tmp_path)
+        segments = _plan_batch_segments(calls, execution_cwd=tmp_path)
         # p1+w1 are disjoint → can share a parallel run; r1 overlaps real.py → new run.
         assert _flatten_ids(segments) == ["p1", "w1", "r1"]
         assert [tc.id for tc in segments[0][1]] == ["p1", "w1"]
@@ -224,7 +224,7 @@ class TestPlanToolBatchSegments:
             _tc("web_search", call_id="r1"),
             _tc("web_search", call_id="r2"),
         ]
-        segments = _plan_tool_batch_segments(calls)
+        segments = _plan_batch_segments(calls)
         assert _kinds(segments) == ["sequential", "parallel"]
 
     def test_flattened_segments_always_preserve_emission_order(self):
@@ -235,7 +235,7 @@ class TestPlanToolBatchSegments:
             _tc("read_file", '{"path":"a.py"}', call_id="r2"),
             _tc("read_file", '{"path":"b.py"}', call_id="r3"),
         ]
-        segments = _plan_tool_batch_segments(calls)
+        segments = _plan_batch_segments(calls)
         assert _flatten_ids(segments) == ["b1", "r1", "c1", "r2", "r3"]
 
 
@@ -257,7 +257,7 @@ class TestReaderWriterPathRoles:
             _tc("patch", '{"path":"scratch/sample.txt","old_string":"a","new_string":"patched"}', call_id="w1"),
             _tc("search_files", '{"pattern":"patched","path":"scratch"}', call_id="s1"),
         ]
-        segments = _plan_tool_batch_segments(calls, execution_cwd=tmp_path)
+        segments = _plan_batch_segments(calls, execution_cwd=tmp_path)
         # Both calls survive, but never in the same PARALLEL segment.
         # (A shared *sequential* segment is fine — sequential is ordered.)
         assert _flatten_ids(segments) == ["w1", "s1"]
@@ -275,7 +275,7 @@ class TestReaderWriterPathRoles:
             _tc("write_file", '{"path":"out/notes.txt","content":"x"}', call_id="w1"),
             _tc("search_files", '{"pattern":"notes"}', call_id="s1"),
         ]
-        segments = _plan_tool_batch_segments(calls, execution_cwd=tmp_path)
+        segments = _plan_batch_segments(calls, execution_cwd=tmp_path)
         for kind, seg_calls in segments:
             ids = [tc.id for tc in seg_calls]
             assert not (kind == "parallel" and {"w1", "s1"} <= set(ids))
@@ -288,7 +288,7 @@ class TestReaderWriterPathRoles:
             _tc("read_file", '{"path":"a.py"}', call_id="r1"),
             _tc("read_file", '{"path":"a.py"}', call_id="r2"),
         ]
-        segments = _plan_tool_batch_segments(calls, execution_cwd=tmp_path)
+        segments = _plan_batch_segments(calls, execution_cwd=tmp_path)
         assert _kinds(segments) == ["parallel"]
         assert [tc.id for tc in segments[0][1]] == ["r1", "r2"]
 
@@ -298,7 +298,7 @@ class TestReaderWriterPathRoles:
             _tc("read_file", '{"path":"src/a.py"}', call_id="r1"),
             _tc("search_files", '{"pattern":"foo","path":"src"}', call_id="s1"),
         ]
-        segments = _plan_tool_batch_segments(calls, execution_cwd=tmp_path)
+        segments = _plan_batch_segments(calls, execution_cwd=tmp_path)
         assert _kinds(segments) == ["parallel"]
 
     def test_search_files_disjoint_from_write_stays_parallel(self, tmp_path, monkeypatch):
@@ -308,7 +308,7 @@ class TestReaderWriterPathRoles:
             _tc("write_file", '{"path":"src/a.py","content":"x"}', call_id="w1"),
             _tc("search_files", '{"pattern":"foo","path":"docs"}', call_id="s1"),
         ]
-        segments = _plan_tool_batch_segments(calls, execution_cwd=tmp_path)
+        segments = _plan_batch_segments(calls, execution_cwd=tmp_path)
         assert _kinds(segments) == ["parallel"]
         assert [tc.id for tc in segments[0][1]] == ["w1", "s1"]
 
@@ -318,7 +318,7 @@ class TestReaderWriterPathRoles:
             _tc("write_file", '{"path":"a.py","content":"1"}', call_id="w1"),
             _tc("write_file", '{"path":"a.py","content":"2"}', call_id="w2"),
         ]
-        segments = _plan_tool_batch_segments(calls, execution_cwd=tmp_path)
+        segments = _plan_batch_segments(calls, execution_cwd=tmp_path)
         for kind, seg_calls in segments:
             ids = [tc.id for tc in seg_calls]
             assert not (kind == "parallel" and {"w1", "w2"} <= set(ids))
@@ -331,7 +331,7 @@ class TestReaderWriterPathRoles:
             _tc("read_file", '{"path":"a.py"}', call_id="r1"),
             _tc("write_file", '{"path":"a.py","content":"x"}', call_id="w1"),
         ]
-        segments = _plan_tool_batch_segments(calls, execution_cwd=tmp_path)
+        segments = _plan_batch_segments(calls, execution_cwd=tmp_path)
         for kind, seg_calls in segments:
             ids = [tc.id for tc in seg_calls]
             assert not (kind == "parallel" and {"r1", "w1"} <= set(ids))
@@ -580,7 +580,7 @@ class TestSegmentedDispatchIntegration:
             preview_size=16,
         )
 
-        assert _kinds(_plan_tool_batch_segments(calls)) == expected_segment_kinds
+        assert _kinds(_plan_batch_segments(calls)) == expected_segment_kinds
 
         def fake_handle(name, args, task_id, **kwargs):
             if kwargs["tool_call_id"].endswith("large"):
@@ -616,7 +616,7 @@ class TestSegmentedDispatchIntegration:
             preview_size=16,
         )
 
-        assert _kinds(_plan_tool_batch_segments(calls)) == ["sequential"]
+        assert _kinds(_plan_batch_segments(calls)) == ["sequential"]
         assert agent.steer("preserve malformed-call steer after budget enforcement")
 
         with patch("agent.tool_executor._budget_for_agent", return_value=budget):

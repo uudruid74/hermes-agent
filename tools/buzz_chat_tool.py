@@ -3,7 +3,7 @@ buzz_chat_tool — direct Buzz channel chat for Hermes agents.
 
 Commands: send, read, members, thread
 
-A registered internal tool (like plan_tool) so agents can read/send
+A registered internal tool (like plan) so agents can read/send
 Buzz messages WITHOUT the terminal write-gate. No MCP, no terminal
 dependency — shells out to the buzz CLI binary (JSON in/out), same
 approach the buzz platform adapter uses.
@@ -208,7 +208,7 @@ BUZZ_CHAT_SCHEMA = {
         "Direct Buzz channel chat (Nostr relay). Commands: "
         "send (post a message), read (fetch recent messages), "
         "members (list channel members), thread (fetch a message thread). "
-        "Bypasses the terminal write-gate like plan_tool — no active plan "
+        "Bypasses the terminal write-gate like plan — no active plan "
         "needed to chat."
     ),
     "parameters": {

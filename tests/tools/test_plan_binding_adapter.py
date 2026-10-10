@@ -7,7 +7,7 @@ import time
 from types import SimpleNamespace
 
 from hermes_cli.kanban_db import SCHEMA_SQL
-from tools import plan_binding_adapter, plan_tool
+from tools import plan_binding_adapter, plan
 
 
 class _SessionDB:
@@ -43,13 +43,13 @@ def _db() -> sqlite3.Connection:
 
 def test_new_approval_binds_compression_root_not_session_or_env(monkeypatch):
     conn = _db()
-    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    monkeypatch.setattr(plan, "_get_kanban_db", lambda board=None: conn)
     monkeypatch.setattr(
-        plan_tool, "clarify_tool", lambda *_args, **_kwargs: '{"user_response":"Approve"}'
+        plan, "clarify_tool", lambda *_args, **_kwargs: '{"user_response":"Approve"}'
     )
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_wrong_env_task")
 
-    result = plan_tool.plan_tool(
+    result = plan.plan(
         _Agent(), "new", title="Bound plan", goal="Bind safely", steps=["work"]
     )
 
@@ -64,16 +64,16 @@ def test_new_approval_binds_compression_root_not_session_or_env(monkeypatch):
 
 def test_new_approval_question_contains_full_plan(monkeypatch):
     conn = _db()
-    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    monkeypatch.setattr(plan, "_get_kanban_db", lambda board=None: conn)
     seen = {}
 
     def approve(question, **_kwargs):
         seen["question"] = question
         return '{"user_response":"Approve"}'
 
-    monkeypatch.setattr(plan_tool, "clarify_tool", approve)
+    monkeypatch.setattr(plan, "clarify_tool", approve)
 
-    plan_tool.plan_tool(
+    plan.plan(
         _Agent(),
         "new",
         title="Visible plan",
@@ -89,9 +89,9 @@ def test_new_approval_question_contains_full_plan(monkeypatch):
 
 def test_iteration_limit_parks_manual_plan_in_attention(monkeypatch):
     conn = _db()
-    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    monkeypatch.setattr(plan, "_get_kanban_db", lambda board=None: conn)
     monkeypatch.setattr(
-        plan_tool, "clarify_tool", lambda *_args, **_kwargs: '{"user_response":"Approve"}'
+        plan, "clarify_tool", lambda *_args, **_kwargs: '{"user_response":"Approve"}'
     )
     notified = []
     monkeypatch.setattr(
@@ -99,7 +99,7 @@ def test_iteration_limit_parks_manual_plan_in_attention(monkeypatch):
         lambda task_id, status, **kwargs: notified.append((task_id, status, kwargs)),
     )
     agent = _Agent()
-    plan_tool.plan_tool(
+    plan.plan(
         agent,
         "new",
         title="Long step",
@@ -150,12 +150,12 @@ def test_iteration_limit_does_not_block_plan_with_pending_review(monkeypatch):
     from hermes_cli import execution_bindings
 
     conn = _db()
-    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    monkeypatch.setattr(plan, "_get_kanban_db", lambda board=None: conn)
     monkeypatch.setattr(
-        plan_tool, "clarify_tool", lambda *_args, **_kwargs: '{"user_response":"Approve"}'
+        plan, "clarify_tool", lambda *_args, **_kwargs: '{"user_response":"Approve"}'
     )
     agent = _Agent()
-    plan_tool.plan_tool(
+    plan.plan(
         agent,
         "new",
         title="Submitted step",
@@ -191,12 +191,12 @@ def test_iteration_limit_does_not_block_plan_with_pending_review(monkeypatch):
 
 def test_approve_question_contains_full_plan(monkeypatch):
     conn = _db()
-    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    monkeypatch.setattr(plan, "_get_kanban_db", lambda board=None: conn)
     monkeypatch.setattr(
-        plan_tool, "clarify_tool", lambda *_args, **_kwargs: '{"user_response":""}'
+        plan, "clarify_tool", lambda *_args, **_kwargs: '{"user_response":""}'
     )
     agent = _Agent()
-    plan_tool.plan_tool(
+    plan.plan(
         agent,
         "new",
         title="Blocked plan",
@@ -212,7 +212,7 @@ def test_approve_question_contains_full_plan(monkeypatch):
 
     agent.clarify_callback = approve
 
-    plan_tool.plan_tool(agent, "approve", task_id=task_id)
+    plan.plan(agent, "approve", task_id=task_id)
 
     assert "## Plan: Blocked plan" in seen["question"]
     assert "**Goal:** Show the blocked plan" in seen["question"]
@@ -229,17 +229,17 @@ def test_new_nests_implicitly_under_the_active_plan(monkeypatch):
     any depth, no explicit parent_task_id required.
     """
     conn = _db()
-    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    monkeypatch.setattr(plan, "_get_kanban_db", lambda board=None: conn)
     monkeypatch.setattr(
-        plan_tool, "clarify_tool", lambda *_args, **_kwargs: '{"user_response":"Approve"}'
+        plan, "clarify_tool", lambda *_args, **_kwargs: '{"user_response":"Approve"}'
     )
     agent = _Agent()
 
-    first = plan_tool.plan_tool(agent, "new", title="Parent", goal="parent", steps=["one"])
+    first = plan.plan(agent, "new", title="Parent", goal="parent", steps=["one"])
     assert first.startswith("TASK APPROVED")
     parent_id = conn.execute("SELECT task_id FROM execution_bindings").fetchone()[0]
 
-    child = plan_tool.plan_tool(
+    child = plan.plan(
         agent, "new", title="Implicit child", goal="no parent arg", steps=["one"]
     )
     assert child.startswith("TASK APPROVED"), child
@@ -257,17 +257,17 @@ def test_new_nests_implicitly_under_the_active_plan(monkeypatch):
 
 def test_new_rejects_a_parent_that_is_not_the_active_plan(monkeypatch):
     conn = _db()
-    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    monkeypatch.setattr(plan, "_get_kanban_db", lambda board=None: conn)
     monkeypatch.setattr(
-        plan_tool, "clarify_tool", lambda *_args, **_kwargs: '{"user_response":"Approve"}'
+        plan, "clarify_tool", lambda *_args, **_kwargs: '{"user_response":"Approve"}'
     )
     agent = _Agent()
 
-    first = plan_tool.plan_tool(agent, "new", title="Parent", goal="parent", steps=["one"])
+    first = plan.plan(agent, "new", title="Parent", goal="parent", steps=["one"])
     assert first.startswith("TASK APPROVED")
     before = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
 
-    blocked = plan_tool.plan_tool(
+    blocked = plan.plan(
         agent, "new", title="Wrong parent", goal="no", steps=["one"],
         parent_task_id="t_doesnotexist",
     )
@@ -285,19 +285,19 @@ def test_delegated_new_does_not_nest_under_the_callers_active_plan(monkeypatch):
     dispatched plan starts its own chain: previous_task must be NULL.
     """
     conn = _db()
-    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    monkeypatch.setattr(plan, "_get_kanban_db", lambda board=None: conn)
     monkeypatch.setattr(
-        plan_tool, "clarify_tool", lambda *_args, **_kwargs: '{"user_response":"Approve"}'
+        plan, "clarify_tool", lambda *_args, **_kwargs: '{"user_response":"Approve"}'
     )
     agent = _Agent()
 
     # The caller has its own active Plan — the dispatcher's own work.
-    own = plan_tool.plan_tool(agent, "new", title="My own plan", goal="mine", steps=["one"])
+    own = plan.plan(agent, "new", title="My own plan", goal="mine", steps=["one"])
     assert own.startswith("TASK APPROVED"), own
     own_task = conn.execute("SELECT task_id FROM execution_bindings").fetchone()[0]
 
     # Now dispatch a plan at ANOTHER agent while our own plan is still active.
-    delegated = plan_tool.plan_tool(
+    delegated = plan.plan(
         agent, "new", title="Worker plan", goal="theirs", steps=["one"],
         assignee="ornith",
     )
@@ -324,17 +324,17 @@ def test_delegated_new_rejects_an_explicit_parent(monkeypatch):
     worker's binding.
     """
     conn = _db()
-    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    monkeypatch.setattr(plan, "_get_kanban_db", lambda board=None: conn)
     monkeypatch.setattr(
-        plan_tool, "clarify_tool", lambda *_args, **_kwargs: '{"user_response":"Approve"}'
+        plan, "clarify_tool", lambda *_args, **_kwargs: '{"user_response":"Approve"}'
     )
     agent = _Agent()
 
-    plan_tool.plan_tool(agent, "new", title="My own plan", goal="mine", steps=["one"])
+    plan.plan(agent, "new", title="My own plan", goal="mine", steps=["one"])
     own_task = conn.execute("SELECT task_id FROM execution_bindings").fetchone()[0]
     before = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
 
-    blocked = plan_tool.plan_tool(
+    blocked = plan.plan(
         agent, "new", title="Nested dispatch", goal="theirs", steps=["one"],
         assignee="ornith", parent_task_id=own_task,
     )
@@ -351,14 +351,14 @@ def test_closing_a_cross_agent_child_refuses_to_restore_foreign_parent(monkeypat
     closing its own plan can never be handed the dispatcher's task.
     """
     conn = _db()
-    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    monkeypatch.setattr(plan, "_get_kanban_db", lambda board=None: conn)
     monkeypatch.setattr(
-        plan_tool, "clarify_tool", lambda *_args, **_kwargs: '{"user_response":"Approve"}'
+        plan, "clarify_tool", lambda *_args, **_kwargs: '{"user_response":"Approve"}'
     )
     agent = _Agent()
 
     # A dispatcher's own active plan.
-    plan_tool.plan_tool(agent, "new", title="Dispatcher plan", goal="mine", steps=["one"])
+    plan.plan(agent, "new", title="Dispatcher plan", goal="mine", steps=["one"])
     own_task = conn.execute("SELECT task_id FROM execution_bindings").fetchone()[0]
 
     # A delegated child pointed at it by hand — exactly what the pre-fix code
@@ -431,16 +431,16 @@ def test_closing_a_cross_agent_child_refuses_to_restore_foreign_parent(monkeypat
 
 def test_advance_closes_binding_and_records_required_summary(monkeypatch):
     conn = _db()
-    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    monkeypatch.setattr(plan, "_get_kanban_db", lambda board=None: conn)
     monkeypatch.setattr(
-        plan_tool, "clarify_tool", lambda *_args, **_kwargs: '{"user_response":"Approve"}'
+        plan, "clarify_tool", lambda *_args, **_kwargs: '{"user_response":"Approve"}'
     )
     agent = _Agent()
-    result = plan_tool.plan_tool(agent, "new", title="Finish", goal="finish", steps=["one"])
+    result = plan.plan(agent, "new", title="Finish", goal="finish", steps=["one"])
     task_id = conn.execute("SELECT task_id FROM execution_bindings").fetchone()[0]
 
-    missing = plan_tool.plan_tool(agent, "advance")
-    advanced = plan_tool.plan_tool(agent, "advance", summary="Finished the only step")
+    missing = plan.plan(agent, "advance")
+    advanced = plan.plan(agent, "advance", summary="Finished the only step")
 
     assert missing == "ERROR: 'advance' requires summary"
     assert f"Task {task_id} Step 1 Approved by user. Plan complete." == advanced
@@ -456,19 +456,19 @@ def test_advance_closes_binding_and_records_required_summary(monkeypatch):
 
 def test_handoff_replaces_current_step_summary_without_advancing(monkeypatch):
     conn = _db()
-    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    monkeypatch.setattr(plan, "_get_kanban_db", lambda board=None: conn)
     monkeypatch.setattr(
-        plan_tool, "clarify_tool", lambda *_args, **_kwargs: '{"user_response":"Approve"}'
+        plan, "clarify_tool", lambda *_args, **_kwargs: '{"user_response":"Approve"}'
     )
     agent = _Agent()
-    plan_tool.plan_tool(
+    plan.plan(
         agent, "new", title="Handoff", goal="resume safely", steps=["first", "second"]
     )
     task_id = conn.execute("SELECT task_id FROM execution_bindings").fetchone()[0]
 
-    assert plan_tool.plan_tool(agent, "handoff") == "ERROR: 'handoff' requires summary"
-    plan_tool.plan_tool(agent, "handoff", summary="Initial scratch note")
-    result = plan_tool.plan_tool(agent, "handoff", summary="Latest scratch note")
+    assert plan.plan(agent, "handoff") == "ERROR: 'handoff' requires summary"
+    plan.plan(agent, "handoff", summary="Initial scratch note")
+    result = plan.plan(agent, "handoff", summary="Latest scratch note")
 
     assert "Latest scratch note" in result
     assert conn.execute(
@@ -486,17 +486,17 @@ def test_handoff_replaces_current_step_summary_without_advancing(monkeypatch):
 
 def test_remind_never_labels_an_explicit_task_historical(monkeypatch):
     conn = _db()
-    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    monkeypatch.setattr(plan, "_get_kanban_db", lambda board=None: conn)
     monkeypatch.setattr(
-        plan_tool, "clarify_tool", lambda *_args, **_kwargs: '{"user_response":"Approve"}'
+        plan, "clarify_tool", lambda *_args, **_kwargs: '{"user_response":"Approve"}'
     )
     agent = _Agent()
-    plan_tool.plan_tool(
+    plan.plan(
         agent, "new", title="Work in progress", goal="finish it", steps=["keep working"]
     )
     task_id = conn.execute("SELECT task_id FROM execution_bindings").fetchone()[0]
 
-    result = plan_tool.plan_tool(agent, "remind", task_id=task_id)
+    result = plan.plan(agent, "remind", task_id=task_id)
 
     assert "Task: Work in progress" in result
     assert "historical" not in result.casefold()
@@ -510,12 +510,12 @@ def test_remind_shows_only_goal_and_active_step(monkeypatch):
     points at `advance`.
     """
     conn = _db()
-    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    monkeypatch.setattr(plan, "_get_kanban_db", lambda board=None: conn)
     monkeypatch.setattr(
-        plan_tool, "clarify_tool", lambda *_args, **_kwargs: '{"user_response":"Approve"}'
+        plan, "clarify_tool", lambda *_args, **_kwargs: '{"user_response":"Approve"}'
     )
     agent = _Agent()
-    plan_tool.plan_tool(
+    plan.plan(
         agent,
         "new",
         title="Two-step plan",
@@ -524,7 +524,7 @@ def test_remind_shows_only_goal_and_active_step(monkeypatch):
     )
     task_id = conn.execute("SELECT task_id FROM execution_bindings").fetchone()[0]
 
-    result = plan_tool.plan_tool(agent, "remind", task_id=task_id)
+    result = plan.plan(agent, "remind", task_id=task_id)
 
     assert "ship it" in result
     assert "first do this" in result
@@ -535,12 +535,12 @@ def test_remind_shows_only_goal_and_active_step(monkeypatch):
 def test_continue_still_shows_every_step(monkeypatch):
     """`continue` keeps the full listing — it restores first-turn context."""
     conn = _db()
-    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    monkeypatch.setattr(plan, "_get_kanban_db", lambda board=None: conn)
     monkeypatch.setattr(
-        plan_tool, "clarify_tool", lambda *_args, **_kwargs: '{"user_response":"Approve"}'
+        plan, "clarify_tool", lambda *_args, **_kwargs: '{"user_response":"Approve"}'
     )
     agent = _Agent()
-    plan_tool.plan_tool(
+    plan.plan(
         agent,
         "new",
         title="Two-step plan",
@@ -549,7 +549,7 @@ def test_continue_still_shows_every_step(monkeypatch):
     )
     task_id = conn.execute("SELECT task_id FROM execution_bindings").fetchone()[0]
 
-    result = plan_tool.plan_tool(agent, "continue", task_id=task_id)
+    result = plan.plan(agent, "continue", task_id=task_id)
 
     assert "first do this" in result
     assert "then do that" in result
@@ -557,22 +557,22 @@ def test_continue_still_shows_every_step(monkeypatch):
 
 def test_continue_rebinds_session_and_agent_and_returns_step_summaries(monkeypatch):
     conn = _db()
-    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    monkeypatch.setattr(plan, "_get_kanban_db", lambda board=None: conn)
     monkeypatch.setattr(
-        plan_tool, "clarify_tool", lambda *_args, **_kwargs: '{"user_response":"Approve"}'
+        plan, "clarify_tool", lambda *_args, **_kwargs: '{"user_response":"Approve"}'
     )
     original = _Agent()
-    plan_tool.plan_tool(
+    plan.plan(
         original, "new", title="Portable plan", goal="cross sessions", steps=["first", "second"]
     )
     task_id = conn.execute("SELECT task_id FROM execution_bindings").fetchone()[0]
-    plan_tool.plan_tool(original, "handoff", summary="Partial first step")
-    plan_tool.plan_tool(
+    plan.plan(original, "handoff", summary="Partial first step")
+    plan.plan(
         original,
         "advance",
         summary="Completed first step in tools/a.py",
     )
-    plan_tool.plan_tool(original, "handoff", summary="Started second step in tests/test_a.py")
+    plan.plan(original, "handoff", summary="Started second step in tests/test_a.py")
     resumed = SimpleNamespace(
         profile_name="Ornith",
         agent_name="ornith",
@@ -582,7 +582,7 @@ def test_continue_rebinds_session_and_agent_and_returns_step_summaries(monkeypat
         _session_temperature=None,
     )
 
-    result = plan_tool.plan_tool(resumed, "continue", task_id=task_id)
+    result = plan.plan(resumed, "continue", task_id=task_id)
 
     assert "Task: Portable plan" in result
     assert "Summary: Completed first step in tools/a.py" in result
@@ -604,12 +604,12 @@ def test_active_plan_compression_context_is_read_only_and_summary_aware(monkeypa
     from tools import plan_binding_adapter
 
     conn = _db()
-    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    monkeypatch.setattr(plan, "_get_kanban_db", lambda board=None: conn)
     monkeypatch.setattr(
-        plan_tool, "clarify_tool", lambda *_args, **_kwargs: '{"user_response":"Approve"}'
+        plan, "clarify_tool", lambda *_args, **_kwargs: '{"user_response":"Approve"}'
     )
     agent = _Agent()
-    plan_tool.plan_tool(
+    plan.plan(
         agent,
         "new",
         title="Compression plan",
@@ -617,7 +617,7 @@ def test_active_plan_compression_context_is_read_only_and_summary_aware(monkeypa
         steps=["inspect", "implement"],
     )
     task_id = conn.execute("SELECT task_id FROM execution_bindings").fetchone()[0]
-    plan_tool.plan_tool(agent, "handoff", summary="Inspection complete")
+    plan.plan(agent, "handoff", summary="Inspection complete")
     before = [tuple(row) for row in conn.execute("SELECT * FROM execution_bindings")]
 
     contexts = plan_binding_adapter.active_plan_compression_context(agent)
@@ -641,12 +641,12 @@ def test_continue_on_already_bound_plan_is_noop_and_steers_to_advance(monkeypatc
     review (filed at binding_revision 3) could never match the binding
     (revision 4)."""
     conn = _db()
-    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    monkeypatch.setattr(plan, "_get_kanban_db", lambda board=None: conn)
     monkeypatch.setattr(
-        plan_tool, "clarify_tool", lambda *_args, **_kwargs: '{"user_response":"Approve"}'
+        plan, "clarify_tool", lambda *_args, **_kwargs: '{"user_response":"Approve"}'
     )
     agent = _Agent()
-    plan_tool.plan_tool(
+    plan.plan(
         agent, "new", title="No-op continue", goal="don't rebind", steps=["first", "second"]
     )
     task_id = conn.execute("SELECT task_id FROM execution_bindings").fetchone()[0]
@@ -654,7 +654,7 @@ def test_continue_on_already_bound_plan_is_noop_and_steers_to_advance(monkeypatc
         "SELECT profile, root_session_id, task_id, revision FROM execution_bindings"
     )]
 
-    result = plan_tool.plan_tool(agent, "continue", task_id=task_id)
+    result = plan.plan(agent, "continue", task_id=task_id)
 
     assert "ALREADY ACTIVE" in result
     assert "advance" in result
@@ -665,7 +665,7 @@ def test_continue_on_already_bound_plan_is_noop_and_steers_to_advance(monkeypatc
 
 
 def test_schema_replaces_done_and_status_with_advance_summary_handoff_continue():
-    properties = plan_tool.PLAN_TOOL_SCHEMA["parameters"]["properties"]
+    properties = plan.PLAN_SCHEMA["parameters"]["properties"]
     commands = properties["command"]["enum"]
 
     assert "done" not in commands
@@ -674,7 +674,7 @@ def test_schema_replaces_done_and_status_with_advance_summary_handoff_continue()
     assert "files" in properties["summary"]["description"].lower()
     assert "advance" in properties["summary"]["description"]
     assert "handoff" in properties["summary"]["description"]
-    assert "Unknown plan command 'done'" in plan_tool.plan_tool(_Agent(), "done")
+    assert "Unknown plan command 'done'" in plan.plan(_Agent(), "done")
 
 
 # ---------------------------------------------------------------------------
@@ -684,7 +684,7 @@ def test_schema_replaces_done_and_status_with_advance_summary_handoff_continue()
 # area (FULL compaction), an identical value keeps it (HEAP compaction, which
 # leaves the cacheable prefix byte-stable).  So the subject has to track the
 # Plan's ACTIVE STEP.  Before this, the four legacy writes lived only in the
-# shadowed plan_tool helpers, so the live adapter path never set a subject at
+# shadowed plan helpers, so the live adapter path never set a subject at
 # all and the gate could never fire.
 # ---------------------------------------------------------------------------
 
@@ -721,11 +721,11 @@ class _SubjectAgent(_Agent):
 
 def _start_plan(monkeypatch, agent, steps):
     conn = _db()
-    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    monkeypatch.setattr(plan, "_get_kanban_db", lambda board=None: conn)
     monkeypatch.setattr(
-        plan_tool, "clarify_tool", lambda *_a, **_k: '{"user_response":"Approve"}'
+        plan, "clarify_tool", lambda *_a, **_k: '{"user_response":"Approve"}'
     )
-    result = plan_tool.plan_tool(
+    result = plan.plan(
         agent, "new", title="Subject plan", goal="gate the compaction", steps=steps
     )
     assert result.startswith("TASK APPROVED (t_")
@@ -739,10 +739,10 @@ def test_subject_tracks_the_active_step_and_changes_on_advance(monkeypatch):
     # Activation named step 1.
     assert agent.subjects[-1] == "Subject plan: inspect"
 
-    plan_tool.plan_tool(agent, "advance", summary="inspected")
+    plan.plan(agent, "advance", summary="inspected")
     assert agent.subjects[-1] == "Subject plan: implement"
 
-    plan_tool.plan_tool(agent, "advance", summary="implemented")
+    plan.plan(agent, "advance", summary="implemented")
     assert agent.subjects[-1] == "Subject plan: verify"
     assert not getattr(agent, "_force_compression_after_plan_completion", False)
 
@@ -761,10 +761,10 @@ def test_step_awaiting_user_review_leaves_the_subject_alone(monkeypatch):
     _start_plan(monkeypatch, agent, ["inspect", "implement"])
     assert agent.subjects[-1] == "Subject plan: inspect"
     monkeypatch.setattr(
-        plan_tool, "clarify_tool", lambda *_a, **_k: '{"user_response":""}'
+        plan, "clarify_tool", lambda *_a, **_k: '{"user_response":""}'
     )
 
-    result = plan_tool.plan_tool(agent, "advance", summary="claim only")
+    result = plan.plan(agent, "advance", summary="claim only")
 
     assert "wait for verification" in result
     assert agent.subjects[-1] == "Subject plan: inspect"
@@ -781,7 +781,7 @@ def test_closing_the_plan_clears_the_subject(monkeypatch):
     _start_plan(monkeypatch, agent, ["only step"])
     assert agent.subjects[-1] == "Subject plan: only step"
 
-    plan_tool.plan_tool(agent, "advance", summary="finished")
+    plan.plan(agent, "advance", summary="finished")
 
     assert agent.subjects[-1] == ""
     assert getattr(agent, "_force_compression_after_plan_completion", False) is True
@@ -795,14 +795,14 @@ def test_final_advance_clears_session_task_and_remind_has_no_active_plan(monkeyp
     # Compatibility state may still carry the Plan id from an older runtime.
     agent.task_ids.append(task_id)
 
-    result = plan_tool.plan_tool(agent, "advance", summary="finished")
+    result = plan.plan(agent, "advance", summary="finished")
 
     assert result == f"Task {task_id} Step 1 Approved by user. Plan complete."
     assert agent.task_ids[-1] is None
     # The steering message is the point: no plan is active, so remind must
     # tell the caller how to claim one rather than just saying "no".
-    assert plan_tool.plan_tool(agent, "remind") == (
-        "ERROR: No active plan in this session. Run `plan_tool continue <task_id>` "
+    assert plan.plan(agent, "remind") == (
+        "ERROR: No active plan in this session. Run `plan continue <task_id>` "
         "with a valid task id to claim the task."
     )
 
@@ -812,7 +812,7 @@ def test_archiving_the_active_plan_requests_completion_compression(monkeypatch):
     conn = _start_plan(monkeypatch, agent, ["only step"])
     task_id = conn.execute("SELECT task_id FROM execution_bindings").fetchone()[0]
 
-    result = plan_tool.plan_tool(agent, "archive", task_id=task_id)
+    result = plan.plan(agent, "archive", task_id=task_id)
 
     assert result == f"ARCHIVED: {task_id}"
     assert agent.subjects[-1] == ""
@@ -823,7 +823,7 @@ def test_archiving_the_active_plan_requests_completion_compression(monkeypatch):
 # ---------------------------------------------------------------------------
 # remind (no task_id) must NEVER auto-attach a plan this session did not
 # claim: no binding means no active plan, full stop. It steers the worker to
-# `plan_tool continue <task_id>` when an assigned task is waiting, and fails
+# `plan continue <task_id>` when an assigned task is waiting, and fails
 # otherwise. There is no reclaim and no fallback (Evan directive 2026-10-05).
 # ---------------------------------------------------------------------------
 
@@ -841,7 +841,7 @@ def test_remind_without_task_id_and_no_active_plan_fails(monkeypatch):
     from tools import plan_binding_adapter
 
     conn = _db()
-    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    monkeypatch.setattr(plan, "_get_kanban_db", lambda board=None: conn)
     # An open plan row exists but belongs to no live binding: it must stay
     # untouched — remind has no reclaim path.
     _plan_task(conn, "t_orphan", created_at=int(time.time()))
@@ -849,10 +849,10 @@ def test_remind_without_task_id_and_no_active_plan_fails(monkeypatch):
     resumed = _SubjectAgent()
     resumed.session_id = "new-session"
 
-    result = plan_tool.plan_tool(resumed, "remind")
+    result = plan.plan(resumed, "remind")
 
     assert "No active plan in this session" in result
-    assert "plan_tool continue <task_id>" in result
+    assert "plan continue <task_id>" in result
     assert conn.execute("SELECT 1 FROM execution_bindings").fetchone() is None
     assert conn.execute(
         "SELECT status FROM tasks WHERE id='t_orphan'"
@@ -863,7 +863,7 @@ def test_remind_steers_to_continue_for_unclaimed_dispatched_task(monkeypatch):
     from tools import plan_binding_adapter
 
     conn = _db()
-    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    monkeypatch.setattr(plan, "_get_kanban_db", lambda board=None: conn)
     now = int(time.time())
     # A task assigned to this agent but still in a waiting state, no binding.
     _plan_task(conn, "t_await", created_at=now, status="blocked", title="Claim me")
@@ -871,18 +871,18 @@ def test_remind_steers_to_continue_for_unclaimed_dispatched_task(monkeypatch):
     resumed = _SubjectAgent()
     resumed.session_id = "new-session"
 
-    result = plan_tool.plan_tool(resumed, "remind")
+    result = plan.plan(resumed, "remind")
 
     # It steers the worker to `continue`, it does NOT say "no plan / not real".
     assert "t_await" in result
-    assert "plan_tool continue t_await" in result
+    assert "plan continue t_await" in result
     assert "ERROR" not in result
 
 
 def test_archive_without_task_id_and_no_active_plan_is_an_error(monkeypatch):
     """archive (no task_id) closes the ACTIVE plan only — never an orphan."""
     conn = _db()
-    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    monkeypatch.setattr(plan, "_get_kanban_db", lambda board=None: conn)
     # An orphaned open plan exists, but archive must NOT reach it.
     now = int(time.time())
     _plan_task(conn, "t_orphan", created_at=now, title="Wrong plan")
@@ -890,7 +890,7 @@ def test_archive_without_task_id_and_no_active_plan_is_an_error(monkeypatch):
     resumed = _SubjectAgent()
     resumed.session_id = "new-session"
 
-    result = plan_tool.plan_tool(resumed, "archive")
+    result = plan.plan(resumed, "archive")
 
     assert result.startswith("ERROR: 'archive' requires task_id")
     assert conn.execute(
@@ -911,11 +911,11 @@ def test_remind_flags_a_separate_plan_awaiting_claim(monkeypatch):
 
     The incident shape: an EARLIER session advanced the bound plan to step 3,
     and a second dispatched plan sits unclaimed. The stored step is shown, but
-    the UNCLAIMED warning names `plan_tool continue` as the only way to claim
+    the UNCLAIMED warning names `plan continue` as the only way to claim
     the waiting row (and confirms which plan is intended).
     """
     conn = _db()
-    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    monkeypatch.setattr(plan, "_get_kanban_db", lambda board=None: conn)
     now = int(time.time())
     # The ACTIVE plan, bound to this session (claimed by `continue`), with a
     # step position an earlier session advanced.
@@ -937,9 +937,9 @@ def test_remind_flags_a_separate_plan_awaiting_claim(monkeypatch):
     agent = _SubjectAgent()
     agent.session_id = "new-session"
 
-    result = plan_tool.plan_tool(agent, "remind")
+    result = plan.plan(agent, "remind")
 
     assert "Active Step 3 of 12" in result
     assert "t_wait" in result
     assert "UNCLAIMED" in result
-    assert "plan_tool continue t_wait" in result
+    assert "plan continue t_wait" in result

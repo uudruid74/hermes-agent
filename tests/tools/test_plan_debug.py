@@ -8,7 +8,7 @@ import re
 import sqlite3
 
 from hermes_cli.kanban_db import SCHEMA_SQL
-from tools import plan_tool
+from tools import plan
 
 
 class _State:
@@ -85,7 +85,7 @@ def _insert_task(conn, task_id, *, assignee, plan_kind="normal", status="manual"
 def _bind(monkeypatch, conn, state):
     from hermes_cli.execution_bindings import ExecutionKey, bootstrap_worker_binding
 
-    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    monkeypatch.setattr(plan, "_get_kanban_db", lambda board=None: conn)
     bootstrap_worker_binding(
         conn, ExecutionKey("tester", "compression-root"), state.task_id
     )
@@ -98,7 +98,7 @@ def test_preapproved_debug_plan_skips_callback_and_links_coding_task(monkeypatch
     agent = _Agent(state)
     _bind(monkeypatch, conn, state)
 
-    result = plan_tool._cmd_new(
+    result = plan._cmd_new(
         agent, "debug", "exercise coding task", ["run smoke test"],
         kind="debug", pre_approved=True, parent_task_id="coding", debug_plan_id="coding",
     )
@@ -119,18 +119,22 @@ def test_debug_plan_completion_rewards_coder_not_tester(monkeypatch):
     conn = _db()
     _insert_task(conn, "coding", assignee="coder", status="blocked", debug_plan_id="debug")
     _insert_task(conn, "debug", assignee="tester", plan_kind="debug")
-    conn.execute("UPDATE tasks SET previous_task = 'coding' WHERE id = 'debug'")
+    # No previous_task wire: the 2026-09-29 ownership guard (31ab7a7d9d)
+    # refuses to restore a parent assigned to a DIFFERENT agent onto this
+    # binding. The coder here is tracked by debug_plan_id (the debug-review
+    # convention), not by parent ownership — this plan simply unbinds on
+    # close, and the coder still gets the completion reward.
     conn.commit()
     state = _State("debug")
     agent = _Agent(state)
     _bind(monkeypatch, conn, state)
     monkeypatch.setattr(
-        plan_tool,
+        plan,
         "clarify_tool",
         lambda *args, **kwargs: '{"user_response": "Approve"}',
     )
 
-    plan_tool._cmd_advance(agent, "Debug plan completed")
+    plan._cmd_advance(agent, "Debug plan completed")
 
     assert state.ratings == {"coder": 20.5}
     assert conn.execute("SELECT status FROM tasks WHERE id = 'debug'").fetchone()[0] == "done"
@@ -145,7 +149,7 @@ def test_debug_failure_uses_severity_adjusted_tester_rating(monkeypatch):
     agent = _Agent(state)
     _bind(monkeypatch, conn, state)
 
-    plan_tool._cmd_fail(agent, "easy bug: 0.8")
+    plan._cmd_fail(agent, "easy bug: 0.8")
 
     assert state.ratings == {"coder": 19.5, "tester": 20.25}
     assert conn.execute("SELECT status FROM tasks WHERE id = 'debug'").fetchone()[0] == "archived"
@@ -161,7 +165,7 @@ def test_debug_crash_penalty_uses_flat_rating_delta(monkeypatch):
     agent = _Agent(state)
     _bind(monkeypatch, conn, state)
 
-    plan_tool._cmd_fail(agent, json.dumps([{"bug": "process crashed", "kind": "crash", "severity": 1.0}]))
+    plan._cmd_fail(agent, json.dumps([{"bug": "process crashed", "kind": "crash", "severity": 1.0}]))
 
     assert state.ratings == {"coder": 19.0, "tester": 20.25}
 
@@ -173,7 +177,7 @@ def test_normal_failure_archives_without_rating_change(monkeypatch):
     agent = _Agent(state)
     _bind(monkeypatch, conn, state)
 
-    plan_tool._cmd_fail(agent, "test failed")
+    plan._cmd_fail(agent, "test failed")
 
     assert state.ratings == {}
     assert conn.execute("SELECT status FROM tasks WHERE id = 'normal'").fetchone()[0] == "archived"
@@ -191,9 +195,9 @@ def test_test_complete_archives_without_mood_or_rating_penalty(monkeypatch):
     agent = _Agent(state)
     _bind(monkeypatch, conn, state)
 
-    result = plan_tool.plan_tool(agent, "test-complete")
+    result = plan.plan(agent, "test-complete")
 
-    assert "test-complete" in plan_tool.PLAN_TOOL_SCHEMA["parameters"]["properties"]["command"]["enum"]
+    assert "test-complete" in plan.PLAN_SCHEMA["parameters"]["properties"]["command"]["enum"]
     assert "Plan test test-complete" in result
     assert state.ratings == {}
     assert state.moods == []

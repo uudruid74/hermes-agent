@@ -4,7 +4,7 @@ import sqlite3
 import threading
 from types import SimpleNamespace
 
-from tools import plan_tool
+from tools import plan
 
 
 class _SessionDB:
@@ -48,20 +48,20 @@ def _plan_db():
 def test_get_session_id_uses_only_canonical_session_id():
     agent = SimpleNamespace(canonical_session_id=None, session_id="mutable-session")
 
-    assert plan_tool._get_session_id(agent) is None
+    assert plan._get_session_id(agent) is None
 
 
 def test_new_keeps_unavailable_clarify_as_pending_approval(monkeypatch):
     """A CLI timeout must not become a fabricated unspecified denial."""
     conn = _plan_db()
-    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    monkeypatch.setattr(plan, "_get_kanban_db", lambda board=None: conn)
     def unavailable_bridge(question, choices, multi_select=False, callback=None, **_kwargs):
         assert callback is not None
         answer = callback(question, choices, multi_select=multi_select)
         return '{"user_response": "%s"}' % answer
 
     monkeypatch.setattr(
-        plan_tool,
+        plan,
         "clarify_tool",
         unavailable_bridge,
         raising=False,
@@ -69,7 +69,7 @@ def test_new_keeps_unavailable_clarify_as_pending_approval(monkeypatch):
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     agent = _UnavailableAgent()
 
-    result = plan_tool._cmd_new(
+    result = plan._cmd_new(
         agent,
         title="Timeout regression",
         goal="Do not deny an unanswered plan",
@@ -97,9 +97,9 @@ def test_new_keeps_unavailable_clarify_as_pending_approval(monkeypatch):
 def test_new_activates_plan_after_an_approve_response(monkeypatch):
     """A real approval still activates the freshly created plan."""
     conn = _plan_db()
-    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    monkeypatch.setattr(plan, "_get_kanban_db", lambda board=None: conn)
     monkeypatch.setattr(
-        plan_tool,
+        plan,
         "clarify_tool",
         lambda *_args, **_kwargs: '{"user_response": "Approve"}',
         raising=False,
@@ -107,7 +107,7 @@ def test_new_activates_plan_after_an_approve_response(monkeypatch):
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     agent = _ApprovedAgent()
 
-    result = plan_tool._cmd_new(
+    result = plan._cmd_new(
         agent,
         title="Approved plan",
         goal="Activate after approval",
@@ -123,7 +123,7 @@ def test_new_activates_plan_after_an_approve_response(monkeypatch):
 def test_new_links_approval_prompt_to_its_new_plan(monkeypatch):
     """Dashboard approval must target the plan task, not the prior session task."""
     conn = _plan_db()
-    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    monkeypatch.setattr(plan, "_get_kanban_db", lambda board=None: conn)
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     seen = {}
 
@@ -137,10 +137,10 @@ def test_new_links_approval_prompt_to_its_new_plan(monkeypatch):
         })
         return '{"user_response": "Approve"}'
 
-    monkeypatch.setattr(plan_tool, "clarify_tool", bridge, raising=False)
+    monkeypatch.setattr(plan, "clarify_tool", bridge, raising=False)
     agent = _ApprovedAgent()
 
-    result = plan_tool._cmd_new(
+    result = plan._cmd_new(
         agent,
         title="Dashboard-linked plan",
         goal="Route approval through clarify_queue",
@@ -186,7 +186,7 @@ def test_new_activates_from_dashboard_queue_answer(tmp_path, monkeypatch):
         _session_temperature=None,
         clarify_callback=dashboard_callback,
     )
-    result = plan_tool._cmd_new(
+    result = plan._cmd_new(
         agent,
         title="Dashboard race plan",
         goal="Approve through clarify_queue",
@@ -213,12 +213,12 @@ def test_remind_returns_requested_task_status(monkeypatch):
                    '[\"Inspect status\"]', 1, 'Report the status', 'default')"""
     )
     conn.commit()
-    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    monkeypatch.setattr(plan, "_get_kanban_db", lambda board=None: conn)
 
-    result = plan_tool._cmd_remind(_UnavailableAgent(), "t_remind")
+    result = plan._cmd_remind(_UnavailableAgent(), "t_remind")
 
     # Live dispatch routes `_cmd_remind` to the adapter (import override at
-    # plan_tool.py:1216), which labels a blocked/closed plan as not-active
+    # plan.py:1216), which labels a blocked/closed plan as not-active
     # rather than the old “Historical task:” wording.
     assert "Task: Status check" in result
     assert "Status: blocked" in result

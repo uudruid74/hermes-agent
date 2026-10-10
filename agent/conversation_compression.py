@@ -1246,7 +1246,7 @@ def _adopt_live_compression_child(
     except Exception:
         pass
 
-    # Transfer the task binding from parent → child so plan_tool remind
+    # Transfer the task binding from parent → child so plan remind
     # and the write gate keep working after compression rotation.
     # (t_2b7a77b2 — compression changed session_id but orphaned the binding)
     try:
@@ -2781,7 +2781,7 @@ def compress_context(
             accepts_plan_context = False
 
         # Capture active Plan state read-only before compression. The built-in
-        # fallback uses the same summary-aware rendering as plan_tool continue;
+        # fallback uses the same summary-aware rendering as plan continue;
         # plugin engines receive it only when their signature opts in below.
         plan_context = ""
         minimal_plan_context = ""

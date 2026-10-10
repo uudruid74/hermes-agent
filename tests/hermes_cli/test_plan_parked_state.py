@@ -43,7 +43,7 @@ def _plan_task(conn: sqlite3.Connection, *, steps: bool = False) -> str:
 
     ``create_task`` normalizes ``initial_status='running'`` to ``ready``
     (unclaimed task), so the row is flipped to ``manual`` directly — the
-    state ``plan_tool new`` leaves a bound plan in. ``steps=True`` also
+    state ``plan new`` leaves a bound plan in. ``steps=True`` also
     seeds a task_steps/task_goal pair so ``continue_plan``'s step validator
     accepts the row.
     """

@@ -328,7 +328,7 @@ def finalize_turn(
         # Manual Plan tasks have no dispatcher-owned worker process or claim
         # lifecycle, so the Kanban timeout bridge above cannot see them. Resolve
         # the active execution binding and use the same durable block/notifier
-        # path when this step never reached ``plan_tool advance``.
+        # path when this step never reached ``plan advance``.
         try:
             from tools.plan_binding_adapter import block_active_plan_at_iteration_limit
 

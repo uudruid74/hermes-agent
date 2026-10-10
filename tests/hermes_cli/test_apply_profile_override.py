@@ -190,7 +190,7 @@ class TestProfileRouteExport:
 
     Regression for the empty-profile origin stamp: ``-p`` used to set ONLY
     HERMES_HOME, so ``os.environ.get("HERMES_PROFILE", "")`` returned empty in
-    a gateway process. Anything using it as a fallback (plan_tool dispatch
+    a gateway process. Anything using it as a fallback (plan dispatch
     origin stamping) then recorded ``profile: ""``, and a completion wake
     resolved to an unqualified ``platform:chat_id`` target — delivered by
     whichever gateway owned the bridge socket rather than the dispatcher's.

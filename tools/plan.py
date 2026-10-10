@@ -1,5 +1,5 @@
 """
-plan_tool — Mandatory Action Protocol for Hermes agents.
+plan — Mandatory Action Protocol for Hermes agents.
 
 Commands: new, advance, review, handoff, continue, dispatch, remind, fail, approve
 
@@ -9,7 +9,7 @@ tool creates 'manual' kanban tasks that carry step-by-step plans.
 
 NOTE (t_2b7a77b2): kanban-changes.md lines 53-54 spec a stuck-agent
 re-prompt timer and line 236 spec an approval timeout. Neither was
-implemented. plan_tool contains zero timer/thread/sleep code. If the
+implemented. plan contains zero timer/thread/sleep code. If the
 timeout is needed, it should be a separate implementation.
 """
 
@@ -111,10 +111,10 @@ def _get_session_id(agent) -> Optional[str]:
 def _get_task_id(agent) -> Optional[str]:
     """Return the active task_id for this session.
 
-    Session DB is authoritative — it's updated by plan_tool when a new
+    Session DB is authoritative — it's updated by plan when a new
     sub-plan is created (set_session_task_id) and when a plan completes
     (clear_session_task_id).  Falls back to the HERMES_KANBAN_TASK env
-    var for the initial kanban worker boot (before any plan_tool call
+    var for the initial kanban worker boot (before any plan call
     has written to the DB).
     """
     session_id = _get_session_id(agent)
@@ -377,8 +377,8 @@ def _cmd_new(agent, title: str, goal: str, steps: List[str],
             f"The plan has been recorded. Your next action is:\n\n"
             f">>> STEP 1: {steps[0]} <<<\n\n"
             f"Begin working on Step 1 now. When complete, call "
-            f"plan_tool(command=\"advance\", summary=\"...\") to record the work and advance.\n"
-            f"Do NOT call plan_tool 'advance' until Step 1 is actually finished."
+            f"plan(command=\"advance\", summary=\"...\") to record the work and advance.\n"
+            f"Do NOT call plan 'advance' until Step 1 is actually finished."
         )
     else:
         # User denied — ask for reason
@@ -416,7 +416,7 @@ def _cmd_new(agent, title: str, goal: str, steps: List[str],
         except Exception:
             pass
 
-        return f"Plan denied ({task_id}): {reason_str}. Stand down. Resubmit with plan_tool(command=\"approve\", task_id=\"{task_id}\") to approve."
+        return f"Plan denied ({task_id}): {reason_str}. Stand down. Resubmit with plan(command=\"approve\", task_id=\"{task_id}\") to approve."
 
 
 # ---------------------------------------------------------------------------
@@ -473,7 +473,7 @@ def _cmd_advance(agent, summary: str) -> str:
         if stepno is None:
             stepno = 1
         import logging
-        _logger = logging.getLogger("plan_tool")
+        _logger = logging.getLogger("plan")
         _logger.info("PLAN_DONE: task=%s raw_stepno=%s resolved_stepno=%s steps_len=%d db_path=%s",
                      task_id, task["task_stepno"], stepno, len(steps), str(kdb))
         goal = task["task_goal"] or ""
@@ -695,7 +695,7 @@ def _cmd_dispatch(agent, title: str, goal: str, project: str, assignee: str,
                 )
     except (OSError, ValueError, sqlite3.Error) as exc:
         import logging
-        logging.getLogger("plan_tool").warning(
+        logging.getLogger("plan").warning(
             "origin routing not stored for %s: %s", task_id, exc
         )
 
@@ -1118,7 +1118,7 @@ def _cmd_approve(agent, task_id: str) -> str:
     return (
         f"Task {task_id} approved: {title}\n\n"
         f"Complete Step 1: {step1}\n"
-        f"Use plan_tool 'advance' with a summary to mark each step complete."
+        f"Use plan 'advance' with a summary to mark each step complete."
     )
 
 
@@ -1130,7 +1130,7 @@ def _enumerate_kanban_dbs():
     """Return list of all kanban.db paths across all boards.
 
     Uses the same profile-scoped resolution as the CLI
-    (hermes_cli.kanban_db) so plan_tool archive/block find the same DBs
+    (hermes_cli.kanban_db) so plan archive/block find the same DBs
     that ``hermes kanban show --board all`` does.  (t_2b7a77b2)
     """
     from hermes_cli.kanban_db import kanban_db_path, list_boards
@@ -1226,7 +1226,7 @@ from tools.plan_binding_adapter import (
 _cmd_advance = _binding_cmd_advance
 
 
-def plan_tool(
+def plan(
     agent,
     command: str,
     title: Optional[str] = None,
@@ -1356,8 +1356,8 @@ def plan_tool(
 
 # --- Schema ---
 
-PLAN_TOOL_SCHEMA = {
-    "name": "plan_tool",
+PLAN_SCHEMA = {
+    "name": "plan",
     "description": (
         "Mandatory Action Protocol — create and manage multistep plans. "
         "Commands: new (present plan for approval), advance (submit a completed-step summary for review), "
@@ -1475,10 +1475,10 @@ PLAN_TOOL_SCHEMA = {
 from tools.registry import registry
 
 registry.register(
-    name="plan_tool",
+    name="plan",
     toolset="session",
-    schema=PLAN_TOOL_SCHEMA,
-    handler=lambda args, **kw: plan_tool(
+    schema=PLAN_SCHEMA,
+    handler=lambda args, **kw: plan(
         agent=kw.get("agent"),
         command=args.get("command", ""),
         title=args.get("title"),

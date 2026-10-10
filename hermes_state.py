@@ -4499,14 +4499,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         Uses an upsert so the binding succeeds even if the session row hasn't
         been created yet (lazy row creation in the TUI gateway means the row
-        may not exist when plan_tool approves a task).
+        may not exist when plan approves a task).
         """
         if not session_id:
             return
         def _do(conn):
             conn.execute(
                 """INSERT INTO sessions (id, source, started_at, task_id)
-                   VALUES (?, 'plan_tool', ?, ?)
+                   VALUES (?, 'plan', ?, ?)
                    ON CONFLICT(id) DO UPDATE SET task_id = excluded.task_id""",
                 (session_id, time.time(), task_id),
             )

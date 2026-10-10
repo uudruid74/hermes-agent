@@ -31,11 +31,11 @@ from hermes_cli.kanban_db import SCHEMA_SQL
 
 def test_deny_stores_reason_and_remind_renders_it(monkeypatch):
     conn, sent, worker, dispatcher, task_id = _delegated_plan(monkeypatch)
-    plan_tool = __import__("tools.plan_tool", fromlist=["plan_tool"])
-    plan_tool.plan_tool(worker, "advance", summary="did the step", step=1)
+    plan = __import__("tools.plan", fromlist=["plan"])
+    plan.plan(worker, "advance", summary="did the step", step=1)
     sent.clear()
 
-    result = plan_tool.plan_tool(
+    result = plan.plan(
         dispatcher,
         "review",
         task_id=task_id,
@@ -55,7 +55,7 @@ def test_deny_stores_reason_and_remind_renders_it(monkeypatch):
     ]
 
     # remind carries the denial response under the active step
-    remind = plan_tool.plan_tool(worker, "remind")
+    remind = plan.plan(worker, "remind")
     assert "Last denial of this step: Missing game_logic import" in remind
 
     # _format_plan (remind/continue/protected-channel renderer) carries it
@@ -72,9 +72,9 @@ def test_active_plan_compression_context_includes_denial(monkeypatch):
     """The protected-channel text (full-compaction plan_context + per-turn
     injection) must contain the denial reason verbatim."""
     conn, sent, worker, dispatcher, task_id = _delegated_plan(monkeypatch)
-    plan_tool = __import__("tools.plan_tool", fromlist=["plan_tool"])
-    plan_tool.plan_tool(worker, "advance", summary="did the step", step=1)
-    plan_tool.plan_tool(
+    plan = __import__("tools.plan", fromlist=["plan"])
+    plan.plan(worker, "advance", summary="did the step", step=1)
+    plan.plan(
         dispatcher, "review", task_id=task_id, decision="denied",
         response="view() shadows builtin list — use fetchall() result directly.",
     )
@@ -88,14 +88,14 @@ def test_active_plan_compression_context_includes_denial(monkeypatch):
 
 def test_repeated_denial_replaces_reason(monkeypatch):
     conn, sent, worker, dispatcher, task_id = _delegated_plan(monkeypatch)
-    plan_tool = __import__("tools.plan_tool", fromlist=["plan_tool"])
-    plan_tool.plan_tool(worker, "advance", summary="attempt 1", step=1)
-    plan_tool.plan_tool(
+    plan = __import__("tools.plan", fromlist=["plan"])
+    plan.plan(worker, "advance", summary="attempt 1", step=1)
+    plan.plan(
         dispatcher, "review", task_id=task_id, decision="denied", response="first defect"
     )
-    plan_tool.plan_tool(worker, "advance", summary="attempt 2", step=1)
+    plan.plan(worker, "advance", summary="attempt 2", step=1)
     sent.clear()
-    plan_tool.plan_tool(
+    plan.plan(
         dispatcher, "review", task_id=task_id, decision="denied", response="second defect — worse"
     )
 
@@ -110,14 +110,14 @@ def test_repeated_denial_replaces_reason(monkeypatch):
 
 def test_approval_clears_denial(monkeypatch):
     conn, sent, worker, dispatcher, task_id = _delegated_plan(monkeypatch)
-    plan_tool = __import__("tools.plan_tool", fromlist=["plan_tool"])
-    plan_tool.plan_tool(worker, "advance", summary="first try", step=1)
-    plan_tool.plan_tool(
+    plan = __import__("tools.plan", fromlist=["plan"])
+    plan.plan(worker, "advance", summary="first try", step=1)
+    plan.plan(
         dispatcher, "review", task_id=task_id, decision="denied", response="defect A"
     )
-    plan_tool.plan_tool(worker, "advance", summary="fixed", step=1)
+    plan.plan(worker, "advance", summary="fixed", step=1)
     sent.clear()
-    plan_tool.plan_tool(
+    plan.plan(
         dispatcher, "review", task_id=task_id, decision="approved"
     )
 
@@ -138,9 +138,9 @@ def test_denial_reason_capped(monkeypatch):
     from hermes_cli.plan_limits import PLAN_TEXT_MAX_CHARS
 
     conn, sent, worker, dispatcher, task_id = _delegated_plan(monkeypatch)
-    plan_tool = __import__("tools.plan_tool", fromlist=["plan_tool"])
-    plan_tool.plan_tool(worker, "advance", summary="try", step=1)
-    plan_tool.plan_tool(
+    plan = __import__("tools.plan", fromlist=["plan"])
+    plan.plan(worker, "advance", summary="try", step=1)
+    plan.plan(
         dispatcher, "review", task_id=task_id, decision="denied",
         response="x" * 1000 + " THE-END-MARKER",
     )

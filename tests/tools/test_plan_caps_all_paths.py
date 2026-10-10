@@ -1,7 +1,7 @@
 """Regression tests: the Plan-text caps must cover EVERY creation path.
 
 Evan, 2026-09-16 spec: cap goal/steps/summaries at 240 chars on submission.
-The first implementation capped only ``plan_tool new``.  Measured on the live
+The first implementation capped only ``plan new``.  Measured on the live
 board afterwards: **141 tasks over the limit**, including a ``ready`` one at
 505 chars — work waiting to be picked up that was already over budget.
 ``dispatch`` is the most common way work enters the board, and it writes the
@@ -17,7 +17,7 @@ function's return value.
 ``execution_bindings.advance_plan`` records one summary and leaves the step in
 place until the dispatcher or user resolves the durable pending review.
 
-Live ``advance`` calls do NOT resolve to ``plan_tool._cmd_advance`` — the
+Live ``advance`` calls do NOT resolve to ``plan._cmd_advance`` — the
 adapter in :mod:`tools.plan_binding_adapter` SHADOWS it, so that module's
 forwarding of ``step`` is what prevents a stale worker from submitting a summary
 for the wrong step.  The
@@ -48,14 +48,14 @@ LONG_STEP = "s" * 400
 
 @pytest.fixture()
 def board(monkeypatch):
-    """A throwaway copy of the real board, wired into plan_tool.
+    """A throwaway copy of the real board, wired into plan.
 
     A temp copy, never the live DB: ``_cmd_dispatch``/``_cmd_cron`` write
     rows, and a test that pollutes the production board is worse than no test.
     """
     if not os.path.exists(REAL_BOARD):
         pytest.skip("live kanban DB not present")
-    from tools import plan_tool
+    from tools import plan
 
     tmp = tempfile.mkdtemp()
     db_path = os.path.join(tmp, "kanban.db")
@@ -63,15 +63,15 @@ def board(monkeypatch):
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     # The live application opens boards through kanban_db.connect(), which
-    # applies additive migrations before plan_tool sees a task row. This fixture
+    # applies additive migrations before plan sees a task row. This fixture
     # opens its copy with raw sqlite3, so mirror that production precondition.
     from hermes_cli.kanban_db import _migrate_add_optional_columns
 
     _migrate_add_optional_columns(conn)
     conn.commit()
 
-    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: contextlib.nullcontext(conn))
-    yield conn, plan_tool
+    monkeypatch.setattr(plan, "_get_kanban_db", lambda board=None: contextlib.nullcontext(conn))
+    yield conn, plan
     conn.close()
 
 
@@ -123,8 +123,8 @@ def test_dispatch_refuses_a_goal_over_the_cap(board):
     246 chars and the worker spent 53 tool calls hunting for text that was never
     stored.  A refusal surfaces at the caller, which still holds the full text.
     """
-    conn, plan_tool = board
-    result = plan_tool._cmd_dispatch(None, "cap test", LONG_GOAL, "default", "neo")
+    conn, plan = board
+    result = plan._cmd_dispatch(None, "cap test", LONG_GOAL, "default", "neo")
     assert "ERROR" in result
     assert "goal" in result and "240" in result
     assert "FILE" in result, "the error must point at the supported long-form path"
@@ -132,8 +132,8 @@ def test_dispatch_refuses_a_goal_over_the_cap(board):
 
 
 def test_dispatch_refuses_a_step_over_the_cap(board):
-    conn, plan_tool = board
-    result = plan_tool._cmd_dispatch(
+    conn, plan = board
+    result = plan._cmd_dispatch(
         None, "step cap test", "goal", "default", "neo", steps=[LONG_STEP, "short"]
     )
     assert "ERROR" in result
@@ -143,9 +143,9 @@ def test_dispatch_refuses_a_step_over_the_cap(board):
 
 def test_dispatch_accepts_text_exactly_at_the_cap(board):
     """Boundary: exactly 240 chars (after whitespace compression) must pass."""
-    conn, plan_tool = board
+    conn, plan = board
     goal = "G" * 240
-    result = plan_tool._cmd_dispatch(None, "at cap", goal, "default", "neo", steps=["s"])
+    result = plan._cmd_dispatch(None, "at cap", goal, "default", "neo", steps=["s"])
     assert "ERROR" not in result, result
     row = _row(conn, "at cap")
     assert row is not None
@@ -153,7 +153,7 @@ def test_dispatch_accepts_text_exactly_at_the_cap(board):
 
 
 def test_dispatch_origin_routing_uses_username_only(board, monkeypatch):
-    _conn, plan_tool = board
+    _conn, plan = board
     captured = {}
     monkeypatch.setenv("USERNAME", "neo")
     monkeypatch.setenv("HERMES_PROFILE", "wrong-route")
@@ -169,7 +169,7 @@ def test_dispatch_origin_routing_uses_username_only(board, monkeypatch):
         lambda _conn, _task_id, **kwargs: captured.update(kwargs),
     )
 
-    result = plan_tool._cmd_dispatch(
+    result = plan._cmd_dispatch(
         SimpleNamespace(
             canonical_session_id="20260921_010203_abcdef",
             agent_name="neo",
@@ -185,8 +185,8 @@ def test_dispatch_origin_routing_uses_username_only(board, monkeypatch):
 
 
 def test_dispatch_refuses_more_than_twelve_steps(board):
-    conn, plan_tool = board
-    result = plan_tool._cmd_dispatch(
+    conn, plan = board
+    result = plan._cmd_dispatch(
         None, "too many", "g", "default", "neo", steps=["s"] * 13
     )
     assert "at most 12 steps" in result
@@ -196,8 +196,8 @@ def test_dispatch_refuses_more_than_twelve_steps(board):
 
 def test_cron_refuses_an_over_cap_template(board, hermetic_cron):
     """A cron template's text is copied into every task the job fires."""
-    conn, plan_tool = board
-    result = plan_tool._cmd_cron(
+    conn, plan = board
+    result = plan._cmd_cron(
         None, "0 9 * * *", "/tmp", "cron cap", LONG_GOAL, [LONG_STEP]
     )
     if "cron path unavailable" in result:
@@ -211,8 +211,8 @@ def test_cron_refuses_an_over_cap_template(board, hermetic_cron):
 
 
 def test_cron_refuses_more_than_twelve_steps(board, hermetic_cron):
-    conn, plan_tool = board
-    result = plan_tool._cmd_cron(
+    conn, plan = board
+    result = plan._cmd_cron(
         None, "0 9 * * *", "/tmp", "cron too many", "g", ["s"] * 13
     )
     assert "at most 12 steps" in result
@@ -227,7 +227,7 @@ def test_insert_request_caps_the_durable_write(board):
     actually lands, and capping there means the durable row is bounded
     regardless of which entry point produced it.
     """
-    conn, _plan_tool = board
+    conn, _plan_mod = board
     from tools import plan_binding_adapter as adapter
 
     adapter._insert_request(
@@ -254,7 +254,7 @@ def test_insert_request_caps_the_durable_write(board):
 
 def test_insert_request_cap_is_idempotent(board):
     """Applied at both the adapter and the kernel — must not double-truncate."""
-    conn, _plan_tool = board
+    conn, _plan_mod = board
     from tools import plan_binding_adapter as adapter
     from hermes_cli.plan_limits import cap_text
 
@@ -307,7 +307,7 @@ def bound_plan(board):
     copy is a sandbox — event cleanup here is fixture prep, never a
     live-board write.
     """
-    conn, _plan_tool = board
+    conn, _plan_mod = board
     from hermes_cli import execution_bindings as B
 
     task_id = conn.execute(
@@ -389,7 +389,7 @@ def test_adapter_forwards_step(bound_plan, monkeypatch):
     monkeypatch.setattr(B, "advance_plan", _spy)
     # The adapter reaches the board via `_legacy()._get_kanban_db()` WITHOUT a
     # `with`, so it needs the connection itself — the `board` fixture's
-    # nullcontext (correct for `plan_tool`'s `with` sites) would blow up here.
+    # nullcontext (correct for `plan`'s `with` sites) would blow up here.
     monkeypatch.setattr(adapter._legacy(), "_get_kanban_db", lambda board=None: conn)
     monkeypatch.setattr(
         adapter, "_current", lambda c, a: (key, B.require_binding(c, key), None)

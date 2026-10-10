@@ -1632,9 +1632,9 @@ def _notify_kanban_status_change(
     elif new_status == "attention":
         # Parked plan task. The detailed prompt (goal / plan / resume steps)
         # goes to the plan's dispatcher agent from the park site; this line is
-        # the human-visible notification that steers any reader to plan_tool.
+        # the human-visible notification that steers any reader to plan.
         human_parts.append(
-            " — Plan-bound task: investigate with plan_tool, not kanban tools"
+            " — Plan-bound task: investigate with plan, not kanban tools"
         )
     human_msg = "".join(human_parts)
 

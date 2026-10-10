@@ -5,7 +5,7 @@ from __future__ import annotations
 import sqlite3
 
 from hermes_cli.kanban_db import SCHEMA_SQL
-from tools import plan_tool
+from tools import plan
 
 from tests.tools.test_plan_binding_adapter import _Agent, _FlexibleSessionDB
 
@@ -24,12 +24,12 @@ def _db() -> sqlite3.Connection:
 
 def _plan(monkeypatch, steps):
     conn = _db()
-    monkeypatch.setattr(plan_tool, "_get_kanban_db", lambda board=None: conn)
+    monkeypatch.setattr(plan, "_get_kanban_db", lambda board=None: conn)
     monkeypatch.setattr(
-        plan_tool, "clarify_tool", lambda *_a, **_k: '{"user_response":"Approve"}'
+        plan, "clarify_tool", lambda *_a, **_k: '{"user_response":"Approve"}'
     )
     agent = _RepeatAgent()
-    plan_tool.plan_tool(
+    plan.plan(
         agent, "new", title="Two-phase", goal="Require proof", steps=list(steps)
     )
     return conn, agent
@@ -46,18 +46,18 @@ def _repeat_without_plan(monkeypatch):
     conn, agent = _plan(monkeypatch, ["do one thing", "do another"])
     responses = iter(["Deny", "The step was not actually completed", "Approve", "Approve"])
     monkeypatch.setattr(
-        plan_tool,
+        plan,
         "clarify_tool",
         lambda *_a, **_k: '{"user_response":"' + next(responses) + '"}',
     )
-    plan_tool.plan_tool(agent, "advance", summary="claimed it")
+    plan.plan(agent, "advance", summary="claimed it")
     return conn, agent
 
 
 def test_repeat_without_steps_demands_a_corrective_plan(monkeypatch):
     conn, agent = _repeat_without_plan(monkeypatch)
 
-    result = plan_tool.plan_tool(agent, "repeat", step=1, reason="never did it")
+    result = plan.plan(agent, "repeat", step=1, reason="never did it")
 
     assert "REQUIRES A CORRECTIVE PLAN" in result
     assert "do one thing" in result, "the re-opened step's text must be shown"
@@ -70,7 +70,7 @@ def test_repeat_without_steps_demands_a_corrective_plan(monkeypatch):
 def test_repeat_with_a_plan_creates_a_corrective_child(monkeypatch):
     conn, agent = _repeat_without_plan(monkeypatch)
 
-    result = plan_tool.plan_tool(
+    result = plan.plan(
         agent,
         "repeat",
         step=1,
@@ -102,7 +102,7 @@ def test_repeat_clears_the_parent_step_summary(monkeypatch):
     """The claim was wrong, so it must not survive as the step's summary."""
     conn, agent = _repeat_without_plan(monkeypatch)
 
-    plan_tool.plan_tool(
+    plan.plan(
         agent,
         "repeat",
         step=1,
@@ -122,7 +122,7 @@ def test_child_completion_summary_returns_to_the_parent_step(monkeypatch):
     """The whole point: the child's outcome lands on the parent's step."""
     conn, agent = _repeat_without_plan(monkeypatch)
 
-    plan_tool.plan_tool(
+    plan.plan(
         agent,
         "repeat",
         step=1,
@@ -134,7 +134,7 @@ def test_child_completion_summary_returns_to_the_parent_step(monkeypatch):
         "SELECT previous_task FROM tasks WHERE previous_task IS NOT NULL"
     ).fetchone()[0]
 
-    result = plan_tool.plan_tool(agent, "advance", summary="parser wired and tested")
+    result = plan.plan(agent, "advance", summary="parser wired and tested")
 
     assert "Approved by user" in result
     body = conn.execute(
@@ -157,7 +157,7 @@ def test_child_completion_summary_returns_to_the_parent_step(monkeypatch):
 def test_repeat_step_must_be_in_range(monkeypatch):
     conn, agent = _repeat_without_plan(monkeypatch)
 
-    result = plan_tool.plan_tool(agent, "repeat", step=9, steps=["x"])
+    result = plan.plan(agent, "repeat", step=9, steps=["x"])
 
     assert "outside 1..2" in result
 
@@ -165,13 +165,13 @@ def test_repeat_step_must_be_in_range(monkeypatch):
 def test_repeat_defaults_to_the_active_step(monkeypatch):
     conn, agent = _repeat_without_plan(monkeypatch)
 
-    result = plan_tool.plan_tool(agent, "repeat", reason="needs work", steps=["x"])
+    result = plan.plan(agent, "repeat", reason="needs work", steps=["x"])
 
     assert "requires title and goal" in result, "active step 1 is the default target"
 
 
 def test_schema_exposes_repeat_and_review():
-    schema = plan_tool.PLAN_TOOL_SCHEMA
+    schema = plan.PLAN_SCHEMA
     commands = schema["parameters"]["properties"]["command"]["enum"]
     properties = schema["parameters"]["properties"]
     assert "repeat" in commands

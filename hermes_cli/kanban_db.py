@@ -146,7 +146,7 @@ VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 # holds by construction — the dispatcher cannot claim it (``claim_task`` only
 # transitions ``ready``), ``recompute_ready`` only promotes ``blocked``/``todo``
 # and never sees it, and ``park_plan_task`` touches no recurrence counter so
-# the loop breaker is unreachable for this class. Restore is ``plan_tool
+# the loop breaker is unreachable for this class. Restore is ``plan
 # continue``, which re-binds the plan and lands the task back in ``manual``.
 PLAN_PARK_STATUS = "attention"
 # Fixed, greppable notification summary for the park transition (Evan,
@@ -4769,7 +4769,7 @@ def recompute_ready(
             task_id = row["id"]
             cur_status = row["status"]
             # Invariant: an approval-gated plan is never auto-promoted. Only a
-            # real human approval (plan_tool approve) may release it; a
+            # real human approval (plan approve) may release it; a
             # dispatcher tick must not flip it to 'ready' where it could be
             # claimed and executed without approval (#global-plan-approval).
             if cur_status == "blocked" and row["block_kind"] == "approval":
@@ -6986,7 +6986,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         _has_assignee = bool((_a["assignee"] or "").strip()) if _a else False
         # A parked plan task (``attention``) must never be handed to the
         # dispatcher — its binding and measuring session are still live. Its
-        # only restore path is ``plan_tool continue``, which re-binds the plan
+        # only restore path is ``plan continue``, which re-binds the plan
         # and lands the task back in ``manual``. ``unblock_task`` can still
         # reach an ``attention`` row (raw CLI / operator), so its restore
         # target is ``manual`` too — never ``ready``.

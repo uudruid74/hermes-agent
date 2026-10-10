@@ -36,7 +36,7 @@ Five profiles, one gateway, one bot token. *(There's also a sixth profile on the
 
 ### 📋 The Plan Tool (or: How We Keep Ornith On Task)
 
-Every non-trivial job runs through `plan_tool` — an ordered list of steps with a success criterion, created *before* any state changes, approved by whoever's in charge. The agent doesn't freewheel toward a vague goal; it walks a fixed plan.
+Every non-trivial job runs through `plan` — an ordered list of steps with a success criterion, created *before* any state changes, approved by whoever's in charge. The agent doesn't freewheel toward a vague goal; it walks a fixed plan.
 
 - **Plans survive context compression.** The plan isn't in the chat window; it's in the board. When the window collapses, the plan doesn't.
 - **Ornith stays on task.** Ornith's job is to review other agents' work. Without a plan, that means wandering. With a plan, that means steps 1..7, in order, no more, no less.
@@ -119,7 +119,7 @@ The wrapper's reply instruction is **conditional by design**: *"If a reply is re
 ### 🔌 Session & Plan APIs
 
 - **Session API** (`set_session`, `session_search`) — inject metadata into the current session (temperature, subject, note, ego) and FTS5-search every past session with bookend context and scroll windows. Durable memory of what happened before; control over what's happening now.
-- **Plan API** (`plan_tool`) — the taskmaster described above. Plans survive compaction, delegate via kanban, enforce the gate, and report steps as they land.
+- **Plan API** (`plan`) — the taskmaster described above. Plans survive compaction, delegate via kanban, enforce the gate, and report steps as they land.
 
 Together, these replace the old "hope the agent remembers what it was doing" model with durable, searchable, auditable execution state.
 

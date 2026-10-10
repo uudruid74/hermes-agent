@@ -71,7 +71,7 @@ _HERMES_CORE_TOOLS = [
     # Session metadata + agent-to-agent messaging
     "set_session", "tell",
     # Mandatory Action Protocol — plan tool
-    "plan_tool",
+    "plan",
     # Cronjob management
     "cronjob",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)

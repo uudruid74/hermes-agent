@@ -2502,9 +2502,9 @@ class CLICommandsMixin:
         goal_line = lines[0] if lines else arg
         steps = lines[1:] if len(lines) > 1 else [goal_line]
         try:
-            from tools.plan_tool import plan_tool
+            from tools.plan import plan
 
-            result = plan_tool(
+            result = plan(
                 agent,
                 "new",
                 title=goal_line[:80],

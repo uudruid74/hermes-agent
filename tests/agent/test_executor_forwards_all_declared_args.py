@@ -5,10 +5,10 @@ WHY THIS EXISTS (2026-09-19)
 ``agent/tool_executor.py`` special-cases a handful of tools with a hardcoded
 branch that rebuilds the call argument-by-argument::
 
-    elif function_name == "plan_tool":
+    elif function_name == "plan":
         def _execute(next_args: dict) -> Any:
-            from tools.plan_tool import plan_tool as _plan_tool
-            return _plan_tool(
+            from tools.plan import plan as _plan
+            return _plan(
                 agent=agent,
                 command=next_args.get("command", ""),
                 ...
@@ -19,11 +19,11 @@ That list is **hand-maintained**, and when a parameter was added to the schema
 and the tool function, nobody updated the middle.  Three live defects came from
 exactly this shape:
 
-  * ``plan_tool``: command-specific parameters have repeatedly been declared in
-    ``PLAN_TOOL_SCHEMA`` and accepted by ``plan_tool()``, but omitted here.
+  * ``plan``: command-specific parameters have repeatedly been declared in
+    ``PLAN_SCHEMA`` and accepted by ``plan()``, but omitted here.
     The review gate now depends on both ``decision`` and ``step`` surviving this
     forwarding path.
-  * ``plan_tool``: ``parent_task_id`` — a nested sub-plan silently became a
+  * ``plan``: ``parent_task_id`` — a nested sub-plan silently became a
     root plan.
   * ``session_search``: ``profile`` — cross-profile recall silently read the
     CURRENT profile's database instead.
@@ -55,7 +55,7 @@ EXECUTOR = REPO / "agent" / "tool_executor.py"
 
 # tool name -> (module, schema attribute candidates)
 SCHEMAS = {
-    "plan_tool": ("tools.plan_tool", ["PLAN_TOOL_SCHEMA"]),
+    "plan": ("tools.plan", ["PLAN_SCHEMA"]),
     "clarify": ("tools.clarify_tool", ["CLARIFY_SCHEMA"]),
     "memory": ("tools.memory_tool", ["MEMORY_SCHEMA"]),
     "read_terminal": ("tools.read_terminal_tool", ["READ_TERMINAL_SCHEMA"]),
@@ -137,7 +137,7 @@ def test_executor_forwards_all_declared_args(tool, forwarded):
         f"They are present in the schema and accepted by the tool, but the "
         f"hardcoded branch in tool_executor.py never forwards them — so the "
         f"tool silently behaves as if they were not supplied. This is how "
-        f"plan_tool lost command-specific parameters (2026-09-19)."
+        f"plan lost command-specific parameters (2026-09-19)."
     )
 
 
@@ -148,12 +148,12 @@ def test_guard_is_load_bearing(monkeypatch, forwarded):
     forwarded set and confirm the comparison catches it. Without this the guard
     could pass for the wrong reason (e.g. schema resolution returning nothing).
     """
-    if "plan_tool" not in forwarded:
-        pytest.skip("plan_tool has no whitelist in this build")
-    declared = _declared_args("tools.plan_tool", SCHEMAS["plan_tool"][1])
+    if "plan" not in forwarded:
+        pytest.skip("plan has no whitelist in this build")
+    declared = _declared_args("tools.plan", SCHEMAS["plan"][1])
     assert "decision" in declared, "fixture assumption: decision is a declared arg"
 
     mutated = dict(forwarded)
-    mutated["plan_tool"] = set(forwarded["plan_tool"]) - {"decision"}
-    dropped = sorted(declared - mutated["plan_tool"])
+    mutated["plan"] = set(forwarded["plan"]) - {"decision"}
+    dropped = sorted(declared - mutated["plan"])
     assert "decision" in dropped, "the guard must detect a dropped `decision`"

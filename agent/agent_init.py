@@ -1498,7 +1498,7 @@ def init_agent(
         agent.session_id = f"{timestamp_str}_{short_uuid}"
     agent.canonical_session_id = agent.session_id
 
-    # Profile identity for the strict execution-binding kernel (plan_tool /
+    # Profile identity for the strict execution-binding kernel (plan /
     # write gate).  Stamped once at init like canonical_session_id; the agent
     # object is the ONLY identity source - no env fallbacks.
     try:

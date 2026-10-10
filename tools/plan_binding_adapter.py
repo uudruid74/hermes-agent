@@ -1,6 +1,6 @@
 """Execution-binding-only adapters for live Plan commands.
 
-The legacy helpers in :mod:`tools.plan_tool` are retained for provenance,
+The legacy helpers in :mod:`tools.plan` are retained for provenance,
 but live command dispatch resolves runtime identity exclusively through this
 module and ``hermes_cli.execution_bindings``.
 """
@@ -18,9 +18,9 @@ logger = logging.getLogger(__name__)
 
 
 def _legacy():
-    from tools import plan_tool
+    from tools import plan
 
-    return plan_tool
+    return plan
 
 
 def _identity(agent):
@@ -35,7 +35,7 @@ def _actor(agent):
     return ApprovalActor(
         session_id=getattr(agent, "session_id", None),
         actor=_legacy()._get_agent_name(agent),
-        via="plan_tool",
+        via="plan",
     )
 
 
@@ -103,7 +103,7 @@ def _insert_request(
     ``goal`` and ``steps`` are whitespace-compressed and head-capped here as
     well as in the adapter (Evan, 2026-09-16): this is the durable write, so
     a caller reaching the kernel directly gets the same bounded Plan rather
-    than only callers that entered through ``plan_tool``.  ``cap_text`` is
+    than only callers that entered through ``plan``.  ``cap_text`` is
     idempotent, so applying it twice is a no-op.
     """
     from hermes_cli import plan_authorizations
@@ -491,7 +491,7 @@ def _create_plan(
         # Evan's exact pseudo text (2026-09-22) — verbatim, nothing added:
         worker_msg = (
             f"You have been assigned a new task.  Please call "
-            f"'plan_tool continue {task_id}' to begin the new task."
+            f"'plan continue {task_id}' to begin the new task."
         )
         wrapped = (
             f"Incoming message from {creator_agent_name} follows:\n"
@@ -528,7 +528,7 @@ def _current(conn, agent):
 def block_active_plan_at_iteration_limit(agent, *, used: int, maximum: int) -> bool:
     """Park an unsubmitted active Plan step after its turn budget is exhausted.
 
-    A pending step review proves that ``plan_tool advance`` already submitted
+    A pending step review proves that ``plan advance`` already submitted
     the step, so that state must remain with the reviewer. Otherwise the bound
     Plan has no live worker after this turn and the task parks in the
     dedicated ``attention`` state (park_plan_task) — never ``blocked``, which
@@ -657,7 +657,7 @@ def _review_request_text(task, pending, *, auto_approved: bool = False) -> str:
     else:
         lines.append(
             "Please make sure this step is completed correctly and approve or deny "
-            "this step using 'plan_tool review'. Pass the task id and decision "
+            "this step using 'plan review'. Pass the task id and decision "
             "'approved', 'denied', or 'yolo' — 'yolo' approves this step AND "
             "auto-approves the remaining steps of this plan, so you will not be "
             "asked again for this plan. A denial must include a response."
@@ -712,7 +712,7 @@ def _attention_request_text(task, pending, *, used: int, maximum: int) -> str:
     A parked plan task's dispatcher is an agent (the plan's creator), not a
     human operator, so this is built as a sibling of
     :func:`_review_request_text` — same preamble, same goal/plan/summary
-    blocks — with the request line steering that agent to ``plan_tool``.
+    blocks — with the request line steering that agent to ``plan``.
     Kanban routes (dispatch, specify, unblock, archive) are named as "do
     not": on a machine where the assignee's model cannot hold two workers,
     any of them spawns a duplicate worker and the run's measurement is lost.
@@ -737,20 +737,20 @@ def _attention_request_text(task, pending, *, used: int, maximum: int) -> str:
     lines.append(
         "---\n"
         "\n"
-        "Investigate with plan_tool. This is a plan-bound task — nothing here "
+        "Investigate with plan. This is a plan-bound task — nothing here "
         "is a kanban problem.\n"
         "\n"
         "- The worker's session is still live and still holds the binding. "
         "Do NOT dispatch, re-specify, unblock, or archive. A state change "
         "here spawns a second worker on a machine that cannot hold one, and "
         "the run's measurement is lost.\n"
-        "- Inspect the current step: 'plan_tool remind "
+        "- Inspect the current step: 'plan remind "
         f"{task['id']}' shows the active step and whether a review is "
         "pending.\n"
-        "- When you are ready to resume, re-bind with 'plan_tool continue "
+        "- When you are ready to resume, re-bind with 'plan continue "
         f"{task['id']}'. That restores the task to 'manual' and wakes the "
         "worker.\n"
-        "- If you need to end the step, use 'plan_tool' — not a kanban "
+        "- If you need to end the step, use 'plan' — not a kanban "
         "command.\n"
         "\n"
         "No reply is required to this notification."
@@ -783,7 +783,7 @@ def _worker_review_message(task, result, reviewer: str, response: Optional[str])
         f"Now complete Step {result.next_step_no}\n\n"
         f"Goal: {task['task_goal'] or ''}\n"
         f"Step {result.next_step_no}: {result.next_step}\n\n"
-        "Please work this step and when this step is complete, use plan_tool "
+        "Please work this step and when this step is complete, use plan "
         f"to advance to the next{yolo_note}"
     )
 
@@ -1491,9 +1491,9 @@ def cmd_remind(agent, task_id: Optional[str] = None) -> str:
                     return (
                         f"No active plan in this session. You are assigned to "
                         f"task {tid} ({title}) but have not claimed it yet. "
-                        f"Run `plan_tool continue {tid}` to claim it."
+                        f"Run `plan continue {tid}` to claim it."
                     )
-            return "ERROR: No active plan in this session. Run `plan_tool continue <task_id>` with a valid task id to claim the task."
+            return "ERROR: No active plan in this session. Run `plan continue <task_id>` with a valid task id to claim the task."
         else:
             task_id = binding.task_id
     task = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
@@ -1517,8 +1517,8 @@ def cmd_remind(agent, task_id: Optional[str] = None) -> str:
             lines.append(f"Final step was: {steps[-1]}")
         lines.append("")
         lines.append(
-            "If this plan needs more work, call `plan_tool repeat` with "
-            "step=1 plus a corrective plan, or `plan_tool archive` to close it."
+            "If this plan needs more work, call `plan repeat` with "
+            "step=1 plus a corrective plan, or `plan archive` to close it."
         )
         return "\n".join(lines)
     stepno = task["task_stepno"]
@@ -1532,7 +1532,7 @@ def cmd_remind(agent, task_id: Optional[str] = None) -> str:
         return (
             f"Task {task_id} is assigned to you but NOT ACTIVE in this session "
             f"(no execution binding — maybe the gateway restarted or the plan "
-            f"was reset). Run `plan_tool continue {task_id}` to claim it, "
+            f"was reset). Run `plan continue {task_id}` to claim it, "
             f"then implement Step {task['task_stepno'] or 1}.\n\n"
             f"{unbound}"
         )
@@ -1553,11 +1553,11 @@ def cmd_remind(agent, task_id: Optional[str] = None) -> str:
             f"has not been claimed — its row sits at step {wstepno}. Any step "
             f"position shown above comes from a stored row, which an earlier "
             f"session may have advanced. Confirm which plan you mean by "
-            f"claiming it: `plan_tool continue {wtid}`."
+            f"claiming it: `plan continue {wtid}`."
         )
     lines.append("")
     lines.append(
-        "If this step is complete, call `plan_tool advance` with a summary "
+        "If this step is complete, call `plan advance` with a summary "
         "to get the next step."
     )
     return "\n".join(lines)
@@ -1582,7 +1582,7 @@ def cmd_continue(agent, task_id: str) -> str:
             task = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
             return (
                 f"Plan {task_id} is ALREADY ACTIVE in this session. "
-                f"No need to call `continue` — use `plan_tool advance` with a "
+                f"No need to call `continue` — use `plan advance` with a "
                 f"summary to move to the next step.\n\n"
                 f"{_format_plan(conn, task, include_summaries=True)}"
             )

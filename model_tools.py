@@ -1145,8 +1145,8 @@ def handle_function_call(
     if function_name in _WRITE_TOOLS or (
         function_name in {"cronjob"} and function_args.get("action") == "create"
     ):
-        # Exempt plan_tool block/archive (emergency safety commands)
-        if function_name == "plan_tool" and function_args.get("command") in ("block", "archive"):
+        # Exempt plan block/archive (emergency safety commands)
+        if function_name == "plan" and function_args.get("command") in ("block", "archive"):
             pass  # allow without active task
         else:
             from agent.file_safety import (
@@ -1166,7 +1166,7 @@ def handle_function_call(
             ):
                 return json.dumps({
                     "error": "Write denied: No active task. "
-                             "Use plan_tool 'new' to create a task first."
+                             "Use plan 'new' to create a task first."
                 })
     # tool_search and tool_describe are pure catalog reads — handle them
     # inline. tool_call is unwrapped to the underlying tool so that every

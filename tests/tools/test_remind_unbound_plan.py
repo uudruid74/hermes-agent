@@ -1,13 +1,13 @@
 """Regression tests for the remind phantom-activation bug (t_a63a4220).
 
-Bug: `plan_tool remind <task_id>` on an unclaimed/reset manual plan rendered
+Bug: `plan remind <task_id>` on an unclaimed/reset manual plan rendered
 "Active Step 1 of N" because of the `task_stepno or 1` fallback. A fresh
 worker (post-gateway-restart, post-reset) believed the plan was running in
 its session, implemented the step, then burned multiple `advance` calls
 against "ERROR: No active task". Observed on ornith 2026-10-09 06:09-06:22.
 
 Fix: cmd_remind with explicit task_id checks the caller's execution binding;
-unbound -> "NOT ACTIVE in this session... Run `plan_tool continue <tid>`".
+unbound -> "NOT ACTIVE in this session... Run `plan continue <tid>`".
 """
 
 import json
@@ -84,7 +84,7 @@ def test_remind_explicit_task_id_unbound_says_not_active_not_step_1(monkeypatch)
     out = plan_binding_adapter.cmd_remind(_Agent(), task_id="t_a63a4220")
 
     assert "NOT ACTIVE in this session" in out
-    assert "plan_tool continue t_a63a4220" in out
+    assert "plan continue t_a63a4220" in out
     assert "Active Step 1 of" not in out  # the phantom is dead
 
 

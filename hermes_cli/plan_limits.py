@@ -137,6 +137,6 @@ def step_count_error(steps: Optional[Iterable[str]]) -> Optional[str]:
         f"ERROR: a Plan may have at most {PLAN_MAX_STEPS} steps "
         f"(got {count}). More steps should use SUBPLANS — create this Plan "
         f"with {PLAN_MAX_STEPS} or fewer steps, then nest a child Plan for "
-        f"the detail (plan_tool 'new' while a Plan is active creates a child "
+        f"the detail (plan 'new' while a Plan is active creates a child "
         f"automatically)."
     )

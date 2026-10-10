@@ -114,7 +114,7 @@ def _is_mcp_tool_parallel_safe(tool_name: str) -> bool:
         return False
 
 
-def _plan_tool_batch_segments(tool_calls, *, execution_cwd: Optional[Path] = None) -> List[tuple]:
+def _plan_batch_segments(tool_calls, *, execution_cwd: Optional[Path] = None) -> List[tuple]:
     """Split a tool-call batch into ordered ``(kind, calls)`` segments.
 
     ``kind`` is ``"parallel"`` (a maximal contiguous run of parallel-safe
@@ -238,13 +238,13 @@ def _plan_tool_batch_segments(tool_calls, *, execution_cwd: Optional[Path] = Non
 def _should_parallelize_tool_batch(tool_calls) -> bool:
     """Return True when the WHOLE tool-call batch is safe to run concurrently.
 
-    Thin view over ``_plan_tool_batch_segments`` kept for callers/tests that
+    Thin view over ``_plan_batch_segments`` kept for callers/tests that
     only care about the homogeneous case: True iff the planner produces a
     single all-parallel segment.
     """
     if len(tool_calls) <= 1:
         return False
-    segments = _plan_tool_batch_segments(tool_calls)
+    segments = _plan_batch_segments(tool_calls)
     return len(segments) == 1 and segments[0][0] == "parallel"
 
 
@@ -725,7 +725,7 @@ __all__ = [
     "_DESTRUCTIVE_PATTERNS",
     "_REDIRECT_OVERWRITE",
     "_is_destructive_command",
-    "_plan_tool_batch_segments",
+    "_plan_batch_segments",
     "_should_parallelize_tool_batch",
     "_canonical_path",
     "_extract_parallel_scope_path",

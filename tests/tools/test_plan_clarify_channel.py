@@ -1,7 +1,7 @@
 """F2 clarify channel tests (t_6a55f4d6, build steps 2+3).
 
 Covers:
-- plan_tool clarify: dispatcher routing (flag written FIRST, then wake-ping)
+- plan clarify: dispatcher routing (flag written FIRST, then wake-ping)
 - plan review dual-mode: needs_clarify flag → clarify answer, flag cleared
 - plan review dual-mode: tool_limit_hit flag → guide answer
 - self-dispatched plan → human path (byte-identical clarify_tool callback)
@@ -23,17 +23,17 @@ from tests.tools.test_plan_step_review import (  # noqa: E402
     _install,
 )
 from tools import plan_binding_adapter  # noqa: E402
-from tools import plan_tool  # noqa: E402
+from tools import plan  # noqa: E402
 from tools.plan_binding_adapter import cmd_review  # noqa: E402
 
 
 def test_clarify_writes_flag_then_pings_dispatcher(monkeypatch):
     """flag-first ordering: the durable ask exists in the DB before the send."""
     conn, sent, worker, dispatcher, task_id = _delegated_plan(monkeypatch)
-    plan_tool.plan_tool(worker, "advance", summary="working step 1", step=1)
+    plan.plan(worker, "advance", summary="working step 1", step=1)
     sent.clear()
 
-    result = plan_tool.plan_tool(
+    result = plan.plan(
         worker, "clarify", question="Should I use WAL or a plain rollback journal?"
     )
     flag = json.loads(
@@ -50,17 +50,17 @@ def test_clarify_writes_flag_then_pings_dispatcher(monkeypatch):
 
 def test_review_answers_clarify_flag_instead_of_step_review(monkeypatch):
     conn, sent, worker, dispatcher, task_id = _delegated_plan(monkeypatch)
-    plan_tool.plan_tool(worker, "advance", summary="working step 1", step=1)
-    plan_tool.plan_tool(worker, "clarify", question="Which branch?")
+    plan.plan(worker, "advance", summary="working step 1", step=1)
+    plan.plan(worker, "clarify", question="Which branch?")
     sent.clear()
 
     # review with no response is refused BEFORE any step resolution
-    refused = plan_tool.plan_tool(
+    refused = plan.plan(
         dispatcher, "review", task_id=task_id, decision="approved"
     )
     assert "pending needs_clarify" in refused
     # the answer dual-modes the review: no step review happened
-    answered = plan_tool.plan_tool(
+    answered = plan.plan(
         dispatcher, "review", task_id=task_id, decision="approved",
         response="Use the default journal mode.",
     )
@@ -93,7 +93,7 @@ def test_review_answers_tool_limit_flag_as_guide(monkeypatch):
         "SELECT status FROM tasks WHERE id=?", (task_id,)
     ).fetchone()[0] == "attention"
 
-    answered = plan_tool.plan_tool(
+    answered = plan.plan(
         dispatcher, "review", task_id=task_id, decision="approved",
         response="Split the step: probe the API first, then rewrite.",
     )
@@ -116,14 +116,14 @@ def test_self_dispatched_clarify_routes_to_human(monkeypatch):
         asked.append((question, choices))
         return json.dumps({"user_response": next(answers)})
 
-    monkeypatch.setattr(plan_tool, "clarify_tool", clarify)
+    monkeypatch.setattr(plan, "clarify_tool", clarify)
     worker = _Agent("ornith", "20261010_010107_abcdef")
-    plan_tool.plan_tool(
+    plan.plan(
         worker, "new", title="Self plan", goal="Try it", steps=["do it"]
     )
     task_id = conn.execute("SELECT id FROM tasks").fetchone()[0]
 
-    result = plan_tool.plan_tool(
+    result = plan.plan(
         worker, "clarify", question="Journal mode for the test DB?"
     )
     assert result == "Use WAL."
@@ -143,15 +143,15 @@ def test_clarify_without_dispatcher_or_callback_is_refused(monkeypatch):
     # The real clarify_tool would block on the (returning-None) callback; stub
     # the boundary and assert the command surfaces the empty answer as an error.
     monkeypatch.setattr(
-        plan_tool, "clarify_tool",
+        plan, "clarify_tool",
         lambda *a, **k: json.dumps({"user_response": ""}),
     )
-    plan_tool.plan_tool(
+    plan.plan(
         worker, "new", title="Self plan", goal="Try", steps=["do it"]
     )
     task_id = conn.execute("SELECT id FROM tasks").fetchone()[0]
 
-    result = plan_tool.plan_tool(worker, "clarify", question="Which one?")
+    result = plan.plan(worker, "clarify", question="Which one?")
     assert "ERROR" in result
     assert conn.execute(
         "SELECT clarify_flag FROM tasks WHERE id=?", (task_id,)
@@ -165,18 +165,18 @@ def test_clarify_requires_active_plan_and_question(monkeypatch):
         clarify_callback = None
 
     conn, _ = _install(monkeypatch)
-    assert "requires question" in plan_tool.plan_tool(_Bare(), "clarify")
+    assert "requires question" in plan.plan(_Bare(), "clarify")
     # With a question but no resolvable identity/binding, the command reports it.
-    bare_result = plan_tool.plan_tool(_Bare(), "clarify", question="hi?")
+    bare_result = plan.plan(_Bare(), "clarify", question="hi?")
     assert "ERROR" in bare_result or "PLAN_STATE_UNAVAILABLE" in bare_result
 
 
 def test_second_clarify_while_one_is_pending_is_refused(monkeypatch):
     conn, _sent, worker, _dispatcher, task_id = _delegated_plan(monkeypatch)
-    plan_tool.plan_tool(worker, "advance", summary="working", step=1)
-    first = plan_tool.plan_tool(worker, "clarify", question="One?")
+    plan.plan(worker, "advance", summary="working", step=1)
+    first = plan.plan(worker, "clarify", question="One?")
     assert "routed to dispatcher" in first
-    second = plan_tool.plan_tool(worker, "clarify", question="Two?")
+    second = plan.plan(worker, "clarify", question="Two?")
     assert "already has a pending clarify ask" in second
 
 

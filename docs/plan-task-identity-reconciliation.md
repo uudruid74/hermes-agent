@@ -10,11 +10,11 @@ must not be added as runtime fallbacks.
 | Provenance | Preserved invariant | Final authority | Regression coverage |
 |---|---|---|---|
 | t_ceca8b15 | terminal top-level close clears binding; nested close restores explicit parent | `execution_bindings.close_plan` | `tests/hermes_cli/test_execution_bindings.py` |
-| t_1efd1efd / 6fb1036b7 | unanswered approval stays `blocked/approval`, never denial | `plan_authorizations` + adapter | `tests/tools/test_plan_tool.py` |
-| t_c2472725 / 055e0f51 / facf7e32 / 0bb6f9a0 | explicit historical IDs for remind/block/archive; neutral test close | Plan adapter | `tests/tools/test_plan_tool.py`, `test_plan_tool_debug.py` |
+| t_1efd1efd / 6fb1036b7 | unanswered approval stays `blocked/approval`, never denial | `plan_authorizations` + adapter | `tests/tools/test_plan.py` |
+| t_c2472725 / 055e0f51 / facf7e32 / 0bb6f9a0 | explicit historical IDs for remind/block/archive; neutral test close | Plan adapter | `tests/tools/test_plan.py`, `test_plan_debug.py` |
 | t_87904541 / 4e6b2722 / 48fa3949 / de13f3ea | compression-root identity replaces canonical-session authority | binding resolver | `test_plan_binding_adapter.py`, `test_plan_execution_binding_lineage.py` |
-| 9e229a23 | dashboard approval remains durable/atomic | `plan_authorizations.resolve_plan_in_txn` | `tests/tools/test_plan_tool.py` |
-| t_e79e2c12 / f99dab05 | Plan wrapper forwards board, cron, root, kind, debug flags | `tools/plan_tool.py` | `tests/tools/test_plan_tool.py` |
+| 9e229a23 | dashboard approval remains durable/atomic | `plan_authorizations.resolve_plan_in_txn` | `tests/tools/test_plan.py` |
+| t_e79e2c12 / f99dab05 | Plan wrapper forwards board, cron, root, kind, debug flags | `tools/plan.py` | `tests/tools/test_plan.py` |
 | t_bc92291c / t_dacd1f6c | deterministic fail-closed binding kernel | `hermes_cli/execution_bindings.py` | `tests/hermes_cli/test_execution_bindings.py` |
 | t_aa4631b3 | no code salvaged | N/A | provenance only |
 | wake recovery 09aa29622 / 7a9d00c52 | preserve task creator provenance without merging wake branch | `_cmd_dispatch(created_by=...)` | Plan tool regression suite |
