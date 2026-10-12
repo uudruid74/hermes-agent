@@ -894,6 +894,18 @@ class ShellFileOperations(FileOperations):
         
         # Content analysis: >30% non-printable chars = binary
         if content_sample:
+            sample = content_sample[:1000]
+            # Truncation artifact: the 1000-byte sample can cut a multi-byte
+            # UTF-8 sequence in half, and the terminal env's errors="replace"
+            # turns the dangling bytes into exactly one U+FFFD at the very end
+            # of the sample (e.g. an em-dash or "·" straddling byte 999).
+            # That is not file corruption. Real binary content scatters many
+            # replacements throughout the sample; it never produces exactly
+            # one trailing U+FFFD. Drop a single trailing replacement before
+            # the corruption check so legit UTF-8 text at the boundary isn't
+            # misclassified as binary.
+            if sample.endswith("\ufffd") and sample.count("\ufffd") == 1:
+                sample = sample[:-1]
             # Undecodable bytes: the terminal env decodes stdout with
             # errors="replace", so any non-UTF-8 byte arrives here already
             # turned into U+FFFD. That char is "printable" (ord 65533), so the
@@ -903,11 +915,11 @@ class ShellFileOperations(FileOperations):
             # sample carries the replacement char as binary (read-only) so the
             # agent can't corrupt it. Legitimate UTF-8 text effectively never
             # contains U+FFFD.
-            if "\ufffd" in content_sample[:1000]:
+            if "\ufffd" in sample:
                 return True
-            non_printable = sum(1 for c in content_sample[:1000]
+            non_printable = sum(1 for c in sample
                                if ord(c) < 32 and c not in '\n\r\t')
-            return non_printable / min(len(content_sample), 1000) > 0.30
+            return non_printable / max(len(sample), 1) > 0.30
         
         return False
     
