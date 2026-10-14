@@ -5,6 +5,7 @@ and run_agent.py for pre-flight context checks.
 """
 
 import base64
+from functools import lru_cache
 import hashlib
 import ipaddress
 import json
@@ -3039,6 +3040,20 @@ _CJK_DENSE_RE = re.compile(
 )
 
 
+@lru_cache(maxsize=16384)
+def _estimate_tokens_rough_cached(text: str) -> int:
+    if text.isascii():
+        # O(1) fast path — ASCII text cannot contain token-dense CJK chars.
+        return (len(text) + 3) // 4
+    dense = len(text) - len(_CJK_DENSE_RE.sub("", text))
+    if not dense:
+        # Non-ASCII but no CJK (accents, Cyrillic, emoji, ...): keep the
+        # classic ~4 chars/token rule.
+        return (len(text) + 3) // 4
+    sparse = len(text) - dense
+    return dense + ((sparse + 3) // 4)
+
+
 def estimate_tokens_rough(text: str) -> int:
     """Rough token estimate for pre-flight checks.
 
@@ -3051,23 +3066,19 @@ def estimate_tokens_rough(text: str) -> int:
 
     Perf: this runs on every message in every preflight/compaction walk,
     including MB-scale tool outputs, so the common all-ASCII case must stay
-    O(1).  ``str.isascii()`` is a flag check on CPython's compact unicode
+    O(1). ``str.isascii()`` is a flag check on CPython's compact unicode
     representation (no scan), and the CJK counting itself is a single
     C-level ``re.findall`` rather than a per-character Python loop.
+
+    The result is memoised on the coerced text (fix-compressor,
+    t_fc6b69d2): llmslim's token-limit splitter calls this per word and per
+    joined prefix (~642K calls on a 680-msg build). Pure str -> int; the
+    empty check and ``str()`` coercion run before the cache key, so
+    unhashable caller values behave exactly as before.
     """
     if not text:
         return 0
-    text = str(text)
-    if text.isascii():
-        # O(1) fast path — ASCII text cannot contain token-dense CJK chars.
-        return (len(text) + 3) // 4
-    dense = len(text) - len(_CJK_DENSE_RE.sub("", text))
-    if not dense:
-        # Non-ASCII but no CJK (accents, Cyrillic, emoji, ...): keep the
-        # classic ~4 chars/token rule.
-        return (len(text) + 3) // 4
-    sparse = len(text) - dense
-    return dense + ((sparse + 3) // 4)
+    return _estimate_tokens_rough_cached(str(text))
 
 
 def estimate_messages_tokens_rough(messages: List[Dict[str, Any]]) -> int:

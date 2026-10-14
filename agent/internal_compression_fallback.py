@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from functools import lru_cache
 import json
 import logging
 import math
@@ -158,6 +159,7 @@ _NARRATION_OPENER_RE = re.compile(
 _ROLE_ONLY_RE = re.compile(r"^\[([A-Z_]{2,12})\]:")
 
 
+@lru_cache(maxsize=8192)
 def _is_narration(text: str) -> bool:
     """True for an agent's own "let me do X" line — never for a user request.
 
@@ -348,6 +350,12 @@ def _verbatim_tail_start(
     return tail_start
 
 
+# The three pure text transforms below are memoised (fix-compressor,
+# t_fc6b69d2): on the 680-msg repro they are called 9.9x / 4.0x / 4.7x on
+# the SAME text per build (two rank passes over overlapping windows), and
+# each _strip_boilerplate call runs ~17 regex substitutions. Pure
+# text->value: identical results, bounded memory, no cross-call state.
+@lru_cache(maxsize=8192)
 def _strip_boilerplate(text: str) -> str:
     """Remove compaction wrappers so they cannot be ranked as context.
 
@@ -372,6 +380,7 @@ def _strip_boilerplate(text: str) -> str:
     return re.sub(r"[ \t]+", " ", cleaned).strip()
 
 
+@lru_cache(maxsize=8192)
 def _is_fragment(text: str) -> bool:
     """True for units with no content beyond a list marker or punctuation.
 
@@ -385,6 +394,7 @@ def _is_fragment(text: str) -> bool:
     return len(re.sub(r"[\W\d_]+", "", cleaned)) == 0
 
 
+@lru_cache(maxsize=8192)
 def _has_wrapper_marker(text: str) -> bool:
     """True when text carries an actual compaction wrapper.
 
@@ -397,6 +407,7 @@ def _has_wrapper_marker(text: str) -> bool:
     return any(pattern.search(text) for pattern in _BOILERPLATE_RES)
 
 
+@lru_cache(maxsize=8192)
 def _is_boilerplate_only(text: str) -> bool:
     """True when a unit is *only* wrapper noise and nothing else.
 
@@ -428,6 +439,7 @@ _STOPWORDS = frozenset(
 )
 
 
+@lru_cache(maxsize=8192)
 def _canonical_form(text: str) -> str:
     """Content-word canonical form of a unit, for near-duplicate detection.
 
@@ -455,6 +467,7 @@ def _content_token_count(text: str) -> int:
     return len(_content_tokens(text))
 
 
+@lru_cache(maxsize=8192)
 def _content_tokens(text: str) -> frozenset[str]:
     """Content-word token set of a unit, for similarity comparisons.
 
@@ -676,6 +689,7 @@ _IDENTIFIER_RE = re.compile(
 _INVIOLABLE_MAX_TOKENS = 60
 
 
+@lru_cache(maxsize=8192)
 def _carries_inviolable(text: str) -> bool:
     """True when a unit carries a path or an identifier worth preserving.
 
@@ -1036,6 +1050,7 @@ def _split_oversized_unit(text: str) -> list[str]:
     return chunks
 
 
+@lru_cache(maxsize=8192)
 def _chunks(text: str) -> list[str]:
     text = _strip_boilerplate(text)
     chunks: list[str] = []
@@ -2047,8 +2062,13 @@ def _rank_units(
         zip(candidates, scores),
         key=lambda item: (-item[1], item[0].order),
     )
-    # Stage 2 (t_57cb0d4e sweep): promote-then-bound, as site 1.
-    return _lock_first(_mmr_order(_tier_promote(ordered)))[:_TIER_CANDIDATE_UNITS]
+    # Stage 2 (t_57cb0d4e sweep): promote-then-bound, as site 1. The
+    # [:_TIER_CANDIDATE_UNITS] cap bounds _mmr_order's INPUT, not its
+    # output (fix-compressor, t_fc6b69d2): MMR is O(n^2) on what it
+    # receives. Inner _lock_first runs full-list so the locked artifacts
+    # land inside the cap; the outer one re-asserts them after MMR's
+    # permutation.
+    return _lock_first(_mmr_order(_lock_first(_tier_promote(ordered))[:_TIER_CANDIDATE_UNITS]))
 
 
 def _mmr_order(
@@ -2067,7 +2087,10 @@ def _mmr_order(
 
     Each step picks the candidate maximising ``score - lam * max_similarity``
     against everything already picked, where similarity is the Jaccard
-    overlap of content-word sets.  O(n^2) on <=256 candidates.
+    overlap of content-word sets. O(n^2) on <=256 candidates: the max
+    similarity is maintained incrementally across picks, so each token-set
+    pair is scored once; recomputing the max inside the scan would be
+    O(n^3) and blow this bound even at the cap (fix-compressor, t_fc6b69d2).
 
     The returned scores are the original ranking scores, unchanged: this
     decides order, not value, so callers that only read the score are
@@ -2079,28 +2102,27 @@ def _mmr_order(
     remaining = list(ranked)
     token_sets = {id(unit): _content_tokens(unit.text) for unit, _score in remaining}
     chosen: list[tuple[_Unit, float]] = []
-    picked_tokens: list[frozenset[str]] = []
+    max_similarity = {id(unit): 0.0 for unit, _score in remaining}
 
     while remaining:
         best_index = 0
         best_value = float("-inf")
         for index, (unit, score) in enumerate(remaining):
-            tokens = token_sets[id(unit)]
-            overlap = 0.0
-            if tokens and picked_tokens:
-                for previous in picked_tokens:
-                    union = len(tokens | previous)
-                    if union:
-                        similarity = len(tokens & previous) / union
-                        if similarity > overlap:
-                            overlap = similarity
-            value = score - lam * overlap
+            value = score - lam * max_similarity[id(unit)]
             if value > best_value:
                 best_value = value
                 best_index = index
         unit, score = remaining.pop(best_index)
         chosen.append((unit, score))
-        picked_tokens.append(token_sets[id(unit)])
+        picked = token_sets[id(unit)]
+        if picked:
+            for candidate, _score in remaining:
+                tokens = token_sets[id(candidate)]
+                if not tokens:
+                    continue
+                similarity = len(tokens & picked) / len(tokens | picked)
+                if similarity > max_similarity[id(candidate)]:
+                    max_similarity[id(candidate)] = similarity
 
     return chosen
 
