@@ -1600,6 +1600,25 @@ class _CompressionLockLeaseRefresher:
                 break
 
 
+def _compression_has_no_llm_summary(agent: Any) -> bool:
+    """Whether this agent's compression has NO LLM summary path at all.
+
+    ``compression.internal_only`` is three-valued (Evan spec, step 5 §4):
+    ``False`` allows LLM summary providers; ``True`` runs the deterministic
+    local selector only; ``None`` (the null mode) emits an omission marker
+    only. Both non-False modes route ``compress()`` straight to
+    ``build_internal_fallback`` (``internal_only is not False``), so no
+    auxiliary compression model is ever called on them and any LLM-shaped
+    feasibility probe is dead work that must not run (2026-10-13: the probe
+    hung 120-190s and fence-cancelled a deterministic run that finishes in
+    seconds — the "commit_fence_cancelled" retry loop).
+    """
+    mode = getattr(
+        getattr(agent, "context_compressor", None), "internal_only", False
+    )
+    return mode is True or mode is None
+
+
 def check_compression_model_feasibility(agent: Any) -> None:
     """Warn at session start if the auxiliary compression model's context
     window is smaller than the main model's compression threshold.
@@ -1615,6 +1634,14 @@ def check_compression_model_feasibility(agent: Any) -> None:
     ``run_conversation()`` call.
     """
     if not agent.compression_enabled:
+        return
+    if _compression_has_no_llm_summary(agent):
+        # No summary LLM exists on this profile (internal_only True/None),
+        # so there is no auxiliary compression model whose feasibility could
+        # matter — and the probe below is not free: it builds an aux client
+        # and performs a LIVE network context-length lookup that hung
+        # 120-190s on 2026-10-13, fence-cancelling a deterministic run that
+        # finishes in seconds. Nothing LLM-shaped may run on these profiles.
         return
     try:
         from agent.auxiliary_client import (
@@ -2292,13 +2319,22 @@ def compress_context(
     # status-callback replay machinery still emits the warning to the user
     # the first time it would matter.
     if not getattr(agent, "_compression_feasibility_checked", False):
-        # Mark as checked only after the probe completes. If the check
-        # raises (e.g. a fatal aux-context ValueError that aborts the
-        # session), leaving the flag unset is harmless; a non-fatal
-        # transient failure is swallowed inside the function so the flag
-        # is set normally on the next successful pass.
-        check_compression_model_feasibility(agent)
-        agent._compression_feasibility_checked = True
+        if _compression_has_no_llm_summary(agent):
+            # Non-LLM profiles (internal_only True/None): the feasibility
+            # probe is pure LLM-shaped work (aux client build + live network
+            # context-length lookup) with nothing to verify. Skip it — a hung
+            # probe stalls the whole deterministic pipeline behind it
+            # (2026-10-13: 120-190s stall, then commit_fence_cancelled while
+            # the CPU selector itself finishes in seconds).
+            agent._compression_feasibility_checked = True
+        else:
+            # Mark as checked only after the probe completes. If the check
+            # raises (e.g. a fatal aux-context ValueError that aborts the
+            # session), leaving the flag unset is harmless; a non-fatal
+            # transient failure is swallowed inside the function so the flag
+            # is set normally on the next successful pass.
+            check_compression_model_feasibility(agent)
+            agent._compression_feasibility_checked = True
 
     _pre_msg_count = len(messages)
     # In-place compaction (config: compression.in_place, see #38763). When True,
