@@ -2188,6 +2188,12 @@ try:
 except Exception as _bootstrap_exc:
     print(f"  Warning: config validation failed: {_bootstrap_exc}", file=sys.stderr)
 
+# Provenance note (neo, 2026-10-14): warn_deprecated_cwd_env_vars() skips values
+# tagged with HERMES_TERMINAL_CWD_RESOLVED to avoid the 2026-09-08 false positive
+# (placeholder resolution's own TERMINAL_CWD output flagged as a legacy .env
+# entry). Ordering caveat: that tag is set AFTER this call site (placeholder
+# resolution below), so bridge/resolver-produced values are not yet tagged here.
+
 # Warn if user has deprecated MESSAGING_CWD / TERMINAL_CWD in .env
 try:
     from hermes_cli.config import warn_deprecated_cwd_env_vars
