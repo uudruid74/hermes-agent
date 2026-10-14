@@ -815,7 +815,7 @@ def _maybe_cache_local_context_length(
 ) -> None:
     """Persist a locally probed context length only when it meets Hermes minimum.
 
-    Sub-minimum live windows (e.g. vLLM ``--max-model-len 32768``) are still
+    Sub-minimum live windows (e.g. vLLM ``--max-model-len 16384``) are still
     returned to callers so ``agent_init`` can fail with the existing
     minimum-context guidance — they must not be normalized into the on-disk cache
     as if they were valid operating limits.
@@ -839,7 +839,9 @@ def _reconcile_local_cached_context_length(
 
     Live probes below :data:`MINIMUM_CONTEXT_LENGTH` invalidate stale cache
     entries but are not persisted — startup should reject them, not bless a
-    sub-64K window as config.
+    sub-minimum window as config. A live window at or above the minimum is
+    persisted so the offline fallback tracks the reconciled value instead of
+    the stale entry.
     """
     live_ctx = _query_local_context_length(model, base_url, api_key=api_key)
     if live_ctx and live_ctx > 0 and live_ctx != cached:
