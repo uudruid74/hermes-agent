@@ -234,13 +234,14 @@ def _set_step_summary(
 ) -> None:
     """Replace the stored summary for one Plan step.
 
-    The summary is whitespace-compressed and cut to its LAST
-    ``PLAN_TEXT_MAX_CHARS`` characters (Evan, 2026-09-16): the conclusion is
-    at the end of a summary, and the Plan is the Protected region, so an
-    uncapped summary grows the context window permanently.  This one function
-    is the choke point for every summary write — ``advance`` (claim and
-    proof paths), ``handoff``, and plan closure all route through it — so the
-    cap cannot be bypassed by taking a different command.
+    The summary is whitespace-compressed and shrunk by cutting its MIDDLE
+    (B1 trim direction, council 2026-10-14 — never cut heads; the old
+    tail-only cut stored summaries starting mid-word). The Plan is the
+    Protected region, so an uncapped summary grows the context window
+    permanently. This one function is the choke point for every summary
+    write — ``advance`` (claim and proof paths), ``handoff``, and plan
+    closure all route through it — so the cap cannot be bypassed by taking
+    a different command.
     """
     from hermes_cli.plan_limits import cap_summary
 
@@ -318,8 +319,8 @@ def _set_step_denial(
 
     Mirrors ``_set_step_summary`` so a denial rides the same durable channel:
     a fresh denial REPLACES the previous one for the same step (latest wins),
-    and the reason is capped to its LAST ``PLAN_TEXT_MAX_CHARS`` characters —
-    the reviewer's fix directive is at the end of the reason.
+    and the reason is capped by cutting its MIDDLE (B1 trim direction — never
+    cut heads; the reviewer's directive and its lead both survive).
     """
     from hermes_cli.plan_limits import cap_summary
 

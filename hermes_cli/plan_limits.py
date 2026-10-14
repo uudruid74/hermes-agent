@@ -15,12 +15,18 @@ submission makes the Plan's worst case a known constant —
 ``PLAN_MAX_STEPS * PLAN_TEXT_MAX_CHARS`` plus the goal — against a known
 window, instead of a number that drifts upward with every cycle.
 
-Two truncation directions, deliberately different:
+Two truncation directions, deliberately different once; a third rule now
+governs summaries (council, 2026-10-14 — nemotron preservation forensics):
 
 * ``cap_head`` for goals and steps — the lead states the objective. Keeping
-  the LAST 240 chars of a task goal would discard the task.
-* ``cap_tail`` for step summaries and proof claims — the conclusion lives at
-  the end. This is Evan's explicit rule for these two fields.
+  the LAST 240 chars of a task goal would discard the task. Heads are never
+  cut here either, so this already complies with the no-head-cut rule.
+* ``cap_middle`` for step summaries and proof claims — the conclusion lives
+  at the end AND the council found stored summaries head-cut mid-word
+  (payloads showed "Summary: ork in this rerun" — B1: head-truncation), so
+  the old tail-only cut is a bug. Shrinking now cuts the MIDDLE (head+tail
+  kept, omission marked): "Never cut heads; budget evicts whole units; if
+  shrinking, cut middle (head+tail)" (Evan, 2026-10-14).
 
 Every function is idempotent: capping already-capped text is a no-op. That is
 what makes it safe to apply at both the adapter (the agent's submission path)
@@ -65,14 +71,56 @@ def _elide(text: str, *, keep_tail: bool) -> str:
     return text[:PLAN_TEXT_MAX_CHARS].strip()
 
 
+def _elide_middle(text: str) -> str:
+    """Cut the MIDDLE of oversized Plan text; never cut the head (B1).
+
+    Keeps the lead (the council's "never cut heads" rule — the mid-word
+    starts like "Summary: ork in this rerun" are the bug being fixed) AND
+    the conclusion (the original reason summaries kept the tail). The
+    omitted span is marked so the reader knows the text was deliberately
+    compressed. Output stays ``<= PLAN_TEXT_MAX_CHARS``, so re-capping is a
+    no-op and the function is idempotent like its siblings.
+    """
+    if len(text) <= PLAN_TEXT_MAX_CHARS:
+        return text
+
+    def _split(omitted: int) -> tuple[str, int, int]:
+        marker = f" …[{omitted:,} chars omitted]… "
+        room = max(PLAN_TEXT_MAX_CHARS - len(marker), 0)
+        head = (room + 1) // 2
+        return marker, head, room - head
+
+    marker, head, tail = _split(len(text))
+    # The omitted count's digit width can change once the true span is known
+    # (same single-recompute pattern as _bound_summary_input).
+    marker, head, tail = _split(len(text) - head - tail)
+    if tail <= 0:
+        tail = 1
+        head = max(PLAN_TEXT_MAX_CHARS - len(marker) - tail, 0)
+    out = text[:head].rstrip() + marker + text[-tail:].lstrip()
+    # Final guard: a marker-width edge must never push the result past the cap.
+    if len(out) > PLAN_TEXT_MAX_CHARS:
+        over = len(out) - PLAN_TEXT_MAX_CHARS
+        head = max(head - (over + 1) // 2, 0)
+        tail = max(tail - (over // 2), 1)
+        out = text[:head] + marker + text[-tail:]
+    return out.strip()
+
+
 def cap_text(text: Optional[str]) -> str:
     """Whitespace-compress a goal or step, then keep its first 240 chars."""
     return _elide(compress_whitespace(text or ""), keep_tail=False)
 
 
 def cap_summary(text: Optional[str]) -> str:
-    """Whitespace-compress a step summary or proof, keep its LAST 240 chars."""
-    return _elide(compress_whitespace(text or ""), keep_tail=True)
+    """Whitespace-compress a step summary or proof; shrink by cutting the middle.
+
+    Head and tail survive (B1 trim direction, council 2026-10-14): the lead
+    names the subject and the conclusion lives at the end — both are kept and
+    the middle is elided with an explicit marker. The old tail-only cut left
+    stored summaries starting mid-word ("Summary: ork in this rerun").
+    """
+    return _elide_middle(compress_whitespace(text or ""))
 
 
 def cap_steps(steps: Optional[Iterable[str]]) -> list[str]:

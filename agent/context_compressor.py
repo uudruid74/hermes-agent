@@ -6819,6 +6819,18 @@ This compaction should PRIORITISE preserving all information related to the focu
         # summary text as their own output (#33256). In both cases, append
         # the explicit end marker so the model has a clear "summary ends
         # here, respond to the message below" signal.
+        # The snapshot's true event time: the newest summarized turn's
+        # clock (the summary replaces turns_to_summarize). Both emit paths
+        # carry it — the standalone summary row (BUG E) and the merged
+        # payload row (B3) below.
+        summary_timestamp = next(
+            (
+                m.get("timestamp")
+                for m in reversed(turns_to_summarize)
+                if isinstance(m, dict) and m.get("timestamp") is not None
+            ),
+            None,
+        )
         if not _merge_summary_into_tail:
             summary = summary + "\n\n" + _SUMMARY_END_MARKER
 
@@ -6838,17 +6850,8 @@ This compaction should PRIORITISE preserving all information related to the focu
             # it with the compaction clock, re-writing every compacted turn to
             # the compaction's timestamp instead of the time it was spoken.
             # The summary replaces turns_to_summarize, so its newest turn is
-            # the correct timestamp to preserve. (When the merged-into-tail
-            # path is taken the carrier already keeps its own timestamp, so no
-            # carry is needed there.)
-            summary_timestamp = next(
-                (
-                    m.get("timestamp")
-                    for m in reversed(turns_to_summarize)
-                    if isinstance(m, dict) and m.get("timestamp") is not None
-                ),
-                None,
-            )
+            # the correct timestamp to preserve. (The merged-into-tail path
+            # carries the same stamp via the B3 block above its branch.)
             if summary_timestamp is not None:
                 summary_dict["timestamp"] = summary_timestamp
             compressed.append(summary_dict)
@@ -6876,6 +6879,17 @@ This compaction should PRIORITISE preserving all information related to the focu
             if _merge_summary_into_tail and tail_idx == _merge_target_idx:
                 # Merge the summary into the tail message that collided.
                 old_content = msg.get("content", "")
+                # B3 payload true-event-time (council 2026-10-14): the merged
+                # row IS a compaction payload row, so it carries the snapshot's
+                # true event time — the newest summarized turn's clock (the same
+                # rule as the BUG E carry above), unconditionally. Inherited
+                # carrier stamps must never propagate: the payload clock
+                # collapse froze 8 fold rows on ONE stale clock across ~2h by
+                # chaining the previous merge's stamp forward. This also keeps
+                # id<->time order monotone (the merged row precedes the tail
+                # rows it summarizes past).
+                if summary_timestamp is not None:
+                    msg["timestamp"] = summary_timestamp
                 if _force_user_leading and summary_role == "user":
                     # The summary must be part of the first user-visible
                     # message for Anthropic/Bedrock, but the real tail request

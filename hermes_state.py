@@ -1871,6 +1871,10 @@ def quarantine_zeroed_state_db(path: Path) -> Optional[Path]:
             handle.close()
 
 
+#: Content-fingerprint edge width for the writer-discipline unit ids (B4+B5).
+_UNIT_FINGERPRINT_CHARS = 96
+
+
 class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin):
     """
     SQLite-backed session storage with FTS5 search.
@@ -6877,7 +6881,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return row[0] if row else None
 
-    def _ts_harvest(self, conn, session_id: str) -> Dict[Any, float]:
+    def _ts_harvest(
+        self, conn, session_id: str
+    ) -> tuple[Dict[Any, float], Dict[str, Dict[str, float]], Dict[str, float]]:
         """Harvest (real timestamp, keyed by stored-content shape) from rows.
 
         Used by the transcript REWRITE flows (archive_and_compact,
@@ -6886,15 +6892,26 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         with the compaction/flush clock by :meth:`_insert_message_rows` — the
         ghost-twin / fabricated-timeline bug (t_4b1721cb).
 
+        Rows: BOTH active and soft-archived rows are harvested (B2, council
+        2026-10-14). The active-only query lost a row's true clock after its
+        first archival — "ghost-row re-persistence" then re-inserted it with
+        the compaction clock, and the fabrication propagated from there. The
+        original rows live exactly in the archived set.
+
         Keys:
         - Exact form: the stored (encoded) content bytes. Rows of user/
           assistant roles get sanitize_context applied on LOAD only, not on
           store, so stored bytes are what was sent — exact matching is safe.
-        - Prefix form (first 64 stored chars, only for stored bodies ≥64
-          chars): covers merge-into-tail rewrites whose inserted content
+        - Prefix form (first 64 stored chars buckets, only for stored bodies
+          ≥64 chars): covers merge-into-tail rewrites whose inserted content
           STARTS with the stored body (old content kept verbatim before the
-          summary delimiters). Gated on ≥64 so short bodies can't hand their
-          clock to unrelated content.
+          summary delimiters). Containment is now VERIFIED — a candidate only
+          matches when its full stored body is an actual prefix of the
+          inserted content (longest match wins). The old blind first-64 key
+          collided across rows sharing a header: every merged
+          ``[PRIOR CONTEXT ...]`` fold row begins with the same 64+ chars, so
+          8 payload rows spanning ~2h all inherited ONE frozen clock (payload
+          clock collapse, bug 2 of the 2026-10-14 council).
         - Call-id forms (the ones that catch summary-form rewrites):
           ``ts_by_call_id`` maps every tool row's ``tool_call_id`` and every
           assistant row's embedded tool_calls ids to that row's real
@@ -6902,23 +6919,34 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
           result)`) shares NO byte prefix with the stored raw JSON but keeps
           the SAME tool_call_id, so this is the identity that survives
           compaction rewriting (the class-1 ghost-twin signature,
-          t_4b1721cb). Returned as the second dict.
-        - Collisions: the MOST RECENT row wins (later rows overwrite), and the
-          consumer's own ``timestamp`` key always wins over the harvest.
+          t_4b1721cb). The FIRST row to carry a call id is the original
+          execution and its clock wins (later rows are rewrites or
+          re-persisted copies — exactly the fabricated stamps this harvest
+          exists to un-fabricate). A tool result row outranks an assistant
+          tool_calls carrier for the same id (the carrier is stamped when the
+          assistant message landed, the result row when the call ran).
+          Content keys keep the most-recent-wins policy — genuine repeated
+          text keeps its latest clock.
+        - Collisions for content keys: the MOST RECENT row wins (later rows
+          overwrite), and the consumer's own ``timestamp`` key always wins
+          over the harvest.
 
-        Returns ``(ts_by_content, ts_by_call_id)``.
+        Returns ``(ts_by_content, ts_by_prefix, ts_by_call_id)``.
 
         Callers must read the harvest inside the same transaction that will
         archive/delete the old rows, i.e. before the archiving UPDATE runs.
         """
         ts_by_content: Dict[Any, float] = {}
-        ts_by_call_id: Dict[str, float] = {}
-        active_rows = conn.execute(
+        ts_by_prefix: Dict[str, Dict[str, float]] = {}
+        ts_call_result: Dict[str, float] = {}
+        ts_call_carrier: Dict[str, float] = {}
+        rows = conn.execute(
             "SELECT content, tool_call_id, tool_calls, timestamp FROM messages "
-            "WHERE session_id = ? AND active = 1 AND timestamp IS NOT NULL",
+            "WHERE session_id = ? AND timestamp IS NOT NULL "
+            "ORDER BY id",
             (session_id,),
         ).fetchall()
-        for row in active_rows:
+        for row in rows:
             stored = row["content"]
             ts = row["timestamp"]
             if ts is None:
@@ -6931,11 +6959,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # Exact form; later rows overwrite earlier ones.
                 ts_by_content[stored] = ts
                 if isinstance(stored, str) and len(stored) >= 64:
-                    ts_by_content[stored[:64]] = ts
+                    ts_by_prefix.setdefault(stored[:64], {})[stored] = ts
             # Call-id keys: a tool row's own tool_call_id…
             cid = row["tool_call_id"]
-            if cid:
-                ts_by_call_id[str(cid)] = ts
+            if cid and str(cid) not in ts_call_result:
+                ts_call_result[str(cid)] = ts
             # …and every id embedded in an assistant carrier's tool_calls.
             raw_calls = row["tool_calls"]
             if raw_calls:
@@ -6949,8 +6977,135 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 if isinstance(calls, list):
                     for tc in calls:
                         if isinstance(tc, dict) and tc.get("id"):
-                            ts_by_call_id[str(tc["id"])] = ts
-        return ts_by_content, ts_by_call_id
+                            key = str(tc["id"])
+                            if (
+                                key not in ts_call_result
+                                and key not in ts_call_carrier
+                            ):
+                                ts_call_carrier[key] = ts
+        # A tool result row's clock is the call's true event time; a carrier
+        # only anchors the id when no result row exists.
+        ts_by_call_id = {**ts_call_carrier, **ts_call_result}
+        return ts_by_content, ts_by_prefix, ts_by_call_id
+
+    # ------------------------------------------------------------------
+    # Writer discipline — one-row -> one-unit-id (B4+B5, council 2026-10-14)
+    #
+    # Every row maps to exactly one unit-id and a unit-id is persisted at
+    # most once per session. Call rows key on the call identity — the
+    # tool_call_id riding through the (target, outcome-class) key of the
+    # call (tool_name + outcome are the Phase-2 grouping dimensions) —
+    # because the call id is the one member that survives content rewrites
+    # (raw JSON result <-> `[terminal] ran ...` stub <-> summary form), so
+    # every re-stub and every re-persisted copy of a call collapses to ONE
+    # durable row. Everything else keys on a content fingerprint (role +
+    # length + head + tail of the stored body AND of tool_calls) plus its
+    # real clock: payload blocks therefore dedup at block level (an
+    # identical block is one emission — "block-level payload dedup") and
+    # prose rows separate genuine repeats by timestamp.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _row_unit_id(
+        role: Optional[str],
+        call_id: Any,
+        text: Any,
+        tool_calls_json: Optional[str],
+    ) -> tuple:
+        """Return the row's unit-id (see the writer-discipline note above)."""
+        if call_id:
+            return ("call", role or "unknown", str(call_id))
+        body = text if isinstance(text, str) else ""
+        calls = tool_calls_json or ""
+        edge = _UNIT_FINGERPRINT_CHARS
+        return (
+            "body",
+            role or "unknown",
+            len(body),
+            body[:edge],
+            body[-edge:],
+            len(calls),
+            calls[:edge],
+            calls[-edge:],
+        )
+
+    def _row_unit_index_for(self, conn, session_id: str) -> Dict[str, Any]:
+        """Lazily build the per-session unit-id index used for write dedup.
+
+        Built once per session per process from cheap columns only (role,
+        tool_call_id, timestamp, length/head/tail substrings) so the
+        content blobs never leave SQLite. Mutated as rows are written.
+        """
+        cache = getattr(self, "_row_unit_index_cache", None)
+        if cache is None:
+            cache = {}
+            self._row_unit_index_cache = cache
+        entry = cache.get(session_id)
+        if entry is not None:
+            return entry
+        edge = _UNIT_FINGERPRINT_CHARS
+        entry = {"calls": set(), "bodies": {}}
+        for row in conn.execute(
+            "SELECT role, tool_call_id, timestamp, "
+            f"length(content) AS clen, substr(content, 1, {edge}) AS chead, "
+            f"substr(content, -{edge}) AS ctail, "
+            f"length(tool_calls) AS tlen, "
+            f"substr(tool_calls, 1, {edge}) AS thead, "
+            f"substr(tool_calls, -{edge}) AS ttail "
+            "FROM messages WHERE session_id = ?",
+            (session_id,),
+        ):
+            cid = row["tool_call_id"]
+            if cid:
+                entry["calls"].add(("call", row["role"] or "unknown", str(cid)))
+                continue
+            try:
+                ts = float(row["timestamp"])
+            except (TypeError, ValueError):
+                continue
+            base = (
+                "body",
+                row["role"] or "unknown",
+                row["clen"] or 0,
+                row["chead"] or "",
+                row["ctail"] or "",
+                row["tlen"] or 0,
+                row["thead"] or "",
+                row["ttail"] or "",
+            )
+            entry["bodies"].setdefault(base, set()).add(ts)
+        cache[session_id] = entry
+        return entry
+
+    @staticmethod
+    def _row_body_unit_seen(
+        bodies: Dict[tuple, set], unit_id: tuple, ts: float, ts_fabricated: bool
+    ) -> bool:
+        """True when a body row's unit is already represented in *bodies*.
+
+        A body row duplicates a durable row when its real clock matches
+        (verbatim copy keeps the original's timestamp) — or when its clock
+        is FABRICATED (the now_ts fallback), which is exactly the class-2
+        re-persistence signature: compression-rewritten dicts arriving at
+        the flush without any provenance. Genuine new content that carries
+        its own real clock is never merged away, however often it repeats.
+        """
+        seen = bodies.get(unit_id)
+        if not seen:
+            return False
+        return ts_fabricated or ts in seen
+
+    @staticmethod
+    def _row_unit_note(
+        calls: set,
+        bodies: Dict[tuple, set],
+        unit_id: tuple,
+        ts: float,
+    ) -> None:
+        if unit_id[0] == "call":
+            calls.add(unit_id)
+        else:
+            bodies.setdefault(unit_id, set()).add(ts)
 
     def _insert_message_rows(
         self,
@@ -6958,7 +7113,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         session_id: str,
         messages: List[Dict[str, Any]],
         _ts_harvest: Optional[
-            tuple[Dict[Any, float], Dict[str, float]]
+            tuple[
+                Dict[Any, float],
+                Dict[str, Dict[str, float]],
+                Dict[str, float],
+            ]
         ] = None,
     ) -> tuple[int, int]:
         """Insert *messages* as fresh active rows for *session_id*.
@@ -6970,9 +7129,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         — the caller owns that, since the two flows reconcile counts differently.
 
         ``_ts_harvest`` (transcript REWRITE flows,see :meth:`_ts_harvest`):
-        ``(ts_by_content, ts_by_call_id)`` — stored-content keys for verbatim
-        and prefix-preserving copies, and tool_call_id keys for summary-form
-        rewrites that share no byte prefix with the original. A message
+        ``(ts_by_content, ts_by_prefix, ts_by_call_id)`` — stored-content keys
+        for verbatim copies, containment-verified prefix buckets for
+        merge-into-tail copies whose inserted content starts with the stored
+        body, and tool_call_id keys for summary-form rewrites that share no
+        byte prefix with the original. A message
         without its own ``timestamp`` key looks the row up there before
         falling back to ``now_ts``, so a compaction re-insert never fabricates
         a fresh-looking timestamp for content that already has a true one
@@ -6981,10 +7142,36 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         now_ts = time.time()
         inserted = 0
         tool_calls_total = 0
+        # Writer discipline (B4+B5, council 2026-10-14): one row -> one
+        # unit-id, persisted at most once per session (see :meth:`_row_unit_id`).
+        # Transcript REWRITE flows (anything passing ``_ts_harvest``) re-insert
+        # their compacted window by design, so they dedup WITHIN the batch only
+        # and never against the rows they are about to archive; append flows
+        # (the turn-boundary flush) also dedup against everything already
+        # durable. That kills the class-2 whole-window re-writes (Run A:
+        # 1,210 re-insertions from 336 originals — 11 identical assignment
+        # rows sharing one stamped clock, 155 copies of 57 clicks) and with
+        # them the bulk batches that break the id<->time running watermark.
+        unit_index = self._row_unit_index_for(conn, session_id)
+        batch_calls: set = set()
+        batch_bodies: Dict[tuple, set] = {}
+        allow_cross_unit_dedup = _ts_harvest is None
         for msg in messages:
             role = msg.get("role", "unknown")
             tool_calls = msg.get("tool_calls")
+            # tool_calls may arrive as a Python list (from the live agent)
+            # or as a JSON string (from import_sessions / export_session,
+            # which store it as TEXT). json.dumps on an already-serialized
+            # string double-encodes it, so parse first.
+            if isinstance(tool_calls, str):
+                try:
+                    tool_calls = json.loads(tool_calls)
+                except (json.JSONDecodeError, TypeError):
+                    tool_calls = []
+            tool_calls_json = json.dumps(tool_calls) if tool_calls else None
+            _encoded = self._encode_content(msg.get("content"))
             message_timestamp = now_ts
+            ts_fabricated = True
             if msg.get("timestamp") is not None:
                 try:
                     ts_value = msg.get("timestamp")
@@ -6992,6 +7179,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         message_timestamp = float(ts_value.timestamp())
                     else:
                         message_timestamp = float(ts_value)
+                    ts_fabricated = False
                 except (TypeError, ValueError):
                     logger.debug("Ignoring invalid explicit message timestamp: %r", msg.get("timestamp"))
             else:
@@ -7004,17 +7192,32 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # tool_call_id). (No match → now_ts, which stays correct for
                 # genuinely brand-new content.)
                 if _ts_harvest:
-                    _ts_by_content, _ts_by_call = _ts_harvest
-                    _encoded = self._encode_content(msg.get("content"))
+                    _ts_by_content, _ts_by_prefix, _ts_by_call = _ts_harvest
                     if _encoded in _ts_by_content:
                         message_timestamp = _ts_by_content[_encoded]
+                        ts_fabricated = False
                     elif isinstance(_encoded, str) and len(_encoded) >= 64:
-                        # Prefix keys are only minted for stored bodies ≥64
-                        # chars (see _ts_harvest), so a shorter inserted body
-                        # can never match one — gate symmetrically.
-                        _prefix_ts = _ts_by_content.get(_encoded[:64])
+                        # Prefix candidates are only minted for stored bodies ≥64
+                        # chars (see _ts_harvest), so a shorter inserted body can
+                        # never match one — gate symmetrically. Matching is
+                        # containment-verified (B2, council 2026-10-14): a candidate
+                        # must be an actual prefix of the inserted content, longest
+                        # wins. The old blind first-64 key let rows sharing a header
+                        # (every merged [PRIOR CONTEXT ...] fold row) steal each
+                        # other's clocks — the payload clock collapse.
+                        _prefix_ts = None
+                        _best_prefix_len = -1
+                        _bucket = _ts_by_prefix.get(_encoded[:64])
+                        for _stored, _cand_ts in (_bucket or {}).items():
+                            if (
+                                len(_stored) > _best_prefix_len
+                                and _encoded.startswith(_stored)
+                            ):
+                                _best_prefix_len = len(_stored)
+                                _prefix_ts = _cand_ts
                         if _prefix_ts is not None:
                             message_timestamp = _prefix_ts
+                            ts_fabricated = False
                     _call_id = msg.get("tool_call_id")
                     if _call_id and str(_call_id) in _ts_by_call:
                         # Tool-row identity wins over content keys: a
@@ -7024,6 +7227,30 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         # keys anyway so a verbatim copy of a DIFFERENT
                         # longer row's text keeps that row's exact clock.
                         message_timestamp = _ts_by_call[str(_call_id)]
+                        ts_fabricated = False
+            # One-row -> one-unit-id: skip rows whose unit is already
+            # represented (durable, or already inserted in this batch).
+            _unit_id = self._row_unit_id(
+                role, msg.get("tool_call_id"), _encoded, tool_calls_json
+            )
+            if _unit_id[0] == "call":
+                _unit_dup = _unit_id in batch_calls or (
+                    allow_cross_unit_dedup and _unit_id in unit_index["calls"]
+                )
+            else:
+                _unit_dup = self._row_body_unit_seen(
+                    batch_bodies, _unit_id, message_timestamp, ts_fabricated
+                ) or (
+                    allow_cross_unit_dedup
+                    and self._row_body_unit_seen(
+                        unit_index["bodies"],
+                        _unit_id,
+                        message_timestamp,
+                        ts_fabricated,
+                    )
+                )
+            if _unit_dup:
+                continue
             reasoning_details = msg.get("reasoning_details") if role == "assistant" else None
             codex_reasoning_items = (
                 msg.get("codex_reasoning_items") if role == "assistant" else None
@@ -7040,16 +7267,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             codex_message_items_json = (
                 json.dumps(codex_message_items) if codex_message_items else None
             )
-            # tool_calls may arrive as a Python list (from the live agent)
-            # or as a JSON string (from import_sessions / export_session,
-            # which store it as TEXT). json.dumps on an already-serialized
-            # string double-encodes it, so parse first.
-            if isinstance(tool_calls, str):
-                try:
-                    tool_calls = json.loads(tool_calls)
-                except (json.JSONDecodeError, TypeError):
-                    tool_calls = []
-            tool_calls_json = json.dumps(tool_calls) if tool_calls else None
             # Accept either `platform_message_id` (new explicit name) or
             # `message_id` (yuanbao's existing convention on message dicts).
             platform_msg_id = (
@@ -7067,7 +7284,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (
                     session_id,
                     role,
-                    self._encode_content(msg.get("content")),
+                    _encoded,
                     msg.get("tool_call_id"),
                     tool_calls_json,
                     _scrub_surrogates(msg.get("tool_name")),
@@ -7089,6 +7306,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 ),
             )
             inserted += 1
+            # The row is durable now — its unit-id becomes visible to the
+            # in-batch and cross-batch dedup checks.
+            self._row_unit_note(batch_calls, batch_bodies, _unit_id, message_timestamp)
+            self._row_unit_note(
+                unit_index["calls"], unit_index["bodies"], _unit_id, message_timestamp
+            )
             if tool_calls is not None:
                 tool_calls_total += (
                     len(tool_calls) if isinstance(tool_calls, list) else 1
@@ -7139,7 +7362,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # Timestamp provenance (t_4b1721cb): harvest BEFORE the delete —
             # same contract as archive_and_compact, so /retry, /undo and
             # /compress transcript rewrites keep each row's real clock.
-            _ts_content, _ts_calls = self._ts_harvest(conn, session_id)
+            _ts_content, _ts_prefix, _ts_calls = self._ts_harvest(conn, session_id)
             conn.execute(
                 f"DELETE FROM messages WHERE session_id = ?{active_clause}",
                 (session_id,),
@@ -7150,7 +7373,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             total_messages, total_tool_calls = self._insert_message_rows(
                 conn, session_id, messages,
-                _ts_harvest=(_ts_content, _ts_calls),
+                _ts_harvest=(_ts_content, _ts_prefix, _ts_calls),
             )
             conn.execute(
                 "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
@@ -7208,7 +7431,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # it) keep the time their content was actually produced instead of
             # being stamped with the compaction clock by _insert_message_rows
             # (the "ghost twin" / fabricated-timeline bug).
-            _ts_content, _ts_calls = self._ts_harvest(conn, session_id)
+            _ts_content, _ts_prefix, _ts_calls = self._ts_harvest(conn, session_id)
 
             # Soft-archive the live turns: active=0 hides them from the live
             # context load, compacted=1 marks them as "summarized away" (vs
@@ -7223,7 +7446,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             inserted, tool_calls_total = self._insert_message_rows(
                 conn, session_id, compacted_messages,
-                _ts_harvest=(_ts_content, _ts_calls),
+                _ts_harvest=(_ts_content, _ts_prefix, _ts_calls),
             )
             # message_count / tool_call_count reflect the LIVE (active) set —
             # the archived rows are still on disk but not part of the live count.

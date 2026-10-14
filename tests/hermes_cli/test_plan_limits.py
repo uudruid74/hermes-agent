@@ -39,13 +39,19 @@ def test_goal_keeps_the_HEAD_of_the_text():
     assert not capped.endswith("TRAILING")
 
 
-def test_summary_keeps_the_LAST_240_chars():
-    """Evan's explicit rule: a summary's conclusion is at the end."""
+def test_summary_cut_keeps_HEAD_and_TAIL():
+    """B1 trim direction (council 2026-10-14): never cut heads — cut middle.
+
+    The old tail-only cap stored summaries starting mid-word ("Summary: ork
+    in this rerun"). Now the lead and the conclusion both survive and the
+    middle is elided with an explicit marker.
+    """
     text = "LEADING" + "x" * 400 + "CONCLUSION"
     capped = cap_summary(text)
-    assert len(capped) == PLAN_TEXT_MAX_CHARS
+    assert len(capped) <= PLAN_TEXT_MAX_CHARS
+    assert capped.startswith("LEADING")
     assert capped.endswith("CONCLUSION")
-    assert not capped.startswith("LEADING")
+    assert "chars omitted" in capped
 
 
 def test_short_text_is_untouched_apart_from_whitespace():
