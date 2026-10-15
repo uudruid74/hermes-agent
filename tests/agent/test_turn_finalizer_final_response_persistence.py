@@ -123,9 +123,13 @@ def test_final_response_closes_tool_tail_before_persistence(monkeypatch):
         _turn_exit_reason="fallback_prior_turn_content",
     )
 
-    assert result["messages"][-1] == {"role": "assistant", "content": "Done."}
+    _tail = result["messages"][-1]
+    assert _tail["role"] == "assistant"
+    assert _tail["content"] == "Done."
+    assert isinstance(_tail.get("timestamp"), float)  # build clock (t_0c64b0d0)
     assert agent.persisted_messages is not None
-    assert agent.persisted_messages[-1] == {"role": "assistant", "content": "Done."}
+    assert agent.persisted_messages[-1]["role"] == "assistant"
+    assert agent.persisted_messages[-1]["content"] == "Done."
 
 
 def test_final_response_fills_pure_tool_call_tail(monkeypatch):

@@ -1488,6 +1488,19 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
         "content": _san_content,
         "reasoning": reasoning_text,
         "finish_reason": finish_reason,
+        # Creation clock, stamped at build (t_0c64b0d0, the assistant-side
+        # sibling of make_tool_result_message's t_4b1721cb stamp). Assistant
+        # dicts that reach the flush without their own clock are stamped with
+        # the flush's now_ts and flagged fabricated, which (a) collapses every
+        # such row in a rewrite batch onto one identical clock (the ghost-stub
+        # signature: 179 empty tool-call carriers sharing one timestamp in
+        # session 20261013_233056_4afae3f9) and (b) lets the writer's unit
+        # dedup silently drop a genuinely new turn-final whose text merely
+        # repeats earlier content (delivered-but-unpersisted response-truth
+        # violation, same session). A real creation clock makes both classes
+        # impossible: the dedup rule only merges rows whose exact clock is
+        # already durable, so new content is never merged away.
+        "timestamp": time.time(),
     }
 
     raw_reasoning_content = getattr(assistant_message, "reasoning_content", None)

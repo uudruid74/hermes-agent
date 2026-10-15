@@ -7156,6 +7156,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         batch_calls: set = set()
         batch_bodies: Dict[tuple, set] = {}
         allow_cross_unit_dedup = _ts_harvest is None
+        _dup_dropped_fabricated = 0
+        _dup_dropped_real_clock = 0
         for msg in messages:
             role = msg.get("role", "unknown")
             tool_calls = msg.get("tool_calls")
@@ -7193,7 +7195,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # genuinely brand-new content.)
                 if _ts_harvest:
                     _ts_by_content, _ts_by_prefix, _ts_by_call = _ts_harvest
-                    if _encoded in _ts_by_content:
+                    # Empty bodies never content-match: every empty row maps
+                    # to the same '' key, so a batch of empty tool-call
+                    # carriers would all inherit ONE row's clock — the
+                    # identical-ts ghost signature (179 carriers sharing one
+                    # timestamp in session 20261013_233056_4afae3f9, t_0c64b0d0).
+                    if _encoded and _encoded in _ts_by_content:
                         message_timestamp = _ts_by_content[_encoded]
                         ts_fabricated = False
                     elif isinstance(_encoded, str) and len(_encoded) >= 64:
@@ -7219,6 +7226,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                             message_timestamp = _prefix_ts
                             ts_fabricated = False
                     _call_id = msg.get("tool_call_id")
+                    if not _call_id and ts_fabricated:
+                        # Assistant tool-call carriers have no tool_call_id
+                        # field of their own — their identity is the embedded
+                        # tool_calls ids, which _ts_harvest already indexes.
+                        # Resolve through those so a rewritten carrier keeps a
+                        # real clock instead of the flush's now_ts.
+                        for _tc in (tool_calls or []):
+                            if (
+                                isinstance(_tc, dict)
+                                and _tc.get("id")
+                                and str(_tc["id"]) in _ts_by_call
+                            ):
+                                _call_id = str(_tc["id"])
+                                break
                     if _call_id and str(_call_id) in _ts_by_call:
                         # Tool-row identity wins over content keys: a
                         # rewritten stub has a SHORT new body whose prefix
@@ -7250,6 +7271,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     )
                 )
             if _unit_dup:
+                if ts_fabricated:
+                    _dup_dropped_fabricated += 1
+                else:
+                    _dup_dropped_real_clock += 1
                 continue
             reasoning_details = msg.get("reasoning_details") if role == "assistant" else None
             codex_reasoning_items = (
@@ -7317,6 +7342,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     len(tool_calls) if isinstance(tool_calls, list) else 1
                 )
             now_ts = max(now_ts + 1e-6, message_timestamp + 1e-6)
+        if _dup_dropped_fabricated or _dup_dropped_real_clock:
+            # Fail loudly (t_0c64b0d0): the unit-dedup used to drop rows in
+            # complete silence, which is how a delivered-but-unpersisted
+            # turn-final went unnoticed. Fabricated-clock drops are the
+            # class-2 re-persistence cleanup (expected on rewrite flows);
+            # real-clock drops are verbatim re-copies. Either way the count
+            # must be visible in the log so a lost row is diagnosable.
+            logger.warning(
+                "Session write dedup dropped %d duplicate row(s) for %s "
+                "(%d without a real clock, %d verbatim re-copies) — "
+                "dropped rows never reached the durable store",
+                _dup_dropped_fabricated + _dup_dropped_real_clock,
+                session_id,
+                _dup_dropped_fabricated,
+                _dup_dropped_real_clock,
+            )
         return inserted, tool_calls_total
 
     def replace_messages(

@@ -25448,6 +25448,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     pending = _leftover_steer
                     logger.debug("Delivering leftover /steer as next turn: '%s...'", pending[:40])
 
+            # OOB requeue-on-unserviced (t_0c64b0d0): a mid-turn message that
+            # aborted the stream, got folded into the turn as a redirect, and
+            # was never answered (the turn ended on interruption machinery) is
+            # requeued here as its own turn instead of dying with the turn.
+            if result and not pending and not pending_event:
+                _unserviced_oob = result.get("unserviced_redirect_text")
+                if _unserviced_oob:
+                    pending = _unserviced_oob
+                    logger.info(
+                        "Requeueing unserviced OOB message as its own turn: '%s...'",
+                        pending[:40],
+                    )
+
             # Safety net: if the pending text is a slash command (e.g. "/stop",
             # "/new"), discard it — commands should never be passed to the agent
             # as user input.  The primary fix is in base.py (commands bypass the

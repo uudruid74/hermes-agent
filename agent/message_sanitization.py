@@ -18,9 +18,35 @@ import hashlib
 import json
 import logging
 import re
+import time
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# The two synthetic texts an interrupted turn can end on. Both are machinery,
+# not answers: a turn whose final response is one of these has NOT serviced any
+# user message folded into it (t_0c64b0d0 — the OOB message that aborted the
+# stream must be re-queued as its own turn instead of dying with the turn).
+INTERRUPT_CHECKPOINT_SENTINEL = "[This response was interrupted by a user correction.]"
+INTERRUPT_CLOSE_PLACEHOLDER = "Operation interrupted."
+INTERRUPT_WAITING_PREFIX = "Operation interrupted: waiting for model response ("
+
+
+def is_degenerate_interrupt_response(text: Any) -> bool:
+    """True when a turn-final is interruption machinery rather than an answer.
+
+    Covers: no response at all, the redirect checkpoint text echoed back by a
+    degenerate model turn, and the two ``Operation interrupted…`` placeholders
+    used by the interrupt close/retry paths.
+    """
+    cleaned = (text or "").strip() if isinstance(text, str) else ""
+    if not cleaned:
+        return True
+    return (
+        cleaned == INTERRUPT_CHECKPOINT_SENTINEL
+        or cleaned == INTERRUPT_CLOSE_PLACEHOLDER
+        or cleaned.startswith(INTERRUPT_WAITING_PREFIX)
+    )
 
 # Lone surrogate code points are invalid in UTF-8 and crash json.dumps
 # inside the OpenAI SDK.  Used by every surrogate-sanitization helper
@@ -308,6 +334,10 @@ def close_interrupted_tool_sequence(messages: list, final_response: Any = None) 
     messages.append({
         "role": "assistant",
         "content": text.strip() or "Operation interrupted.",
+        # Creation clock at build (t_0c64b0d0): a clockless row is written
+        # with a fabricated flush clock and can be silently unit-deduped away
+        # when its content repeats earlier text.
+        "timestamp": time.time(),
     })
     return True
 

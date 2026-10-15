@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import time
 from typing import Any, Callable
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
@@ -474,7 +475,15 @@ def finalize_turn(
             if _tail_role != "assistant":
                 # Tail is not an assistant row — append the final response
                 # so the durable turn closes with the answer (#43849/#44100).
-                messages.append({"role": "assistant", "content": final_response})
+                # Stamp the creation clock like build_assistant_message does
+                # (t_0c64b0d0): a clockless row is written with a fabricated
+                # flush clock and can be silently unit-deduped away when its
+                # content repeats earlier text — delivered-but-unpersisted.
+                messages.append({
+                    "role": "assistant",
+                    "content": final_response,
+                    "timestamp": time.time(),
+                })
             elif isinstance(_tail, dict) and _tail.get("content") != final_response and _is_pure_tool_call_tail(_tail):
                 # The tail IS an assistant row, but a *pure tool-call turn*:
                 # tool_calls with no text of its own. The role check alone
@@ -853,6 +862,25 @@ def finalize_turn(
     _leftover_steer = agent._drain_pending_steer()
     if _leftover_steer:
         result["pending_steer"] = _leftover_steer
+
+    # OOB requeue-on-unserviced (t_0c64b0d0): a redirect message folded into
+    # this turn that the turn never answered — the final response is
+    # interruption machinery (empty, the checkpoint echo, an interrupt
+    # placeholder) — is handed back so the gateway can deliver it as its own
+    # turn instead of dying with the degenerate turn.
+    _folded_redirects = getattr(agent, "_turn_folded_redirect_texts", None)
+    if _folded_redirects:
+        agent._turn_folded_redirect_texts = []
+        from agent.message_sanitization import is_degenerate_interrupt_response
+
+        if is_degenerate_interrupt_response(final_response):
+            result["unserviced_redirect_text"] = "\n\n".join(_folded_redirects)
+            logger.warning(
+                "Turn ended on interruption machinery (%d folded OOB "
+                "message(s) unserviced) — handing the text back for requeue "
+                "as its own turn",
+                len(_folded_redirects),
+            )
     agent._response_was_previewed = False
 
     # Include interrupt message if one triggered the interrupt

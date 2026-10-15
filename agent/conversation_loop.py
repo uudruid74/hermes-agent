@@ -182,20 +182,40 @@ def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text
         # Transcript shows the user's own words; the provider replays the
         # scaffolded form so it still sees the interrupted context.
         messages.append(
-            {"role": "user", "content": text, "api_content": correction}
+            {
+                "role": "user",
+                "content": text,
+                "api_content": correction,
+                "timestamp": time.time(),
+            }
         )
     else:
         entry: Dict[str, Any] = {
             "role": "assistant",
             "content": visible or checkpoint,
             "api_content": checkpoint,
+            # Creation clock at build (t_0c64b0d0) — see build_assistant_message.
+            "timestamp": time.time(),
         }
         if not visible:
             # Nothing reached the screen — this row carries no assistant prose
             # at all, only the cut-off notice for the model.
             entry["display_kind"] = "hidden"
         messages.append(entry)
-        messages.append({"role": "user", "content": text})
+        messages.append({
+            "role": "user",
+            "content": text,
+            "timestamp": time.time(),
+        })
+
+    # t_0c64b0d0: remember what was folded into this turn so finalize_turn
+    # can requeue it as its own turn when the turn ends without servicing it
+    # (degenerate final after the OOB message aborted the stream).
+    _folded = getattr(agent, "_turn_folded_redirect_texts", None)
+    if _folded is None:
+        _folded = []
+        agent._turn_folded_redirect_texts = _folded
+    _folded.append(text)
 
     agent._current_streamed_assistant_text = ""
     agent._stream_needs_break = True
@@ -1416,6 +1436,11 @@ def run_conversation(
     _last_preflight_pressure: Optional[int] = None
     _preflight_compression_blocked = _ctx.preflight_compression_blocked
     _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
+    # Fold-tracking is turn-scoped (t_0c64b0d0): only messages folded into
+    # THIS turn may be handed back for requeue. Reset here so an early-return
+    # turn (paths that skip finalize_turn) can never leak a stale fold into a
+    # later turn's unserviced-OOB handoff.
+    agent._turn_folded_redirect_texts = []
     # Last composed answer intentionally held back by a verification gate. If
     # that continuation consumes the remaining budget, this is the best
     # user-facing result available; it must not be confused with error or
@@ -3652,7 +3677,14 @@ def run_conversation(
                     getattr(agent, "_current_streamed_assistant_text", "") or ""
                 ).strip()
                 if _partial:
-                    messages.append({"role": "assistant", "content": _partial})
+                    # Creation clock at build (t_0c64b0d0): a clockless row is
+                    # written with a fabricated flush clock and can be silently
+                    # unit-deduped away when its content repeats earlier text.
+                    messages.append({
+                        "role": "assistant",
+                        "content": _partial,
+                        "timestamp": time.time(),
+                    })
                     final_response = _partial
                 else:
                     final_response = f"{INTERRUPT_WAITING_FOR_MODEL_PREFIX}{api_elapsed:.1f}s elapsed)."
@@ -7503,7 +7535,11 @@ def run_conversation(
                     final_response = f"I apologize, but I encountered repeated errors: {error_msg}"
                 # Append as assistant so the history stays valid for
                 # session resume (avoids consecutive user messages).
-                messages.append({"role": "assistant", "content": final_response})
+                messages.append({
+                    "role": "assistant",
+                    "content": final_response,
+                    "timestamp": time.time(),
+                })
                 break
     
     # Post-loop turn finalization extracted to agent/turn_finalizer.finalize_turn
