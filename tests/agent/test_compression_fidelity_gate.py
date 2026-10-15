@@ -347,3 +347,95 @@ class TestHarnessSmoke:
             assert isinstance(metrics["a_mid_sentence"]["violations"], list)
             assert arm["plan_head_report"]["introduced_head_cuts"] == []
         assert report["verdict"]["a_mid_sentence"]["trail_delta"] is not None
+
+
+# ------------------------------------------------- arm-iii region parity
+class TestArmIIIVerbatimTailParity:
+    """The A/B spec requires the SAME protect_head/tail across arms (t_fede7b73).
+
+    The production LLM seam cuts its tail by token budget; the fallback keeps
+    ``protect_last_n`` template-visible messages verbatim.  The harness pins
+    arm iii to the fallback's policy — the pin must be exactly the fallback's
+    own tail derivation, and the unpinned token-budget cut must disagree on a
+    window where the two policies differ (that disagreement is the confound).
+    """
+
+    @staticmethod
+    def _messages(count: int = 20):
+        return [
+            {
+                "role": "user" if idx % 2 else "assistant",
+                "content": f"turn {idx}: " + "filler content for budgeting " * 4,
+                "timestamp": float(idx),
+            }
+            for idx in range(count)
+        ]
+
+    @staticmethod
+    def _compressor(context_length: int):
+        from agent.context_compressor import ContextCompressor
+
+        return ContextCompressor(
+            model="harness/replay",
+            threshold_percent=0.85,
+            protect_first_n=1,
+            protect_last_n=8,
+            summary_target_ratio=0.15,
+            quiet_mode=True,
+            config_context_length=context_length,
+            internal_only=True,
+            summary_model_override="",
+            abort_on_summary_failure=False,
+        )
+
+    def test_pin_matches_fallback_tail_derivation(self):
+        from agent.internal_compression_fallback import _verbatim_tail_start
+        from tools.compression_ab_harness import _verbatim_tail_cut
+
+        compressor = self._compressor(context_length=78000)
+        messages = self._messages()
+        for head_end in (0, 1, 3):
+            assert _verbatim_tail_cut(compressor, messages, head_end) == (
+                _verbatim_tail_start(messages, head_end, compressor.protect_last_n)
+            )
+
+    def test_token_budget_tail_disagrees_on_this_window(self):
+        """The region-policy confound the pin removes (179 rows vs the 8).
+
+        Tool scaffolding between the visible turns: the token-budget cut bounds
+        the tail by ROW count (its floor is n - min_tail rows), while the
+        fallback policy keeps ``protect_last_n`` VISIBLE messages and their
+        tool rows ride along.  On tool-dense windows the token-budget tail
+        keeps many more rows verbatim — the ornith-window shape where the
+        unpinned LLM arm kept 179 rows out against the fallback's 85.
+        """
+        from tools.compression_ab_harness import _verbatim_tail_cut
+
+        compressor = self._compressor(context_length=78000)
+        messages = []
+        for idx in range(8):
+            stamp = float(len(messages))
+            messages.append(
+                {"role": "user", "content": f"request {idx} " + "u" * 40,
+                 "timestamp": stamp}
+            )
+            messages.append(
+                {"role": "assistant", "content": "",
+                 "tool_calls": [{"id": f"call_{idx}", "type": "function",
+                                 "function": {"name": "read_file", "arguments": "{}"}}],
+                 "timestamp": stamp + 0.1}
+            )
+            messages.append(
+                {"role": "tool", "content": "result " + "r" * 40,
+                 "tool_call_id": f"call_{idx}", "timestamp": stamp + 0.2}
+            )
+            messages.append(
+                {"role": "assistant", "content": f"answer {idx} " + "a" * 40,
+                 "timestamp": stamp + 0.3}
+            )
+        pinned = _verbatim_tail_cut(compressor, messages, 0)
+        token_budget_cut = compressor._find_tail_cut_by_tokens(messages, 0)
+        assert token_budget_cut != pinned
+        # The pin keeps protect_last_n visible turns (their tool rows ride
+        # along) — a LARGER tail than the token-budget cut's row-count floor.
+        assert pinned < token_budget_cut

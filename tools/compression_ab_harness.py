@@ -68,6 +68,7 @@ from agent.context_compressor import (  # noqa: E402
 import agent.context_compressor as _cc  # noqa: E402
 from agent.internal_compression_fallback import (  # noqa: E402
     INTERNAL_FALLBACK_PREFIX,
+    _verbatim_tail_start,
 )
 from tools.compression_fidelity_gate import (  # noqa: E402
     duplication_ratio,
@@ -271,6 +272,21 @@ def make_compressor(args, *, internal_only, summary_model="") -> ContextCompress
     return compressor
 
 
+def _verbatim_tail_cut(self, messages, head_end, token_budget=None):
+    """Arm-iii region control: the fallback arms' verbatim-tail policy.
+
+    Zephyr's A/B spec requires the SAME protect_head/tail across arms.  The
+    production LLM seam cuts its tail by TOKEN BUDGET
+    (``_find_tail_cut_by_tokens``), which kept 179 rows verbatim against the
+    fallback's ``protect_last_n``-turn tail (85-87 rows out) — a region-policy
+    confound on (b)/(c), not a summariser difference (Evan, t_fede7b73: "the
+    179 rows would not be kept verbatim, only the 8").  The harness pins arm
+    iii to the fallback's nominal tail boundary (``_verbatim_tail_start`` over
+    the same ``protect_last_n``) so the arms differ ONLY in the summariser.
+    """
+    return _verbatim_tail_start(messages, head_end, self.protect_last_n)
+
+
 def run_arm(
     arm_name: str,
     args,
@@ -291,10 +307,13 @@ def run_arm(
         summary_model=summary_model if use_llm else "",
     )
     original_builder = _cc.build_internal_fallback
+    original_tail_cut = ContextCompressor._find_tail_cut_by_tokens
     if use_phase1:
         if PHASE1_MODULE is None:
             raise RuntimeError("arm i requested but the Phase-1 module was not loaded")
         _cc.build_internal_fallback = PHASE1_MODULE.build_internal_fallback
+    if use_llm:
+        ContextCompressor._find_tail_cut_by_tokens = _verbatim_tail_cut
     try:
         started = time.monotonic()
         out_messages = compressor.compress(
@@ -308,12 +327,18 @@ def run_arm(
         duration = time.monotonic() - started
     finally:
         _cc.build_internal_fallback = original_builder
+        ContextCompressor._find_tail_cut_by_tokens = original_tail_cut
 
     emitted = window_text(out_messages)
     block = extract_payload_block(out_messages)
     result = {
         "arm": arm_name,
         "duration_s": round(duration, 2),
+        "tail_policy": (
+            "protect_last_n:_verbatim_tail_start (arm-iii parity pin)"
+            if use_llm
+            else "protect_last_n:_verbatim_tail_start (fallback nominal)"
+        ),
         "window_rows_in": len(messages),
         "window_rows_out": len(out_messages),
         "emitted_chars": len(emitted),
@@ -619,6 +644,10 @@ def main() -> int:
             "summary_model": summary_model,
             "plan_context_sha256": _sha256_text(plan_context),
             "arms_selected": sorted(arms_selected),
+            "tail_policy": (
+                "arm iii pinned to _verbatim_tail_start(protect_last_n) — "
+                "identical verbatim-tail policy across arms (t_fede7b73)"
+            ),
         },
         "arms": report_arms,
         "verdict": verdict,

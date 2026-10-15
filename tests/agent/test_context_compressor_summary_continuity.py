@@ -349,6 +349,116 @@ def test_repeated_internal_fallback_keeps_prior_summary_single_level():
     assert previous_summary.count(VERBATIM_CONTEXT_MARKER) == 1
 
 
+def test_refold_does_not_duplicate_section_skeleton():
+    """A section-skeleton prior folds exactly once (fold-copy ratchet).
+
+    Regression (t_fede7b73): the plan path folds and ``make_result`` re-folds.
+    The pre-fix stale-section cut stopped at "the next ## header" — which was
+    INSIDE the folded prior's own section skeleton — so every re-fold orphaned
+    the previous fold's text as payload sections and appended a fresh copy
+    (measured 0.85-0.90 block duplication on the ornith window).  The fold is
+    self-delimiting now: the re-fold is idempotent and each section appears
+    exactly once.
+    """
+    from agent.internal_compression_fallback import (
+        _PCS_END_MARKER,
+        _with_prior_summary,
+    )
+
+    skeleton_prior = (
+        "## Historical Task Snapshot\n"
+        "User asked (deterministic, from compacted turns): 'finish the work'\n"
+        "Historical only; newer protected-tail messages after this summary win.\n"
+        "\n"
+        "## Goal\n"
+        "Implement the transport plan stepwise under review.\n"
+        "\n"
+        "## Constraints & Preferences\n"
+        "- One step at a time; Neo must approve each step.\n"
+        "\n"
+        "## Completed Actions\n"
+        "1. **PATCH** game_logic.py — inserted new_game stubs [tool: patch]\n"
+        "\n"
+        "## Active State\n"
+        "- Working directory: /home/ekl/Documents/Programming/pente-mcp\n"
+        "\n"
+        "## Blocked\n"
+        "- None.\n"
+    )
+    summary = (
+        f"{INTERNAL_FALLBACK_PREFIX}\n\n"
+        "## Relevant Earlier Context\n\n"
+        "[USER]: Step 2: new_game + set_board in game_logic.py.\n\n"
+        f"{VERBATIM_CONTEXT_MARKER}"
+    )
+
+    folded_once = _with_prior_summary(summary, skeleton_prior)
+    folded_twice = _with_prior_summary(folded_once, skeleton_prior)
+
+    assert folded_twice == folded_once
+    for header in (
+        "## Historical Task Snapshot",
+        "## Goal",
+        "## Constraints & Preferences",
+        "## Completed Actions",
+        "## Active State",
+        "## Blocked",
+    ):
+        assert folded_once.count(header) == 1
+    assert folded_once.count("## Prior Context Summary") == 1
+    assert folded_once.count(_PCS_END_MARKER) == 1
+
+
+def test_fold_drops_sections_already_rendered_in_current_summary():
+    """The fold must not re-state sections the current summary carries."""
+    from agent.internal_compression_fallback import _canonical_prior_summary
+
+    prior = (
+        "## Goal\n"
+        "Implement the transport plan stepwise under review.\n"
+        "\n"
+        "## Completed Actions\n"
+        "1. **PATCH** game_logic.py — inserted new_game stubs [tool: patch]\n"
+        "\n"
+        "## Key Decisions\n"
+        "- Schema migration uses revision 42.\n"
+    )
+    current = (
+        "## Relevant Earlier Context\n\n"
+        "## Goal\n"
+        "Implement the transport plan stepwise under review.\n"
+        "\n"
+        "## Completed Actions\n"
+        "1. **PATCH** game_logic.py — inserted new_game stubs [tool: patch]"
+    )
+
+    canonical = _canonical_prior_summary(prior, current)
+
+    # Re-stated sections are dropped whole; the unique block survives.
+    assert "## Goal" not in canonical
+    assert "## Completed Actions" not in canonical
+    assert "## Key Decisions" in canonical
+    assert "Schema migration uses revision 42." in canonical
+
+
+def test_fold_drops_repeated_lines_but_keeps_unique_ones():
+    """Line-level dedup drops only text the current summary states."""
+    from agent.internal_compression_fallback import _canonical_prior_summary
+
+    prior = (
+        "## Goal\n"
+        "Implement the transport plan.\n"
+        "Keep this unique constraint line."
+    )
+    current = "Implement the transport plan."
+
+    canonical = _canonical_prior_summary(prior, current)
+
+    assert "Implement the transport plan." not in canonical
+    assert "Keep this unique constraint line." in canonical
+    assert "## Goal" in canonical
+
+
 def test_forced_leading_merged_summary_strips_live_tail_from_summary_body():
     """Rehydrating a forced-leading merged summary should ignore live tail."""
     merged = (

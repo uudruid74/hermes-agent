@@ -206,6 +206,7 @@ _BOILERPLATE_RES = (
     re.compile(r"\[System note:[^\]]*\]", re.IGNORECASE),
     re.compile(r"\[OUT-OF-BAND USER MESSAGE[^\]]*\]", re.IGNORECASE),
     re.compile(r"\[/OUT-OF-BAND USER MESSAGE\]", re.IGNORECASE),
+    re.compile(r"\[END OF PRIOR CONTEXT SUMMARY\]"),
 )
 # The Plan tool's own result markers (Evan, 2026-09-16).  The newest one in
 # the compressed region is the Heap boundary: everything before it belongs to
@@ -2371,6 +2372,46 @@ def _lexrank_summary(
     return "\n\n".join(parts)
 
 
+# Fold-section delimiters (t_fede7b73).  The fold block is self-delimiting so
+# a re-fold removes EXACTLY the section it previously inserted.  The old cut
+# heuristic ("to the next ## header") is the section-skeleton form of the
+# fold-copy ratchet: the folded prior is full of ## sections, so the cut
+# stopped INSIDE the stale fold, orphaned its text as payload sections, and
+# the fresh copy landed beside it — measured 0.85-0.90 block duplication on
+# the ornith window (Phase-3 fidelity gate, t_c9cb4bec).
+_PCS_HEADER = "## Prior Context Summary"
+_PCS_END_MARKER = "[END OF PRIOR CONTEXT SUMMARY]"
+_SECTION_HEADER_RE = re.compile(r"^#{1,6}\s+\S")
+
+
+def _normalized_fold_line(line: str) -> str:
+    """Whitespace-collapsed form for fold de-duplication line matching."""
+    return re.sub(r"\s+", " ", line.strip())
+
+
+def _drop_repeated_fold_lines(block: str, current_lines: set[str]) -> str:
+    """Drop lines the current summary already states (fold-copy ratchet).
+
+    A block re-stating a section header the current summary renders is the
+    same SECTION twice in one payload — drop it whole rather than carry the
+    section again (or orphan its content under a missing header).  Other
+    re-stated content lines are dropped individually; unique lines survive.
+    """
+    lines = block.splitlines()
+    for line in lines:
+        if (
+            _SECTION_HEADER_RE.match(line)
+            and _normalized_fold_line(line) in current_lines
+        ):
+            return ""
+    kept = [
+        line
+        for line in lines
+        if not line.strip() or _normalized_fold_line(line) not in current_lines
+    ]
+    return "\n".join(kept).strip()
+
+
 def _canonical_prior_summary(previous_summary: str, current_summary: str) -> str:
     """Flatten one persisted fallback payload into unique semantic paragraphs.
 
@@ -2381,24 +2422,30 @@ def _canonical_prior_summary(previous_summary: str, current_summary: str) -> str
     Paragraphs already regenerated in the current payload need not be carried
     again; older facts absent from the current window still survive.
 
-    Non-fallback summaries keep their existing byte-for-byte carry behavior.
+    Fold-copy de-duplication (t_fede7b73): paragraphs that re-state section
+    headers or content lines already present in the current summary are
+    dropped before emission — the payload must not carry the same sections
+    twice in one block.  Only text the current summary already states is
+    dropped, so nothing absent from the current summary is lost.
     """
     prior = (previous_summary or "").strip()
-    is_internal_fallback = (
-        prior.lstrip().startswith(INTERNAL_FALLBACK_PREFIX)
-        or VERBATIM_CONTEXT_MARKER in prior
-    )
-    if not prior or not is_internal_fallback:
+    if not prior:
         return prior
 
     transport_lines = {
         INTERNAL_FALLBACK_PREFIX,
-        "## Prior Context Summary",
+        _PCS_HEADER,
+        _PCS_END_MARKER,
         "## Verbatim Recent Context",
         "The messages after this summary marker are preserved verbatim.",
     }
     current_blocks = {
         block.strip() for block in re.split(r"\n{2,}", current_summary) if block.strip()
+    }
+    current_lines = {
+        _normalized_fold_line(line)
+        for line in (current_summary or "").splitlines()
+        if line.strip()
     }
     blocks: list[str] = []
     seen: set[str] = set()
@@ -2411,6 +2458,9 @@ def _canonical_prior_summary(previous_summary: str, current_summary: str) -> str
         if not block or block in seen or block in current_blocks:
             continue
         seen.add(block)
+        block = _drop_repeated_fold_lines(block, current_lines)
+        if not block:
+            continue
         blocks.append(block)
     return "\n\n".join(blocks)
 
@@ -2450,6 +2500,29 @@ def _cap_prior_tokens(prior: str, cap_tokens: int) -> str:
     return "\n\n".join(keeps)
 
 
+def _drop_stale_fold(summary: str) -> str:
+    """Remove fold sections previously inserted by ``_with_prior_summary``.
+
+    Only sentinel-delimited folds are cut: a bare ``## Prior Context Summary``
+    heading that arrived inside quoted unit content is payload text, not a
+    fold.  Cutting at "the next ## header" (the pre-t_fede7b73 heuristic)
+    stopped INSIDE the fold's own section-skeleton content — orphaning the
+    previous fold's text as payload sections while a fresh copy landed beside
+    it (the measured 0.85-0.90 block duplication, fold-copy ratchet family).
+    The sentinel makes the replacement exact and the re-fold idempotent.
+    """
+    while True:
+        start = summary.find(_PCS_HEADER)
+        if start < 0:
+            return summary
+        end = summary.find(_PCS_END_MARKER, start + len(_PCS_HEADER))
+        if end < 0:
+            return summary
+        head = summary[:start].rstrip()
+        tail = summary[end + len(_PCS_END_MARKER):].lstrip()
+        summary = (head + ("\n\n" if head and tail else "") + tail).strip()
+
+
 def _with_prior_summary(
     summary: str,
     previous_summary: str,
@@ -2461,7 +2534,15 @@ def _with_prior_summary(
     prior is capped at ``_FOLD_CAP_SHARE`` of it before folding. Callers that
     pass a target account the capped fold pre-gate; the legacy two-arg form
     (uncapped, post-gate) is kept for callers outside the budget loop.
+
+    The fold is self-delimiting and replaced wholesale on re-fold (the
+    t_57cb0d4e convergence guard, exact since t_fede7b73): any fold this
+    builder already inserted is dropped before the fresh one is assembled, so
+    the payload carries the fold exactly once and ``make_result``'s re-fold is
+    idempotent.  The canonical prior is de-duplicated against the summary's
+    remaining content before emission (t_fede7b73).
     """
+    summary = _drop_stale_fold(summary)
     prior = _canonical_prior_summary(previous_summary, summary)
     if not prior:
         return summary
@@ -2472,22 +2553,7 @@ def _with_prior_summary(
         prior = capped  # cap applies even when empty: an over-cap fold folds nothing
     if not prior:
         return summary
-    block = f"## Prior Context Summary\n{prior}"
-    # Header replacement (t_57cb0d4e convergence guard): a summary that
-    # already carries a Prior Context Summary section is being re-folded —
-    # the incoming canonical prior is the fresher, deduped form, so replace
-    # the stale section wholesale instead of nesting a second header (two
-    # `## Prior Context Summary` sections in one payload was measured on the
-    # ornith chain). Keeps the fold idempotent w.r.t. headers.
-    _PCS_HEADER = "## Prior Context Summary"
-    if _PCS_HEADER in summary:
-        head = summary.partition(_PCS_HEADER)[0]
-        tail_part = summary.partition(_PCS_HEADER)[2]
-        # Cut the stale section: everything up to the next section header or
-        # the verbatim marker, whichever comes first.
-        next_header = re.search(r"^## .+$", tail_part, re.M)
-        cut_at = next_header.start() if next_header else len(tail_part)
-        summary = (head.rstrip() + "\n\n" + tail_part[cut_at:].lstrip()).strip()
+    block = f"{_PCS_HEADER}\n{prior}\n\n{_PCS_END_MARKER}"
     if VERBATIM_CONTEXT_MARKER in summary:
         head, _, rest = summary.partition(VERBATIM_CONTEXT_MARKER)
         return head.rstrip() + "\n\n" + block + "\n\n" + VERBATIM_CONTEXT_MARKER + rest
