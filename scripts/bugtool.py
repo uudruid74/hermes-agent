@@ -20,6 +20,10 @@ STATE_ROOT = Path(os.environ.get("BUGTOOL_STATE_ROOT", "/home/ekl/.local/state/b
 DISPATCH_LOG = STATE_ROOT / "bugs-dispatched.log"
 HERMES = os.environ.get("BUGTOOL_HERMES", "hermes")
 LIVE_STATUSES = {"todo", "ready", "running", "blocked", "scheduled"}
+# Cap-counting statuses: a BLOCKED task is not consuming the agent's attention
+# (it sits waiting for a dependency), so it must not count toward the
+# per-agent dispatch cap (Evan 2026-10-14).
+CAP_COUNT_STATUSES = {"todo", "ready", "running", "scheduled"}
 def tags_from_args(args: argparse.Namespace) -> list[str]:
     """Parse comma-separated --tags into a YAML list; empty when omitted."""
     raw = getattr(args, "tags", "") or ""
@@ -553,7 +557,9 @@ DISPATCHED_STATUS = "dispatched"
 # Per-agent cap (t_cd44bbde, Phase B): at most this many LIVE tasks per assignee
 # before further dispatches for that agent are DEFERRED (never dropped — the
 # bug stays pending+checked and the next pass retries).
-MAX_LIVE_TASKS_PER_AGENT = 1
+# 0 = unlimited disabled; 5 = default generous cap (Evan 2026-10-14: cap 1 raised;
+# Neo's OpenAI-bound queue clears, blocked tasks no longer count toward attention).
+MAX_LIVE_TASKS_PER_AGENT = 5
 
 
 def bug_status(text: str) -> str:
@@ -626,7 +632,7 @@ def live_task_count_by_agent(assignee: str) -> int:
         return 0
     if not isinstance(records, list):
         return 0
-    return sum(1 for record in records if record.get("status") in LIVE_STATUSES)
+    return sum(1 for record in records if record.get("status") in CAP_COUNT_STATUSES)
 
 
 def task_body(path: Path, text: str, directive: Optional[str] = None) -> str:
