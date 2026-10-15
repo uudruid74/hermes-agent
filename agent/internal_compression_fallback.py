@@ -8,6 +8,7 @@ import json
 import logging
 import math
 import re
+import time
 from collections import Counter
 from typing import Any, Callable
 
@@ -251,6 +252,30 @@ class _Unit:
     semantic_chunk: int | None = None
 
 
+# Text-bearing fields per the tool schemas (terminal: ``output``; file
+# tools: ``content``; error paths: ``error`` / ``message``; generic tools:
+# ``result``; multimodal parts: ``text``). Gate (c) opened for the
+# tool-trail class (Phase 2, t_490b92fc): a decoded dict/list tool result
+# used to fall through to ``""`` at the bottom of ``_content_text``, so its
+# outcome was invisible to every consumer. Schema-derived union —
+# task-agnostic by construction (Evan's hard rule).
+_TEXT_CONTENT_KEYS = ("text", "output", "content", "error", "message", "result")
+
+
+def _dict_content_text(item: dict[str, Any]) -> str:
+    """Extract text from a structured content part or tool result dict."""
+    if isinstance(item.get("text"), str):
+        return item["text"]
+    parts: list[str] = []
+    for key in _TEXT_CONTENT_KEYS:
+        if key == "text":
+            continue
+        value = item.get(key)
+        if isinstance(value, str) and value:
+            parts.append(value)
+    return "\n".join(parts)
+
+
 def _content_text(content: Any) -> str:
     if isinstance(content, str):
         return content
@@ -261,7 +286,13 @@ def _content_text(content: Any) -> str:
                 parts.append(item)
             elif isinstance(item, dict) and isinstance(item.get("text"), str):
                 parts.append(item["text"])
+            elif isinstance(item, dict):
+                piece = _dict_content_text(item)
+                if piece:
+                    parts.append(piece)
         return "\n".join(parts)
+    if isinstance(content, dict):
+        return _dict_content_text(content)
     return ""
 
 
@@ -304,6 +335,21 @@ def _template_visible_role(message: dict[str, Any]) -> str | None:
     if isinstance(role, str) and _is_payload_message(message):
         return None
     return role if isinstance(role, str) else None
+
+
+# Gate (a) opened for the tool-trail class (Phase 2, t_490b92fc):
+# ``_template_visible_role`` above hides the tool flow (tool rows and
+# assistant ``tool_calls`` rows) from the turn machinery. The tool-trail
+# unit class ADMITS exactly the rows that gate hides — that is its whole
+# subject — so the admission boundary lives here beside the gate it opens,
+# and the trail builder must never filter on template visibility. Opening
+# (a) alone is a no-op (Zephyr, council 2026-10-14): (b) would still strip
+# the rows and (c) would still empty non-str content — all three open
+# together.
+def _is_tool_flow(message: dict[str, Any]) -> bool:
+    """True for the rows the template hides: tool results and tool calls."""
+    role = message.get("role")
+    return role == "tool" or (role == "assistant" and bool(message.get("tool_calls")))
 
 
 def _verbatim_tail_start(
@@ -1066,7 +1112,7 @@ _MASKED_OBSERVATION = "[observation omitted — outside the last turn]"
 
 def _strip_tail_tool_rows(
     messages: list[dict[str, Any]], tail_start: int
-) -> tuple[list[dict[str, Any]], int]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Tail promise rung (Evan, 2026-10-04 — t_57cb0d4e): keep the last turn
     whole, strip tool calls and observations from all earlier turns.
 
@@ -1075,8 +1121,11 @@ def _strip_tail_tool_rows(
     carries context — so the promise keeps every user/assistant prose turn
     and drops only the heavy mechanical half. Tool-call assistants are
     dropped whole (their prose lives in the following assistant turn when
-    there is one); observations drop likewise. Returns ``(messages, dropped)``;
-    the input list is never mutated.
+    there is one); observations drop likewise. Returns ``(messages,
+    dropped_rows)`` — gate (b) opened for the tool-trail class (Phase 2,
+    t_490b92fc): whole-removal hands the removed rows to the caller so the
+    tool-trail ledger digests their actions instead of losing them. The
+    input list is never mutated.
     """
     tail = messages[tail_start:]
     keep_from = len(tail)
@@ -1085,13 +1134,10 @@ def _strip_tail_tool_rows(
             keep_from = offset
             break
     out = list(messages[:tail_start])
-    dropped = 0
+    dropped: list[dict[str, Any]] = []
     for offset, message in enumerate(tail):
-        if offset < keep_from and (
-            message.get("role") == "tool"
-            or (message.get("role") == "assistant" and message.get("tool_calls"))
-        ):
-            dropped += 1
+        if offset < keep_from and _is_tool_flow(message):
+            dropped.append(message)
             continue
         out.append(message)
     return out, dropped
@@ -2553,6 +2599,386 @@ def _carry_marker_spine(
 # Wintermute's information test): see _marker_keep_label (t_57cb0d4e).
 
 
+# ------------------------------------------------------- Phase 2 tool-trail
+# Tool-trail unit class (council plan 2026-10-14, t_490b92fc): the tool
+# provenance ledger nemotron preserved and our fallback dropped by
+# construction. One line per action, pair-aware — an error->fix sequence is
+# ONE ledger line carrying its interval (t_first–t_second) — bounded by a
+# floor-and-ceiling quota, ranked on its own text-shape salience path, and
+# emitted like the marker spine: outside the ranker/heap funnel, own
+# budget, own block.
+#
+# STAGE 1 — admission + quota. Admission is SIGNAL-PURE (Wintermute COND 1):
+# identity/order signals only — tool_call_id dedup, same-target grouping,
+# recency buckets (the order tuple), session order. No content-shape signal
+# admits or rejects a row. The dedup key is (target, outcome-class), NOT
+# (target) (COND 2): naive newest-occurrence dedup on (target) erases the
+# error->fix pair — the highest-value content class measured — while
+# (target, outcome-class) keeps both keys and fuses them into one line
+# (NOTE A: a pair spans two rows and two clocks; a single snapshot ts would
+# recreate the timestamp-loss bug at unit level). NOTE C: one source row ->
+# one unit identity with tool_call_id included — ghost twins (same
+# tool_call_id re-persisted under the compaction clock) collapse to one
+# occurrence instead of feeding the dup machinery this ledger replaces.
+#
+# STAGE 2 — salience on its OWN path: text-shape score over the rendered
+# line (names a path / command / edit / exit). NOT routed through
+# llmslim_selector.py — its _EXTERNAL_ROLES branch zeroes tool rows (the
+# 37-in/4-survive/0-emitted failure) — and not through _rank_units.
+# llmslim_selector.py stays untouched (council).
+#
+# STAGE 3 — emission: one line per action with provenance (tool, target,
+# outcome, interval), chronological, under a hard ceiling.
+#
+# Quota = floor AND ceiling (Zephyr: "bound+account, cap don't exempt"):
+# the FLOOR is a token reserve carved from the tail's budget BEFORE tail
+# measurement (carve -> measure -> gate -> emit), so the trail can never be
+# sized to zero; the CEILING is the hard cap on the emitted block — the
+# anti-bug-4 guard ("trail must not outrank real content"). Both shares are
+# Phase-3 tunables pending the 3-arm harness sweep; the ceiling is a
+# minority share, well under the fold's 0.16.
+_TRAIL_FLOOR_SHARE = 0.005
+_TRAIL_CEILING_SHARE = 0.05
+
+
+def _tool_trail_reserve(target_tokens: int) -> int:
+    """Floor: token reserve for the trail, carved before tail sizing."""
+    return max(0, int(target_tokens * _TRAIL_FLOOR_SHARE))
+
+
+def _tool_trail_budget(target_tokens: int) -> int:
+    """Ceiling: hard cap for the emitted trail block (anti-bug-4 guard)."""
+    return max(
+        _tool_trail_reserve(target_tokens),
+        int(target_tokens * _TRAIL_CEILING_SHARE),
+    )
+
+
+_TRAIL_TARGET_MAX = 96
+_TRAIL_SHELL_RE = re.compile(r"[|;&$`]")
+_TRAIL_URL_RE = re.compile(r"^https?://", re.I)
+_TRAIL_EDIT_TOOL_RE = re.compile(
+    r"\b(?:patch|write_file|edit|multi_edit|apply_patch|str_replace)\b", re.I
+)
+_TRAIL_EXIT_RE = re.compile(r"\bexit[ _]?-?\d+\b", re.I)
+
+# The action-object argument names, per the tool schemas (terminal:
+# ``command``; file tools: ``path``; search: ``pattern``; web: ``query`` /
+# ``urls``; write/create tools: ``path`` before ``content``). Schema
+# vocabulary, task-agnostic — not values observed in any particular data.
+_ACTION_ARG_HINTS = (
+    "command", "path", "pattern", "query", "url", "urls", "target", "file",
+    "script", "expression", "prompt", "goal", "title", "subject", "message",
+    "note", "body", "text", "content", "code", "source", "destination", "input",
+)
+
+
+@dataclass(frozen=True)
+class _TrailOccurrence:
+    """One admitted tool action (one source row -> one unit identity)."""
+
+    tool: str
+    target: str          # full argument value — the grouping identity
+    target_display: str  # truncated rendering for the digest line
+    outcome: str         # rendered label ("exit 1", "error: ...", "ok")
+    outcome_class: str   # "ok" | "error" | "void" — the dedup key half
+    order: tuple[int, ...]
+    t_first: float | None
+    t_second: float | None
+
+
+@dataclass(frozen=True)
+class _TrailLine:
+    """One fused ledger line — the pair-as-unit (COND 2 / NOTE A)."""
+
+    text: str
+    key: str
+    order: tuple[int, ...]
+    token_count: int
+    salience: int
+
+
+def _tool_target(args: dict[str, Any]) -> str:
+    """The action's object, from the call arguments (tool-schema derived).
+
+    The first schema-hint name present wins; otherwise the longest string
+    value. Deterministic for identical arguments, which is all same-target
+    grouping requires. Content blobs can win the fallback pick, but never
+    the hinted one — the hint names are the tools' own parameters.
+    """
+    for name in _ACTION_ARG_HINTS:
+        value = args.get(name)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    candidates = [
+        value.strip()
+        for value in args.values()
+        if isinstance(value, str) and value.strip()
+    ]
+    return max(candidates, key=len) if candidates else ""
+
+
+def _outcome_of(content: Any) -> tuple[str, str]:
+    """(outcome-class, label) from a tool result row's content.
+
+    Schema-derived fields (``exit_code`` / ``error`` / ``success``). Reads
+    the RAW content — a decoded dict's ``exit_code`` never reaches
+    ``_content_text`` (only string fields do), so extracting from the text
+    form alone would lose the outcome of exactly the rows gate (c) opened.
+    """
+    data: dict[str, Any] | None = content if isinstance(content, dict) else None
+    if data is None and isinstance(content, str):
+        try:
+            parsed = json.loads(content)
+        except (ValueError, TypeError):
+            parsed = None
+        if isinstance(parsed, dict):
+            data = parsed
+    if data is not None:
+        exit_code = data.get("exit_code")
+        if isinstance(exit_code, int):
+            return ("ok" if exit_code == 0 else "error"), f"exit {exit_code}"
+        error = data.get("error")
+        if isinstance(error, str) and error.strip():
+            return "error", f"error: {error.strip()[:40]}"
+        if error:
+            return "error", f"error: {str(error)[:40]}"
+        if isinstance(data.get("success"), bool):
+            ok = bool(data["success"])
+            return ("ok" if ok else "error"), ("ok" if ok else "failed")
+    text = _content_text(content)
+    exit_code = _parse_exit_code(text)
+    if exit_code is not None:
+        return ("ok" if exit_code == 0 else "error"), f"exit {exit_code}"
+    if text.strip():
+        return "ok", "ok"
+    return "void", "no result"
+
+
+def _tool_trail_scan(
+    rows: list[dict[str, Any]], start_index: int = 0
+) -> list[_TrailOccurrence]:
+    """Admit tool actions from a message region (STAGE 1, signal-pure).
+
+    Identity/order only: one occurrence per tool_call_id (NOTE C — ghost
+    twins collapse here), paired by tool_call_id, ordered by session
+    position. Echo-marker commands are skipped — the marker spine is their
+    ONLY selection path ("nothing is double-emitted"). Unpaired rows are
+    skipped rather than hallucinated (same rule as the spine).
+    """
+    pending: dict[str, tuple[str, str, str, float | None]] = {}
+    occurrences: list[_TrailOccurrence] = []
+    seen_calls: set[str] = set()
+    for offset, message in enumerate(rows):
+        role = message.get("role")
+        raw_ts = message.get("timestamp")
+        ts = float(raw_ts) if isinstance(raw_ts, (int, float)) else None
+        if role == "assistant":
+            for call in message.get("tool_calls") or []:
+                if not isinstance(call, dict):
+                    continue
+                fn = call.get("function")
+                if not isinstance(fn, dict):
+                    continue
+                fn_name = str(fn.get("name") or "tool")
+                args_raw = fn.get("arguments")
+                args: dict[str, Any] = {}
+                if isinstance(args_raw, str):
+                    try:
+                        parsed_args = json.loads(args_raw)
+                    except (ValueError, TypeError):
+                        parsed_args = None
+                    if isinstance(parsed_args, dict):
+                        args = parsed_args
+                elif isinstance(args_raw, dict):
+                    args = args_raw
+                command = args.get("command")
+                if isinstance(command, str) and _is_echo_marker_command(command):
+                    continue
+                cid = str(call.get("id") or call.get("call_id") or "")
+                if not cid or cid in seen_calls:
+                    continue
+                seen_calls.add(cid)
+                target = _tool_target(args)
+                display = target
+                if len(display) > _TRAIL_TARGET_MAX:
+                    display = display[:_TRAIL_TARGET_MAX].rstrip() + "…"
+                pending[cid] = (fn_name, target, display, ts)
+        elif role == "tool":
+            cid = str(message.get("tool_call_id") or "")
+            entry = pending.pop(cid, None)
+            if entry is None:
+                continue
+            fn_name, target, display, call_ts = entry
+            outcome_class, outcome = _outcome_of(message.get("content"))
+            occurrences.append(
+                _TrailOccurrence(
+                    tool=fn_name,
+                    target=target,
+                    target_display=display,
+                    outcome=outcome,
+                    outcome_class=outcome_class,
+                    order=(start_index + offset, 0),
+                    t_first=call_ts if call_ts is not None else ts,
+                    t_second=ts,
+                )
+            )
+    return occurrences
+
+
+def _tool_trail_lines(occurrences: list[_TrailOccurrence]) -> list[_TrailLine]:
+    """Pair-aware fusion (COND 2 / NOTE A): one line per action segment.
+
+    Occurrences group by (tool, target); inside a group the outcome-class
+    sequence is run-length compressed (the (target, outcome-class) dedup —
+    repeats of one class collapse to one representative) and then split
+    into segments of at most two runs, the pair-as-unit. An error->fix
+    pair therefore survives as ONE line carrying the fused interval
+    t_first–t_second, never as two competing rows.
+    """
+    by_target: dict[tuple[str, str], list[_TrailOccurrence]] = {}
+    for occurrence in occurrences:
+        by_target.setdefault((occurrence.tool, occurrence.target), []).append(occurrence)
+
+    lines: list[_TrailLine] = []
+    for (tool, _target), occs in by_target.items():
+        runs: list[list[_TrailOccurrence]] = []
+        for occurrence in occs:
+            if runs and runs[-1][-1].outcome_class == occurrence.outcome_class:
+                runs[-1].append(occurrence)
+            else:
+                runs.append([occurrence])
+        for start in range(0, len(runs), 2):
+            segment = runs[start:start + 2]
+            fused = [occurrence for run in segment for occurrence in run]
+            labels = "→".join(run[0].outcome for run in segment)
+            stamps = [
+                stamp
+                for occurrence in fused
+                for stamp in (occurrence.t_first, occurrence.t_second)
+                if stamp is not None
+            ]
+            interval = (
+                f"{_trail_ts(min(stamps))}–{_trail_ts(max(stamps))}" if stamps else ""
+            )
+            display = fused[0].target_display
+            text = f"- {tool}: {display} — {labels}"
+            if interval:
+                text += f" ({interval})"
+            lines.append(
+                _TrailLine(
+                    text=text,
+                    key=f"{tool}: {display} — {labels}",
+                    order=fused[0].order,
+                    token_count=estimate_tokens_rough(text),
+                    salience=_trail_salience(text),
+                )
+            )
+    return lines
+
+
+def _trail_salience(text: str) -> int:
+    """STAGE 2, own path: text-shape salience of a rendered ledger line.
+
+    Names a path / command / edit / exit — one point each. Never routed
+    through llmslim_selector (its external-role branch zeroes tool rows) or
+    _rank_units: this is the trail class's own scoring path.
+    """
+    score = 0
+    if _PATH_RE.search(text):
+        score += 1
+    if _TRAIL_SHELL_RE.search(text):
+        score += 1
+    if _TRAIL_EDIT_TOOL_RE.search(text):
+        score += 1
+    if _TRAIL_EXIT_RE.search(text):
+        score += 1
+    return score
+
+
+def _trail_ts(stamp: float) -> str:
+    """UTC wall-clock for a row timestamp (interval provenance, NOTE A)."""
+    return time.strftime("%H:%M:%S", time.gmtime(stamp))
+
+
+def _tool_trail_block(lines: list[_TrailLine]) -> str:
+    """Render the trail block: one line per action, chronological."""
+    if not lines:
+        return ""
+    ordered = sorted(lines, key=lambda item: item.order)
+    return "## Actions & Outcomes\n" + "\n".join(item.text for item in ordered)
+
+
+def _carried_trail_keys(previous_summary: str) -> set[str]:
+    """Line keys already carried by the previous payload's trail block.
+
+    Same convergence guard as the marker spine's label dedupe: the fold
+    carries the old block forward, so re-admitting its lines would regrow
+    the trail every cycle. Keys are the rendered line minus its interval.
+    """
+    keys: set[str] = set()
+    _, found, rest = (previous_summary or "").partition("## Actions & Outcomes")
+    if not found:
+        return keys
+    next_header = re.search(r"^## .+$", rest, re.M)
+    body = rest[: next_header.start()] if next_header else rest
+    for raw in body.splitlines():
+        line = raw.strip()
+        if not line.startswith("- ") or " — " not in line:
+            continue
+        keys.add(re.sub(r" \([^()]*\)$", "", line[2:]).strip())
+    return keys
+
+
+def _carry_tool_trail(
+    summary: str,
+    trail: list[_TrailLine],
+    budget_tokens: int,
+    *,
+    previous_summary: str = "",
+    selection_telemetry: dict[str, Any] | None = None,
+) -> str:
+    """Insert the trail block into ``summary`` under its ceiling.
+
+    Selection order is Stage-2 salience first with recency as the
+    tiebreak — the cut drops lowest-salience/oldest first — while the
+    emitted block stays chronological (curated content keeps session
+    order). Lines the previous payload already carries are skipped (the
+    convergence guard above). The block rides below the spine and above
+    the verbatim marker, outside the heap's budget entirely.
+    """
+    if not trail or budget_tokens <= 0:
+        return summary
+    carried = _carried_trail_keys(previous_summary)
+    kept: list[_TrailLine] = []
+    spent = 0
+    seen: set[str] = set()
+    for line in sorted(
+        trail, key=lambda item: (-item.salience, tuple(-part for part in item.order))
+    ):
+        if line.key in carried or line.key in seen:
+            continue
+        if kept and spent + line.token_count > budget_tokens:
+            # Greedy fill: a bulky low-salience line must not block smaller
+            # ones from the same quota.
+            continue
+        seen.add(line.key)
+        kept.append(line)
+        spent += line.token_count
+    block = _tool_trail_block(kept)
+    if not block:
+        return summary
+    if selection_telemetry is not None:
+        info = selection_telemetry.setdefault("tool_trail", {})
+        info["emitted_lines"] = len(kept)
+        info["emitted_tokens"] = spent
+        info["carried_skipped"] = len(carried)
+    if VERBATIM_CONTEXT_MARKER in summary:
+        head, _, rest = summary.partition(VERBATIM_CONTEXT_MARKER)
+        return head.rstrip() + "\n\n" + block + "\n\n" + VERBATIM_CONTEXT_MARKER + rest
+    return summary.rstrip() + "\n\n" + block
+
+
 _OMISSION_MARKER_PREFIX = (
     "[CONTEXT WINDOW COMPRESSED — middle omitted for length (null mode)]"
 )
@@ -2670,14 +3096,61 @@ def build_internal_fallback(
     #
     # Stage 1 carve (§11): the spine reserve is subtracted from the tail's
     # budget BEFORE tail measurement, so a 32K tail cannot size it to zero.
+    # The tool-trail FLOOR is carved the same way (carve -> measure -> gate
+    # -> emit), so the trail can never be sized to zero either.
     tail_tokens = estimate_messages_tokens_rough(messages[tail_start:])
-    tail_target = max(0, target_tokens - _marker_spine_reserve(target_tokens))
+    tail_target = max(
+        0,
+        target_tokens
+        - _marker_spine_reserve(target_tokens)
+        - _tool_trail_reserve(target_tokens),
+    )
+    # Gates (b) + the mask rung: whatever the two rungs destroy from the
+    # tail is captured for the tool-trail ledger instead of vanishing. The
+    # originals are recovered by tool_call_id because the mask replaces
+    # content before the strip drops the row.
+    tail_tool_originals = [
+        message for message in messages[tail_start:] if _is_tool_flow(message)
+    ]
+    originals_by_call = {
+        str(message.get("tool_call_id") or ""): message
+        for message in tail_tool_originals
+        if message.get("role") == "tool"
+    }
+    captured_tail_rows: list[dict[str, Any]] = []
     if tail_tokens > tail_target:
         messages = _mask_tail_observations(messages, tail_start)
         tail_tokens = estimate_messages_tokens_rough(messages[tail_start:])
-        if tail_tokens > tail_target:
-            messages, _dropped = _strip_tail_tool_rows(messages, tail_start)
-            tail_tokens = estimate_messages_tokens_rough(messages[tail_start:])
+    if tail_tokens > tail_target:
+        messages, dropped_rows = _strip_tail_tool_rows(messages, tail_start)
+        tail_tokens = estimate_messages_tokens_rough(messages[tail_start:])
+        captured_tail_rows.extend(
+            originals_by_call.get(str(row.get("tool_call_id") or ""), row)
+            if row.get("role") == "tool"
+            else row
+            for row in dropped_rows
+        )
+    for row in messages[tail_start:]:
+        # The mask rung keeps its stubs in place but replaced their
+        # content — those originals carry the outcomes.
+        if row.get("role") == "tool" and row.get("content") == _MASKED_OBSERVATION:
+            captured_tail_rows.append(
+                originals_by_call.get(str(row.get("tool_call_id") or ""), row)
+            )
+
+    # The tool-trail class (Phase 2): admitted from the compressed middle
+    # plus the rows the rungs above destroyed. Rows the verbatim tail keeps
+    # raw are deliberately NOT digested — no duplication across regions.
+    trail_lines = _tool_trail_lines(
+        _tool_trail_scan(messages[head_count:tail_start], start_index=head_count)
+        + _tool_trail_scan(captured_tail_rows, start_index=tail_start)
+    )
+    selection_telemetry["tool_trail"] = {
+        "candidate_lines": len(trail_lines),
+        "captured_tail_rows": len(captured_tail_rows),
+        "floor_reserve": _tool_trail_reserve(target_tokens),
+        "ceiling_tokens": _tool_trail_budget(target_tokens),
+    }
 
     notes = _session_notes(messages, memory_context, previous_summary)
 
@@ -2807,6 +3280,11 @@ def build_internal_fallback(
                 summary, spine_units, _marker_spine_budget(target_tokens),
                 previous_summary=previous_summary,
             )
+            summary = _carry_tool_trail(
+                summary, trail_lines, _tool_trail_budget(target_tokens),
+                previous_summary=previous_summary,
+                selection_telemetry=selection_telemetry,
+            )
             return make_result(summary, head_count, fitted_tail_start, "plan")
 
         # The full plan is itself too large to fit — degrade to
@@ -2847,6 +3325,11 @@ def build_internal_fallback(
             _all_spine[-marker_recent_count:] if marker_recent_count > 0 else [],
             _marker_spine_budget(target_tokens),
             previous_summary=previous_summary,
+        )
+        summary = _carry_tool_trail(
+            summary, trail_lines, _tool_trail_budget(target_tokens),
+            previous_summary=previous_summary,
+            selection_telemetry=selection_telemetry,
         )
         return make_result(
             summary,
@@ -2894,6 +3377,13 @@ def build_internal_fallback(
     if not candidates:
         selection_telemetry["no_op_reason"] = "no_candidates"
         summary = _lexrank_summary([], protected)
+        # The trail still emits here: a tool-only middle has no prose
+        # candidates but is exactly the case the ledger preserves.
+        summary = _carry_tool_trail(
+            summary, trail_lines, _tool_trail_budget(target_tokens),
+            previous_summary=previous_summary,
+            selection_telemetry=selection_telemetry,
+        )
         return make_result(
             summary,
             head_count,
@@ -2938,6 +3428,11 @@ def build_internal_fallback(
     summary = _carry_marker_spine(
         summary, spine_units, _marker_spine_budget(target_tokens),
         previous_summary=previous_summary,
+    )
+    summary = _carry_tool_trail(
+        summary, trail_lines, _tool_trail_budget(target_tokens),
+        previous_summary=previous_summary,
+        selection_telemetry=selection_telemetry,
     )
     _record_selected_units(selection_telemetry, selected)
     _log_inviolable_dropout(summary, ranked)
