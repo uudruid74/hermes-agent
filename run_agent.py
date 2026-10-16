@@ -7626,24 +7626,36 @@ class AIAgent:
         task_started = False
         task_finished = False
         relay_outcome = "failed"
+        # RELAY SCOPE ISOLATION — skip the relay turn-scope lifecycle for
+        # persistence-isolated forks (bg-review). Such a fork shares the parent's
+        # session_id, so acquire_conversation would return the PARENT's
+        # RelaySession and begin_turn would push a second TURN_SCOPE on the
+        # parent's stack; the parent's end_turn (its own finally) then pops the
+        # fork's handle and raises "scope handle is not at the top of the stack"
+        # (nemo_relay/scope.py:144). Everything downstream is already None-safe:
+        # except/finally guard on `relay_turn is not None` / `task_started`.
+        # NOT gated below: set_conversation_context / set_accounting_context —
+        # the fork still needs those for prompt-cache and aux-spend accounting.
+        relay_active = not getattr(self, "_relay_scope_disabled", False)
         try:
-            relay_lease = relay_runtime.SESSION_COORDINATOR.acquire_conversation(
-                profile_key=relay_runtime.current_profile_key(),
-                session_id=task_context["session_id"],
-                platform=task_context["platform"],
-                parent_session_id=relay_parent_session_id,
-                model=str(getattr(self, "model", None) or ""),
-            )
-            relay_turn = relay_runtime.SESSION_COORDINATOR.begin_turn(
-                relay_lease,
-                turn_id=relay_turn_id,
-                task_id=effective_task_id,
-            )
-            start_task_run(
-                **task_context,
-                parent_session_id=getattr(self, "_parent_session_id", None) or "",
-            )
-            task_started = True
+            if relay_active:
+                relay_lease = relay_runtime.SESSION_COORDINATOR.acquire_conversation(
+                    profile_key=relay_runtime.current_profile_key(),
+                    session_id=task_context["session_id"],
+                    platform=task_context["platform"],
+                    parent_session_id=relay_parent_session_id,
+                    model=str(getattr(self, "model", None) or ""),
+                )
+                relay_turn = relay_runtime.SESSION_COORDINATOR.begin_turn(
+                    relay_lease,
+                    turn_id=relay_turn_id,
+                    task_id=effective_task_id,
+                )
+                start_task_run(
+                    **task_context,
+                    parent_session_id=getattr(self, "_parent_session_id", None) or "",
+                )
+                task_started = True
             # Publish the conversation id for ambient Nous Portal tagging. Every
             # LLM call made inside this turn — main loop, compression, vision,
             # web_extract, session_search, MoA slots, background-review forks
@@ -7685,12 +7697,17 @@ class AIAgent:
                 relay_outcome = "failed"
             else:
                 relay_outcome = "success"
-            relay_runtime.SESSION_COORDINATOR.finish_logical_calls(
-                relay_turn,
-                outcome=relay_outcome,
-            )
-            task_finished = True
-            finish_task_run(**task_context, result=result)
+            if relay_active:
+                # relay_turn is guaranteed non-None here (begin_turn's return is
+                # non-optional and only runs under relay_active); the explicit
+                # guard keeps Pyright honest without a type: ignore.
+                if relay_turn is not None:
+                    relay_runtime.SESSION_COORDINATOR.finish_logical_calls(
+                        relay_turn,
+                        outcome=relay_outcome,
+                    )
+                task_finished = True
+                finish_task_run(**task_context, result=result)
             return result
         except BaseException as exc:
             if isinstance(exc, (KeyboardInterrupt, InterruptedError)) or (

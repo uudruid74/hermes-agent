@@ -1603,6 +1603,15 @@ def init_agent(
     # background skill/memory review fork so its harness turn can't leak into
     # the user's real session and hijack the next live turn. Default False.
     agent._persist_disabled = False
+    # When True, this agent SKIPS the relay turn-scope lifecycle in the
+    # run_conversation forwarder (acquire_conversation / begin_turn / end_turn).
+    # Set on the background review fork, which shares the parent's session_id:
+    # without this its begin_turn pushes a second TURN_SCOPE on the PARENT's
+    # relay scope stack, and the parent's end_turn pop then fails with "scope
+    # handle is not at the top of the stack" (nemo_relay/scope.py:144), leaking
+    # a handle per occurrence. _persist_disabled isolates the DB only — it does
+    # NOT cover the scope stack. Explicit default so every agent declares it.
+    agent._relay_scope_disabled = False
     agent._session_init_model_config = {
         "max_iterations": agent.max_iterations,
         "reasoning_config": reasoning_config,

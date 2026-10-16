@@ -33,6 +33,13 @@ class _Relay:
         self._scope_starts: dict[Any, dict[str, Any]] = {}
         self._scope = contextvars.ContextVar("relay_scope", default=None)
         self._scope_serial = 0
+        # LIFO mirror of nemo_relay/scope.py — pushes append to this stack and
+        # _scope_pop only accepts the top. The old fake popped any handle it was
+        # given without checking order, so the bg-review fork's out-of-order pop
+        # (its turn scope B sitting over the parent's A) was silently tolerated
+        # in tests while the real native pop raised at scope.py:144. Keeping this
+        # stack is what makes the regression reproducible in the fake.
+        self._scope_stack: list[Any] = []
         self.ScopeType = SimpleNamespace(Agent="agent", Function="function")
         self.LLMRequest = _Request
         self.scope = SimpleNamespace(
@@ -51,6 +58,7 @@ class _Relay:
     def _scope_push(self, name: str, scope_type: Any, **kwargs: Any) -> Any:
         self._scope_serial += 1
         handle = ("scope", name, self._scope_serial)
+        self._scope_stack.append(handle)
         self._scope.set(handle)
         self.events.append(("scope.push", name, scope_type, kwargs))
         if scope_type == self.ScopeType.Function:
@@ -69,6 +77,13 @@ class _Relay:
         return handle
 
     def _scope_pop(self, handle: Any, **kwargs: Any) -> None:
+        # Mirror nemo_relay/scope.py:144 — a pop must target the top of the
+        # stack. An out-of-order pop means a handle leaked or a second scope was
+        # pushed over a live one; the real native pop raises here rather than
+        # silently closing the wrong scope.
+        if not self._scope_stack or self._scope_stack[-1] != handle:
+            raise RuntimeError("scope handle is not at the top of the stack")
+        self._scope_stack.pop()
         self.events.append(("scope.pop", handle, kwargs))
         start = self._scope_starts.pop(handle, None)
         if start is not None:
@@ -888,26 +903,68 @@ def test_subagent_agent_boundary_closes_its_own_scope(
     )
 
 
+@pytest.mark.parametrize("relay_scope_disabled", [True, False])
+def test_relay_scope_disabled_skips_turn_scope(
+    direct_runtime, monkeypatch, relay_scope_disabled
+):
+    """Regression: a relay-scope-disabled agent must not push a turn scope.
 
+    A persistence-isolated fork shares the parent's session_id, so if it ran the
+    relay lifecycle its begin_turn would push a TURN_SCOPE onto the PARENT's
+    scope stack. The parent's own end_turn (run in its finally, which always
+    executes after the fork spawns) would then pop the fork's handle and raise
+    "scope handle is not at the top of the stack" (nemo_relay/scope.py:144).
 
+    _relay_scope_disabled=True  -> no acquire, no turn-scope push, no pop.
+    _relay_scope_disabled=False -> one acquire: one push, closed by one LIFO pop.
+    """
+    from run_agent import AIAgent
 
+    session = "fork-session" if relay_scope_disabled else "normal-session"
+    agent = SimpleNamespace(
+        session_id=session,
+        platform="cli",
+        _session_db=None,
+        _conversation_root_id=lambda: session,
+        _relay_scope_disabled=relay_scope_disabled,
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop.run_conversation",
+        lambda *_args, **_kwargs: {
+            "final_response": "done",
+            "completed": True,
+            "interrupted": False,
+        },
+    )
 
+    # Both cases must complete and return: the fork still runs its turn, it
+    # merely skips the relay scope lifecycle.
+    result = AIAgent.run_conversation(agent, "review", task_id="turn-1")
+    assert result["final_response"] == "done"
 
+    # scope.push events carry the scope NAME in event[1]; scope.pop events
+    # carry the HANDLE tuple, whose name component is event[1][1] (see the
+    # existing subagent-boundary test).
+    all_pushes = [e for e in direct_runtime.events if e[0] == "scope.push"]
+    turn_pushes = [e for e in all_pushes if e[1] == relay_runtime.TURN_SCOPE]
+    turn_pops = [
+        event
+        for event in direct_runtime.events
+        if event[0] == "scope.pop" and event[1][1] == relay_runtime.TURN_SCOPE
+    ]
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+    if relay_scope_disabled:
+        # The fork never touches the relay scope stack at all: no session scope
+        # (acquire_conversation), no turn scope (begin_turn), no task_run scope
+        # (start_task_run) — the whole gated block is skipped.
+        assert all_pushes == []
+        assert turn_pops == []
+    else:
+        # A normal agent acquires exactly one turn scope and closes it LIFO —
+        # the fake's _scope_pop now enforces that ordering (Step 4).
+        assert len(turn_pushes) == 1
+        assert len(turn_pops) == 1
+        assert turn_pushes[0][1] == relay_runtime.TURN_SCOPE
 
 
 def test_failed_flush_keeps_daily_export_open_for_later_task(

@@ -960,6 +960,19 @@ def _run_review_in_thread(
             # _get_session_db_for_recall); the review writes only to the skill
             # and memory stores via its tools, which is all it needs.
             review_agent._persist_disabled = True
+            # RELAY SCOPE ISOLATION — the scope-stack corruption root cause.
+            # _persist_disabled isolates the DB, NOT the relay scope stack. The
+            # fork shares the parent's session_id (pinned above for cache
+            # parity), so its run_conversation() hits the SAME forwarder and
+            # ensure_session() returns the PARENT's RelaySession — begin_turn()
+            # then pushes a second TURN_SCOPE on top of the parent's. The
+            # parent's end_turn() (run_agent.py finally) always runs AFTER this
+            # spawn, so its scope.pop() finds the fork's handle on top and raises
+            # "scope handle is not at the top of the stack" (nemo_relay/scope.py:144),
+            # leaking one handle per occurrence. Gating the relay block on this
+            # flag keeps the fork off the parent's stack entirely. The fork needs
+            # NO relay marks — no consumer reads them.
+            review_agent._relay_scope_disabled = True
             review_agent._session_db = None
             review_agent._session_json_enabled = False
             # Suppress all status/warning emits from the fork so the
