@@ -4528,6 +4528,27 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
         self._execute_write(_do)
 
+    def find_task_session_id(self, task_id: str) -> Optional[str]:
+        """Return the most recent live session bound to ``task_id``, or None.
+
+        Kanban workers bind their session to the claimed task at boot
+        (``HERMES_KANBAN_TASK`` → :meth:`set_session_task_id`), so notification
+        wakes can target the worker's real session (``cli:<session_id>``).
+        Only unended sessions qualify — a notice queued for a finished
+        session would never drain.
+        """
+        if not task_id:
+            return None
+        with self._lock:
+            cursor = self._conn.execute(
+                "SELECT id FROM sessions "
+                "WHERE task_id = ? AND ended_at IS NULL "
+                "ORDER BY started_at DESC LIMIT 1",
+                (task_id,),
+            )
+            row = cursor.fetchone()
+        return row["id"] if row else None
+
     def _merge_model_config(self, session_id: str, updates: Dict[str, Any]) -> None:
         """Merge keys into the session's model_config JSON."""
         def _do(conn):

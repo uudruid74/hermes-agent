@@ -1339,6 +1339,81 @@ def _enqueue_kanban_session_notice(task: Any, human_msg: str) -> bool:
     return queued
 
 
+def _resolve_worker_session(task: Any) -> Optional[tuple[Path, str]]:
+    """Resolve the task's live worker session as ``(profile_home, session_id)``.
+
+    Kanban workers bind their session to the claimed task at boot
+    (``sessions.task_id`` via ``HERMES_KANBAN_TASK``); that binding is the
+    ``cli:<session_id>`` wake target for notifications while the worker runs.
+    Returns ``None`` when the task has no live worker session (unstarted,
+    finished, or crashed-and-reclaimed without a bound session).
+    """
+    if task is None:
+        return None
+    task_id = str(getattr(task, "id", "") or "").strip()
+    if not task_id:
+        return None
+    assignee = str(getattr(task, "assignee", "") or "").strip() or "default"
+    try:
+        from hermes_cli.profiles import get_profile_dir
+        from hermes_state import SessionDB
+
+        profile_home = get_profile_dir(assignee)
+    except (ImportError, ValueError) as exc:
+        logger.warning(
+            "kanban notify could not resolve worker profile=%s: %s",
+            assignee,
+            exc,
+        )
+        return None
+    session_db = SessionDB(db_path=profile_home / "state.db")
+    try:
+        session_id = session_db.find_task_session_id(task_id)
+    finally:
+        session_db.close()
+    return (profile_home, session_id) if session_id else None
+
+
+def _wake_task_worker_session(task: Any, payload: str, status: str) -> bool:
+    """Wake the task's live worker session (``cli:<session_id>``) if any.
+
+    Returns True when the worker wake replaced the chat-DM wake. A wake aimed
+    at the acting session itself would be a self-echo (t_0bae723b) and falls
+    back to the configured notification routing instead.
+    """
+    worker = _resolve_worker_session(task)
+    if worker is None:
+        return False
+    profile_home, session_id = worker
+    actor_session = _acting_session_identity()["HERMES_SESSION_ID"].strip()
+    if actor_session and actor_session == session_id:
+        logger.info(
+            "kanban notify task=%s status=%s target=cli:%s suppressed "
+            "self-wake (actor session is the worker session)",
+            getattr(task, "id", ""),
+            status,
+            session_id,
+        )
+        return False
+    from hermes_state import SessionDB
+
+    session_db = SessionDB(db_path=profile_home / "state.db")
+    try:
+        queued = session_db.enqueue_session_notice(session_id, payload)
+    finally:
+        session_db.close()
+    logger.info(
+        "kanban notify task=%s status=%s target=cli:%s profile=%s "
+        "adapter=session_notice result=%s",
+        getattr(task, "id", ""),
+        status,
+        session_id,
+        getattr(task, "assignee", "") or "default",
+        "queued" if queued else "session-not-found",
+    )
+    return bool(queued)
+
+
 def _send_kanban_wake(
     *,
     target: str,
@@ -1647,6 +1722,20 @@ def _notify_kanban_status_change(
         "assignee": assignee or "unassigned",
     })
 
+    # Wake the task's live worker session (cli:<session_id>) when bound — the
+    # notification reaches the session where the work happens. When this
+    # succeeds it replaces the chat-DM bridge wake below ("instead of the
+    # hardcoded telegram DM"); with no bound worker session the configured
+    # notification routing below is unchanged.
+    worker_woken = False
+    try:
+        worker_woken = _wake_task_worker_session(task, json_payload, new_status)
+    except Exception:
+        logger.exception(
+            "kanban notify task=%s status=%s worker session wake failed",
+            task_id, new_status,
+        )
+
     if not (origin and origin.get("platform") and origin.get("chat_id")):
         try:
             _enqueue_kanban_session_notice(task, human_msg)
@@ -1725,6 +1814,11 @@ def _notify_kanban_status_change(
         )
 
     try:
+        if worker_woken:
+            # The LLM wake is already bound to the worker's real session
+            # (cli:<session_id>) above; the chat-DM bridge wake would
+            # double-fire the same event into the origin chat.
+            return
         if _wake_targets_acting_session(origin, platform, chat_id, thread_id, task):
             # The wake would inject a synthetic user message into the very
             # session that authored this action (its own claim/comment/

@@ -662,6 +662,19 @@ class AIAgent:
             logger.warning(
                 "Session DB creation failed (will retry next turn): %s", e
             )
+            return
+        # Kanban workers bind their session to the claimed task so kanban
+        # notifications can wake the worker's real session (cli:<session_id>)
+        # instead of a chat DM. Degraded binding only downgrades delivery to
+        # the configured notification routing — never fatal.
+        kanban_task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+        if kanban_task_id:
+            import sqlite3
+
+            try:
+                self._session_db.set_session_task_id(self.session_id, kanban_task_id)
+            except (sqlite3.Error, OSError) as exc:
+                logger.warning("Kanban task-session binding failed: %s", exc)
 
     def _transition_context_engine_session(
         self,

@@ -299,3 +299,109 @@ def test_load_hermes_env_bridges_config_yaml_scalars(tmp_path, monkeypatch):
     assert os.environ.get("TELEGRAM_HOME_CHANNEL") == "5550001111"
 
 
+# ---------------------------------------------------------------------------
+# Bare-profile wake resolution (per-profile home channel) — t_6a22e29b
+# ---------------------------------------------------------------------------
+
+def test_bare_profile_resolves_configured_home_channel(monkeypatch, tmp_path):
+    import hermes_cli.profiles
+
+    home = tmp_path / "gopher"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "platforms:\n"
+        "  telegram:\n"
+        "    enabled: true\n"
+        "    home_channel:\n"
+        "      platform: telegram\n"
+        "      chat_id: '-1004406953125'\n"
+        "      name: Virtually Real Team\n"
+        "      thread_id: '1'\n"
+    )
+    monkeypatch.setattr(
+        hermes_cli.profiles, "profile_exists", lambda name: name == "gopher"
+    )
+    monkeypatch.setattr(hermes_cli.profiles, "get_profile_dir", lambda _name: home)
+
+    assert (
+        send_cmd._resolve_agent_wake_target("gopher")
+        == "gopher:telegram:-1004406953125:1"
+    )
+
+
+def test_bare_profile_falls_back_without_configured_channel(monkeypatch, tmp_path):
+    import hermes_cli.profiles
+
+    home = tmp_path / "zephyr"
+    home.mkdir()
+    (home / "config.yaml").write_text("platforms:\n  telegram:\n    enabled: true\n")
+    monkeypatch.setattr(
+        hermes_cli.profiles, "profile_exists", lambda name: name == "zephyr"
+    )
+    monkeypatch.setattr(hermes_cli.profiles, "get_profile_dir", lambda _name: home)
+
+    assert (
+        send_cmd._resolve_agent_wake_target("zephyr")
+        == f"zephyr:telegram:{send_cmd._AGENT_DM_CHAT_ID}"
+    )
+
+
+def test_bare_profile_falls_back_when_config_missing(monkeypatch, tmp_path):
+    import hermes_cli.profiles
+
+    home = tmp_path / "lone"
+    home.mkdir()
+    monkeypatch.setattr(
+        hermes_cli.profiles, "profile_exists", lambda name: name == "lone"
+    )
+    monkeypatch.setattr(hermes_cli.profiles, "get_profile_dir", lambda _name: home)
+
+    assert (
+        send_cmd._resolve_agent_wake_target("lone")
+        == f"lone:telegram:{send_cmd._AGENT_DM_CHAT_ID}"
+    )
+
+
+def test_full_targets_pass_through_resolution():
+    assert send_cmd._resolve_agent_wake_target("telegram") == "telegram"
+    assert send_cmd._resolve_agent_wake_target("cli:sess-1") == "cli:sess-1"
+    assert (
+        send_cmd._resolve_agent_wake_target("zephyr:telegram:123")
+        == "zephyr:telegram:123"
+    )
+
+
+def test_profile_qualified_to_target_selects_profile_before_send(
+    fake_tool, monkeypatch, tmp_path
+):
+    import os
+
+    import hermes_cli.profiles
+
+    profile_home = tmp_path / "zephyr"
+    profile_home.mkdir()
+    monkeypatch.setattr(send_cmd, "_load_hermes_env", lambda: None)
+    monkeypatch.setattr(
+        hermes_cli.profiles, "profile_exists", lambda name: name == "zephyr"
+    )
+    monkeypatch.setattr(
+        hermes_cli.profiles, "get_profile_dir", lambda _name: profile_home
+    )
+    monkeypatch.setenv("HERMES_HOME", "/home/user/.hermes/profiles/neo")
+    monkeypatch.setenv("HERMES_PROFILE", "neo")
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+
+    args = _parse(["-t", "zephyr:telegram:5550001111:7", "visible message"])
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(args)
+
+    assert exc.value.code == 0
+    assert fake_tool.calls == [{
+        "action": "send",
+        "message": "visible message",
+        "target": "telegram:5550001111:7",
+    }]
+    assert os.environ["HERMES_HOME"] == str(profile_home)
+    assert os.environ["HERMES_PROFILE"] == "zephyr"
+
+

@@ -371,3 +371,177 @@ def test_tell_is_in_hermes_cli_toolset_used_by_agent_profiles():
 
     assert "tell" in TOOLSETS["hermes-cli"]["tools"]
     assert "tell" in TOOLSETS["session"]["tools"]
+
+
+# ---------------------------------------------------------------------------
+# Session anchoring (reply loop-back) — t_6a22e29b
+# ---------------------------------------------------------------------------
+
+def test_tell_own_session_id_anchors_reply_to_origin(monkeypatch):
+    monkeypatch.setenv("USERNAME", "gopher")
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    calls = []
+
+    def fake_spawn(command, **_kwargs):
+        calls.append(command)
+        return _spawned()
+
+    monkeypatch.setattr(tell_tool, "spawn_detached", fake_spawn)
+
+    result = json.loads(
+        tell_tool.tell_tool(
+            agent="zephyr",
+            message="Free-time journal window — want to talk?",
+            session_id="cron_journal_20261017_090000",
+            origin_session_id="cron_journal_20261017_090000",
+            echo_callback=lambda _message: None,
+        )
+    )
+
+    # Own session id => anchored delivery to the agent's wake target (no
+    # dead-pointer cli: target) with the reply routed into the origin session.
+    assert calls[0][:4] == ["hermes", "send", "-u", "zephyr"]
+    assert (
+        "agent='gopher' and session_id='cron_journal_20261017_090000'"
+        in calls[0][-1]
+    )
+    assert result == {"dispatched": True, "note": "notified zephyr"}
+
+
+def test_tell_own_session_id_from_env_anchors_reply(monkeypatch):
+    monkeypatch.setenv("USERNAME", "gopher")
+    monkeypatch.setenv("HERMES_SESSION_ID", "cron_journal_20261017_090000")
+    calls = []
+
+    def fake_spawn(command, **_kwargs):
+        calls.append(command)
+        return _spawned()
+
+    monkeypatch.setattr(tell_tool, "spawn_detached", fake_spawn)
+
+    tell_tool.tell_tool(
+        agent="zephyr",
+        message="Talk with me.",
+        session_id="cron_journal_20261017_090000",
+        echo_callback=lambda _message: None,
+    )
+
+    assert calls[0][:4] == ["hermes", "send", "-u", "zephyr"]
+    assert "session_id='cron_journal_20261017_090000'" in calls[0][-1]
+
+
+def test_tell_foreign_session_id_still_targets_directly(monkeypatch):
+    monkeypatch.setenv("USERNAME", "gopher")
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    calls = []
+
+    def fake_spawn(command, **_kwargs):
+        calls.append(command)
+        return _spawned()
+
+    monkeypatch.setattr(tell_tool, "spawn_detached", fake_spawn)
+
+    tell_tool.tell_tool(
+        agent="zephyr",
+        message="Into your session.",
+        session_id="20261017_121500_receiver",
+        origin_session_id="cron_journal_20261017_090000",
+        echo_callback=lambda _message: None,
+    )
+
+    assert calls[0][:4] == [
+        "hermes", "send", "-u", "zephyr:cli:20261017_121500_receiver",
+    ]
+    assert "session_id=" not in calls[0][-1]
+
+
+# ---------------------------------------------------------------------------
+# Visible delivery — t_6a22e29b
+# ---------------------------------------------------------------------------
+
+def test_tell_visible_posts_target_chat_too(monkeypatch):
+    monkeypatch.setenv("USERNAME", "gopher")
+    monkeypatch.delenv("HERMES_TELL_VISIBLE", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    calls = []
+
+    def fake_spawn(command, **_kwargs):
+        calls.append(command)
+        return _spawned()
+
+    monkeypatch.setattr(tell_tool, "spawn_detached", fake_spawn)
+    monkeypatch.setattr(
+        "hermes_cli.send_cmd._resolve_agent_wake_target",
+        lambda agent: f"{agent}:telegram:5550001111:7",
+    )
+
+    result = json.loads(
+        tell_tool.tell_tool(
+            agent="zephyr",
+            message="Visible please.",
+            visible=True,
+            echo_callback=lambda _message: None,
+        )
+    )
+
+    assert calls[0][:4] == ["hermes", "send", "-u", "zephyr"]
+    assert calls[1][:4] == ["hermes", "send", "-t", "zephyr:telegram:5550001111:7"]
+    assert calls[1][-1] == calls[0][-1]
+    assert result == {"dispatched": True, "note": "notified zephyr", "visible": True}
+
+
+def test_tell_visible_env_flag_enables_visible_post(monkeypatch):
+    monkeypatch.setenv("USERNAME", "gopher")
+    monkeypatch.setenv("HERMES_TELL_VISIBLE", "1")
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    calls = []
+
+    def fake_spawn(command, **_kwargs):
+        calls.append(command)
+        return _spawned()
+
+    monkeypatch.setattr(tell_tool, "spawn_detached", fake_spawn)
+    monkeypatch.setattr(
+        "hermes_cli.send_cmd._resolve_agent_wake_target",
+        lambda agent: f"{agent}:telegram:8900123006",
+    )
+
+    result = json.loads(
+        tell_tool.tell_tool(
+            agent="zephyr",
+            message="Env-visible.",
+            echo_callback=lambda _message: None,
+        )
+    )
+
+    assert len(calls) == 2
+    assert calls[1][:4] == ["hermes", "send", "-t", "zephyr:telegram:8900123006"]
+    assert result["visible"] is True
+
+
+def test_tell_visible_spawn_failure_reports_error(monkeypatch):
+    monkeypatch.setenv("USERNAME", "gopher")
+    monkeypatch.delenv("HERMES_TELL_VISIBLE", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    calls = []
+
+    def fake_spawn(command, **_kwargs):
+        calls.append(command)
+        return _spawned() if command[2] == "-u" else None
+
+    monkeypatch.setattr(tell_tool, "spawn_detached", fake_spawn)
+    monkeypatch.setattr(
+        "hermes_cli.send_cmd._resolve_agent_wake_target",
+        lambda agent: f"{agent}:telegram:8900123006",
+    )
+
+    result = json.loads(
+        tell_tool.tell_tool(
+            agent="zephyr",
+            message="Half-delivered.",
+            visible=True,
+            echo_callback=lambda _message: None,
+        )
+    )
+
+    assert result == {"error": "failed to launch visible 'hermes send' for zephyr"}
