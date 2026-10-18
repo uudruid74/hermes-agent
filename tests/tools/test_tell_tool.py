@@ -25,6 +25,10 @@ def test_tell_wraps_message_and_targets_agent_profile(monkeypatch):
         return _spawned()
 
     monkeypatch.setattr(tell_tool, "spawn_detached", fake_spawn)
+    monkeypatch.setattr(
+        "hermes_cli.send_cmd._resolve_agent_wake_target",
+        lambda agent: f"{agent}:telegram:5550001111",
+    )
 
     result = json.loads(
         tell_tool.tell_tool(
@@ -34,18 +38,16 @@ def test_tell_wraps_message_and_targets_agent_profile(monkeypatch):
         )
     )
 
+    wrapped = (
+        "Incoming message from zephyr follows:\n"
+        "---\n"
+        "Check the relay.\n"
+        "---\n"
+        "If a reply is required, use 'tell' with agent='zephyr'."
+    )
     assert calls == [
-        [
-            "hermes",
-            "send",
-            "-u",
-            "gopher",
-            "Incoming message from zephyr follows:\n"
-            "---\n"
-            "Check the relay.\n"
-            "---\n"
-            "If a reply is required, use 'tell' with agent='zephyr'.",
-        ]
+        ["hermes", "send", "-u", "gopher", wrapped],
+        ["hermes", "send", "-t", "gopher:telegram:5550001111", wrapped],
     ]
     assert echoes == ["gopher: Check the relay."]
     assert result == {"dispatched": True, "note": "notified gopher"}
@@ -97,8 +99,18 @@ def test_tell_reply_reaches_explicit_session_via_send_cli(monkeypatch, tmp_path)
     monkeypatch.setattr(profiles, "profile_exists", lambda name: name == "neo")
     monkeypatch.setattr(profiles, "get_profile_dir", lambda _name: target_home)
     monkeypatch.setattr(send_cmd, "_load_hermes_env", lambda: None)
+    monkeypatch.setattr(
+        send_cmd,
+        "_resolve_agent_wake_target",
+        lambda agent: f"{agent}:telegram:5550001111:7" if ":" not in agent else agent,
+    )
+    calls = []
 
     def run_send_cli(command, **_kwargs):
+        calls.append(command)
+        if command[2] == "-t":
+            # Visible copy: shape-checked only — no platform send in tests.
+            return _spawned()
         args = argparse.Namespace(
             to=None,
             user=command[3],
@@ -135,6 +147,9 @@ def test_tell_reply_reaches_explicit_session_via_send_cli(monkeypatch, tmp_path)
     assert "Round trip reply." in notices[0]["text"]
     assert "agent='zephyr'" in notices[0]["text"]
     assert "session_id=" not in notices[0]["text"]
+    # The visible copy posts the same payload to the target's home channel.
+    assert calls[1][:4] == ["hermes", "send", "-t", "neo:telegram:5550001111:7"]
+    assert calls[1][-1] == calls[0][-1]
 
 
 def test_tell_does_not_fall_back_to_superseded_identity_vars(monkeypatch):
@@ -183,7 +198,7 @@ def test_tell_echoes_exact_message_to_origin_before_send(monkeypatch):
         echo_callback=capture_echo,
     )
 
-    assert events == ["echo", "send"]
+    assert events == ["echo", "send", "send"]
     assert echoes == ["gopher: line one\n[REDACTED must remain literal]\nline three"]
 
 
@@ -356,6 +371,7 @@ def test_tell_is_owned_by_agent_runtime():
 def test_tell_schema_requires_agent_and_message_and_accepts_session_id():
     assert tell_tool.TELL_SCHEMA["parameters"]["required"] == ["agent", "message"]
     assert "session_id" in tell_tool.TELL_SCHEMA["parameters"]["properties"]
+    assert "visible" not in tell_tool.TELL_SCHEMA["parameters"]["properties"]
     assert tell_tool.TELL_SCHEMA["name"] == "tell"
 
 
@@ -456,12 +472,11 @@ def test_tell_foreign_session_id_still_targets_directly(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Visible delivery — t_6a22e29b
+# Visible delivery is the default — t_18dc3026
 # ---------------------------------------------------------------------------
 
-def test_tell_visible_posts_target_chat_too(monkeypatch):
+def test_tell_posts_target_chat_by_default(monkeypatch):
     monkeypatch.setenv("USERNAME", "gopher")
-    monkeypatch.delenv("HERMES_TELL_VISIBLE", raising=False)
     monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
     calls = []
 
@@ -479,7 +494,6 @@ def test_tell_visible_posts_target_chat_too(monkeypatch):
         tell_tool.tell_tool(
             agent="zephyr",
             message="Visible please.",
-            visible=True,
             echo_callback=lambda _message: None,
         )
     )
@@ -487,41 +501,11 @@ def test_tell_visible_posts_target_chat_too(monkeypatch):
     assert calls[0][:4] == ["hermes", "send", "-u", "zephyr"]
     assert calls[1][:4] == ["hermes", "send", "-t", "zephyr:telegram:5550001111:7"]
     assert calls[1][-1] == calls[0][-1]
-    assert result == {"dispatched": True, "note": "notified zephyr", "visible": True}
-
-
-def test_tell_visible_env_flag_enables_visible_post(monkeypatch):
-    monkeypatch.setenv("USERNAME", "gopher")
-    monkeypatch.setenv("HERMES_TELL_VISIBLE", "1")
-    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
-    calls = []
-
-    def fake_spawn(command, **_kwargs):
-        calls.append(command)
-        return _spawned()
-
-    monkeypatch.setattr(tell_tool, "spawn_detached", fake_spawn)
-    monkeypatch.setattr(
-        "hermes_cli.send_cmd._resolve_agent_wake_target",
-        lambda agent: f"{agent}:telegram:8900123006",
-    )
-
-    result = json.loads(
-        tell_tool.tell_tool(
-            agent="zephyr",
-            message="Env-visible.",
-            echo_callback=lambda _message: None,
-        )
-    )
-
-    assert len(calls) == 2
-    assert calls[1][:4] == ["hermes", "send", "-t", "zephyr:telegram:8900123006"]
-    assert result["visible"] is True
+    assert result == {"dispatched": True, "note": "notified zephyr"}
 
 
 def test_tell_visible_spawn_failure_reports_error(monkeypatch):
     monkeypatch.setenv("USERNAME", "gopher")
-    monkeypatch.delenv("HERMES_TELL_VISIBLE", raising=False)
     monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
     calls = []
 
@@ -532,14 +516,13 @@ def test_tell_visible_spawn_failure_reports_error(monkeypatch):
     monkeypatch.setattr(tell_tool, "spawn_detached", fake_spawn)
     monkeypatch.setattr(
         "hermes_cli.send_cmd._resolve_agent_wake_target",
-        lambda agent: f"{agent}:telegram:8900123006",
+        lambda agent: f"{agent}:telegram:5550001111:7",
     )
 
     result = json.loads(
         tell_tool.tell_tool(
             agent="zephyr",
             message="Half-delivered.",
-            visible=True,
             echo_callback=lambda _message: None,
         )
     )

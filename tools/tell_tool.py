@@ -2,13 +2,14 @@
 """Agent-to-agent messaging through ``hermes send -u``.
 
 The agent→platform mapping lives in `hermes send -u`: a bare profile name
-is expanded to the agent's telegram DM (see send_cmd.py
+is expanded to the agent's home channel (see send_cmd.py
 `_resolve_agent_wake_target`). A caller may instead provide a full session id,
 which is routed through the existing ``profile:cli:session_id`` target.
 
-Every tell is *mandatorily* echoed and logged: the exact outbound payload is
-surfaced to the calling session and written to the log. There is no opt-out —
-no secret agent-to-agent traffic.
+Every tell is *mandatorily* echoed, logged, and posted to the target's chat:
+the exact outbound payload is surfaced to the calling session, written to the
+log, and delivered as a visible chat message. There is no opt-out — no secret
+agent-to-agent traffic.
 """
 
 import json
@@ -27,7 +28,6 @@ def tell_tool(
     echo_callback: Callable[[str], object],
     session_id: str | None = None,
     origin_session_id: str | None = None,
-    visible: bool = False,
 ) -> str:
     """Wake another Hermes profile after exposing the exact message to the caller."""
     sender = (os.environ.get("USERNAME") or "").strip() or "agent"
@@ -35,21 +35,21 @@ def tell_tool(
     reply_session_id = (
         origin_session_id or os.environ.get("HERMES_SESSION_ID") or ""
     ).strip()
-    # A caller that passes its OWN session id is anchoring the conversation:
-    # the message goes to the agent's normal wake target and the reply is
-    # routed back into that exact session (cron/journal/kanban closure).
-    # Any other session id remains a direct delivery target on the
-    # recipient's side.
-    anchor_session_id = ""
+    # Two routing rules, nothing else:
+    # 1. Live session origin — a caller that passes its OWN session id anchors
+    #    the conversation: delivery goes to the agent's home-channel wake
+    #    target and the reply is routed back into that exact session
+    #    (cron/journal/kanban closure). Any other session id remains a direct
+    #    delivery target on the recipient's side.
+    # 2. Kanban/cron origin — no live session to anchor: the wake and the
+    #    visible post default to the target's home channel (bare profile).
     if target_session_id and target_session_id == reply_session_id:
-        anchor_session_id = target_session_id
-        target_session_id = ""
-    if anchor_session_id:
         reply_instruction = (
             "If a reply is required, use 'tell' with "
-            f"agent='{sender}' and session_id='{anchor_session_id}' — "
+            f"agent='{sender}' and session_id='{target_session_id}' — "
             "that routes the reply into this exact session."
         )
+        target_session_id = ""
     else:
         # Replies use profile discovery. A gateway session ID is not a CLI
         # session target, and presenting it here causes `tell` to misroute
@@ -76,33 +76,18 @@ def tell_tool(
     proc = spawn_detached(["hermes", "send", "-u", target, wrapped])
     if proc is None:
         return json.dumps({"error": f"failed to launch 'hermes send' for {agent}"})
-    if visible or _env_visible_flag():
-        # Also surface the exact outbound payload as a visible platform
-        # message in the target agent's chat (that is what a human checks —
-        # a DB-only wake is invisible there). The profile-qualified target
-        # makes `hermes send -t` deliver with the TARGET profile's
-        # credentials and home channel.
-        from hermes_cli.send_cmd import _resolve_agent_wake_target
+    # Visibility is the doctrine, not a flag: the exact outbound payload is
+    # ALWAYS also posted to the target's chat (the DB-only wake above is
+    # invisible there). The profile-qualified target makes `hermes send -t`
+    # deliver with the TARGET profile's credentials and home channel.
+    from hermes_cli.send_cmd import _resolve_agent_wake_target
 
-        visible_target = _resolve_agent_wake_target(agent)
-        visible_proc = spawn_detached(["hermes", "send", "-t", visible_target, wrapped])
-        if visible_proc is None:
-            return json.dumps({
-                "error": f"failed to launch visible 'hermes send' for {agent}"
-            })
-        return json.dumps({
-            "dispatched": True,
-            "note": f"notified {agent}",
-            "visible": True,
-        })
+    visible_proc = spawn_detached(
+        ["hermes", "send", "-t", _resolve_agent_wake_target(agent), wrapped]
+    )
+    if visible_proc is None:
+        return json.dumps({"error": f"failed to launch visible 'hermes send' for {agent}"})
     return json.dumps({"dispatched": True, "note": f"notified {agent}"})
-
-
-def _env_visible_flag() -> bool:
-    """``HERMES_TELL_VISIBLE`` enables visible delivery for every tell."""
-    return os.environ.get("HERMES_TELL_VISIBLE", "").strip().lower() in {
-        "1", "true", "yes", "on",
-    }
 
 
 TELL_SCHEMA = {
@@ -111,8 +96,8 @@ TELL_SCHEMA = {
         "Send a wrapped message to another Hermes agent profile. By default this wakes its "
         "Telegram DM session; session_id targets one full session directly. Passing your OWN "
         "session id as session_id anchors the conversation: replies are routed back into that "
-        "exact session. Replies otherwise route by the sender's agent profile. Set visible=true "
-        "to also surface the message in the target's chat."
+        "exact session. Replies otherwise route by the sender's agent profile. Every tell is "
+        "also posted as a visible message in the target's chat."
     ),
     "parameters": {
         "type": "object",
@@ -134,13 +119,6 @@ TELL_SCHEMA = {
                     "routing."
                 ),
             },
-            "visible": {
-                "type": "boolean",
-                "description": (
-                    "Also post the message as a visible chat message in the target agent's "
-                    "home channel (default off; HERMES_TELL_VISIBLE=1 enables globally)."
-                ),
-            },
         },
         "required": ["agent", "message"],
     },
@@ -159,7 +137,6 @@ registry.register(
         echo_callback=kw["echo_callback"],
         session_id=args.get("session_id"),
         origin_session_id=kw.get("session_id"),
-        visible=bool(args.get("visible")),
     ),
     emoji="📨",
 )
