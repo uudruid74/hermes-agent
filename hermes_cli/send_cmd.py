@@ -481,7 +481,7 @@ def cmd_send(args: argparse.Namespace) -> None:
             "  hermes send -t discord:#ops --file report.md\n"
             "  hermes send -u telegram \"agent wake event\"\n"
             "  hermes send -u telegram:-1001234567890:17585 \"cmd\"\n"
-            "  hermes send -u cli:session_id \"out-of-band notice\"\n"
+            "  hermes send -u cli:session_id \"wake the agent with this\"\n"
             "  hermes send --list      # list available targets",
             file=sys.stderr,
         )
@@ -518,12 +518,43 @@ def cmd_send(args: argparse.Namespace) -> None:
         session_db = SessionDB(db_path=get_hermes_home() / "state.db")
         try:
             queued = session_db.enqueue_session_notice(session_id, message)
+            # Signal half of the wake (t_8140688e): look up the live CLI
+            # process for this session and SIGUSR1 it so the queued message is
+            # injected as a real user turn instead of sitting in the queue.
+            # The heartbeat check handles stale/gone sessions.
+            pid = session_db.get_cli_wake_pid(session_id)
         finally:
             session_db.close()
-        result = json.dumps(
-            {"success": True, "note": "queued for CLI session"}
-            if queued else {"error": f"CLI session not found: {session_id}"}
-        )
+
+        if not queued:
+            result = json.dumps({"error": f"CLI session not found: {session_id}"})
+        elif pid is None:
+            # Message is queued but no live CLI to wake — surface it so the
+            # caller knows the wake may happen later (or never) rather than
+            # silently pretending it was delivered.
+            result = json.dumps({
+                "success": True,
+                "note": f"queued for CLI session {session_id} (no live process to wake)",
+                "queued": True,
+                "woken": False,
+            })
+        else:
+            import signal as _sig
+
+            _woken = False
+            try:
+                os.kill(pid, _sig.SIGUSR1)  # windows-footgun: ok — POSIX signal, guarded by get_cli_wake_pid only finding live POSIX CLI registrations
+                _woken = True
+            except (ProcessLookupError, PermissionError, OSError):
+                _woken = False
+            result = json.dumps({
+                "success": True,
+                "note": f"queued for CLI session {session_id} and woken (pid {pid})"
+                        if _woken else f"queued for CLI session {session_id} (signal failed)",
+                "queued": True,
+                "woken": _woken,
+                "pid": pid,
+            })
         sys.exit(_emit_result(
             result,
             json_mode=getattr(args, "json", False),
@@ -627,8 +658,9 @@ def register_send_subparser(subparsers) -> argparse.ArgumentParser:
             "'platform:chat_id', 'platform:chat_id:thread_id', or a BARE "
             "AGENT PROFILE NAME ('gopher', 'ornith', …) which is expanded to "
             "the agent's telegram DM wake target. Use "
-            "'cli:session_id' to queue an "
-            "out-of-band notice for a live CLI session. Examples: -u telegram, "
+            "'cli:session_id' to wake a live CLI session: queues the message "
+            "and SIGUSR1s the target process so the agent acts on it as a real "
+            "user turn. Examples: -u telegram, "
             "-u gopher, -u telegram:-1001234567890:17585, -u cli:session_id."
         ),
     )

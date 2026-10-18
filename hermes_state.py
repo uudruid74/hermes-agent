@@ -6660,6 +6660,55 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return self._execute_write(_do)
 
+    def register_cli_wake(self, session_id: str, pid: int, *, now: Optional[float] = None) -> None:
+        """Upsert the running CLI session's OS PID (heartbeat every few seconds)."""
+        ts = now if now is not None else time.time()
+
+        def _do(conn):
+            conn.execute(
+                """INSERT INTO cli_wakes (session_id, pid, started_at, heartbeat)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(session_id) DO UPDATE SET
+                       pid = excluded.pid,
+                       heartbeat = excluded.heartbeat""",
+                (session_id, pid, ts, ts),
+            )
+
+        self._execute_write(_do)
+
+    def get_cli_wake_pid(self, session_id: str, *,
+                         max_heartbeat_age: float = 15.0,
+                         now: Optional[float] = None) -> Optional[int]:
+        """Return the live OS PID for a session, or None if not a live CLI.
+
+        ``None`` means either the session has no registered CLI (e.g. a
+        gateway session) or its heartbeat is stale (the CLI exited). This keeps
+        ``hermes send -u cli:<session>`` from signaling a gone process.
+        """
+        ts = now if now is not None else time.time()
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT pid, heartbeat FROM cli_wakes WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            if ts - row["heartbeat"] > max_heartbeat_age:
+                conn.execute("DELETE FROM cli_wakes WHERE session_id = ?", (session_id,))
+                return None
+            return row["pid"]
+
+        return self._execute_write(_do)
+
+    def clear_cli_wake(self, session_id: str) -> None:
+        """Remove the CLI PID record (on clean CLI exit)."""
+
+        def _do(conn):
+            conn.execute("DELETE FROM cli_wakes WHERE session_id = ?", (session_id,))
+
+        self._execute_write(_do)
+
     def set_latest_matching_message_display_kind(
         self, session_id: str, *, role: str, content: str, display_kind: str,
         display_metadata: Optional[Dict[str, Any]] = None,

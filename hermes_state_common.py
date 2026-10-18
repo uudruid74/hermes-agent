@@ -357,6 +357,18 @@ CREATE TABLE IF NOT EXISTS session_notices (
     created_at REAL NOT NULL
 );
 
+-- Running CLI sessions, keyed by session_id, so a separate
+-- ``hermes send -u cli:<session>`` / kanban notification process can look up
+-- the target's OS PID and SIGUSR1 it without sockets. heartbeat is refreshed
+-- every few seconds while the CLI runs; a stale row (heartbeat older than the
+-- sender's timeout) means the session is gone and is cleaned up on lookup.
+CREATE TABLE IF NOT EXISTS cli_wakes (
+    session_id TEXT PRIMARY KEY REFERENCES sessions(id),
+    pid INTEGER NOT NULL,
+    started_at REAL NOT NULL,
+    heartbeat REAL NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);

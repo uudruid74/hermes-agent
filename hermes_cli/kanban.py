@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import shlex
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -1315,8 +1316,27 @@ def _load_user_profile_env(env: dict, profile: Optional[str]) -> None:
         )
 
 
+def _signal_cli_wake(session_db: Any, session_id: str) -> bool:
+    """SIGUSR1 the live CLI process registered for ``session_id``, if any.
+
+    Signal half of the session wake (t_8140688e): without it the enqueued
+    notice just sits in ``session_notices`` until someone drains it by hand.
+    Returns True when the signal was delivered.
+    """
+    if not hasattr(signal, "SIGUSR1"):
+        return False
+    pid = session_db.get_cli_wake_pid(session_id)
+    if pid is None:
+        return False
+    try:
+        os.kill(pid, signal.SIGUSR1)  # windows-footgun: ok — POSIX signal, guarded by hasattr(signal, 'SIGUSR1') above
+        return True
+    except (ProcessLookupError, PermissionError, OSError):
+        return False
+
+
 def _enqueue_kanban_session_notice(task: Any, human_msg: str) -> bool:
-    """Queue a notice for the creator's CLI session at its next boundary."""
+    """Queue a notice for the creator's CLI session and wake it (real turn)."""
     if not (task and task.session_id):
         return False
 
@@ -1327,14 +1347,16 @@ def _enqueue_kanban_session_notice(task: Any, human_msg: str) -> bool:
     session_db = SessionDB(db_path=profile_home / "state.db")
     try:
         queued = session_db.enqueue_session_notice(task.session_id, human_msg)
+        woken = _signal_cli_wake(session_db, task.session_id) if queued else False
     finally:
         session_db.close()
 
     logger.info(
-        "kanban notify target=cli:%s profile=%s adapter=session_notice result=%s",
+        "kanban notify target=cli:%s profile=%s adapter=session_notice result=%s woken=%s",
         task.session_id,
         task.created_by or "default",
         "queued" if queued else "session-not-found",
+        woken,
     )
     return queued
 
@@ -1400,16 +1422,20 @@ def _wake_task_worker_session(task: Any, payload: str, status: str) -> bool:
     session_db = SessionDB(db_path=profile_home / "state.db")
     try:
         queued = session_db.enqueue_session_notice(session_id, payload)
+        # Signal half (t_8140688e): without the SIGUSR1 the notice would sit in
+        # the queue until the worker happened to drain it by hand.
+        woken = _signal_cli_wake(session_db, session_id) if queued else False
     finally:
         session_db.close()
     logger.info(
         "kanban notify task=%s status=%s target=cli:%s profile=%s "
-        "adapter=session_notice result=%s",
+        "adapter=session_notice result=%s woken=%s",
         getattr(task, "id", ""),
         status,
         session_id,
         getattr(task, "assignee", "") or "default",
         "queued" if queued else "session-not-found",
+        woken,
     )
     return bool(queued)
 

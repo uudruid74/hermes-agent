@@ -6394,15 +6394,112 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         except Exception:
             pass
 
-    def _drain_session_notices(self) -> None:
-        """Move cross-process notices into the existing clean-boundary renderer."""
+    def _inject_pending_wake_turns(self) -> None:
+        """Deliver queued session notices as real user turns (the wake path).
+
+        Drains ``session_notices`` and hands each message to the agent as a
+        genuine user message: ``agent.steer()`` in single-query mode (kanban
+        workers run there — the message reaches the model at the next tool
+        boundary and leftovers are run as follow-up turns by
+        ``_run_single_query_wake_turns``), or ``_pending_input`` in the
+        interactive loop so it runs as the next turn. This is the difference
+        between a wake — the agent sees the message and acts on it — and a
+        passive line above the prompt (t_8140688e).
+        """
         if not self._session_db or not self.session_id:
             return
-        from agent.credits_tracker import AgentNotice
+        try:
+            notices = self._session_db.drain_session_notices(self.session_id)
+        except Exception:
+            logging.debug("session notice drain failed", exc_info=True)
+            return
+        for payload in notices:
+            text = (payload.get("text") or "").strip()
+            if not text:
+                continue
+            if getattr(self, "_single_query_mode", False):
+                agent = getattr(self, "agent", None)
+                steer = getattr(agent, "steer", None)
+                if callable(steer):
+                    steer(text)
+                    continue
+            pending = getattr(self, "_pending_input", None)
+            if pending is not None:
+                pending.put(text)
 
-        for payload in self._session_db.drain_session_notices(self.session_id):
-            self._on_notice(AgentNotice(text=payload["text"], level=payload["level"]))
-        self._flush_credit_notices()
+    def _install_wake_signal_handler(self) -> None:
+        """SIGUSR1 = remote wake (``hermes send -u cli:<session>`` / kanban).
+
+        The handler must stay I/O-free (never open SQLite from a signal
+        handler), so it only sets a flag; the wake-service thread drains the
+        queue and injects each message as a user turn.
+        """
+        if sys.platform == "win32":
+            return
+        import signal as _signal
+
+        if not hasattr(_signal, "SIGUSR1"):
+            return
+
+        def _sigusr1_wake(signum, frame):
+            self._wake_flag = True
+
+        try:
+            _signal.signal(_signal.SIGUSR1, _sigusr1_wake)
+        except ValueError:
+            # Not the main thread — the wake-service tick drain still delivers
+            # within its interval, just without the instant signal nudge.
+            logging.debug("SIGUSR1 wake handler not installed (non-main thread)")
+
+    def _start_cli_wake_service(self) -> None:
+        """Register this CLI session in ``cli_wakes`` and start the wake service.
+
+        The service keeps the registration's heartbeat fresh so a separate
+        ``hermes send -u cli:<session_id>`` (or kanban notification) can find
+        this PID and SIGUSR1 it, and it drains ``session_notices`` into real
+        user turns on wake — or every few seconds as a missed-signal backstop.
+        Started by both the interactive loop and the single-query path: kanban
+        workers boot through the latter (``HERMES_KANBAN_TASK``) and must be
+        wakeable exactly like an interactive session.
+        """
+        if getattr(self, "_wake_service_started", False):
+            return
+        self._wake_service_started = True
+        self._wake_flag = False
+        self._install_wake_signal_handler()
+
+        def _wake_service_loop():
+            last_tick = 0.0
+            try:
+                while not self._should_exit:
+                    time.sleep(0.25)
+                    # Session ids rotate on mid-run compression; re-read each tick.
+                    session_id = getattr(self, "session_id", None)
+                    session_db = getattr(self, "_session_db", None)
+                    if not session_id or session_db is None:
+                        continue
+                    now = time.monotonic()
+                    if not (self._wake_flag or now - last_tick >= 5.0):
+                        continue
+                    self._wake_flag = False
+                    last_tick = now
+                    try:
+                        self._inject_pending_wake_turns()
+                        session_db.register_cli_wake(session_id, os.getpid())
+                    except Exception:
+                        logging.debug("cli wake service tick failed", exc_info=True)
+            finally:
+                session_id = getattr(self, "session_id", None)
+                session_db = getattr(self, "_session_db", None)
+                if session_id and session_db is not None:
+                    try:
+                        session_db.clear_cli_wake(session_id)
+                    except Exception:
+                        logging.debug("cli wake deregistration failed", exc_info=True)
+
+        threading.Thread(
+            target=_wake_service_loop, daemon=True, name="wake-service"
+        ).start()
 
     def _flush_credit_notices(self) -> None:
         """Print any queued credit notices as level-colored lines. Called at turn end
@@ -17540,7 +17637,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         if not self._agent_running:
                             self._check_config_mcp_changes()
                             try:
-                                self._drain_session_notices()
+                                self._inject_pending_wake_turns()
                             except Exception:
                                 logging.debug("session notice drain failed", exc_info=True)
                             # Check for background process notifications (completions
@@ -17742,7 +17839,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         # Drain process notifications (completions + watch matches)
                         # that arrived while the agent was running.
                         try:
-                            self._drain_session_notices()
+                            self._inject_pending_wake_turns()
                             self._drain_process_notifications("cli-post-turn")
                         except Exception:
                             pass  # Non-fatal — don't break the main loop
@@ -17753,6 +17850,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Start processing thread
         process_thread = threading.Thread(target=process_loop, daemon=True)
         process_thread.start()
+
+        # Register in cli_wakes + start the wake service so a separate
+        # ``hermes send -u cli:<session_id>`` / kanban notification can find
+        # this PID and deliver its message as a real user turn (t_8140688e).
+        self._start_cli_wake_service()
 
         # Wake word ("Hey Hermes") — start the always-on hotword listener if
         # enabled. Off-thread so a first-run engine install never blocks the
@@ -18093,6 +18195,44 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 # ============================================================================
 # Main Entry Point
 # ============================================================================
+
+def _run_single_query_wake_turns(cli: "HermesCLI", runner, first_result=None) -> None:
+    """Run wake messages that arrived too late for the turn's tool batches.
+
+    ``run_conversation`` hands a late steer back as ``result["pending_steer"]``
+    (agent/turn_finalizer.py) and ``chat()`` re-queues it on ``_pending_input``;
+    in single-query mode nothing else consumes that queue, so the message would
+    die with the process. Run each one as a real follow-up user turn — the same
+    "deliver leftover steer as the next turn" rule as the interactive loop and
+    the gateway (see chat(), tui_gateway/server.py). The queue is re-checked
+    after every turn so wakes arriving during a follow-up are delivered too.
+    """
+    pending: list = []
+    if isinstance(first_result, dict):
+        leftover = first_result.get("pending_steer")
+        if leftover and leftover.strip():
+            pending.append(leftover.strip())
+    queue_obj = getattr(cli, "_pending_input", None)
+    while True:
+        if queue_obj is not None and not pending:
+            while True:
+                try:
+                    item = queue_obj.get_nowait()
+                except queue.Empty:
+                    break
+                if isinstance(item, _VoiceInputMessage):
+                    item = item.text
+                if isinstance(item, str) and item.strip():
+                    pending.append(item.strip())
+        if not pending:
+            return
+        text = pending.pop(0)
+        try:
+            runner(text)
+        except Exception:
+            logging.debug("single-query wake follow-up turn failed", exc_info=True)
+            return
+
 
 def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     """Drive a kanban goal_mode worker through the Ralph-style goal loop.
@@ -18637,6 +18777,10 @@ def main(
         cli._single_query_mode = True
         if not cli._claim_active_session("cli", stderr=bool(quiet)):
             sys.exit(1)
+        # Register in cli_wakes + start the wake service before the turn runs:
+        # kanban workers boot here (HERMES_KANBAN_TASK) and notifications must
+        # reach them as real user turns without manual SQL (t_8140688e).
+        cli._start_cli_wake_service()
         try:
             query, single_query_images = _collect_query_images(query, image)
             # Kanban workers spawn with ``hermes chat -q "work kanban task <id>"``;
@@ -18787,6 +18931,33 @@ def main(
                         elif response:
                             print(response)
 
+                        # Wake messages that landed after the last tool batch
+                        # (late steer, or queued while no turn was running) run
+                        # as real follow-up user turns so the worker sees and
+                        # acts on them instead of dying with the process.
+                        def _run_wake_turn(text):
+                            _wake_agent = cli.agent
+                            if _wake_agent is None:
+                                return
+                            wake_result = _wake_agent.run_conversation(
+                                user_message=text,
+                                conversation_history=cli.conversation_history,
+                            )
+                            if (
+                                getattr(_wake_agent, "session_id", None)
+                                and _wake_agent.session_id != cli.session_id
+                            ):
+                                cli.session_id = _wake_agent.session_id
+                            wake_response = (
+                                wake_result.get("final_response", "")
+                                if isinstance(wake_result, dict)
+                                else str(wake_result)
+                            )
+                            if wake_response:
+                                print(wake_response)
+
+                        _run_single_query_wake_turns(cli, _run_wake_turn, first_result=result)
+
                         # Kanban goal-loop mode: a worker spawned for a
                         # goal_mode card keeps working in THIS session until an
                         # auxiliary judge agrees the card is done, the worker
@@ -18853,6 +19024,10 @@ def main(
                 # banner, doesn't depend on the welcome banner being shown.
                 cli._show_security_advisories()
                 cli.chat(query, images=single_query_images or None)
+                # Wake messages (late steer / queued while no turn was
+                # running) run as real follow-up user turns so the worker sees
+                # and acts on them instead of dying with the process.
+                _run_single_query_wake_turns(cli, cli.chat)
                 cli._print_exit_summary(clear_screen=False)
                 # Kanban workers launched with `hermes -p X chat -q …` must
                 # signal a provider quota wall with the EX_TEMPFAIL sentinel,

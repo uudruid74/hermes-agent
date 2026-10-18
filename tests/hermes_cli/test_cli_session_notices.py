@@ -25,29 +25,28 @@ def _send_args(target: str, message: str) -> argparse.Namespace:
     )
 
 
-def test_session_notice_round_trip_and_cli_drain(tmp_path):
+def test_session_notice_round_trip_injects_as_user_turn(tmp_path):
     db = SessionDB(db_path=tmp_path / "state.db")
     db.create_session("cli-session", "cli")
     assert db.enqueue_session_notice("cli-session", "✅ task done", level="success")
+
+    import queue
 
     import cli
 
     cli_instance = object.__new__(cli.HermesCLI)
     cli_instance._session_db = db
     cli_instance.session_id = "cli-session"
-    notices = []
+    setattr(cli_instance, "_single_query_mode", False)
+    cli_instance._agent_running = False
+    cli_instance.agent = None
+    cli_instance._pending_input = queue.Queue()
 
-    def receive_notice(notice):
-        notices.append(notice)
+    cli.HermesCLI._inject_pending_wake_turns(cli_instance)
 
-    cli_instance._on_notice = receive_notice
-    cli_instance._flush_credit_notices = lambda: None
-
-    cli.HermesCLI._drain_session_notices(cli_instance)
-
-    assert [(notice.text, notice.level) for notice in notices] == [
-        ("✅ task done", "success")
-    ]
+    # The notice is delivered as a real user turn the agent acts on —
+    # not a passive screen line, and nothing left in the queue (t_8140688e).
+    assert cli_instance._pending_input.get_nowait() == "✅ task done"
     assert db.drain_session_notices("cli-session") == []
     db.close()
 
