@@ -11,8 +11,10 @@ parity across every registered verb.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
+import sqlite3
 import subprocess
 import threading
 import time
@@ -1086,32 +1088,26 @@ def test_cli_daemon_help_marks_deprecated():
 
 
 @pytest.mark.parametrize("corrupt_exc", ["sqlite", "guard"])
-def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
+def test_startup_sync_survives_corrupt_board_without_traceback(
     monkeypatch, tmp_path, caplog, corrupt_exc
 ):
-    """Corrupt board DBs log one actionable error and stop retrying per tick."""
-    import asyncio
+    """A corrupt board DB logs ONE clean actionable error and does not crash
+    the one-shot startup reality check (and leaves no traceback). The old
+    per-tick quarantine is gone with the loop — the pass just reports and
+    moves on; event kicks re-report until the file is fixed."""
     import logging
-    import sqlite3
-
     from gateway.run import GatewayRunner
-    import hermes_cli.config as _cfg_mod
-    import hermes_cli.kanban_db as _kb
+    from hermes_cli import kanban_db as _kb
+    from hermes_cli import config as _cfg_mod
 
     runner = object.__new__(GatewayRunner)
-    runner._running = True
     corrupt_db = tmp_path / "kanban.db"
     corrupt_db.write_text("not sqlite", encoding="utf-8")
 
     monkeypatch.setattr(
         _cfg_mod,
         "load_config",
-        lambda: {
-            "kanban": {
-                "dispatch_in_gateway": True,
-                "dispatch_interval_seconds": 1,
-            }
-        },
+        lambda: {"kanban": {"dispatch_in_gateway": True}},
     )
     monkeypatch.setattr(
         _kb,
@@ -1124,11 +1120,9 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
         lambda slug: {"slug": slug},
     )
     monkeypatch.setattr(_kb, "kanban_db_path", lambda board=None: corrupt_db)
-
-    calls = {"connect": 0, "to_thread": 0}
+    monkeypatch.setenv("HERMES_KANBAN_DISPATCH_KICKS", "1")
 
     def _connect(*args, **kwargs):
-        calls["connect"] += 1
         if corrupt_exc == "guard":
             raise _kb.KanbanDbCorruptError(
                 corrupt_db,
@@ -1137,46 +1131,19 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
             )
         raise sqlite3.DatabaseError("file is not a database")
 
-    async def _to_thread(fn, *args, **kwargs):
-        # PR salvage (#32857 commit 7): the dispatcher now reaps zombies at
-        # the top of each tick via ``asyncio.to_thread(_kb.reap_worker_zombies)``
-        # BEFORE the per-board tick work. Each tick now issues 3 ``to_thread``
-        # calls (reaper + ``_tick_once`` + ``_ready_nonempty``) instead of 2,
-        # so this counter must reach 6 to allow the same 2 dispatch ticks the
-        # pre-reaper test expected at 4. Connect counts in the assertion below
-        # are unchanged.
-        calls["to_thread"] += 1
-        result = fn(*args, **kwargs)
-        if calls["to_thread"] >= 6:
-            runner._running = False
-        return result
-
-    async def _sleep(_delay):
-        return None
-
     monkeypatch.setattr(_kb, "connect", _connect)
-    monkeypatch.setattr("gateway.run.asyncio.to_thread", _to_thread)
-    monkeypatch.setattr("gateway.run.asyncio.sleep", _sleep)
 
     with caplog.at_level(logging.ERROR, logger="gateway.run"):
         asyncio.run(
             asyncio.wait_for(
-                runner._kanban_dispatcher_watcher(),
+                runner._kanban_startup_sync(),
                 timeout=3.0,
             )
         )
 
     messages = [record.getMessage() for record in caplog.records]
     assert sum("not a valid SQLite database" in msg for msg in messages) == 1
-    assert not any("tick failed on board" in msg for msg in messages)
     assert not any(record.exc_info for record in caplog.records)
-    # First tick connect (dispatch) + two probes per `_has_ready_work` call
-    # (ready then review, both via _kb.connect). The second dispatch tick
-    # skips the dispatch connect because the corrupt board fingerprint is
-    # disabled, but the ready/review probes still each connect. PR f55d94a1e
-    # added the review-column probe alongside the existing ready-column
-    # probe, bumping this from 3 → 5.
-    assert calls["connect"] == 5
 
 
 # ---------------------------------------------------------------------------

@@ -1336,6 +1336,14 @@ def _handle_create(args: dict, **kw) -> str:
             subscribed = _maybe_auto_subscribe(
                 conn, new_tid, origin_session_id=session_id
             )
+            # Event-driven dispatch (no polling): a new task may be runnable
+            # now — kick one tick; a fresh triage task wakes the decomposer.
+            from hermes_cli.kanban import kick_dispatch, spawn_triage_decompose
+
+            board = args.get("board") or None
+            if new_task is not None and new_task.status == "triage":
+                spawn_triage_decompose(new_tid, board=board)
+            kick_dispatch(board=board)
             return _ok(
                 task_id=new_tid,
                 status=new_task.status if new_task else None,
@@ -1508,6 +1516,10 @@ def _handle_unblock(args: dict, **kw) -> str:
             if not ok:
                 return tool_error(f"could not unblock {tid} (not blocked or unknown)")
             task = kb.get_task(conn, str(tid))
+            # Event-driven dispatch (no polling): the task may be runnable now.
+            from hermes_cli.kanban import kick_dispatch
+
+            kick_dispatch(board=board or None)
             return _ok(task_id=str(tid), status=task.status if task else None)
         finally:
             conn.close()
@@ -1532,6 +1544,11 @@ def _handle_link(args: dict, **kw) -> str:
         kb, conn = _connect(board=board)
         try:
             kb.link_tasks(conn, parent_id=parent_id, child_id=child_id)
+            # Event-driven dispatch (no polling): linking can unblock a
+            # dependent's promotion to ready.
+            from hermes_cli.kanban import kick_dispatch
+
+            kick_dispatch(board=board or None)
             return _ok(parent_id=parent_id, child_id=child_id)
         finally:
             conn.close()

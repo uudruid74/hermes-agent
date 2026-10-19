@@ -415,6 +415,13 @@ def _hermetic_environment(tmp_path, monkeypatch):
     for name in _HERMES_BEHAVIORAL_VARS:
         monkeypatch.delenv(name, raising=False)
 
+    # Event-driven kanban automation (kick_dispatch / triage-decompose
+    # spawn) is OFF in tests: dispatch tests exercise dispatch_once with
+    # stub spawn functions, and unrelated tests must never claim/spawn real
+    # workers or fire aux-LLM decompositions. Tests that want the kick set
+    # HERMES_KANBAN_DISPATCH_KICKS=1 explicitly (monkeypatch.setenv).
+    monkeypatch.setenv("HERMES_KANBAN_DISPATCH_KICKS", "0")
+
     # Honcho's fallback host/config resolution legitimately reads the user's
     # global ~/.honcho/config.json. Keep HOME stable (subprocess tests depend
     # on it), but pin the host so ordinary tests cannot inherit a developer's

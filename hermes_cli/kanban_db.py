@@ -5998,6 +5998,7 @@ def complete_task(
             summary=notify_summary,
             title=_done_task.title if _done_task else None,
             assignee=_done_task.assignee if _done_task else None,
+            artifacts=list(completed_payload.get("artifacts") or []),
         )
     except Exception:
         _log.exception("kanban completion notification failed for task=%s", task_id)

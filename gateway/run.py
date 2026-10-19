@@ -2273,7 +2273,7 @@ from gateway.session_state import (
     legacy_lease_token_property,
 )
 from gateway.authz_mixin import GatewayAuthorizationMixin
-from gateway.kanban_watchers import GatewayKanbanWatchersMixin
+from gateway.kanban_startup_sync import GatewayKanbanStartupSyncMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
 from gateway.turn_context import TurnContext
 from gateway.platforms.base import (
@@ -5738,7 +5738,7 @@ class TurnRunner:
 
 
 
-class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
+class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanStartupSyncMixin, GatewaySlashCommandsMixin):
     """
     Main gateway controller.
 
@@ -11476,11 +11476,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # to /new (does not kill the turn; see agent.session_stall_timeout).
         self._spawn_supervised(self._session_stall_watcher, "session_stall_watcher")
 
-        # Start background kanban dispatcher — spawns workers for ready
-        # tasks. Gated by `kanban.dispatch_in_gateway` (default True).
-        # When false, users run `hermes kanban daemon` externally or
-        # simply don't use kanban; this loop becomes a no-op.
-        self._spawn_supervised(self._kanban_dispatcher_watcher, "kanban_dispatcher_watcher")
+        # One-shot kanban reality check — syncs dispatch to whatever changed
+        # while the gateway was down (reclaim/promote/claim/spawn + the
+        # auto-decompose backlog), then RETURNS. Not a loop: state changes
+        # drive dispatch via hermes_cli.kanban.kick_dispatch (event-time).
+        self._spawn_supervised(self._kanban_startup_sync, "kanban_startup_sync")
 
         # Start background reconnection watcher for platforms that failed at startup
         if self._failed_platforms:
@@ -12352,12 +12352,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             return "default"
 
-    # ── Kanban board watchers ───────────────────────────────────────────
-    # The kanban dispatcher watcher loop + its helpers live in
-    # GatewayKanbanWatchersMixin (gateway/kanban_watchers.py). Notification
-    # delivery is event-time (hermes_cli/kanban.py::_notify_kanban_status_change
-    # → hermes send -t); the notification polling loop was deleted on
-    # Evan's directive (2026-10-19).
+    # ── Kanban startup sync ─────────────────────────────────────────────
+    # The one-shot kanban reality check lives in
+    # GatewayKanbanStartupSyncMixin (gateway/kanban_startup_sync.py).
+    # Dispatch and notification delivery are event-time
+    # (hermes_cli/kanban.py::kick_dispatch / _notify_kanban_status_change →
+    # hermes send -t); the polling watcher loops were deleted on Evan's
+    # directive (2026-10-19).
 
     def _ensure_reconnect_watcher_running(self) -> None:
         """Ensure the platform reconnect watcher background task is alive.

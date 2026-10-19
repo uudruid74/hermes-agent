@@ -8821,9 +8821,10 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
     return (evt_sid, evt_type)
 
 
-# Mirror gateway/kanban_watchers.py TERMINAL_KINDS: claim silent kinds too so
-# the cursor advances past them and they can't wedge a later completed/blocked
-# event behind an unclaimed row.
+# Kanban terminal kinds — the old gateway notifier's list (that polling
+# watcher was deleted 2026-10-19; this is the TUI's own display-side copy).
+# Claim silent kinds too so the cursor advances past them and they can't
+# wedge a later completed/blocked event behind an unclaimed row.
 _KANBAN_NOTIFY_KINDS = (
     "completed", "blocked", "gave_up", "crashed", "timed_out",
     "status", "archived", "unblocked",
@@ -8835,7 +8836,8 @@ _KANBAN_POLL_SECONDS = 5.0
 def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[str]:
     """Single-line notification text for one kanban event.
 
-    Wording mirrors the gateway notifier (gateway/kanban_watchers.py) so a
+    Wording matches the event-time notification text (the old gateway
+    notifier, now hermes_cli/kanban.py::_notify_kanban_status_change) so a
     task completion reads the same in the TUI as it does on Telegram.
     Returns None for kinds that are claimed but intentionally silent.
     """

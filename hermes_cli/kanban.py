@@ -24,9 +24,10 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_swarm as ks
@@ -1143,10 +1144,24 @@ def kanban_command(args: argparse.Namespace) -> int:
             print(f"kanban: unknown action {action!r}", file=sys.stderr)
             return 2
         try:
-            return int(handler(args) or 0)
+            rc = int(handler(args) or 0)
         except (ValueError, RuntimeError) as exc:
             print(f"kanban: {exc}", file=sys.stderr)
             return 1
+        if action in _DISPATCH_KICK_ACTIONS:
+            # Event-driven dispatch (no polling): a mutating command just
+            # changed what work can run — kick one dispatch tick now.
+            kick_dispatch()
+        return rc
+
+
+# CLI actions whose success can enable dispatch work (create/claim/release/
+# promote/unblock/decompose/...). Read-only actions never kick.
+_DISPATCH_KICK_ACTIONS = frozenset({
+    "create", "assign", "set-model", "reclaim", "reassign", "link", "unlink",
+    "claim", "complete", "edit", "block", "schedule", "unblock", "promote",
+    "reopen-review", "archive", "decompose", "specify",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -1692,6 +1707,166 @@ def _wake_targets_acting_session(
     return False
 
 
+def dispatch_settings_from_config() -> dict:
+    """Coerce the ``kanban.*`` dispatch settings for :func:`kb.dispatch_once`.
+
+    One implementation of the config plumbing that the gateway startup sync
+    and the event kick share. Validation mirrors the historical gateway
+    reader: out-of-range values fall back to the library defaults.
+    """
+    from hermes_cli.config import load_config
+
+    def _pos(value) -> Optional[int]:
+        if value is None:
+            return None
+        try:
+            ival = int(value)
+        except (TypeError, ValueError):
+            return None
+        return ival if ival >= 1 else None
+
+    try:
+        cfg = load_config()
+        k = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+    except (OSError, ValueError, TypeError):
+        k = {}
+    try:
+        failure_limit = int(k.get("failure_limit", kb.DEFAULT_FAILURE_LIMIT))
+    except (TypeError, ValueError):
+        failure_limit = kb.DEFAULT_FAILURE_LIMIT
+    if failure_limit < 1:
+        failure_limit = kb.DEFAULT_FAILURE_LIMIT
+    try:
+        stale_timeout = int(k.get("dispatch_stale_timeout_seconds", 0) or 0)
+    except (TypeError, ValueError):
+        stale_timeout = 0
+    return {
+        "max_spawn": _pos(k.get("max_spawn")),
+        "max_in_progress": _pos(k.get("max_in_progress")),
+        "failure_limit": failure_limit,
+        "stale_timeout_seconds": stale_timeout,
+        "default_assignee": (str(k.get("default_assignee") or "") or "").strip() or None,
+        "max_in_progress_per_profile": _pos(k.get("max_in_progress_per_profile")),
+    }
+
+
+# Re-entrancy guard for kick_dispatch: a dispatch tick claims/completes tasks,
+# which fires _notify_kanban_status_change, which would kick ANOTHER tick
+# (per-board tick locks only serialize same-board recursion).
+_kick_state = threading.local()
+
+_DISPATCH_KICK_ENV = "HERMES_KANBAN_DISPATCH_KICKS"
+
+
+def _resolve_auto_decompose_settings(
+    load_config: Callable[[], Any],
+) -> "tuple[bool, int]":
+    """Resolve ``(enabled, per_pass)`` for the auto-decomposer from config.
+
+    ``kanban.auto_decompose`` (default True) gates the decomposer;
+    ``kanban.auto_decompose_per_tick`` (default 3) caps how many triage
+    tasks one pass may decompose so a bulk load can't burst-spend the aux
+    LLM (the Aug-2026 runaway-fanout guard, #49638). Read fresh at every
+    wake so flipping ``kanban.auto_decompose: false`` stops it immediately.
+    """
+    try:
+        cfg = load_config()
+    except Exception:
+        return (True, 3)
+    kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+    enabled = bool(kanban_cfg.get("auto_decompose", True))
+    try:
+        per_tick = int(kanban_cfg.get("auto_decompose_per_tick", 3))
+    except (TypeError, ValueError):
+        per_tick = 3
+    if per_tick < 1:
+        per_tick = 3
+    return (enabled, per_tick)
+
+
+def kick_dispatch(board: Optional[str] = None) -> None:
+    """Run one dispatch tick NOW — the event-driven dispatcher (no polling).
+
+    Called at state-change time (the notification hook below, mutating CLI
+    actions and tool commands) and once at gateway startup (the reality
+    check that syncs whatever changed while nothing was listening).
+    ``dispatch_once`` takes the per-board tick lock (issue #35240), so kicks
+    from any process serialize safely — a concurrent holder means this kick
+    is a no-op and the holder is already doing the work.
+
+    Set ``HERMES_KANBAN_DISPATCH_KICKS=0`` to disable (the test suite does;
+    dispatch tests exercise ``dispatch_once`` with stub spawn functions).
+    """
+    if os.environ.get(_DISPATCH_KICK_ENV, "1").strip().lower() in {"0", "false", "no", "off"}:
+        return
+    if getattr(_kick_state, "active", False):
+        return
+    _kick_state.active = True
+    try:
+        settings = dispatch_settings_from_config()
+        conn = kb.connect(board=board)
+        try:
+            kb.dispatch_once(conn, board=board, **settings)
+        finally:
+            conn.close()
+    except Exception as exc:
+        detail = str(exc).lower()
+        corrupt = getattr(kb, "KanbanDbCorruptError", None)
+        if (corrupt is not None and isinstance(exc, corrupt)) or (
+            isinstance(exc, sqlite3.Error)
+            and ("not a database" in detail or "malformed" in detail)
+        ):
+            logger.error(
+                "kanban dispatch kick: board %s is not a valid SQLite database; "
+                "dispatch is paused for it until the file is fixed — move or "
+                "restore the file, then run `hermes kanban init` if you need a "
+                "fresh board",
+                board or "default",
+            )
+        else:
+            logger.exception("kanban dispatch kick failed (board=%s)", board)
+    finally:
+        _kick_state.active = False
+
+
+def spawn_triage_decompose(task_id: str, board: Optional[str] = None) -> None:
+    """Wake the auto-decomposer for one just-created triage task (event-driven).
+
+    ``decompose_task`` promotes the task out of triage, so the per-task
+    trigger is idempotent — a duplicate spawn is a no-op. Runs detached so
+    the aux-LLM decomposition never blocks the creating command. Gated by
+    ``HERMES_KANBAN_DISPATCH_KICKS`` with the dispatch kick AND by the live
+    ``kanban.auto_decompose`` flag — flipping it off stops fan-out at once
+    (#49638), it never requires a restart.
+    """
+    if os.environ.get(_DISPATCH_KICK_ENV, "1").strip().lower() in {"0", "false", "no", "off"}:
+        return
+    try:
+        from hermes_cli.config import load_config
+
+        enabled, _per_pass = _resolve_auto_decompose_settings(load_config)
+    except (OSError, ValueError, TypeError):
+        enabled = True
+    if not enabled:
+        return
+    try:
+        from hermes_cli._subprocess_compat import spawn_detached
+
+        argv = ["hermes", "kanban"]
+        if board:
+            argv += ["--board", str(board)]
+        argv += ["decompose", str(task_id)]
+        proc = spawn_detached(argv)
+        if proc is None:
+            logger.warning(
+                "kanban auto-decompose: failed to spawn decomposer for %s", task_id
+            )
+    except (OSError, ValueError):
+        logger.exception(
+            "kanban auto-decompose: spawn failed for task=%s", task_id
+        )
+
+
 def _notify_kanban_status_change(
     task_id: str,
     new_status: str,
@@ -1699,13 +1874,25 @@ def _notify_kanban_status_change(
     summary: Optional[str] = None,
     title: Optional[str] = None,
     assignee: Optional[str] = None,
+    artifacts: Optional[list[str]] = None,
 ) -> None:
     """Best-effort human delivery and LLM wake for a Kanban state change.
 
-    Both paths resolve the task's origin profile once, then queue delivery on
-    that profile's live gateway bridge. Neither path spawns a CLI subprocess.
-    Delivery failures are logged and fall back to a creator-session notice.
+    This function is THE state-change choke point (CLI, tools, dispatcher and
+    plan bindings all land here), so it also kicks the event-driven
+    dispatcher first — the transition just happened and may enable work.
+
+    Both delivery paths resolve the task's origin profile once, then queue on
+    that profile's live gateway bridge. ``artifacts`` (completed-task
+    deliverables) ride the same wake event: the paths go into the wake
+    payload for the agent, and each existing file is delivered to the origin
+    chat as a native ``MEDIA:`` upload via ``hermes send -u`` — one fire-and-
+    forget subprocess per file (the bridge delivery path is text-only).
+    Missing paths are skipped silently — they may have been referenced by
+    name only. Delivery failures are logged and fall back to a
+    creator-session notice.
     """
+    kick_dispatch()
     try:
         conn = kb.connect()
         try:
@@ -1739,6 +1926,14 @@ def _notify_kanban_status_change(
         )
     human_msg = "".join(human_parts)
 
+    # Artifact wake (completed-task deliverables): keep only paths that
+    # exist — missing ones may have been referenced by name only.
+    artifact_files = [
+        str(p).strip()
+        for p in (artifacts or [])
+        if str(p).strip() and os.path.isfile(str(p).strip())
+    ]
+
     json_payload = json.dumps({
         "source": "kanban",
         "type": new_status,
@@ -1746,6 +1941,7 @@ def _notify_kanban_status_change(
         "title": title or task_id,
         "summary": summary_line or None,
         "assignee": assignee or "unassigned",
+        "artifacts": artifact_files or None,
     })
 
     # Wake the task's live worker session (cli:<session_id>) when bound — the
@@ -1838,6 +2034,31 @@ def _notify_kanban_status_change(
             target,
             profile,
         )
+
+    # Artifact wake delivery: each existing deliverable rides the same event
+    # into the origin chat as a native MEDIA: upload. `hermes send -u` is the
+    # media-aware delivery primitive (the bridge delivery above is text-only)
+    # — one fire-and-forget subprocess per file. The upload in the chat IS
+    # the artifact notification.
+    if artifact_files:
+        from hermes_cli._subprocess_compat import spawn_detached
+
+        for _path in artifact_files:
+            try:
+                proc = spawn_detached(
+                    ["hermes", "send", "-u", target, f"MEDIA:{_path}"],
+                    env=notify_env,
+                )
+                if proc is None:
+                    logger.warning(
+                        "kanban notify task=%s artifact %s failed to spawn send",
+                        task_id, _path,
+                    )
+            except (OSError, ValueError):
+                logger.exception(
+                    "kanban notify task=%s artifact %s delivery failed",
+                    task_id, _path,
+                )
 
     try:
         if worker_woken:
@@ -2356,6 +2577,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
             _store_cli_origin_routing(conn, task_id, channel_flag)
         else:
             _store_cli_implicit_origin(conn, task_id)
+        if task is not None and task.status == "triage":
+            spawn_triage_decompose(task_id)
     if getattr(args, "json", False):
         print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))
     else:
