@@ -3711,6 +3711,110 @@ def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
     return Task.from_row(row) if row else None
 
 
+def resolve_live_session_id(profile: str, captured_id: str) -> Optional[str]:
+    """Resolve a captured session id to the CURRENT live session id.
+
+    Use-time resolution (Evan 2026-10-19): the captured id may be stale — a
+    dead session whose chat has rolled on to a new one, or an id that names
+    no session row at all (a compression-root label — waking it fabricates a
+    fresh imaginary session). A dead session resolves to its chat's live
+    session; anything unresolvable returns ``None`` so the caller can fall
+    back to the profile home wake.
+    """
+    captured_id = str(captured_id or "").strip()
+    if not captured_id or not profile:
+        return None
+    try:
+        from hermes_cli.profiles import get_profile_dir
+
+        db_path = get_profile_dir(profile) / "state.db"
+        if not db_path.exists():
+            return None
+        state = sqlite3.connect(str(db_path))
+    except (OSError, sqlite3.Error, ImportError, ValueError):
+        return None
+    try:
+        row = state.execute(
+            "SELECT session_key, ended_at FROM sessions WHERE id = ?",
+            (captured_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        session_key, ended_at = row
+        if ended_at is None:
+            return captured_id
+        if not session_key:
+            return None
+        live = state.execute(
+            "SELECT id FROM sessions WHERE session_key = ? AND ended_at IS NULL "
+            "ORDER BY started_at DESC LIMIT 1",
+            (session_key,),
+        ).fetchone()
+        return live[0] if live else None
+    except sqlite3.Error:
+        return None
+    finally:
+        state.close()
+
+
+def resolve_worker_live_session_id(profile: str, task_id: str) -> Optional[str]:
+    """The worker's live bound session (``sessions.task_id``), if any."""
+    try:
+        from hermes_cli.profiles import get_profile_dir
+        from hermes_state import SessionDB
+
+        session_db = SessionDB(db_path=get_profile_dir(profile) / "state.db")
+    except (OSError, sqlite3.Error, ImportError, ValueError):
+        return None
+    try:
+        return session_db.find_task_session_id(task_id)
+    except (OSError, sqlite3.Error, ValueError):
+        return None
+    finally:
+        session_db.close()
+
+
+def _is_acting_session(session_id: str) -> bool:
+    """A wake to the session performing this action is a self-echo (t_0bae723b)."""
+    from hermes_cli.kanban import _acting_session_identity
+
+    actor = (_acting_session_identity().get("HERMES_SESSION_ID") or "").strip()
+    return bool(actor) and actor == session_id
+
+
+def wake_target_for(conn: sqlite3.Connection, task_id: str, recipient: str) -> str:
+    """Use-time wake target for a plan/kanban message to *recipient*.
+
+    Origin party (the dispatcher): a session origin resolves to its CURRENT
+    live session and wakes ``<profile>:cli:<sid>`` — ``hermes send -t``
+    injects the prompt as a user turn THERE; a chat origin wakes that exact
+    chat (``platform:chat_id:thread_id``). Worker direction: the worker's
+    live bound session. The bare profile (home-channel wake) is only the
+    last-resort fallback.
+    """
+    origin = get_origin_routing(conn, task_id) or {}
+    origin_profile = str(origin.get("profile") or "").strip()
+    chat_id = str(origin.get("chat_id") or "").strip()
+    platform = str(origin.get("platform") or "").strip().lower()
+    thread_id = str(origin.get("thread_id") or "").strip()
+
+    if chat_id and origin_profile and origin_profile.casefold() == recipient.casefold():
+        if platform == "session":
+            live = resolve_live_session_id(recipient, chat_id)
+            if live and not _is_acting_session(live):
+                return f"{recipient}:cli:{live}"
+        elif platform:
+            target = f"{recipient}:{platform}:{chat_id}"
+            if thread_id:
+                target = f"{target}:{thread_id}"
+            return target
+    else:
+        live = resolve_worker_live_session_id(recipient, task_id)
+        if live and not _is_acting_session(live):
+            return f"{recipient}:cli:{live}"
+    return recipient
+
+
 def _review_ask_target(
     conn: sqlite3.Connection, task_id: str, *, direction: str
 ) -> Optional[str]:
@@ -3783,12 +3887,13 @@ def send_dispatcher_message(
             )
     except sqlite3.Error as exc:
         return False, f"durable ask write failed: {exc}"
-    target = _review_ask_target(conn, task_id, direction=direction)
-    if not target:
+    recipient = _review_ask_target(conn, task_id, direction=direction)
+    if not recipient:
         return True, (
             "ask recorded; no AI recipient resolves — the human reviewer "
             "(dashboard) is the fallback"
         )
+    target = wake_target_for(conn, task_id, recipient)
     from hermes_cli._subprocess_compat import spawn_detached
 
     proc = spawn_detached(["hermes", "send", "-t", target, text])

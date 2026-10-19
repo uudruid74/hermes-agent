@@ -11476,11 +11476,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # to /new (does not kill the turn; see agent.session_stall_timeout).
         self._spawn_supervised(self._session_stall_watcher, "session_stall_watcher")
 
-        # Start background kanban notifier — each gateway delivers events for
-        # subscriptions owned by the profiles whose adapters it hosts, even
-        # when another gateway owns the single dispatcher.
-        self._spawn_supervised(self._kanban_notifier_watcher, "kanban_notifier_watcher")
-
         # Start background kanban dispatcher — spawns workers for ready
         # tasks. Gated by `kanban.dispatch_in_gateway` (default True).
         # When false, users run `hermes kanban daemon` externally or
@@ -12358,10 +12353,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return "default"
 
     # ── Kanban board watchers ───────────────────────────────────────────
-    # The kanban notifier/dispatcher watcher loops + their helpers live in
-    # GatewayKanbanWatchersMixin (gateway/kanban_watchers.py). They use only
-    # self state, so inheriting the mixin keeps every self._kanban_* call site
-    # working unchanged while lifting ~1,000 LOC out of this file.
+    # The kanban dispatcher watcher loop + its helpers live in
+    # GatewayKanbanWatchersMixin (gateway/kanban_watchers.py). Notification
+    # delivery is event-time (hermes_cli/kanban.py::_notify_kanban_status_change
+    # → hermes send -t); the notification polling loop was deleted on
+    # Evan's directive (2026-10-19).
 
     def _ensure_reconnect_watcher_running(self) -> None:
         """Ensure the platform reconnect watcher background task is alive.

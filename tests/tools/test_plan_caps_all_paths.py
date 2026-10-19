@@ -396,7 +396,7 @@ def test_adapter_forwards_step(bound_plan, monkeypatch):
     )
     monkeypatch.setattr(adapter, "_sync_subject_from_binding", lambda agent: None)
     monkeypatch.setattr(adapter, "_dispatcher_for_task", lambda *_args: "neo")
-    monkeypatch.setattr(adapter, "_send_user", lambda *_args: None)
+    monkeypatch.setattr(adapter, "_send_user", lambda *_args, **_kwargs: None)
 
     adapter.cmd_advance(_Agent(), "verified step", step=1)
     assert seen.get("step") == 1, "adapter dropped `step`"

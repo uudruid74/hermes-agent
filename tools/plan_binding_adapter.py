@@ -505,7 +505,11 @@ def _create_plan(
         # in the durable task row, not in this synchronous call.
         from hermes_cli._subprocess_compat import spawn_detached
 
-        spawn_detached(["hermes", "send", "-t", assigned, wrapped])
+        from hermes_cli import kanban_db as kb
+
+        spawn_detached(
+            ["hermes", "send", "-t", kb.wake_target_for(conn, task_id, assigned), wrapped]
+        )
         # No binding activation on our side — surface the dispatch notice.
         # Evan's exact spec (2026-09-22): the creator sees ONLY the notify line.
         return f"{assigned} has been notified of task {task_id}"
@@ -626,13 +630,31 @@ def _dispatcher_for_task(conn, task_id: str) -> Optional[str]:
     return None
 
 
-def _send_user(profile: str, message: str) -> Optional[str]:
+def _send_user(
+    profile: str,
+    message: str,
+    *,
+    conn=None,
+    task_id: Optional[str] = None,
+) -> Optional[str]:
+    """Wake *profile* with *message* via ``hermes send -t`` (user-turn inject).
+
+    When ``conn``/``task_id`` are given, the wake target is resolved at use
+    time (``hermes_cli.kanban_db.wake_target_for``) — the task's origin
+    session/chat or the worker's live bound session — instead of the
+    profile home channel.
+    """
     from hermes_cli._subprocess_compat import spawn_detached
 
-    proc = spawn_detached(["hermes", "send", "-t", profile, message])
+    target = profile
+    if conn is not None and task_id:
+        from hermes_cli import kanban_db as kb
+
+        target = kb.wake_target_for(conn, task_id, profile)
+    proc = spawn_detached(["hermes", "send", "-t", target, message])
     if proc is None:
         # Spawn failure (binary missing, permission) — surfaced, not buried.
-        return f"failed to launch 'hermes send' for {profile}"
+        return f"failed to launch 'hermes send' for {target}"
     return None
 
 
@@ -696,7 +718,7 @@ def _deliver_attention_request(task_id: str, message: str) -> None:
             else None
         )
     if recipient:
-        error = _send_user(recipient, message)
+        error = _send_user(recipient, message, conn=conn, task_id=task_id)
         if error:
             logger.warning("attention request delivery: %s", error)
     else:
@@ -822,7 +844,9 @@ def _resolve_review(
             session_db.update_agent_rating(source["assignee"], 0.5)
     message = _worker_review_message(task, result, reviewer, response)
     if notify_worker:
-        failure = _send_user(str(task["assignee"]), message)
+        failure = _send_user(
+            str(task["assignee"]), message, conn=conn, task_id=task_id
+        )
         if failure:
             return f"ERROR: Review recorded, but worker notification failed: {failure}", result
     else:
@@ -892,7 +916,11 @@ def cmd_advance(agent, summary: str, step: Optional[int] = None) -> str:
         request = _review_request_text(task, pending, auto_approved=True)
         # No dispatcher means the human is the reviewer (self-created plan) —
         # they already answered yolo, so there is no one to notify.
-        failure = _send_user(dispatcher, request) if dispatcher else None
+        failure = (
+            _send_user(dispatcher, request, conn=conn, task_id=result.task_id)
+            if dispatcher
+            else None
+        )
         suffix = f" Dispatcher notification failed: {failure}" if failure else ""
         if reviewed.closed:
             return (
@@ -906,7 +934,7 @@ def cmd_advance(agent, summary: str, step: Optional[int] = None) -> str:
 
     request = _review_request_text(task, pending)
     if dispatcher:
-        failure = _send_user(dispatcher, request)
+        failure = _send_user(dispatcher, request, conn=conn, task_id=result.task_id)
         suffix = f" Dispatcher notification failed: {failure}" if failure else ""
         return (
             f"Step {pending.step_no} summary submitted. Pause and wait for "
@@ -1038,7 +1066,9 @@ def cmd_review(
                 f"{reviewer} answered your clarifying question on "
                 f"{task_id} (Step {step_no}):\n\n{response}"
             )
-        failure = _send_user(str(task["assignee"]), worker_message)
+        failure = _send_user(
+            str(task["assignee"]), worker_message, conn=conn, task_id=task_id
+        )
         if failure:
             # The response IS durable (it was the caller's argument); the
             # worker wake is best-effort in exactly one direction: if it
@@ -1691,7 +1721,11 @@ def cmd_approve(agent, task_id: str) -> str:
     # in the durable task row, not in this synchronous call.
     from hermes_cli._subprocess_compat import spawn_detached
 
-    spawn_detached(["hermes", "send", "-t", assigned, wrapped])
+    from hermes_cli import kanban_db as kb
+
+    spawn_detached(
+        ["hermes", "send", "-t", kb.wake_target_for(conn, task_id, assigned), wrapped]
+    )
     # No binding activation on our side — surface the dispatch notice.
     # Evan's exact spec (2026-09-22): the creator sees ONLY the notify line.
     return f"{assigned} has been notified of task {task_id}"
@@ -1767,7 +1801,7 @@ def cmd_clarify(agent, question: str) -> str:
         "Reply with 'plan review' — pass the task id, decision 'approved', "
         "and your answer as the response."
     )
-    failure = _send_user(dispatcher, ping)
+    failure = _send_user(dispatcher, ping, conn=conn, task_id=binding.task_id)
     suffix = f" Dispatcher notification failed: {failure}" if failure else ""
     return (
         f"Clarify ask recorded on plan {binding.task_id} and routed to "
