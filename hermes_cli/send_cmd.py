@@ -38,6 +38,20 @@ _USAGE_EXIT = 2
 _FAILURE_EXIT = 1
 _SUCESS_EXIT = 0
 
+# Agent-to-agent DM fallback chat id (Evan's Telegram DM), used ONLY for
+# profiles with no configured home channel. A BARE PROFILE NAME passed to
+# `-t` is expanded to `profile:<platform>:<home channel>` where the home
+# channel is read from the profile's own config.yaml
+# (`platforms.telegram.home_channel`, written by `/sethome`) — see
+# `_resolve_agent_wake_target` / `_profile_home_channel_target`. Keeping the
+# agent→platform mapping in ONE place (here) means callers (tell tool, pente
+# MCP, cron jobs) can pass a bare agent name and never touch session ids or
+# platform details. Restored by t_a427292d (revert of the e3a5cc511c
+# bare-platform fallback): without it a bare-profile wake resolves to the
+# platform home channel, keys a fresh per-user group session, and the wake
+# never reaches the target's real DM session.
+_AGENT_DM_CHAT_ID = "8900123006"
+
 
 def _read_message_body(
     positional: Optional[str],
@@ -119,30 +133,44 @@ def _profile_home_channel_target(profile: str) -> str:
     """Resolve a profile's configured home channel to ``platform:chat[:thread]``.
 
     Reads ``platforms.telegram.home_channel`` (the ``HomeChannel`` dict
-    ``/sethome`` persists) from the profile's own ``config.yaml``. No
-    fallback: a profile without a configured chat resolves to its bare
-    platform, which is ``hermes send``'s documented home-channel default
-    shape — nothing here hardcodes a chat id.
+    ``/sethome`` persists) from the profile's own ``config.yaml``. Profiles
+    without a configured channel fall back to
+    ``telegram:<_AGENT_DM_CHAT_ID>`` (Evan's DM) — the only remaining use of
+    that id. The fallback keeps bare-profile wakes in the target's REAL DM
+    session; the bare-platform default (introduced by e3a5cc511c, removed
+    again here by t_a427292d) routed threadless wakes into a fresh per-user
+    group session the target and the user never see.
     """
     import yaml
 
+    fallback = f"telegram:{_AGENT_DM_CHAT_ID}"
     from hermes_cli.profiles import get_profile_dir
 
-    config_path = get_profile_dir(profile) / "config.yaml"
     try:
+        config_path = get_profile_dir(profile) / "config.yaml"
         raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     except FileNotFoundError:
-        raw = {}
-    home = ((raw.get("platforms") or {}).get("telegram") or {}).get("home_channel") or {}
-    return ":".join(
-        part
-        for part in (
-            str(home.get("platform") or "telegram").strip() or "telegram",
-            str(home.get("chat_id") or "").strip(),
-            str(home.get("thread_id") or "").strip(),
+        return fallback
+    except (OSError, UnicodeDecodeError, ValueError, yaml.YAMLError) as exc:
+        print(
+            f"hermes send: cannot read {profile} config.yaml ({exc}); "
+            f"falling back to {_AGENT_DM_CHAT_ID}",
+            file=sys.stderr,
         )
-        if part
-    )
+        return fallback
+
+    home = ((raw.get("platforms") or {}).get("telegram") or {}).get("home_channel")
+    if not isinstance(home, dict):
+        return fallback
+    chat_id = str(home.get("chat_id") or "").strip()
+    if not chat_id:
+        return fallback
+    platform = str(home.get("platform") or "telegram").strip() or "telegram"
+    target = f"{platform}:{chat_id}"
+    thread_id = str(home.get("thread_id") or "").strip()
+    if thread_id:
+        target = f"{target}:{thread_id}"
+    return target
 
 
 def _resolve_agent_wake_target(user_flag: str) -> str:

@@ -3754,7 +3754,7 @@ def send_dispatcher_message(
 
     Writes the durable ask as a ``review-<kind>`` event FIRST (the ask lives
     on the task row's event log, durable in the same txn), THEN spawns the
-    best-effort ``hermes send -u`` wake-ping to the resolved target. No
+    best-effort ``hermes send -t`` wake-ping to the resolved target. No
     queue, no retry, NO task-state mutation (HARD RULE): status, steps, and
     claims are untouched — the response comes back through whichever review
     channel applies (``plan review`` for plan-bound tasks, the subscriber

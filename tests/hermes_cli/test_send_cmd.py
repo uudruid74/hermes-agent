@@ -340,9 +340,10 @@ def test_bare_profile_resolves_configured_home_channel(monkeypatch, tmp_path):
     )
 
 
-def test_bare_profile_without_channel_resolves_bare_platform(monkeypatch, tmp_path):
-    """No configured chat resolves to the bare platform — send's documented
-    home-channel default shape. Never a hardcoded chat id."""
+def test_bare_profile_without_channel_resolves_dm_fallback(monkeypatch, tmp_path):
+    """No configured chat falls back to the agent DM (t_6a22e29b behavior,
+    restored by t_a427292d) so the wake lands in the target's REAL session
+    instead of a fresh threadless group session."""
     import hermes_cli.profiles
 
     home = tmp_path / "zephyr"
@@ -353,10 +354,13 @@ def test_bare_profile_without_channel_resolves_bare_platform(monkeypatch, tmp_pa
     )
     monkeypatch.setattr(hermes_cli.profiles, "get_profile_dir", lambda _name: home)
 
-    assert send_cmd._resolve_agent_wake_target("zephyr") == "zephyr:telegram"
+    assert (
+        send_cmd._resolve_agent_wake_target("zephyr")
+        == f"zephyr:telegram:{send_cmd._AGENT_DM_CHAT_ID}"
+    )
 
 
-def test_bare_profile_without_config_resolves_bare_platform(monkeypatch, tmp_path):
+def test_bare_profile_without_config_resolves_dm_fallback(monkeypatch, tmp_path):
     import hermes_cli.profiles
 
     home = tmp_path / "lone"
@@ -366,7 +370,10 @@ def test_bare_profile_without_config_resolves_bare_platform(monkeypatch, tmp_pat
     )
     monkeypatch.setattr(hermes_cli.profiles, "get_profile_dir", lambda _name: home)
 
-    assert send_cmd._resolve_agent_wake_target("lone") == "lone:telegram"
+    assert (
+        send_cmd._resolve_agent_wake_target("lone")
+        == f"lone:telegram:{send_cmd._AGENT_DM_CHAT_ID}"
+    )
 
 
 def test_full_targets_pass_through_resolution():

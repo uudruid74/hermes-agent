@@ -112,7 +112,7 @@ Because the wiki is the knowledge layer, a filed bug **auto-injects into context
 
 ### 🗣️ Agent-to-Agent `tell`
 
-Agents wake each other directly. `tell(agent, message)` wraps the message, injects it into the target profile's Telegram DM session via `hermes send -u`, and signs it with the sender's profile name. No group chat, no relay board, no human in the middle — Zephyr pings Gopher, Gopher pings back.
+Agents wake each other directly. `tell(agent, message)` wraps the message, injects it into the target profile's Telegram DM session via `hermes send -t` (the from-user wake, which also posts the visible copy down the `-u` path), and signs it with the sender's profile name. No group chat, no relay board, no human in the middle — Zephyr pings Gopher, Gopher pings back.
 
 The wrapper's reply instruction is **conditional by design**: *"If a reply is required, use the 'tell' command to reply."* The first version mandated a reply unconditionally, and the first round-trip test (2026-09-05) turned into an infinite politeness loop — two agents acking each other into eternity. Now the loop closes itself.
 
