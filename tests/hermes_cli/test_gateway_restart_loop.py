@@ -234,12 +234,15 @@ class TestGatewaySelfTargetingGuard:
 # ---------------------------------------------------------------------------
 
 class TestTerminalToolGatewayLifecycleGuard:
-    """terminal_tool must refuse gateway lifecycle commands when _HERMES_GATEWAY=1.
+    """terminal_tool guard state after 2026-10-15 (Evan).
 
-    Issue #37453: systemctl --user restart hermes-gateway runs as a child of the
-    gateway process.  When systemd delivers SIGTERM the gateway kills its own
-    restart command mid-execution — the service may never restart.  The guard
-    must fire before execution, unconditionally (force=True cannot bypass it).
+    The lifecycle scanner was removed: the old
+    contains_gateway_lifecycle_command_or_referenced_script check
+    pattern-matched innocent commands (greps, reads) while missing the real
+    restart path (restart-barbicans uses `$agent gateway stop`). What remains:
+    (1) the launchctl submit/bootstrap KeepAlive guard for direct command
+    strings, and (2) the generic systemctl approval pattern in
+    tools/approval.py. Lifecycle commands now flow to normal execution.
     """
 
     def _make_fake_env(self):
@@ -248,6 +251,16 @@ class TestTerminalToolGatewayLifecycleGuard:
             def execute(self, command, **kwargs):  # pragma: no cover
                 raise AssertionError("execute must not be reached")
         return _FakeEnv()
+
+    def _make_recording_env(self, calls, output="", returncode=0, cwd=None):
+        class _RecordingEnv:
+            env = {}
+            def __init__(self):
+                self.cwd = cwd
+            def execute(self, command, **kwargs):
+                calls.append(command)
+                return {"output": output, "returncode": returncode}
+        return _RecordingEnv()
 
     def _minimal_config(self):
         return {"env_type": "local", "cwd": "/tmp", "timeout": 60, "lifetime_seconds": 3600}
@@ -270,45 +283,63 @@ class TestTerminalToolGatewayLifecycleGuard:
         "systemctl stop hermes-gateway.service",
         "hermes gateway restart",
         "launchctl kickstart gui/501/ai.hermes.gateway",
+        "pkill -f hermes.*gateway",
+    ])
+    def test_lifecycle_commands_no_longer_scanned(self, monkeypatch, cmd):
+        """Lifecycle commands are no longer hard-blocked by the scanner. They
+        flow to normal execution (approval patterns may still flag them)."""
+        import tools.terminal_tool as tt
+        calls = []
+        self._patch_env(
+            monkeypatch, self._make_recording_env(calls), inside_gateway=True
+        )
+        monkeypatch.setattr(
+            tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True}
+        )
+
+        result = json.loads(tt.terminal_tool(command=cmd))
+
+        assert result["exit_code"] == 0
+        assert calls == [cmd]
+
+    @pytest.mark.parametrize("cmd", [
         # #62891 exact reported shape and its bootstrap sibling.
         "launchctl submit -l ai.hermes.gateway-hard-restart-no-photon-notice -- /bin/sh ~/.hermes/scripts/hard_restart_gateway_no_photon_notice.sh",
         "launchctl submit -l com.foo -- /path/gateway",
         "launchctl bootstrap gui/501 ~/Library/LaunchAgents/ai.hermes.gateway.restart-once.plist",
-        "pkill -f hermes.*gateway",
     ])
-    def test_blocks_lifecycle_commands_inside_gateway(self, monkeypatch, cmd):
+    def test_still_blocks_launchctl_submit_inside_gateway(self, monkeypatch, cmd):
+        """The launchctl submit KeepAlive guard remains for direct command
+        strings (macOS persistent-job foot-gun, issue #62891)."""
         import tools.terminal_tool as tt
         self._patch_env(monkeypatch, self._make_fake_env(), inside_gateway=True)
 
         result = json.loads(tt.terminal_tool(command=cmd))
 
         assert result["exit_code"] == 1
-        assert "Blocked" in result["error"]
+        assert "KeepAlive" in result["error"]
 
-    def test_force_true_cannot_bypass_block(self, monkeypatch):
-        import tools.terminal_tool as tt
-        self._patch_env(monkeypatch, self._make_fake_env(), inside_gateway=True)
-
-        result = json.loads(tt.terminal_tool(
-            command="systemctl restart hermes-gateway", force=True
-        ))
-
-        assert result["exit_code"] == 1
-        assert "Blocked" in result["error"]
-
-    def test_blocks_lifecycle_command_hidden_in_referenced_script(
+    def test_lifecycle_command_hidden_in_referenced_script_not_blocked(
         self, monkeypatch, tmp_path
     ):
+        """Referenced-script deep scanning was part of the removed lifecycle
+        scanner; a script containing a lifecycle command now runs."""
         import tools.terminal_tool as tt
 
         script = tmp_path / "delayed-ops.sh"
         script.write_text("#!/bin/bash\nsleep 45\nhermes gateway restart\n")
-        self._patch_env(monkeypatch, self._make_fake_env(), inside_gateway=True)
+        calls = []
+        self._patch_env(
+            monkeypatch, self._make_recording_env(calls), inside_gateway=True
+        )
+        monkeypatch.setattr(
+            tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True}
+        )
 
         result = json.loads(tt.terminal_tool(command=f"/bin/bash {script}"))
 
-        assert result["exit_code"] == 1
-        assert "referenced script" in result["error"]
+        assert result["exit_code"] == 0
+        assert calls == [f"/bin/bash {script}"]
 
     def test_blocks_launchctl_submit_inside_gateway(self, monkeypatch, tmp_path):
         import tools.terminal_tool as tt
@@ -372,52 +403,69 @@ class TestTerminalToolGatewayLifecycleGuard:
         assert result["exit_code"] == 0
         assert calls == [command]
 
-    def test_blocks_launchctl_submit_hidden_in_referenced_script(
+    def test_launchctl_submit_in_referenced_script_not_scanned(
         self, monkeypatch, tmp_path
     ):
+        """Referenced-script deep scanning belonged to the removed lifecycle
+        scanner; a script containing launchctl submit now runs (the remaining
+        launchctl guard applies to direct command strings only)."""
         import tools.terminal_tool as tt
 
         script = tmp_path / "wrapper.sh"
         script.write_text(
             "#!/bin/bash\nlaunchctl submit -l ai.hermes.loop -- /bin/true\n"
         )
-        self._patch_env(monkeypatch, self._make_fake_env(), inside_gateway=True)
+        calls = []
+        self._patch_env(
+            monkeypatch, self._make_recording_env(calls), inside_gateway=True
+        )
+        monkeypatch.setattr(
+            tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True}
+        )
 
         result = json.loads(tt.terminal_tool(command=f"/bin/bash {script}"))
 
-        assert result["exit_code"] == 1
-        assert "referenced script" in result["error"]
+        assert result["exit_code"] == 0
+        assert calls == [f"/bin/bash {script}"]
 
-    def test_relative_script_uses_live_session_cwd(self, monkeypatch, tmp_path):
+    def test_lifecycle_in_relative_script_not_scanned(self, monkeypatch, tmp_path):
         import tools.terminal_tool as tt
 
         script = tmp_path / "relative.sh"
         script.write_text("#!/bin/bash\nhermes gateway restart\n")
 
-        class _FakeEnv:
-            env = {}
-            cwd = str(tmp_path)
-            def execute(self, command, **kwargs):  # pragma: no cover
-                raise AssertionError("execute must not be reached")
-
-        self._patch_env(monkeypatch, _FakeEnv(), inside_gateway=True)
+        calls = []
+        env = self._make_recording_env(calls, cwd=str(tmp_path))
+        self._patch_env(monkeypatch, env, inside_gateway=True)
+        monkeypatch.setattr(
+            tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True}
+        )
 
         result = json.loads(tt.terminal_tool(command="/bin/bash relative.sh"))
 
-        assert result["exit_code"] == 1
-        assert "referenced script" in result["error"]
+        assert result["exit_code"] == 0
+        assert calls == ["/bin/bash relative.sh"]
 
-    def test_blocks_executable_shebang_script(self, monkeypatch, tmp_path):
+    def test_lifecycle_in_executable_shebang_script_not_scanned(
+        self, monkeypatch, tmp_path
+    ):
         import tools.terminal_tool as tt
 
         script = tmp_path / "delayed.sh"
         script.write_text("#!/bin/bash\nhermes gateway stop\n")
         script.chmod(0o700)
-        self._patch_env(monkeypatch, self._make_fake_env(), inside_gateway=True)
+        calls = []
+        self._patch_env(
+            monkeypatch, self._make_recording_env(calls), inside_gateway=True
+        )
+        monkeypatch.setattr(
+            tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True}
+        )
 
         result = json.loads(tt.terminal_tool(command=str(script)))
 
-        assert result["exit_code"] == 1
+        assert result["exit_code"] == 0
+        assert calls == [str(script)]
 
     def test_launchctl_submit_parser_handles_shell_quoting(self, monkeypatch):
         import tools.terminal_tool as tt
@@ -430,40 +478,49 @@ class TestTerminalToolGatewayLifecycleGuard:
         assert result["exit_code"] == 1
         assert "KeepAlive" in result["error"]
 
-    def test_shell_option_with_value_still_scans_script(self, monkeypatch, tmp_path):
+    def test_lifecycle_with_shell_option_not_scanned(self, monkeypatch, tmp_path):
         import tools.terminal_tool as tt
 
         script = tmp_path / "options.sh"
         script.write_text("#!/bin/bash\nhermes gateway restart\n")
-        self._patch_env(monkeypatch, self._make_fake_env(), inside_gateway=True)
+        calls = []
+        self._patch_env(
+            monkeypatch, self._make_recording_env(calls), inside_gateway=True
+        )
+        monkeypatch.setattr(
+            tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True}
+        )
 
         result = json.loads(tt.terminal_tool(
             command=f"/bin/bash -O extglob {script}"
         ))
 
-        assert result["exit_code"] == 1
+        assert result["exit_code"] == 0
+        assert calls == [f"/bin/bash -O extglob {script}"]
 
-    def test_shell_c_payload_recursively_scans_script(self, monkeypatch, tmp_path):
+    def test_shell_c_payload_with_nested_lifecycle_not_scanned(
+        self, monkeypatch, tmp_path
+    ):
         import tools.terminal_tool as tt
 
         script = tmp_path / "nested.sh"
         script.write_text("#!/bin/bash\nlaunchctl submit -l ai.hermes.loop -- /bin/true\n")
 
-        class _FakeEnv:
-            env = {}
-            cwd = str(tmp_path)
-            def execute(self, command, **kwargs):  # pragma: no cover
-                raise AssertionError("execute must not be reached")
-
-        self._patch_env(monkeypatch, _FakeEnv(), inside_gateway=True)
+        calls = []
+        env = self._make_recording_env(calls, cwd=str(tmp_path))
+        self._patch_env(monkeypatch, env, inside_gateway=True)
+        monkeypatch.setattr(
+            tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True}
+        )
 
         result = json.loads(tt.terminal_tool(
             command="/bin/bash -c '/bin/bash nested.sh'"
         ))
 
-        assert result["exit_code"] == 1
+        assert result["exit_code"] == 0
+        assert calls == ["/bin/bash -c '/bin/bash nested.sh'"]
 
-    def test_nested_wrapper_script_is_scanned(self, monkeypatch, tmp_path):
+    def test_nested_wrapper_script_not_scanned(self, monkeypatch, tmp_path):
         import tools.terminal_tool as tt
 
         inner = tmp_path / "inner.sh"
@@ -471,28 +528,37 @@ class TestTerminalToolGatewayLifecycleGuard:
         outer = tmp_path / "outer.sh"
         outer.write_text("#!/bin/bash\n/bin/bash inner.sh\n")
 
-        class _FakeEnv:
-            env = {}
-            cwd = str(tmp_path)
-            def execute(self, command, **kwargs):  # pragma: no cover
-                raise AssertionError("execute must not be reached")
-
-        self._patch_env(monkeypatch, _FakeEnv(), inside_gateway=True)
+        calls = []
+        env = self._make_recording_env(calls, cwd=str(tmp_path))
+        self._patch_env(monkeypatch, env, inside_gateway=True)
+        monkeypatch.setattr(
+            tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True}
+        )
 
         result = json.loads(tt.terminal_tool(command=f"/bin/bash {outer}"))
 
-        assert result["exit_code"] == 1
+        assert result["exit_code"] == 0
+        assert calls == [f"/bin/bash {outer}"]
 
-    def test_non_regular_referenced_script_fails_closed(self, monkeypatch, tmp_path):
+    def test_referenced_non_regular_script_not_scanned(self, monkeypatch, tmp_path):
+        """FIFO/non-regular referenced scripts were fail-closed only because of
+        the removed script scanner; they now flow to normal execution."""
         import tools.terminal_tool as tt
 
         fifo = tmp_path / "script.fifo"
         os.mkfifo(fifo)
-        self._patch_env(monkeypatch, self._make_fake_env(), inside_gateway=True)
+        calls = []
+        self._patch_env(
+            monkeypatch, self._make_recording_env(calls), inside_gateway=True
+        )
+        monkeypatch.setattr(
+            tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True}
+        )
 
         result = json.loads(tt.terminal_tool(command=f"/bin/bash {fifo}"))
 
-        assert result["exit_code"] == 1
+        assert result["exit_code"] == 0
+        assert calls == [f"/bin/bash {fifo}"]
 
     def test_quoted_launchctl_submit_text_is_not_blocked(self, monkeypatch):
         import tools.terminal_tool as tt
@@ -805,7 +871,7 @@ class TestRestartLoopGuard:
         assert rlg.check_and_record(3, 60, now=1002.0) is False
 
 class TestTerminalToolGatewayLifecycleGuardRemote:
-    """Remote-backend and two-session cwd regression coverage."""
+    """Remote-backend regression coverage after scanner removal (2026-10-15)."""
 
     def _patch_env(self, monkeypatch, fake_env, *, inside_gateway: bool):
         import tools.terminal_tool as tt
@@ -819,11 +885,12 @@ class TestTerminalToolGatewayLifecycleGuardRemote:
         else:
             monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
 
-    def test_remote_backend_script_read_uses_env_execute(self, monkeypatch, tmp_path):
+    def test_remote_backend_lifecycle_script_not_scanned(self, monkeypatch, tmp_path):
+        """The remote referenced-script scan was part of the removed lifecycle
+        scanner; a remote script containing a lifecycle command now runs."""
         import tools.terminal_tool as tt
 
-        # Path only exists on the remote backend; locally it is absent, so the
-        # guard must fall back to env.execute('cat ...') to scan it.
+        # Path only exists on the remote backend; locally it is absent.
         script = "/remote/workspace/remote.sh"
         calls = []
 
@@ -833,18 +900,20 @@ class TestTerminalToolGatewayLifecycleGuardRemote:
             def execute(self, command, **kwargs):
                 calls.append(command)
                 if "cat" in command and "/remote/workspace/remote.sh" in command:
-                    return {"output": "#!/bin/bash\\nhermes gateway restart\\n", "returncode": 0}
+                    return {"output": "#!/bin/bash\nhermes gateway restart\n", "returncode": 0}
                 return {"output": "", "returncode": 0}
 
         fake_env = _RemoteEnv()
         fake_env.cwd = "/remote/workspace"
         self._patch_env(monkeypatch, fake_env, inside_gateway=True)
+        monkeypatch.setattr(
+            tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True}
+        )
 
         result = json.loads(tt.terminal_tool(command=f"/bin/bash {script}"))
 
-        assert result["exit_code"] == 1
-        assert "referenced script" in result["error"]
-        assert any("cat" in c for c in calls)
+        assert result["exit_code"] == 0
+        assert calls == [f"/bin/bash {script}"]
 
 
 class TestCronCreateLifecycleBlockExtra:

@@ -2525,18 +2525,18 @@ def terminal_tool(
 
         session_key = get_current_session_key(default="") or (task_id or "")
 
-        # Hard-block: gateway lifecycle commands (systemctl/launchctl/hermes
-        # restart|stop targeting hermes-gateway) must never run inside the
-        # gateway process itself. The restart would SIGTERM the gateway, which
-        # kills this very subprocess before it can complete — the service may
-        # never restart. This mirrors the `hermes gateway restart` guard in
-        # hermes_cli/gateway.py and the cron-path guard in hermes_cli/cron.py,
-        # but applies unconditionally (force=True cannot help here).
+        # Hard-block: launchctl submit/bootstrap registers a persistent
+        # KeepAlive job (macOS) and is unsafe from inside the gateway process.
+        # NOTE 2026-10-15 (Evan): the *gateway lifecycle scanner* was removed —
+        # the old contains_gateway_lifecycle_command_or_referenced_script
+        # check pattern-matched innocent commands (greps, reads) and never even
+        # caught the real restart path (restart-barbicans uses `$agent gateway
+        # stop`, which no pattern matched). False security was worse than none.
+        # Fleet rule: everyone knows not to restart the gateway. Only the
+        # launchctl submit KeepAlive guard remains, and the generic systemctl
+        # approval pattern in tools/approval.py.
         if os.environ.get("_HERMES_GATEWAY") == "1":
-            from cron.lifecycle_guard import (
-                contains_gateway_lifecycle_command_or_referenced_script,
-                contains_launchctl_submit_command,
-            )
+            from cron.lifecycle_guard import contains_launchctl_submit_command
             if contains_launchctl_submit_command(command):
                 return json.dumps({
                     "output": "",
@@ -2546,62 +2546,6 @@ def terminal_tool(
                         "KeepAlive job and is unsafe from inside the gateway process. "
                         "Use Hermes cron for one-shot delayed work, or install an "
                         "explicit LaunchAgent from a separate shell."
-                    ),
-                    "status": "error",
-                }, ensure_ascii=False)
-            guard_cwd_base = get_session_cwd(session_key)
-            if guard_cwd_base is None:
-                guard_cwd_base = getattr(env, "cwd", None) or cwd
-            guard_cwd = _resolve_command_cwd(
-                workdir=command_workdir,
-                default_cwd=guard_cwd_base,
-                session_key=session_key,
-            )
-
-            def _read_script_in_env(script_path: str) -> Optional[str]:
-                """Best-effort script read; uses env.execute only when local read fails.
-
-                For local backends the script path is on the host filesystem. For
-                SSH/Modal/Daytona the same path is remote; the local read misses, so we
-                fall back to ``env.execute('cat ...')``.
-                """
-                if env is None:
-                    return None
-                try:
-                    local_path = Path(script_path).expanduser()
-                    if not local_path.is_absolute():
-                        local_path = Path(guard_cwd) / local_path
-                    if local_path.is_file():
-                        metadata = local_path.stat()
-                        if stat.S_ISREG(metadata.st_mode) and metadata.st_size <= 1024 * 1024:
-                            data = local_path.read_bytes()
-                            if len(data) <= 1024 * 1024:
-                                return data.decode("utf-8", errors="replace")
-                except Exception:
-                    pass
-                # Remote / sandboxed backend: read via the environment's shell.
-                try:
-                    result = env.execute(f"cat {shlex.quote(script_path)}")
-                    if result.get("returncode", -1) == 0:
-                        return result.get("output", "")
-                except Exception:
-                    pass
-                return None
-
-            if contains_gateway_lifecycle_command_or_referenced_script(
-                command,
-                cwd=guard_cwd,
-                read_remote_script=_read_script_in_env,
-            ):
-                return json.dumps({
-                    "output": "",
-                    "exit_code": 1,
-                    "error": (
-                        "Blocked: command or referenced script cannot restart or stop "
-                        "the gateway from inside the gateway process. The gateway would "
-                        "kill this command before it could complete (SIGTERM propagates "
-                        "to child processes). Run `hermes gateway restart` from a "
-                        "separate shell outside the running gateway."
                     ),
                     "status": "error",
                 }, ensure_ascii=False)

@@ -782,13 +782,6 @@ DANGEROUS_PATTERNS = [
     # approving -exec / -delete flags.
     (r'\bfind\b.*-exec(?:dir)?\s+(/\S*/)?rm\b', "find -exec/-execdir rm"),
     (r'\bfind\b.*-delete\b', "find -delete"),
-    # Gateway lifecycle protection: prevent the agent from killing its own
-    # gateway process.  These commands trigger a gateway restart/stop that
-    # terminates all running agents mid-work.  Allow global flags between
-    # `hermes` and `gateway` (e.g. `hermes -p ade gateway restart`) so a
-    # profile flag can't slip the agent past the guard.
-    (r'\bhermes\s+(?:-{1,2}\S+(?:\s+\S+)?\s+)*gateway\s+(stop|restart)\b', "stop/restart hermes gateway (kills running agents)"),
-    (r'\bhermes\s+update\b', "hermes update (restarts gateway, kills running agents)"),
     # Docker container lifecycle — any user with docker.sock mounted (a common
     # Docker Compose pattern) gives the agent the ability to restart/stop/kill
     # containers without approval.  These are agent-initiated lifecycle operations
@@ -828,24 +821,6 @@ DANGEROUS_PATTERNS = [
      "docker compose restart/stop/kill/down (container lifecycle)"),
     (r'\bdocker\s+(?:-{1,2}\S+(?:[=\s]\S+)?\s+)*(restart|stop|kill)\b',
      "docker restart/stop/kill (container lifecycle)"),
-    # Gateway protection: never start gateway outside systemd management
-    (r'gateway\s+run\b.*(&\s*$|&\s*;|\bdisown\b|\bsetsid\b)', "start gateway outside systemd (use 'systemctl --user restart hermes-gateway')"),
-    (r'\bnohup\b.*gateway\s+run\b', "start gateway outside systemd (use 'systemctl --user restart hermes-gateway')"),
-    # Self-termination protection: prevent agent from killing its own process
-    (r'\b(pkill|killall)\b.*\b(hermes|gateway|cli\.py)\b', "kill hermes/gateway process (self-termination)"),
-    # Self-termination via kill + command substitution (pgrep/pidof).
-    # The name-based pattern above catches `pkill hermes` but not
-    # `kill -9 $(pgrep -f hermes)` because the substitution is opaque
-    # to regex at detection time. Catch the structural pattern instead.
-    # `pidof` is the BSD/Linux alternative to `pgrep` and is equally
-    # opaque, so include it in the same alternation.
-    (r'\bkill\b.*\$\(\s*(pgrep|pidof)\b', "kill process via pgrep/pidof expansion (self-termination)"),
-    (r'\bkill\b.*`\s*(pgrep|pidof)\b', "kill process via backtick pgrep/pidof expansion (self-termination)"),
-    # launchctl-driven gateway stop/restart on macOS. The agent can bypass
-    # the `hermes gateway stop|restart` pattern above by driving launchd
-    # directly against the service label (commonly `ai.hermes.gateway`).
-    # Catch the operations that stop, restart, or unload it.
-    (r'\blaunchctl\s+(stop|kickstart|bootout|unload|kill|disable|remove)\b.*\b(hermes|ai\.hermes)\b', "stop/restart hermes launchd service (kills running agents)"),
     # File copy/move/edit into sensitive system paths (/etc/ and macOS
     # /private/etc/ mirror).
     (rf'\b(cp|mv|install)\b.*\s{_SYSTEM_CONFIG_PATH}', "copy/move file into system config path"),

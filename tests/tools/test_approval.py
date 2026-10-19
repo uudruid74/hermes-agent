@@ -674,18 +674,24 @@ class TestForkBombDetection:
 
 
 class TestGatewayProtection:
-    """Prevent agents from starting the gateway outside systemd management."""
+    """Gateway lifecycle commands were un-guarded 2026-10-15 (Evan).
 
-    def test_gateway_run_backgrounded_detected(self):
+    The old gateway-restart/self-termination scanner patterns were removed
+    because they were false-positive theater: `restart-barbicans` uses
+    `$agent gateway stop/start` which never matched any guard pattern, while
+    innocent commands (greps, reads) got blocked. Fleet rule: everyone knows
+    not to restart the gateway. Only the generic systemctl guard remains.
+    """
+
+    def test_gateway_run_backgrounded_not_flagged(self):
         cmd = "kill 1605 && cd ~/.hermes/hermes-agent && source venv/bin/activate && python -m hermes_cli.main gateway run --replace &disown; echo done"
         dangerous, key, desc = detect_dangerous_command(cmd)
-        assert dangerous is True
-        assert "systemctl" in desc
+        assert dangerous is False
         for variant in (
             "python -m hermes_cli.main gateway run --replace &",
             "nohup python -m hermes_cli.main gateway run --replace",
         ):
-            assert detect_dangerous_command(variant)[0] is True, variant
+            assert detect_dangerous_command(variant)[0] is False, variant
 
 
     def test_systemctl_restart_flagged(self):
@@ -792,30 +798,27 @@ class TestHeredocScriptExecution:
 
 
 class TestPgrepKillExpansion:
-    """kill -9 $(pgrep hermes) bypasses the pkill/killall name-matching
-    pattern because the command substitution is opaque to regex.
+    """kill $(pgrep/pidof) expansions were un-guarded 2026-10-15 (Evan).
 
-    See security audit Test 7.
+    Removed alongside the other self-termination/gateway scanner patterns
+    (false-positive theater — same rationale as TestGatewayProtection).
     """
 
-    def test_kill_pgrep_expansion_detected(self):
+    def test_kill_pgrep_expansion_not_flagged(self):
         for cmd in (
             'kill -9 $(pgrep -f "hermes.*gateway")',
             "kill -9 `pgrep hermes`",
             "kill $(pgrep gateway)",
         ):
             dangerous, _, desc = detect_dangerous_command(cmd)
-            assert dangerous is True, cmd
-            assert "pgrep" in desc.lower()
+            assert dangerous is False, cmd
 
-    def test_kill_pidof_expansion_detected(self):
-        """`kill $(pidof hermes)` is the BSD/Linux equivalent of the
-        pgrep expansion and bypasses the pkill/killall name pattern
-        in the same way. See issue #33071."""
-        dangerous, _, desc = detect_dangerous_command("kill -TERM $(pidof hermes_cli.main)")
-        assert dangerous is True
-        assert "pidof" in desc.lower() or "pgrep" in desc.lower()
-        assert detect_dangerous_command("kill -9 `pidof hermes`")[0] is True
+    def test_kill_pidof_expansion_not_flagged(self):
+        """`kill $(pidof hermes)` was the BSD/Linux equivalent of the pgrep
+        expansion; now un-guarded with the rest of the self-termination set."""
+        dangerous, _, _ = detect_dangerous_command("kill -TERM $(pidof hermes_cli.main)")
+        assert dangerous is False
+        assert detect_dangerous_command("kill -9 `pidof hermes`")[0] is False
 
     def test_safe_kill_pid_not_flagged(self):
         """A plain 'kill 12345' (literal PID, no expansion) must stay safe."""
@@ -824,12 +827,12 @@ class TestPgrepKillExpansion:
 
 
 class TestLaunchctlGatewayLifecycle:
-    """launchctl stop/kickstart/bootout/unload against the Hermes service
-    label achieves the same effect as `hermes gateway stop|restart` and
-    must require the same approval. See issue #33071.
+    """launchctl against the Hermes label was un-guarded 2026-10-15 (Evan).
+
+    macOS-only counterpart of the removed gateway-lifecycle patterns.
     """
 
-    def test_launchctl_against_hermes_label_detected(self):
+    def test_launchctl_against_hermes_label_not_flagged(self):
         for cmd in (
             "launchctl stop ai.hermes.gateway",
             "launchctl kickstart -k system/ai.hermes.gateway",
@@ -837,7 +840,7 @@ class TestLaunchctlGatewayLifecycle:
             "launchctl unload ~/Library/LaunchAgents/ai.hermes.gateway.plist",
         ):
             dangerous, _, desc = detect_dangerous_command(cmd)
-            assert dangerous is True, cmd
+            assert dangerous is False, cmd
 
     def test_unrelated_labels_not_flagged(self):
         """Read-only inspection, and lifecycle ops on non-Hermes labels, are
