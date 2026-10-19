@@ -60,6 +60,41 @@ class TestParserLimitRecovery:
         _hardline_block_result(_PARSER_LIMIT_DESCRIPTION, "python3 -c 'y'")
         assert not stale.exists()
 
+    def test_size_refusal_names_size_first_and_the_blocked_operation(self, monkeypatch):
+        """A size refusal must name SIZE first and the operation it blocked.
+
+        Regression: the headline claimed "unconditional blocklist" for a
+        payload that was merely too large, sending the operator after a
+        forbidden operation that does not exist.
+        """
+        import tools.approval as ap
+        monkeypatch.setattr(ap, "_save_blocked_payload", lambda c: None)
+        cmd = "hermes kanban comment \"" + ("body " * 900) + "\""
+        r = _hardline_block_result(_PARSER_LIMIT_DESCRIPTION, cmd)
+        msg = r["message"]
+        assert msg.startswith("BLOCKED (parser/size limit)")
+        assert "blocked operation was `hermes kanban comment" in msg
+        assert "SIZE/shape limit" in msg
+        assert "unconditional blocklist" not in msg
+
+    def test_size_check_beats_keyword_match(self):
+        """Size must be reported as the cause even when a keyword is present.
+
+        Otherwise the headline names the keyword as the reason and sends the
+        operator down the wrong path.
+        """
+        import tools.approval as ap
+        cmd = "echo " + "shutdown " * 700
+        assert ap.detect_hardline_command(cmd)[1] == _PARSER_LIMIT_DESCRIPTION
+        assert ap.detect_dangerous_command(cmd)[1] == _PARSER_LIMIT_DESCRIPTION
+
+    def test_real_hardline_keeps_blocklist_headline(self):
+        """No regression: genuine blocklist hits keep the hardline message."""
+        r = _hardline_block_result("recursive delete of root filesystem", "rm -rf /")
+        assert r["message"].startswith("BLOCKED (hardline)")
+        assert "unconditional blocklist" in r["message"]
+        assert "RECOVERY" not in r["message"]
+
 
 class TestBackgroundGuidanceRecipes:
     def test_ampersand_block_names_exact_call_shape(self):

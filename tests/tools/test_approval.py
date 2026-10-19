@@ -210,6 +210,49 @@ class TestDetectSqlPatterns:
         assert desc is None
 
 
+class TestReadOnlyKeywordFalsePositives:
+    """A keyword inside a read-only search operand is DATA, not an operation.
+
+    Regression: grep operand-masking was gated on PCRE, so every ordinary
+    read-only search leaked its quoted operand into the flat DANGEROUS_PATTERNS
+    matcher (which is not _CMDPOS-anchored).
+    """
+
+    def test_grep_sql_operand_not_flagged(self):
+        for cmd in (
+            'grep -n "DELETE FROM" file.py',
+            'grep "DROP TABLE" schema.sql',
+            "grep -e 'DELETE FROM' f.sql",
+        ):
+            is_dangerous, key, desc = detect_dangerous_command(cmd)
+            assert is_dangerous is False, f"{cmd!r} -> {desc}"
+
+    def test_grep_rm_string_operand_not_flagged(self):
+        # A read-only search FOR a dangerous string — the operand is data.
+        # At HEAD this tripped the flat "delete in root path" DANGEROUS pattern.
+        is_dangerous, _, desc = detect_dangerous_command('grep "rm -rf /" notes.md')
+        assert is_dangerous is False, f"read-only grep flagged dangerous: {desc}"
+        # It was never a hardline hit either: the _CMDPOS-anchored rm rule
+        # already ignored the quoted operand.
+        assert detect_hardline_command('grep "rm -rf /" notes.md')[0] is False
+
+    def test_real_sql_executor_still_flagged(self):
+        for cmd in (
+            'psql -c "DELETE FROM users"',
+            'mysql -e "DELETE FROM t"',
+            'sqlite3 db.sqlite "DELETE FROM t"',
+        ):
+            is_dangerous, _, _ = detect_dangerous_command(cmd)
+            assert is_dangerous is True, cmd
+
+    def test_substitution_in_operand_still_flagged(self):
+        # Masking must never hide a substitution that actually executes.
+        for cmd in ('grep "$(rm -rf /)" file', "grep `rm -rf /` file"):
+            is_dangerous, _, _ = detect_dangerous_command(cmd)
+            is_hardline, _ = detect_hardline_command(cmd)
+            assert is_dangerous or is_hardline, cmd
+
+
 class TestSafeCommand:
     def test_ordinary_commands_are_safe(self):
         for cmd in ("echo hello world", "ls -la /tmp", "git status"):

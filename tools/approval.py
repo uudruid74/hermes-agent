@@ -630,8 +630,77 @@ def _save_blocked_payload(command: str) -> Optional[str]:
         return None
 
 
+def _leading_operation(command: str, max_words: int = 3, limit: int = 60) -> str:
+    """Best-effort name of the operation a size-blocked payload was doing.
+
+    Display only — never feeds a decision. A size refusal must name what it
+    actually blocked, otherwise the operator is sent chasing an operation that
+    was never even inspected.
+    """
+    head = (command or "").lstrip()[:200]
+    if not head:
+        return ""
+    tokens = _shell_tokens_with_spans(head, 0) or []
+    words = [v for v, _s, _e, _i in tokens if v and v not in _SHELL_PUNCTUATION]
+    if not words:
+        # Tokenizer bailed on an unterminated quote inside the head — fall back.
+        words = [w for w in head.split() if w not in _SHELL_PUNCTUATION]
+    text = " ".join(words[:max_words]).strip()
+    if len(text) > limit:
+        text = text[:limit].rstrip() + "…"
+    return text
+
+
+def _size_limit_block_result(description: str, command: str) -> dict:
+    """Block result for a payload that exceeded the parser/size limit.
+
+    A size refusal is not a content judgement — the operation was never
+    inspected. Claiming the command is "on the unconditional blocklist"
+    misnames the cause: it is confidently specific and sends the operator
+    looking for a forbidden operation that does not exist. Name the size limit
+    first, then the operation that was actually blocked.
+    """
+    operation = _leading_operation(command)
+    blocked = f"`{operation}`" if operation else "an unparseable inline payload"
+    message = (
+        f"BLOCKED (parser/size limit): {description}. "
+        f"The blocked operation was {blocked}. "
+        "This is a payload SIZE/shape limit, not a blocklist entry — the "
+        "operation itself was never inspected and is not forbidden. Inline "
+        "commands above the parser limit (giant one-liners, very long "
+        "heredocs, separator-free blobs) cannot be tokenized safely, so they "
+        "are refused before execution."
+    )
+    # The parser-limit block is almost always a giant inline payload
+    # (heredoc script, base64 blob, one-line python -c program) — not a
+    # genuinely forbidden operation. 198 occurrences in a 250k-call
+    # production window, typically followed by blind rephrase retries.
+    # Auto-save the payload as a runnable script and point at it; fall
+    # back to the manual write_file recipe when saving fails.
+    saved = _save_blocked_payload(command) if command else None
+    if saved:
+        message += (
+            f" RECOVERY: your command was saved to {saved} — review it, then "
+            f"run: terminal(command=\"bash {saved}\"). Do not retry inline."
+        )
+    else:
+        message += (
+            " RECOVERY: write the script to a file with write_file, then run "
+            "it: terminal(command=\"bash /path/script.sh\") or "
+            "\"python3 /path/script.py\". Do not retry inline."
+        )
+    return {
+        "approved": False,
+        "hardline": True,
+        "message": message,
+    }
+
+
 def _hardline_block_result(description: str, command: str = "") -> dict:
     """Build the standard block result for a hardline match."""
+    # A parser/size refusal is NOT a blocklist entry — see above.
+    if description in (_PARSER_LIMIT_DESCRIPTION, _MALFORMED_EXEC_DESCRIPTION):
+        return _size_limit_block_result(description, command)
     message = (
         f"BLOCKED (hardline): {description}. "
         "This command is on the unconditional blocklist and cannot "
@@ -640,30 +709,6 @@ def _hardline_block_result(description: str, command: str = "") -> dict:
         "need to run it, run it yourself in a terminal outside the "
         "agent."
     )
-    # The parser-limit block is almost always a giant inline payload
-    # (heredoc script, base64 blob, one-line python -c program) — not a
-    # genuinely forbidden operation. 198 occurrences in a 250k-call
-    # production window, typically followed by blind rephrase retries.
-    # Auto-save the payload as a runnable script and point at it; fall
-    # back to the manual write_file recipe when saving fails.
-    if description in (_PARSER_LIMIT_DESCRIPTION, _MALFORMED_EXEC_DESCRIPTION):
-        saved = _save_blocked_payload(command) if command else None
-        if saved:
-            message += (
-                " RECOVERY: this block fires on oversized/unparseable inline "
-                "command payloads (heredocs, giant one-liners), not on the "
-                f"operation itself. Your command was saved to {saved} — "
-                f"review it, then run: terminal(command=\"bash {saved}\"). "
-                "Do not retry inline."
-            )
-        else:
-            message += (
-                " RECOVERY: this block fires on oversized/unparseable inline "
-                "command payloads (heredocs, giant one-liners), not on the "
-                "operation itself. Write the script to a file with write_file, "
-                "then run it: terminal(command=\"bash /path/script.sh\") or "
-                "\"python3 /path/script.py\". Do not retry inline."
-            )
     return {
         "approved": False,
         "hardline": True,
@@ -1402,11 +1447,32 @@ def _quoted_grep_pattern_spans(command: str) -> tuple[list[tuple[int, int]], boo
                 if operand_index is None:
                     return [], bool(pcre)
                 pattern_indexes.append(operand_index)
-            if pcre:
-                for index in pattern_indexes:
-                    _, token_start, token_end, quoted = args[index]
-                    if quoted:
-                        spans.append((segment_at + token_start, segment_at + token_end))
+            # Mask a quoted pattern operand when its text is provably inert:
+            # wholly single-quoted, or double-quoted with no `$(` / backtick
+            # substitution. Such text is search DATA — grep never executes it —
+            # so it must not reach the flat DANGEROUS_PATTERNS matcher, which
+            # is not _CMDPOS-anchored:
+            #   `grep -n "DELETE FROM" file.py`  -> "SQL DELETE without WHERE"
+            #   `grep "rm -rf /" notes.md`       -> "delete in root path"
+            # Both are DANGEROUS_PATTERNS hits (approval prompts), NOT hardline
+            # floor hits — the _CMDPOS-anchored rm rule already ignores a quoted
+            # operand. A plain read-only search was escalated to an approval
+            # prompt it could never pass.
+            #
+            # Previously this was gated on ``pcre`` as well, so only
+            # `grep -P "..."` operands were hidden and every other read-only
+            # search leaked its operand into detection.
+            #
+            # Operands that CAN execute are deliberately NOT masked:
+            # `"$(rm -rf /)"`, `` `rm -rf /` ``, and `rg --pre CMD` keep their
+            # text, and _execution_flag_findings inspects the UNMASKED command
+            # regardless. Masking never widens what can run undetected —
+            # verified by execution on those exact shapes.
+            for index in pattern_indexes:
+                raw, token_start, token_end, inert = args[index]
+                token_raw = segment[token_start:token_end]
+                if inert or ("$(" not in token_raw and "`" not in token_raw):
+                    spans.append((segment_at + token_start, segment_at + token_end))
     return spans, False
 
 
