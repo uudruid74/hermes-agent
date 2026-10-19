@@ -3791,7 +3791,7 @@ def send_dispatcher_message(
         )
     from hermes_cli._subprocess_compat import spawn_detached
 
-    proc = spawn_detached(["hermes", "send", "-u", target, text])
+    proc = spawn_detached(["hermes", "send", "-t", target, text])
     if proc is None:
         return True, (
             f"ask recorded; wake-ping to {target} failed to spawn — the ask "

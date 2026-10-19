@@ -358,7 +358,7 @@ CREATE TABLE IF NOT EXISTS session_notices (
 );
 
 -- Running CLI sessions, keyed by session_id, so a separate
--- ``hermes send -u cli:<session>`` / kanban notification process can look up
+-- ``hermes send -t cli:<session>`` / kanban notification process can look up
 -- the target's OS PID and SIGUSR1 it without sockets. heartbeat is refreshed
 -- every few seconds while the CLI runs; a stale row (heartbeat older than the
 -- sender's timeout) means the session is gone and is cleaned up on lookup.

@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""Agent-to-agent messaging through ``hermes send -u``.
+"""Agent-to-agent messaging through ``hermes send -t`` (the from-user wake).
 
-The agent→platform mapping lives in `hermes send -u`: a bare profile name
+The agent→target mapping lives in `hermes send -t`: a bare profile name
 is expanded to the agent's home channel (see send_cmd.py
 `_resolve_agent_wake_target`). A caller may instead provide a full session id,
 which is routed through the existing ``profile:cli:session_id`` target.
+
+One ``-t`` call does the whole job (Evan's one-call rule): it injects the
+message as a user turn so the target agent wakes, and posts the visible copy
+down the ``-u`` path internally.
 
 Every tell is *mandatorily* echoed, logged, and posted to the target's chat:
 the exact outbound payload is surfaced to the calling session, written to the
@@ -71,22 +75,14 @@ def tell_tool(
     target = f"{agent}:cli:{target_session_id}" if target_session_id else agent
     # Fire-and-forget: the message is echoed + logged above (the mandatory
     # transparency contract), then dispatched detached so the caller's tool
-    # loop never blocks on delivery. A spawn failure (binary missing) is the
-    # only synchronous error we can still observe and report.
-    proc = spawn_detached(["hermes", "send", "-u", target, wrapped])
+    # loop never blocks on delivery. ONE `-t` call does both halves — the
+    # from-user wake into the target and the visible `-u` copy, which
+    # `hermes send -t` sends internally (Evan's one-call rule). A spawn
+    # failure (binary missing) is the only synchronous error we can still
+    # observe and report.
+    proc = spawn_detached(["hermes", "send", "-t", target, wrapped])
     if proc is None:
         return json.dumps({"error": f"failed to launch 'hermes send' for {agent}"})
-    # Visibility is the doctrine, not a flag: the exact outbound payload is
-    # ALWAYS also posted to the target's chat (the DB-only wake above is
-    # invisible there). The profile-qualified target makes `hermes send -t`
-    # deliver with the TARGET profile's credentials and home channel.
-    from hermes_cli.send_cmd import _resolve_agent_wake_target
-
-    visible_proc = spawn_detached(
-        ["hermes", "send", "-t", _resolve_agent_wake_target(agent), wrapped]
-    )
-    if visible_proc is None:
-        return json.dumps({"error": f"failed to launch visible 'hermes send' for {agent}"})
     return json.dumps({"dispatched": True, "note": f"notified {agent}"})
 
 

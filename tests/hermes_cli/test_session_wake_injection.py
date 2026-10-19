@@ -1,6 +1,6 @@
 """Session wake INJECTION coverage — t_8140688e.
 
-The enqueue-only bug: ``hermes send -u cli:<session>`` and kanban
+The enqueue-only bug: ``hermes send -t cli:<session>`` and kanban
 notifications queued a ``session_notices`` row and reported success, but
 nothing ever delivered it as a turn — the worker only saw the message by
 reading the queue over SQL by hand. These tests assert the delivery chain

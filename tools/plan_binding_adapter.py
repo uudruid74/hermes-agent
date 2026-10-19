@@ -505,7 +505,7 @@ def _create_plan(
         # in the durable task row, not in this synchronous call.
         from hermes_cli._subprocess_compat import spawn_detached
 
-        spawn_detached(["hermes", "send", "-u", assigned, wrapped])
+        spawn_detached(["hermes", "send", "-t", assigned, wrapped])
         # No binding activation on our side — surface the dispatch notice.
         # Evan's exact spec (2026-09-22): the creator sees ONLY the notify line.
         return f"{assigned} has been notified of task {task_id}"
@@ -629,7 +629,7 @@ def _dispatcher_for_task(conn, task_id: str) -> Optional[str]:
 def _send_user(profile: str, message: str) -> Optional[str]:
     from hermes_cli._subprocess_compat import spawn_detached
 
-    proc = spawn_detached(["hermes", "send", "-u", profile, message])
+    proc = spawn_detached(["hermes", "send", "-t", profile, message])
     if proc is None:
         # Spawn failure (binary missing, permission) — surfaced, not buried.
         return f"failed to launch 'hermes send' for {profile}"
@@ -1691,7 +1691,7 @@ def cmd_approve(agent, task_id: str) -> str:
     # in the durable task row, not in this synchronous call.
     from hermes_cli._subprocess_compat import spawn_detached
 
-    spawn_detached(["hermes", "send", "-u", assigned, wrapped])
+    spawn_detached(["hermes", "send", "-t", assigned, wrapped])
     # No binding activation on our side — surface the dispatch notice.
     # Evan's exact spec (2026-09-22): the creator sees ONLY the notify line.
     return f"{assigned} has been notified of task {task_id}"

@@ -507,7 +507,10 @@ def _handle_send(args):
             chat_id = _resolved
 
     # ========================================================================
-    # EVAN-LOCKED: `hermes send -u` IS A USER -> AGENT INJECTION PATH.
+    # EVAN-LOCKED (flag semantics corrected per Evan's 2026-10-18 spec — this
+    # injection path belongs to `hermes send -t/--user`; `-u/--to` is plain
+    # system→user delivery and never injects):
+    # `hermes send -t/--user` IS A USER -> AGENT INJECTION PATH.
     #
     # DO NOT CHANGE THIS TO PLATFORM DELIVERY. DO NOT FALL THROUGH TO
     # `_send_to_platform`. DO NOT REMOVE THE BRIDGE SOCKET FALLBACK. The CLI

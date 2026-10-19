@@ -3,7 +3,7 @@
 kanban_request_review / kanban_request_changes (worker tools) and the
 `kanban reopen-review` CLI verb all inherit ONE base:
 kanban_db.send_dispatcher_message — durable event first, then the
-best-effort `hermes send -u` wake. No status/step mutation.
+best-effort `hermes send -t` wake. No status/step mutation.
 """
 
 from __future__ import annotations

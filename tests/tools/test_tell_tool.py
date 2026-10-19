@@ -25,10 +25,6 @@ def test_tell_wraps_message_and_targets_agent_profile(monkeypatch):
         return _spawned()
 
     monkeypatch.setattr(tell_tool, "spawn_detached", fake_spawn)
-    monkeypatch.setattr(
-        "hermes_cli.send_cmd._resolve_agent_wake_target",
-        lambda agent: f"{agent}:telegram:5550001111",
-    )
 
     result = json.loads(
         tell_tool.tell_tool(
@@ -45,9 +41,10 @@ def test_tell_wraps_message_and_targets_agent_profile(monkeypatch):
         "---\n"
         "If a reply is required, use 'tell' with agent='zephyr'."
     )
+    # ONE `-t` call: the from-user wake; `hermes send -t` sends the visible
+    # `-u` copy internally (Evan's one-call rule — no second spawn here).
     assert calls == [
-        ["hermes", "send", "-u", "gopher", wrapped],
-        ["hermes", "send", "-t", "gopher:telegram:5550001111", wrapped],
+        ["hermes", "send", "-t", "gopher", wrapped],
     ]
     assert echoes == ["gopher: Check the relay."]
     assert result == {"dispatched": True, "note": "notified gopher"}
@@ -75,7 +72,7 @@ def test_tell_routes_to_explicit_session_but_reply_names_only_sender(monkeypatch
     assert command[:4] == [
         "hermes",
         "send",
-        "-u",
+        "-t",
         "neo:cli:cron_daily_20260922_120000",
     ]
     assert "agent='zephyr'" in command[-1]
@@ -85,7 +82,7 @@ def test_tell_routes_to_explicit_session_but_reply_names_only_sender(monkeypatch
 def test_tell_reply_reaches_explicit_session_via_send_cli(monkeypatch, tmp_path):
     import argparse
 
-    from hermes_cli import profiles, send_cmd
+    from hermes_cli import _subprocess_compat, profiles, send_cmd
     from hermes_state import SessionDB
 
     target_home = tmp_path / "neo"
@@ -105,12 +102,11 @@ def test_tell_reply_reaches_explicit_session_via_send_cli(monkeypatch, tmp_path)
         lambda agent: f"{agent}:telegram:5550001111:7" if ":" not in agent else agent,
     )
     calls = []
+    copies = []
 
     def run_send_cli(command, **_kwargs):
         calls.append(command)
-        if command[2] == "-t":
-            # Visible copy: shape-checked only — no platform send in tests.
-            return _spawned()
+        # The ONE `-t` call runs the wake through the real cmd_send.
         args = argparse.Namespace(
             to=None,
             user=command[3],
@@ -126,7 +122,14 @@ def test_tell_reply_reaches_explicit_session_via_send_cli(monkeypatch, tmp_path)
         assert exc.value.code == 0
         return _spawned()
 
+    def fake_copy_spawn(command, **_kwargs):
+        # The visible copy is the nested `hermes send -u` sent by the
+        # one-call rule inside `hermes send -t`.
+        copies.append(command)
+        return _spawned()
+
     monkeypatch.setattr(tell_tool, "spawn_detached", run_send_cli)
+    monkeypatch.setattr(_subprocess_compat, "spawn_detached", fake_copy_spawn)
 
     result = json.loads(
         tell_tool.tell_tool(
@@ -147,9 +150,12 @@ def test_tell_reply_reaches_explicit_session_via_send_cli(monkeypatch, tmp_path)
     assert "Round trip reply." in notices[0]["text"]
     assert "agent='zephyr'" in notices[0]["text"]
     assert "session_id=" not in notices[0]["text"]
-    # The visible copy posts the same payload to the target's home channel.
-    assert calls[1][:4] == ["hermes", "send", "-t", "neo:telegram:5550001111:7"]
-    assert calls[1][-1] == calls[0][-1]
+    # One `-t` call produced both halves: the session wake above and the
+    # visible copy, which `hermes send -t` posts down the `-u` path.
+    assert len(calls) == 1
+    assert len(copies) == 1
+    assert copies[0][:4] == ["hermes", "send", "-u", "neo:telegram:5550001111:7"]
+    assert copies[0][-1] == calls[0][-1]
 
 
 def test_tell_does_not_fall_back_to_superseded_identity_vars(monkeypatch):
@@ -198,7 +204,7 @@ def test_tell_echoes_exact_message_to_origin_before_send(monkeypatch):
         echo_callback=capture_echo,
     )
 
-    assert events == ["echo", "send", "send"]
+    assert events == ["echo", "send"]
     assert echoes == ["gopher: line one\n[REDACTED must remain literal]\nline three"]
 
 
@@ -332,7 +338,7 @@ def test_agent_runtime_reply_instruction_names_only_sender(monkeypatch):
     assert sent[0][:4] == [
         "hermes",
         "send",
-        "-u",
+        "-t",
         "zephyr:cli:20260922_121500_receiver",
     ]
     assert "agent='neo'" in sent[0][-1]
@@ -416,7 +422,7 @@ def test_tell_own_session_id_anchors_reply_to_origin(monkeypatch):
 
     # Own session id => anchored delivery to the agent's wake target (no
     # dead-pointer cli: target) with the reply routed into the origin session.
-    assert calls[0][:4] == ["hermes", "send", "-u", "zephyr"]
+    assert calls[0][:4] == ["hermes", "send", "-t", "zephyr"]
     assert (
         "agent='gopher' and session_id='cron_journal_20261017_090000'"
         in calls[0][-1]
@@ -442,7 +448,7 @@ def test_tell_own_session_id_from_env_anchors_reply(monkeypatch):
         echo_callback=lambda _message: None,
     )
 
-    assert calls[0][:4] == ["hermes", "send", "-u", "zephyr"]
+    assert calls[0][:4] == ["hermes", "send", "-t", "zephyr"]
     assert "session_id='cron_journal_20261017_090000'" in calls[0][-1]
 
 
@@ -466,7 +472,7 @@ def test_tell_foreign_session_id_still_targets_directly(monkeypatch):
     )
 
     assert calls[0][:4] == [
-        "hermes", "send", "-u", "zephyr:cli:20261017_121500_receiver",
+        "hermes", "send", "-t", "zephyr:cli:20261017_121500_receiver",
     ]
     assert "session_id=" not in calls[0][-1]
 
@@ -485,10 +491,6 @@ def test_tell_posts_target_chat_by_default(monkeypatch):
         return _spawned()
 
     monkeypatch.setattr(tell_tool, "spawn_detached", fake_spawn)
-    monkeypatch.setattr(
-        "hermes_cli.send_cmd._resolve_agent_wake_target",
-        lambda agent: f"{agent}:telegram:5550001111:7",
-    )
 
     result = json.loads(
         tell_tool.tell_tool(
@@ -498,20 +500,24 @@ def test_tell_posts_target_chat_by_default(monkeypatch):
         )
     )
 
-    assert calls[0][:4] == ["hermes", "send", "-u", "zephyr"]
-    assert calls[1][:4] == ["hermes", "send", "-t", "zephyr:telegram:5550001111:7"]
-    assert calls[1][-1] == calls[0][-1]
+    # One `-t` call carries the wake; `hermes send -t` posts the visible copy
+    # to the target's chat down the `-u` path internally (one-call rule).
+    assert len(calls) == 1
+    assert calls[0][:4] == ["hermes", "send", "-t", "zephyr"]
+    assert "Visible please." in calls[0][-1]
     assert result == {"dispatched": True, "note": "notified zephyr"}
 
 
-def test_tell_visible_spawn_failure_reports_error(monkeypatch):
+def test_tell_makes_one_send_call_not_two(monkeypatch):
+    """Acceptance (t_2c13a080): tell wakes via -t and gets the visible copy
+    from the same call — there is no separate -u spawn from tell."""
     monkeypatch.setenv("USERNAME", "gopher")
     monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
     calls = []
 
     def fake_spawn(command, **_kwargs):
         calls.append(command)
-        return _spawned() if command[2] == "-u" else None
+        return _spawned()
 
     monkeypatch.setattr(tell_tool, "spawn_detached", fake_spawn)
     monkeypatch.setattr(
@@ -519,12 +525,11 @@ def test_tell_visible_spawn_failure_reports_error(monkeypatch):
         lambda agent: f"{agent}:telegram:5550001111:7",
     )
 
-    result = json.loads(
-        tell_tool.tell_tool(
-            agent="zephyr",
-            message="Half-delivered.",
-            echo_callback=lambda _message: None,
-        )
+    tell_tool.tell_tool(
+        agent="zephyr",
+        message="Only one call.",
+        echo_callback=lambda _message: None,
     )
 
-    assert result == {"error": "failed to launch visible 'hermes send' for zephyr"}
+    assert len(calls) == 1
+    assert calls[0][:3] == ["hermes", "send", "-t"]

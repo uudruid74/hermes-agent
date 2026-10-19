@@ -6428,7 +6428,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 pending.put(text)
 
     def _install_wake_signal_handler(self) -> None:
-        """SIGUSR1 = remote wake (``hermes send -u cli:<session>`` / kanban).
+        """SIGUSR1 = remote wake (``hermes send -t cli:<session>`` / kanban).
 
         The handler must stay I/O-free (never open SQLite from a signal
         handler), so it only sets a flag; the wake-service thread drains the
@@ -6455,7 +6455,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         """Register this CLI session in ``cli_wakes`` and start the wake service.
 
         The service keeps the registration's heartbeat fresh so a separate
-        ``hermes send -u cli:<session_id>`` (or kanban notification) can find
+        ``hermes send -t cli:<session_id>`` (or kanban notification) can find
         this PID and SIGUSR1 it, and it drains ``session_notices`` into real
         user turns on wake — or every few seconds as a missed-signal backstop.
         Started by both the interactive loop and the single-query path: kanban
@@ -17852,7 +17852,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         process_thread.start()
 
         # Register in cli_wakes + start the wake service so a separate
-        # ``hermes send -u cli:<session_id>`` / kanban notification can find
+        # ``hermes send -t cli:<session_id>`` / kanban notification can find
         # this PID and deliver its message as a real user turn (t_8140688e).
         self._start_cli_wake_service()
 

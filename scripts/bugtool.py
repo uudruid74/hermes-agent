@@ -796,7 +796,7 @@ def escalate(path: Path, text: str) -> None:
     summaries = re.findall(r"^### Failure Report \(task (t_[A-Za-z0-9]+)\)\n\n(.+?)(?=^### |\Z)", text, flags=re.MULTILINE | re.DOTALL)
     details = "; ".join(f"{task}: {summary.strip().splitlines()[0]}" for task, summary in summaries)
     message = f"Bug auto-dispatch stopped after 4 failures: {path}. {details}"
-    result = subprocess.run([HERMES, "send", "-t", "evan", message], text=True, capture_output=True, check=False)
+    result = subprocess.run([HERMES, "send", "-u", "evan", message], text=True, capture_output=True, check=False)
     if result.returncode:
         print(f"escalation command failed: {(result.stderr or result.stdout).strip()}", file=sys.stderr)
     else:

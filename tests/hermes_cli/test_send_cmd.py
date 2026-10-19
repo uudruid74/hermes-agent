@@ -213,10 +213,12 @@ def test_list_shows_profile_session_key_routable_target_and_bridge(
     assert "/tmp/hermes/mcp_bridge.zephyr.sock" in out
 
 
-def test_profile_qualified_user_target_selects_profile_before_send(
+def test_profile_qualified_wake_target_selects_profile_before_send(
     fake_tool, monkeypatch
 ):
     import hermes_cli.profiles
+
+    from hermes_cli import _subprocess_compat
 
     profile_home = "/home/user/.hermes/profiles/zephyr"
     monkeypatch.setattr(send_cmd, "_load_hermes_env", lambda: None)
@@ -225,18 +227,27 @@ def test_profile_qualified_user_target_selects_profile_before_send(
     monkeypatch.setenv("HERMES_HOME", "/home/user/.hermes/profiles/neo")
     monkeypatch.setenv("HERMES_PROFILE", "neo")
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    copies = []
+    monkeypatch.setattr(
+        _subprocess_compat,
+        "spawn_detached",
+        lambda argv, **_kw: copies.append(list(argv)) or object(),
+    )
 
-    args = _parse(["-u", "zephyr:telegram:123", "wake"])
+    args = _parse(["-t", "zephyr:telegram:123", "wake"])
     with pytest.raises(SystemExit) as exc:
         send_cmd.cmd_send(args)
 
     assert exc.value.code == 0
+    # The wake is a user-turn injection (internal=True) ...
     assert fake_tool.calls == [{
         "action": "send",
         "message": "wake",
         "target": "telegram:123",
         "internal": True,
     }]
+    # ... and ONE `-t` call also produced the visible copy down the `-u` path.
+    assert copies == [["hermes", "send", "-u", "zephyr:telegram:123", "wake"]]
     assert __import__("os").environ["HERMES_HOME"] == profile_home
     assert __import__("os").environ["HERMES_PROFILE"] == "zephyr"
 
@@ -387,11 +398,13 @@ def test_profile_qualified_to_target_selects_profile_before_send(
     monkeypatch.setenv("HERMES_PROFILE", "neo")
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)
 
-    args = _parse(["-t", "zephyr:telegram:5550001111:7", "visible message"])
+    args = _parse(["-u", "zephyr:telegram:5550001111:7", "visible message"])
     with pytest.raises(SystemExit) as exc:
         send_cmd.cmd_send(args)
 
     assert exc.value.code == 0
+    # Plain system→user delivery: one send, no user-turn injection, and no
+    # copy machinery (that belongs to `-t` wakes).
     assert fake_tool.calls == [{
         "action": "send",
         "message": "visible message",
@@ -399,5 +412,120 @@ def test_profile_qualified_to_target_selects_profile_before_send(
     }]
     assert os.environ["HERMES_HOME"] == str(profile_home)
     assert os.environ["HERMES_PROFILE"] == "zephyr"
+
+
+# ---------------------------------------------------------------------------
+# -u/-t semantics (Evan spec, t_2c13a080): -u = stock system→user delivery,
+# -t = from-user wake + the mandatory visible -u copy (one-call rule).
+# ---------------------------------------------------------------------------
+
+def test_flag_semantics_u_is_delivery_t_is_wake():
+    u_args = _parse(["-u", "telegram:123", "hi"])
+    assert u_args.to == "telegram:123"
+    assert u_args.user is None
+    t_args = _parse(["-t", "gopher", "hi"])
+    assert t_args.user == "gopher"
+    assert t_args.to is None
+
+
+def test_u_delivers_as_system_to_user_send(fake_tool, monkeypatch):
+    """`-u` is a plain system→user delivery: never internal=True, never a
+    wake, and no copy machinery."""
+    from hermes_cli import _subprocess_compat
+
+    monkeypatch.setattr(send_cmd, "_load_hermes_env", lambda: None)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    copies = []
+    monkeypatch.setattr(
+        _subprocess_compat,
+        "spawn_detached",
+        lambda argv, **_kw: copies.append(list(argv)) or object(),
+    )
+
+    args = _parse(["-u", "telegram:123", "status report"])
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(args)
+
+    assert exc.value.code == 0
+    assert fake_tool.calls == [{
+        "action": "send",
+        "message": "status report",
+        "target": "telegram:123",
+    }]
+    assert copies == []
+
+
+def test_t_wake_is_injected_as_user_turn(fake_tool, monkeypatch):
+    """`-t` wakes as if from the user: the send carries internal=True."""
+    import hermes_cli.profiles
+
+    from hermes_cli import _subprocess_compat
+
+    monkeypatch.setattr(send_cmd, "_load_hermes_env", lambda: None)
+    monkeypatch.setattr(hermes_cli.profiles, "profile_exists", lambda name: False)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr(
+        _subprocess_compat, "spawn_detached", lambda argv, **_kw: object()
+    )
+
+    args = _parse(["-t", "zephyr:telegram:123", "wake up"])
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(args)
+
+    assert exc.value.code == 0
+    assert fake_tool.calls == [{
+        "action": "send",
+        "message": "wake up",
+        "target": "zephyr:telegram:123",
+        "internal": True,
+    }]
+
+
+def test_t_copy_spawn_failure_reports_copy_error(fake_tool, monkeypatch, capsys):
+    """A failed mandatory copy is reported alongside the wake, never buried."""
+    import hermes_cli.profiles
+
+    from hermes_cli import _subprocess_compat
+
+    monkeypatch.setattr(send_cmd, "_load_hermes_env", lambda: None)
+    monkeypatch.setattr(hermes_cli.profiles, "profile_exists", lambda name: False)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr(_subprocess_compat, "spawn_detached", lambda argv, **_kw: None)
+
+    args = _parse(["--json", "-t", "zephyr:telegram:123", "wake up"])
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(args)
+
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    assert '"success"' in out
+    assert "copy_error" in out
+    assert "hermes send -u" in out
+
+
+def test_wake_copy_target_routes_each_shape(monkeypatch):
+    import hermes_cli.profiles
+
+    monkeypatch.setattr(
+        send_cmd, "_resolve_agent_wake_target", lambda a: f"{a}:telegram:5551"
+    )
+    monkeypatch.setattr(
+        hermes_cli.profiles, "profile_exists", lambda name: name == "neo"
+    )
+    monkeypatch.setattr(
+        hermes_cli.profiles, "get_active_profile_name", lambda: "neo"
+    )
+
+    # cli session wake in another profile → that profile's home channel.
+    assert send_cmd._wake_copy_target("zephyr:cli:sess-1") == "zephyr:telegram:5551"
+    # bare cli wake in the current profile → its home channel.
+    assert send_cmd._wake_copy_target("cli:sess-1") == "neo:telegram:5551"
+    # bare profile wake → its expanded home-channel wake target.
+    assert send_cmd._wake_copy_target("zephyr") == "zephyr:telegram:5551"
+    # unresolvable current profile → no copy target (reported, not buried).
+    monkeypatch.setattr(
+        hermes_cli.profiles, "get_active_profile_name", lambda: "custom"
+    )
+    assert send_cmd._wake_copy_target("cli:sess-1") is None
 
 

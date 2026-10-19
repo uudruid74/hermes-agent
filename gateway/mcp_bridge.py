@@ -224,7 +224,7 @@ async def _handle_inject(runner, cmd: dict, writer: asyncio.StreamWriter) -> Non
     Used by external processes (e.g. ``hermes send`` CLI) to route messages
     through the gateway's session manager when the in-process adapter is
     unavailable.  Without ``user_context`` the message arrives as an
-    ``internal=True`` wake event.  With ``user_context`` (``hermes send -u``)
+    ``internal=True`` wake event.  With ``user_context`` (``hermes send -t``)
     it arrives as a simulated user message with full user identity.
     """
     platform_name = cmd.get("platform", "")

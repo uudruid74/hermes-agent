@@ -111,7 +111,7 @@ def test_advance_records_one_summary_holds_step_and_notifies_dispatcher(monkeypa
         "[plan-step-summary:1] Inspected parser and documented the failure"
     ]
     assert len(sent) == 1
-    assert sent[0][:4] == ["hermes", "send", "-u", "neo"]
+    assert sent[0][:4] == ["hermes", "send", "-t", "neo"]
     notice = sent[0][4]
     assert f"ornith has completed step 1, task id {task_id}" in notice
     assert "Goal: Ship verified work" in notice
@@ -145,7 +145,7 @@ def test_repeat_advance_while_pending_renotifies_without_mutation(monkeypatch):
     assert "wait for verification" in result.lower()
     assert "ERROR" not in result
     assert len(sent) == 2, "the repeat must re-send the review request"
-    assert sent[1][:4] == ["hermes", "send", "-u", "neo"]
+    assert sent[1][:4] == ["hermes", "send", "-t", "neo"]
     assert sent[1][4] == sent[0][4], "the re-notify is the same review request"
     assert conn.execute(
         "SELECT COUNT(*) FROM task_events WHERE task_id=? "
@@ -180,7 +180,7 @@ def test_approved_review_advances_and_notifies_worker(monkeypatch):
     assert result == f"Task {task_id} Step 1 approved. Worker notified."
     assert _stepno(conn, task_id) == 2
     assert len(sent) == 1
-    assert sent[0][:4] == ["hermes", "send", "-u", "ornith"]
+    assert sent[0][:4] == ["hermes", "send", "-t", "ornith"]
     message = sent[0][4]
     assert f"Task {task_id} Step 1 Approved by neo. Now complete Step 2" in message
     assert "Goal: Ship verified work" in message
@@ -210,7 +210,7 @@ def test_yolo_review_persists_and_auto_approves_later_steps(monkeypatch):
         "SELECT plan_auto_approve FROM tasks WHERE id=?", (task_id,)
     ).fetchone()[0] == 1
     assert len(sent) == 1
-    assert sent[0][:4] == ["hermes", "send", "-u", "ornith"]
+    assert sent[0][:4] == ["hermes", "send", "-t", "ornith"]
 
     sent.clear()
     advanced = plan.plan(
@@ -221,7 +221,7 @@ def test_yolo_review_persists_and_auto_approves_later_steps(monkeypatch):
     assert _stepno(conn, task_id) == 3
     assert bindings.pending_step_review(conn, task_id) is None
     assert len(sent) == 1
-    assert sent[0][:4] == ["hermes", "send", "-u", "neo"]
+    assert sent[0][:4] == ["hermes", "send", "-t", "neo"]
     notice = sent[0][4]
     assert "ornith has completed step 2" in notice
     assert "YOLO auto-approved this step" in notice
@@ -239,7 +239,7 @@ def test_yolo_review_persists_and_auto_approves_later_steps(monkeypatch):
     assert bindings.pending_step_review(conn, task_id) is None
     assert conn.execute("SELECT COUNT(*) FROM execution_bindings").fetchone()[0] == 0
     assert len(sent) == 1
-    assert sent[0][:4] == ["hermes", "send", "-u", "neo"]
+    assert sent[0][:4] == ["hermes", "send", "-t", "neo"]
     assert "YOLO auto-approved this step" in sent[0][4]
 
     kinds = [

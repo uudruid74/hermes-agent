@@ -6683,7 +6683,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         ``None`` means either the session has no registered CLI (e.g. a
         gateway session) or its heartbeat is stale (the CLI exited). This keeps
-        ``hermes send -u cli:<session>`` from signaling a gone process.
+        ``hermes send -t cli:<session>`` from signaling a gone process.
         """
         ts = now if now is not None else time.time()
 

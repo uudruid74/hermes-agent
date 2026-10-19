@@ -146,17 +146,18 @@ def _profile_home_channel_target(profile: str) -> str:
 
 
 def _resolve_agent_wake_target(user_flag: str) -> str:
-    """Expand a bare profile name passed to ``-u`` into a profile-qualified
+    """Expand a bare profile name passed to ``-t`` into a profile-qualified
     wake target (agent wake).
 
-    ``hermes send -u gopher "msg"`` is an AGENT WAKE — it resolves gopher →
+    ``hermes send -t gopher "msg"`` is an AGENT WAKE — it resolves gopher →
     ``gopher:<platform>:<home channel>`` and routes through that profile's
     gateway bridge exactly like the old ``tell`` tool did. The home channel
     comes from the profile's own config.yaml (see
     ``_profile_home_channel_target``). Full targets (with colons) and
     platform names (``telegram``, ``discord``…) pass through untouched, so
-    existing ``-u telegram`` / ``-u cli:session_id`` semantics are
-    preserved. Profile names never collide with platform names.
+    existing wake-target shapes are preserved. Profile names never collide
+    with platform names. The same expansion also names the delivery target
+    for the mandatory ``-u`` copy of a wake (see ``_wake_copy_target``).
     """
     clean = user_flag.strip()
     if ":" in clean:
@@ -166,6 +167,30 @@ def _resolve_agent_wake_target(user_flag: str) -> str:
     if profile_exists(clean):
         return f"{clean}:{_profile_home_channel_target(clean)}"
     return clean
+
+
+def _wake_copy_target(wake_target: str) -> Optional[str]:
+    """Delivery target for the mandatory ``-u`` copy of a ``-t`` wake.
+
+    The copy must land in a HUMAN-VISIBLE chat under the same profile's
+    credentials (the visibility doctrine: no secret agent-to-agent traffic).
+    A ``cli:`` session wake has no chat of its own, so its copy goes to the
+    owning profile's home channel; every other wake already names its chat
+    and the copy posts to the same one. ``_resolve_agent_wake_target`` is
+    the single source of truth for every shape (it profile-qualifies the
+    target so the spawned ``hermes send -u`` delivers with the target
+    profile's credentials). ``None`` means no resolvable home channel
+    exists — the caller must report that, not bury it.
+    """
+    clean = wake_target.strip()
+    if clean.lower().startswith("cli:"):
+        from hermes_cli.profiles import get_active_profile_name, profile_exists
+
+        active = get_active_profile_name()
+        return _resolve_agent_wake_target(active) if profile_exists(active) else None
+    if ":cli:" in clean.lower():
+        return _resolve_agent_wake_target(clean.split(":", 1)[0])
+    return _resolve_agent_wake_target(clean)
 
 
 def _list_profile_sessions() -> list[dict]:
@@ -218,6 +243,19 @@ def _list_profile_sessions() -> list[dict]:
                 "platform": platform,
             })
     return targets
+
+
+def _with_copy_error(result_json: str, copy_error: Optional[str]) -> str:
+    """Surface a failed mandatory ``-u`` copy inside the wake's result payload.
+
+    The wake result stays the primary outcome; the copy is doctrine, so its
+    failure is reported alongside rather than replacing or hiding the wake.
+    """
+    if not copy_error:
+        return result_json
+    payload = json.loads(result_json) if result_json else {}
+    payload["copy_error"] = copy_error
+    return json.dumps(payload)
 
 
 def _emit_result(
@@ -338,7 +376,7 @@ def _list_targets(platform_filter: Optional[str], *, json_mode: bool) -> int:
             print()
 
     if sessions:
-        print("Agent sessions (-u):")
+        print("Agent sessions (-t):")
         for session in sessions:
             print(f"  {session['target']} — {session['display_name']}")
             print(f"    session: {session['session_key']}")
@@ -435,7 +473,7 @@ def _load_hermes_env() -> None:
         os.environ[key] = str(val)
 
     # Step 3: derive session identity from TELEGRAM_ALLOWED_USERS so that
-    # ``hermes send -u`` carries the real user identity even when called from
+    # ``hermes send -t`` carries the real user identity even when called from
     # a subprocess (kanban hook, cron job) that lacks HERMES_SESSION_* env vars.
     # Without this, _handle_send falls back to user_id="cli" and the auth gate
     # in _is_user_authorized() drops the message.
@@ -450,13 +488,14 @@ def cmd_send(args: argparse.Namespace) -> None:
     """Entry point wired into the top-level argparse dispatcher."""
 
     target = _resolve_target(getattr(args, "to", None))
-    user_flag = _resolve_target(getattr(args, "user", None))
+    wake_raw = _resolve_target(getattr(args, "user", None))
+    user_flag = wake_raw
     if user_flag:
         user_flag = _resolve_agent_wake_target(user_flag)
         user_flag = _select_user_target_profile(user_flag)
     elif target:
-        # Profile-qualified `-t` targets (`zephyr:telegram:chat`) deliver
-        # through the TARGET profile's credentials/home, same as `-u`.
+        # Profile-qualified `-u` targets (`zephyr:telegram:chat`) deliver
+        # through the TARGET profile's credentials/home, same as `-t`.
         target = _select_user_target_profile(target)
 
     # Bridge ~/.hermes/.env and ~/.hermes/config.yaml into os.environ so the
@@ -474,14 +513,14 @@ def cmd_send(args: argparse.Namespace) -> None:
 
     if not target and not user_flag:
         print(
-            "hermes send: -t/--to PLATFORM[:channel[:thread]] or "
-            "-u/--user PLATFORM[:channel[:thread]] is required\n"
+            "hermes send: -u/--to PLATFORM[:channel[:thread]] (system→user "
+            "delivery) or -t/--user <wake-target> (from-user wake) is required\n"
             "Examples:\n"
-            "  hermes send -t telegram \"hello\"\n"
-            "  hermes send -t discord:#ops --file report.md\n"
-            "  hermes send -u telegram \"agent wake event\"\n"
-            "  hermes send -u telegram:-1001234567890:17585 \"cmd\"\n"
-            "  hermes send -u cli:session_id \"wake the agent with this\"\n"
+            "  hermes send -u telegram \"hello\"\n"
+            "  hermes send -u discord:#ops --file report.md\n"
+            "  hermes send -t gopher \"agent wake event\"\n"
+            "  hermes send -t telegram:-1001234567890:17585 \"cmd\"\n"
+            "  hermes send -t cli:session_id \"wake the agent with this\"\n"
             "  hermes send --list      # list available targets",
             file=sys.stderr,
         )
@@ -504,6 +543,33 @@ def cmd_send(args: argparse.Namespace) -> None:
     subject = getattr(args, "subject", None)
     if subject:
         message = f"{subject}\n\n{message.lstrip()}"
+
+    # One-call rule (Evan spec 2026-10-18): a `-t` wake ALWAYS also sends the
+    # visible copy down the `-u` path — callers make ONE call and get both the
+    # wake and the human-readable post. The copy is spawned FIRST so an
+    # interrupted process can never leave a wake with no visible trace.
+    copy_error = None
+    if wake_raw:
+        try:
+            copy_target = _wake_copy_target(wake_raw)
+        except ValueError as exc:
+            copy_target = None
+            copy_error = f"no visible copy target resolves for wake {wake_raw!r}: {exc}"
+        if copy_target is None:
+            copy_error = copy_error or f"no visible copy target resolves for wake {wake_raw!r}"
+        else:
+            from hermes_cli._subprocess_compat import spawn_detached
+
+            copy_proc = spawn_detached(
+                ["hermes", "send", "-u", copy_target, message]
+            )
+            if copy_proc is None:
+                copy_error = (
+                    "failed to launch visible copy 'hermes send -u' for "
+                    f"{copy_target}"
+                )
+        if copy_error:
+            print(f"hermes send: {copy_error}", file=sys.stderr)
 
     # Import lazily so `hermes send --help` stays fast and does not pull in
     # the full tool registry / gateway config stack.
@@ -556,7 +622,7 @@ def cmd_send(args: argparse.Namespace) -> None:
                 "pid": pid,
             })
         sys.exit(_emit_result(
-            result,
+            _with_copy_error(result, copy_error),
             json_mode=getattr(args, "json", False),
             quiet=getattr(args, "quiet", False),
         ))
@@ -568,12 +634,16 @@ def cmd_send(args: argparse.Namespace) -> None:
     # Signal/SMS/WhatsApp; live-adapter path for plugin platforms).
     #
     # ========================================================================
-    # EVAN-LOCKED: `hermes send -u` MUST CREATE AN INBOUND USER TURN.
+    # EVAN-LOCKED (flag semantics corrected per Evan's 2026-10-18 spec — the
+    # t_9550c744 close that pinned this injection path to `-u` shipped the
+    # INVERTED flags and is void; see outbox/tell-u-t-semantics-inversion):
+    # `hermes send -t/--user` MUST CREATE AN INBOUND USER TURN (the wake).
     #
     # It is NOT an outbound send. It must retain the user's identity and route
     # through the gateway bridge when this CLI process has no local adapter.
-    # Do not alter this path, add a platform-delivery fallback, or reinterpret
-    # `internal=True` without Evan's explicit prior approval. See t_9550c744.
+    # `-u/--to` is plain system→user delivery and never injects. Do not alter
+    # this path, add a platform-delivery fallback, or reinterpret
+    # `internal=True` without Evan's explicit prior approval.
     # ========================================================================
     tool_args: dict = {
         "action": "send",
@@ -585,7 +655,7 @@ def cmd_send(args: argparse.Namespace) -> None:
     else:
         tool_args["target"] = target
 
-    result = send_message_tool(tool_args)
+    result = _with_copy_error(send_message_tool(tool_args), copy_error)
     exit_code = _emit_result(
         result,
         json_mode=getattr(args, "json", False),
@@ -613,14 +683,14 @@ def register_send_subparser(subparsers) -> argparse.ArgumentParser:
         ),
         epilog=(
             "Examples:\n"
-            "  hermes send -t telegram \"deploy finished\"\n"
-            "  echo \"RAM 92%\" | hermes send -t telegram:-1001234567890\n"
-            "  hermes send -t discord:#ops --file /tmp/report.md\n"
-            "  hermes send -t slack:#eng --subject \"[CI]\" --file build.log\n"
-            "  hermes send -t telegram \"MEDIA:/tmp/chart.png\"   # send a media attachment\n"
-            "  hermes send -u telegram \"agent wake event\"      # deliver as agent wake\n"
-            "  hermes send -u gopher \"hello\"                   # wake agent profile by name\n"
-            "  hermes send -u telegram:-1001234567890:17585 \"cmd\"\n"
+            "  hermes send -u telegram \"deploy finished\"\n"
+            "  echo \"RAM 92%\" | hermes send -u telegram:-1001234567890\n"
+            "  hermes send -u discord:#ops --file /tmp/report.md\n"
+            "  hermes send -u slack:#eng --subject \"[CI]\" --file build.log\n"
+            "  hermes send -u telegram \"MEDIA:/tmp/chart.png\"   # send a media attachment\n"
+            "  hermes send -t gopher \"hello\"                   # wake agent profile by name\n"
+            "  hermes send -t cli:session_id \"wake the agent with this\"\n"
+            "  hermes send -t telegram:-1001234567890:17585 \"wake\"\n"
             "  hermes send --list                  # all platforms\n"
             "  hermes send --list telegram         # filter by platform\n"
             "\n"
@@ -629,17 +699,20 @@ def register_send_subparser(subparsers) -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
-    # -t and -u are mutually exclusive — you deliver to a platform OR route
-    # as a user→agent wake event.
+    # -u and -t are mutually exclusive — plain system→user delivery OR a
+    # from-user wake event (which itself carries the visible -u copy).
     target_group = parser.add_mutually_exclusive_group()
 
     target_group.add_argument(
-        "-t",
+        "-u",
         "--to",
         metavar="TARGET",
         default=None,
         help=(
-            "Delivery target (agent → platform). Format: 'platform' (home "
+            "System -> user delivery (stock hermes, UNCHANGED). Posts the "
+            "human-readable text to the user's chat: cron output, kanban "
+            "notices, scripts. NEVER an agent wake, never a user-turn "
+            "injection. Format: 'platform' (home "
             "channel), 'platform:chat_id', 'platform:chat_id:thread_id', or "
             "'platform:#channel-name'. Examples: telegram, "
             "telegram:-1001234567890:17585, discord:#ops, slack:C0123ABCD."
@@ -647,21 +720,23 @@ def register_send_subparser(subparsers) -> argparse.ArgumentParser:
     )
 
     target_group.add_argument(
-        "-u",
+        "-t",
         "--user",
         metavar="ORIGIN",
         default=None,
         help=(
-            "Simulate user→agent message (routes through handle_message with "
-            "full user identity). Format: "
+            "From-user wake (fork addition): injects the message AS A USER "
+            "TURN so the target agent wakes and acts on it. One call always "
+            "gives both halves — the wake AND a visible copy down the -u "
+            "path. Format: "
             "'profile:platform:chat_id', 'platform' (home channel), "
             "'platform:chat_id', 'platform:chat_id:thread_id', or a BARE "
             "AGENT PROFILE NAME ('gopher', 'ornith', …) which is expanded to "
             "the agent's telegram DM wake target. Use "
             "'cli:session_id' to wake a live CLI session: queues the message "
             "and SIGUSR1s the target process so the agent acts on it as a real "
-            "user turn. Examples: -u telegram, "
-            "-u gopher, -u telegram:-1001234567890:17585, -u cli:session_id."
+            "user turn. Examples: -t telegram, "
+            "-t gopher, -t telegram:-1001234567890:17585, -t cli:session_id."
         ),
     )
 

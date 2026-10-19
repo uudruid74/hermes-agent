@@ -1,4 +1,4 @@
-"""Regression tests for cross-process ``hermes send -u`` injection."""
+"""Regression tests for cross-process ``hermes send -t`` injection."""
 
 import asyncio
 import json

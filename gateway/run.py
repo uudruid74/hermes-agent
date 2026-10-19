@@ -8906,7 +8906,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key,
             )
             effective_mode = "queue"
-        # Kanban status-change notifications arrive via hermes send -u
+        # Kanban status-change notifications arrive via hermes send -t
         # with a JSON payload containing "source":"kanban". They must
         # never interrupt the running agent — queue silently.
         demoted_for_kanban = (
@@ -26858,7 +26858,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     if callable(start_watchdog):
         start_watchdog()
 
-    # The bridge socket is the cross-process endpoint for `hermes send -u`.
+    # The bridge socket is the cross-process endpoint for `hermes send -t`.
     # The CLI must inject inbound user turns through this gateway process.
     try:
         from gateway.mcp_bridge import start_bridge_server
