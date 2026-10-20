@@ -7482,8 +7482,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "UPDATE sessions SET message_count = 0, tool_call_count = 0 WHERE id = ?",
                 (session_id,),
             )
+            ordered_messages = self._enforce_injection_timeline(
+                messages,
+                (_ts_content, _ts_prefix, _ts_calls),
+                now_ts=time.time(),
+            )
             total_messages, total_tool_calls = self._insert_message_rows(
-                conn, session_id, messages,
+                conn, session_id, ordered_messages,
                 _ts_harvest=(_ts_content, _ts_prefix, _ts_calls),
             )
             conn.execute(
@@ -7506,6 +7511,121 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (session_id,),
             )
             return cursor.fetchone() is not None
+
+    def _enforce_injection_timeline(
+        self,
+        messages: List[Dict[str, Any]],
+        _ts_harvest: Optional[tuple] = None,
+        now_ts: Optional[float] = None,
+    ) -> List[Dict[str, Any]]:
+        """Injection contract (Evan 2026-10-20): original timestamps, in
+        time order, no duplicates.
+
+        Compaction re-inserts its window as a batch; AUTOINCREMENT id order
+        IS replay order, so the batch must land in timestamp order or the
+        window's id<->time order breaks and the NEXT compaction's positional
+        head/summarize/tail split cuts across eras (observed on Gopher
+        2026-10-19: a summary stamped at its seam landed mid-tail because the
+        tail's kept rows predated the seam).
+
+        Three guarantees, enforced here rather than trusted from upstream:
+
+        1. Every dict carries its effective timestamp (own key -> harvest
+           chain -> now) written back, so ``_insert_message_rows`` persists
+           exactly the value this function sorted by.
+        2. A compaction payload row (``_compressed_summary`` or the payload
+           marker prefix) is clamped into its POSITIONAL neighbours' time
+           range — the summary sits exactly where verbatim history stops,
+           never inside the kept span.
+        3. The batch is stable-sorted by timestamp, so id order == time
+           order for every downstream reader (get_messages orders by id by
+           design, c03acca50).
+        """
+        if not messages:
+            return messages
+        now = now_ts if now_ts is not None else time.time()
+
+        def _resolve(msg: Dict[str, Any]) -> float:
+            raw = msg.get("timestamp")
+            if raw is not None:
+                try:
+                    return float(raw.timestamp() if hasattr(raw, "timestamp") else raw)
+                except (TypeError, ValueError):
+                    pass
+            if _ts_harvest:
+                ts_by_content, ts_by_prefix, ts_by_call = _ts_harvest
+                content = msg.get("content")
+                enc = content if isinstance(content, str) else None
+                if enc and enc in ts_by_content:
+                    return float(ts_by_content[enc])
+                if enc and len(enc) >= 64:
+                    best_ts = None
+                    best_len = -1
+                    for stored, cand in (ts_by_prefix.get(enc[:64]) or {}).items():
+                        if len(stored) > best_len and enc.startswith(stored):
+                            best_len = len(stored)
+                            best_ts = float(cand)
+                    if best_ts is not None:
+                        return best_ts
+                call_id = msg.get("tool_call_id")
+                if not call_id:
+                    for tc in (msg.get("tool_calls") or []):
+                        if isinstance(tc, dict) and tc.get("id"):
+                            call_id = str(tc["id"])
+                            break
+                if call_id and str(call_id) in ts_by_call:
+                    return float(ts_by_call[str(call_id)])
+            return now
+
+        resolved = [_resolve(msg) for msg in messages]
+
+        # (2) Clamp payload rows into their positional neighbours' range.
+        for idx, msg in enumerate(messages):
+            is_payload = bool(msg.get("_compressed_summary"))
+            if not is_payload:
+                content = msg.get("content")
+                if isinstance(content, str):
+                    stripped = content.lstrip()
+                    is_payload = stripped.startswith(
+                        ("[CONTEXT WINDOW COMPRESSED]", "[PRIOR CONTEXT")
+                    )
+            if not is_payload:
+                continue
+            lo = max((t for t in resolved[:idx]), default=None)
+            hi = min((t for t in resolved[idx + 1:]), default=None)
+            target = resolved[idx]
+            if lo is not None and target < lo:
+                target = lo
+            if hi is not None and target >= hi:
+                target = hi - 0.001
+            resolved[idx] = target
+
+        # (1) Write resolved stamps back so the insert persists the sorted
+        # values verbatim.  Two cases matter: a row that resolved through the
+        # harvest chain gets its original stamp written back, and a row the
+        # clamp MOVED (broken seam -> position) must persist the clamped
+        # value, not its stale dict key (the summary row's key is the seam
+        # stamp upstream computed; the clamp is the DB-side truth).  A row
+        # with no key that resolved to ``now`` keeps its absent key so
+        # ``_insert_message_rows`` applies its own (identical) fallback and
+        # the fabrication bookkeeping stays honest.
+        for msg, ts in zip(messages, resolved):
+            raw = msg.get("timestamp")
+            if raw is None:
+                if ts != now:
+                    msg["timestamp"] = ts
+                continue
+            try:
+                raw_f = float(raw.timestamp() if hasattr(raw, "timestamp") else raw)
+            except (TypeError, ValueError):
+                raw_f = None
+            if raw_f is None or abs(raw_f - ts) > 1e-9:
+                msg["timestamp"] = ts
+
+        # (3) Stable sort: equal stamps keep list order (tool-call/response
+        # pairs share a clock and must stay adjacent).
+        ordered = [msg for _, msg in sorted(zip(resolved, messages), key=lambda p: p[0])]
+        return ordered
 
     def archive_and_compact(
         self, session_id: str, compacted_messages: List[Dict[str, Any]]
@@ -7555,9 +7675,30 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "WHERE session_id = ? AND active = 1",
                 (session_id,),
             )
+            ordered_messages = self._enforce_injection_timeline(
+                compacted_messages,
+                (_ts_content, _ts_prefix, _ts_calls),
+                now_ts=time.time(),
+            )
             inserted, tool_calls_total = self._insert_message_rows(
-                conn, session_id, compacted_messages,
+                conn, session_id, ordered_messages,
                 _ts_harvest=(_ts_content, _ts_prefix, _ts_calls),
+            )
+            # No-duplicates contract (Evan 2026-10-20): every rewrite pass
+            # leaves an archived copy of the rows it replaces; byte-identical
+            # copies of the same (role, call-id, body) accumulate once per
+            # compaction — the "ghost-twin preamble" trail (8 dead copies of
+            # one 48KB row in Gopher's session, 4,402 trail rows / 6.6MB).
+            # Keep the original (lowest id) per identity; content stays
+            # discoverable via search_messages through the surviving copy.
+            conn.execute(
+                "DELETE FROM messages WHERE session_id = ? AND active = 0 "
+                "AND compacted = 1 AND id NOT IN ("
+                "  SELECT MIN(id) FROM messages"
+                "  WHERE session_id = ? AND active = 0 AND compacted = 1"
+                "  GROUP BY role, COALESCE(tool_call_id, ''), COALESCE(content, '')"
+                ")",
+                (session_id, session_id),
             )
             # message_count / tool_call_count reflect the LIVE (active) set —
             # the archived rows are still on disk but not part of the live count.
@@ -7822,6 +7963,35 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
             return best if best is not None else session_id
 
+    # Compaction-payload scaffolding (Evan 2026-10-20): "get rid of all the
+    # headers — just a single 'compressed previous context'. The markers can
+    # be in the database, but let's not let it take up space in the model's
+    # context window."  The stored payload row keeps its full structure (the
+    # fold/parse machinery reads it verbatim); the MODEL-FED view strips the
+    # scaffolding and keeps the one transport marker at position 0.
+    _PAYLOAD_VIEW_PREFIXES = ("[CONTEXT WINDOW COMPRESSED]", "[PRIOR CONTEXT")
+    _PAYLOAD_SCAFFOLD_LINES = frozenset({
+        "## Protected Context",
+        "## Relevant Earlier Context",
+        "## Session Notes",
+        "## Actions & Outcomes",
+        "## Verbatim Recent Context",
+        "## Prior Context Summary",
+        "The messages after this summary marker are preserved verbatim.",
+        "[END OF PRIOR CONTEXT SUMMARY]",
+        "[PRIOR CONTEXT SUMMARY]",
+    })
+
+    @classmethod
+    def _strip_payload_scaffolding(cls, text: str) -> str:
+        if not text.lstrip().startswith(cls._PAYLOAD_VIEW_PREFIXES):
+            return text
+        kept = [
+            line for line in text.split("\n")
+            if line.strip() not in cls._PAYLOAD_SCAFFOLD_LINES
+        ]
+        return re.sub(r"\n{3,}", "\n\n", "\n".join(kept))
+
     def get_messages_as_conversation(
         self,
         session_id: str,
@@ -7870,13 +8040,24 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 tuple(session_ids),
             ).fetchall()
 
-        return self._rows_to_conversation(
+        conversation = self._rows_to_conversation(
             rows,
             session_id=session_id,
             include_ancestors=include_ancestors,
             repair_alternation=repair_alternation,
             include_row_ids=include_row_ids,
         )
+        # Model view: payload scaffolding lives in the DB, not the window.
+        # Applies to content and the api_content sidecar alike so a replay
+        # keeps one consistent text (prompt-cache divergence stays closed).
+        for msg in conversation:
+            content = msg.get("content")
+            if isinstance(content, str):
+                msg["content"] = self._strip_payload_scaffolding(content)
+            sidecar = msg.get("api_content")
+            if isinstance(sidecar, str):
+                msg["api_content"] = self._strip_payload_scaffolding(sidecar)
+        return conversation
 
     # Columns every conversation projection decodes. Shared by
     # get_messages_as_conversation and get_resume_conversations so a single
