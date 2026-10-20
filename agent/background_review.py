@@ -22,6 +22,7 @@ import copy
 import json
 import logging
 import os
+import time
 from typing import Any, Dict, List, Optional
 
 from agent.thread_scoped_output import thread_scoped_silence
@@ -539,6 +540,94 @@ _COMBINED_REVIEW_PROMPT = (
     "and stop — but don't reach for that conclusion as a default."
 )
 
+
+
+# Tools whose calls can leave DURABLE filesystem changes (Zephyr 2026-10-20
+# Part C: the review fork's surface is NOT skill_manage-only — write_file and
+# patch wrote real files invisibly in the 2026-10-20 Gopher incident, and
+# terminal can write anything).
+_CURATOR_MUTATING_TOOLS = (
+    "skill_manage",
+    "write_file",
+    "patch",
+    "terminal",
+)
+
+
+def extract_curator_mutations(review_messages: Optional[List[Dict]]) -> List[str]:
+    """Summarize the review fork's durable mutating calls (target + outcome).
+
+    The fork is persistence-isolated (``_persist_disabled``), which makes its
+    real file writes structurally invisible in the parent's context — on
+    2026-10-20 Gopher hallucinated explanations for skill files that had
+    changed under him ("The skill file has state I didn't create") because
+    nothing in his transcript recorded the curator's writes. Every call on
+    the mutating surface is listed here, attributed where the tool knows its
+    target; terminal keeps its command line (shell side effects cannot be
+    attributed to a path).
+    """
+    results_by_id: Dict[str, Any] = {}
+    for msg in review_messages or []:
+        if isinstance(msg, dict) and msg.get("role") == "tool":
+            tcid = msg.get("tool_call_id")
+            if tcid:
+                results_by_id[str(tcid)] = msg.get("content")
+    lines: List[str] = []
+    for msg in review_messages or []:
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        for tc in msg.get("tool_calls", []) or []:
+            if not isinstance(tc, dict):
+                continue
+            fn = tc.get("function", {}) or {}
+            name = fn.get("name", "")
+            if name not in _CURATOR_MUTATING_TOOLS:
+                continue
+            try:
+                args = json.loads(fn.get("arguments", "{}") or "{}")
+            except (json.JSONDecodeError, TypeError):
+                args = {}
+            action = args.get("action") or ""
+            target = (
+                args.get("file_path")
+                or args.get("path")
+                or (args.get("name") if name == "skill_manage" else "")
+                or str(args.get("command") or "")[:120]
+            )
+            outcome = "ok"
+            raw = results_by_id.get(str(tc.get("id")))
+            if isinstance(raw, str) and (
+                '"error"' in raw or "Refusing" in raw or "BLOCKED" in raw
+            ):
+                outcome = "ERROR"
+            label = f"{name}({action})" if action else name
+            lines.append(f"{label} {target} [{outcome}]")
+    return lines
+
+
+def surface_curator_mutations(agent: Any, lines: List[str]) -> None:
+    """Shape (a) — surface the fork's durable writes to the parent's context.
+
+    The fork keeps its write isolation; the parent gets a synthetic note row
+    listing the mutations so its context reflects reality at the next turn.
+    Appended to the parent's live message list — the parent's normal flush
+    persists it. Informational framing deliberately (the 2026-08 curator
+    takeover came from an INSTRUCTIVE row being re-read as a standing task).
+    """
+    if not lines:
+        return
+    row = {
+        "role": "user",
+        "content": (
+            "[BACKGROUND CURATOR — persistent file changes made after your "
+            "last turn. For your context only — NOT a task request.]\n"
+            + "\n".join(f"- {line}" for line in lines)
+        ),
+        "timestamp": time.time(),
+    }
+    msgs = getattr(agent, "_session_messages", None)
+    if isinstance(msgs, list):
+        msgs.append(row)
 
 
 def summarize_background_review_actions(
@@ -1142,6 +1231,25 @@ def _run_review_in_thread(
                 e,
             )
             actions = []
+
+        # Shape (a) evidence layer (Zephyr 2026-10-20): the fork's durable
+        # writes must reach the PARENT's context — the fork is persistence-
+        # isolated, so without this row the parent's transcript is structurally
+        # blind to files the curator changed (the Gopher "skill file has state
+        # I didn't create" hallucination). Best-effort: a trace failure never
+        # takes down the review.
+        try:
+            _mutations = extract_curator_mutations(review_messages)
+        except Exception:
+            logger.warning("extract_curator_mutations failed", exc_info=True)
+            _mutations = []
+        if _mutations:
+            try:
+                surface_curator_mutations(agent, _mutations)
+            except Exception:
+                logger.warning(
+                    "could not surface curator mutations to parent", exc_info=True
+                )
 
         if actions:
             summary = " · ".join(dict.fromkeys(actions))

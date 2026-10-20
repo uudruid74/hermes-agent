@@ -1308,6 +1308,23 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
         )
         if read_guard:
             return read_guard
+    else:
+        # Guard symmetry (Zephyr 2026-10-20): a NEW reference file used to
+        # write freely while the paired SKILL.md patch was refused ("not
+        # loaded in this review turn") — leaving reference docs for a change
+        # the SKILL.md never took. A curator fork must have loaded the
+        # skill's SKILL.md anchor before adding files under it, exactly as
+        # before editing it.
+        anchor = existing["path"] / "SKILL.md"
+        if anchor.exists():
+            read_guard = _background_review_read_before_write_guard(
+                name,
+                anchor,
+                "write_file",
+                f"{file_path} (new file — requires the SKILL.md anchor)",
+            )
+            if read_guard:
+                return read_guard
     target.parent.mkdir(parents=True, exist_ok=True)
     # Back up for rollback
     original_content = target.read_text(encoding="utf-8") if target.exists() else None
