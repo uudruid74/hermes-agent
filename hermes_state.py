@@ -7579,6 +7579,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         resolved = [_resolve(msg) for msg in messages]
 
+        # (1b) Zephyr 2026-10-20 lead (cheap hardening): a row whose stamp
+        # resolves to ``now`` (no key, no harvest match) would stable-sort to
+        # the END of the batch and split its tool-call/result pair. Keep an
+        # unmatched row at its list position by inheriting the nearest
+        # resolved neighbour's clock — in practice the pair's shared era.
+        for idx in range(len(resolved)):
+            if resolved[idx] == now:
+                if idx > 0:
+                    resolved[idx] = resolved[idx - 1]
+                elif len(resolved) > 1:
+                    resolved[idx] = resolved[1]
+
         # (2) Clamp payload rows into their positional neighbours' range.
         for idx, msg in enumerate(messages):
             is_payload = bool(msg.get("_compressed_summary"))
@@ -7686,17 +7698,31 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             # No-duplicates contract (Evan 2026-10-20): every rewrite pass
             # leaves an archived copy of the rows it replaces; byte-identical
-            # copies of the same (role, call-id, body) accumulate once per
-            # compaction — the "ghost-twin preamble" trail (8 dead copies of
-            # one 48KB row in Gopher's session, 4,402 trail rows / 6.6MB).
-            # Keep the original (lowest id) per identity; content stays
-            # discoverable via search_messages through the surviving copy.
+            # copies of the same logical row accumulate once per compaction —
+            # the "ghost-twin preamble" trail (8 dead copies of one 48KB row
+            # in Gopher's session, 4,402 trail rows / 6.6MB).
+            #
+            # The identity is the FULL message body — (role, tool_call_id,
+            # content, tool_calls, api_content, display_metadata,
+            # codex_message_items, timestamp) — NOT just (role, call-id,
+            # content). Zephyr 2026-10-20: assistant tool-call rows carry
+            # content='' and tool_call_id NULL, so the narrower key collapsed
+            # genuinely distinct messages (32,814 rows measured on Gopher's
+            # trail); identical CONTENT at different timestamps (a repeated
+            # "Continue" turn, 84x in one session) is likewise distinct
+            # messages. Only rows that are identical in EVERY persisted body
+            # field AND share their (harvested original) clock are copies of
+            # one row. Keep the original (lowest id) per identity; content
+            # stays discoverable via search_messages through the survivor.
             conn.execute(
                 "DELETE FROM messages WHERE session_id = ? AND active = 0 "
                 "AND compacted = 1 AND id NOT IN ("
                 "  SELECT MIN(id) FROM messages"
                 "  WHERE session_id = ? AND active = 0 AND compacted = 1"
-                "  GROUP BY role, COALESCE(tool_call_id, ''), COALESCE(content, '')"
+                "  GROUP BY role, COALESCE(tool_call_id, ''), COALESCE(content, ''),"
+                "           COALESCE(tool_calls, ''), COALESCE(api_content, ''),"
+                "           COALESCE(display_metadata, ''), COALESCE(codex_message_items, ''),"
+                "           COALESCE(timestamp, 0)"
                 ")",
                 (session_id, session_id),
             )

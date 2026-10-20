@@ -95,6 +95,37 @@ class TestInjectionTimeline:
             stamps = [r["timestamp"] for r in rows]
             assert stamps == sorted(stamps), stamps
 
+    def test_unresolved_stamp_keeps_tool_pair_adjacent(self):
+        """Zephyr 2026-10-20 lead: a row with no resolvable stamp must not
+        sort to the batch's END (which would split its tool-call/result
+        pair). It inherits its neighbour's clock and keeps its position."""
+        with TemporaryDirectory() as tmp:
+            db = _db(tmp)
+            db.append_messages_batch("s2", [
+                {"role": "user", "content": "u " + "x" * 700, "timestamp": 100.0},
+            ])
+            db.archive_and_compact("s2", [
+                {"role": "user", "content": "u " + "x" * 700, "timestamp": 100.0},
+                # carrier: NO timestamp key, unharvestable content
+                {
+                    "role": "assistant", "content": "",
+                    "tool_calls": json.dumps([{"id": "call_pair", "name": "terminal"}]),
+                },
+                # its tool result carries the pair's clock
+                {
+                    "role": "tool", "tool_call_id": "call_pair",
+                    "content": "result body " + "y" * 700, "timestamp": 300.0,
+                },
+            ])
+            rows = db.get_messages("s2")
+            carrier = next(
+                r for r in rows if r.get("tool_calls")
+            )
+            result = next(r for r in rows if r.get("tool_call_id") == "call_pair")
+            assert carrier["id"] < result["id"], (
+                f"pair split: carrier id={carrier['id']} result id={result['id']}"
+            )
+
 
 class TestArchiveTrailDedup:
     def test_identical_copies_do_not_accumulate_across_passes(self):
@@ -145,6 +176,49 @@ class TestArchiveTrailDedup:
             all_rows = db.get_messages("s4", include_inactive=True)
             twins = [r for r in all_rows if r.get("tool_call_id") == "call_1"]
             assert len(twins) == 2, [(r["id"], r["content"][:30]) for r in twins]
+
+    def test_distinct_tool_call_carriers_with_empty_content_survive(self):
+        """Zephyr 2026-10-20: assistant tool-call carriers carry content=''
+        and no tool_call_id — they differ ONLY in tool_calls. The dedupe
+        identity must include tool_calls or every such row collapses into
+        one (32,814 distinct rows measured on Gopher's trail)."""
+        with TemporaryDirectory() as tmp:
+            db = _db(tmp)
+            carrier = lambda n: {
+                "role": "assistant", "content": "",
+                "tool_calls": json.dumps([{"id": f"call_{n}", "name": "read_file"}]),
+                "timestamp": 100.0 + n,
+            }
+            batch = [carrier(1), carrier(2), carrier(3)]
+            db.append_messages_batch("s3", [dict(m) for m in batch])
+            for _ in range(3):
+                db.archive_and_compact("s3", [dict(m) for m in batch])
+            all_rows = db.get_messages("s3", include_inactive=True)
+            carriers = [
+                r for r in all_rows
+                if not r["active"] and r.get("tool_calls")
+            ]
+            assert len(carriers) == 3, [(r["id"], r.get("tool_calls")) for r in carriers]
+
+    def test_identical_content_at_distinct_timestamps_survives(self):
+        """Identical text at different clocks is distinct messages (the
+        repeated 'Continue' turn class) — only same-clock copies collapse."""
+        with TemporaryDirectory() as tmp:
+            db = _db(tmp)
+            batch = [
+                {"role": "user", "content": "Continue", "timestamp": 100.0},
+                {"role": "user", "content": "Continue", "timestamp": 200.0},
+            ]
+            db.append_messages_batch("s4", [dict(m) for m in batch])
+            for _ in range(3):
+                db.archive_and_compact("s4", [dict(m) for m in batch])
+            all_rows = db.get_messages("s4", include_inactive=True)
+            continues = [
+                r for r in all_rows if not r["active"] and r["content"] == "Continue"
+            ]
+            assert len(continues) == 2, [(r["id"], r["timestamp"]) for r in continues]
+            # ...while a same-clock byte-identical copy still collapses.
+            assert len({r["timestamp"] for r in continues}) == 2
 
 
 class TestModelViewPayloadRendering:
