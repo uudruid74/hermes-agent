@@ -279,8 +279,10 @@ def clarify_tool(
         if not choices:
             choices = None  # empty list → open-ended
 
-    if callback is None:
-        return tool_error("Clarify tool is not available in this execution context.")
+    # NOTE: the "callback required" gate runs AFTER the dispatcher routing
+    # attempt below — a dispatcher-routed ask never needs the interactive
+    # callback (headless workers call clarify with no callback context; the
+    # t_31094219 re-test hit exactly that).
 
     # Write to clarify_queue so dashboard can pick it up
     clarify_id = None
@@ -330,6 +332,28 @@ def clarify_tool(
             question,
             getattr(agent, "agent_name", "unknown") if agent is not None else "unknown",
         )
+
+    # The callback is the HUMAN answer channel. A dispatcher-routed ask
+    # doesn't need one; refuse (and drop the just-written ask) only when
+    # neither answer channel exists.
+    if callback is None and not dispatcher:
+        if clarify_id:
+            import sqlite3 as _sq
+
+            from hermes_cli.kanban_db import kanban_db_path
+
+            try:
+                drop = _sq.connect(str(kanban_db_path()))
+                try:
+                    drop.execute("DELETE FROM clarify_queue WHERE id=?", (clarify_id,))
+                    drop.commit()
+                finally:
+                    drop.close()
+            except _sq.Error as exc:
+                import sys
+
+                print(f"CLARIFY_DBG: stale-ask cleanup failed: {exc}", file=sys.stderr)
+        return tool_error("Clarify tool is not available in this execution context.")
 
     # Race: callback (WebSocket/CLI) vs DB poll (dashboard).
     # The dashboard writes answers to clarify_queue; the callback blocks on

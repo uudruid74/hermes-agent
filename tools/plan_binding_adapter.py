@@ -1731,6 +1731,62 @@ def cmd_approve(agent, task_id: str) -> str:
     return f"{assigned} has been notified of task {task_id}"
 
 
+def _raw_card_clarify(conn, agent, question: str) -> str:
+    """``plan clarify`` from a worker on a raw kanban card (no plan binding).
+
+    Evan 2026-10-20: *"It is supposed to work from a kanban task."* The card
+    has no execution binding, so the F2 flag channel does not apply — route
+    through the clarify tool's dispatcher machinery instead: the durable
+    clarify_queue ask, the F11 wake to the creator/origin, and the
+    park-until-answer wait. Same semantics as calling ``clarify`` directly.
+    """
+    from hermes_state import SessionDB
+
+    session_id = getattr(agent, "session_id", None)
+    session_task_id = None
+    if session_id:
+        sdb = SessionDB()
+        row = None
+        read_ctx = sdb._read_ctx()
+        if read_ctx is not None:
+            with read_ctx as ctx:
+                row = ctx.execute(  # type: ignore[union-attr]
+                    "SELECT task_id FROM sessions WHERE id=?", (session_id,)
+                ).fetchone()
+        if row:
+            session_task_id = row["task_id"] if isinstance(row, dict) else row[0]
+    task_id = str(session_task_id or "").strip()
+    if not task_id:
+        return "ERROR: No active task"
+    if conn.execute("SELECT id FROM tasks WHERE id=?", (task_id,)).fetchone() is None:
+        return "ERROR: No active task"
+    # One pending ask at a time — same guard as the plan path.
+    pending = conn.execute(
+        "SELECT id FROM clarify_queue WHERE task_id=? AND status='pending' LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if pending is not None:
+        return (
+            f"ERROR: Task {task_id} already has a pending clarify ask; "
+            "wait for the dispatcher's answer before asking again"
+        )
+    from tools.clarify_tool import clarify_tool
+
+    result = clarify_tool(
+        question,
+        callback=getattr(agent, "clarify_callback", None),
+        agent=agent,
+        task_id=task_id,
+    )
+    try:
+        payload = json.loads(result)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        return f"ERROR: Clarify answer was not recorded: {exc}"
+    if payload.get("error"):
+        return f"ERROR: {payload['error']}"
+    return str(payload.get("user_response", ""))
+
+
 def cmd_clarify(agent, question: str) -> str:
     """Ask the plan's dispatcher a clarifying question (F2 channel).
 
@@ -1753,10 +1809,17 @@ def cmd_clarify(agent, question: str) -> str:
 
     conn = _legacy()._get_kanban_db()
     key, binding, error = _current(conn, agent)
+    if key is None or binding is None:
+        # Raw kanban card: no plan binding exists. The clarify tool's
+        # dispatcher machinery handles the ask (t_31094219, Evan: "It is
+        # supposed to work from a kanban task"); "No active task" propagates
+        # only when there is no card either.
+        raw = _raw_card_clarify(conn, agent, question)
+        if not raw.startswith("ERROR: No active task"):
+            return raw
+        return error or "ERROR: No active task"
     if error:
         return error
-    if key is None or binding is None:
-        return "ERROR: No active task"
     task = conn.execute(
         "SELECT * FROM tasks WHERE id=?", (binding.task_id,)
     ).fetchone()
