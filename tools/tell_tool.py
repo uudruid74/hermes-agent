@@ -39,26 +39,23 @@ def tell_tool(
     reply_session_id = (
         origin_session_id or os.environ.get("HERMES_SESSION_ID") or ""
     ).strip()
-    # Two routing rules, nothing else:
-    # 1. Live session origin — a caller that passes its OWN session id anchors
-    #    the conversation: delivery goes to the agent's home-channel wake
-    #    target and the reply is routed back into that exact session
-    #    (cron/journal/kanban closure). Any other session id remains a direct
-    #    delivery target on the recipient's side.
-    # 2. Kanban/cron origin — no live session to anchor: the wake and the
-    #    visible post default to the target's home channel (bare profile).
+    # Reply routing (Evan 2026-10-20: "the tell response path was supposed to
+    # name a specific session id to be consistent"): the reply instruction
+    # ALWAYS names the sender's session, so the reply lands in that exact
+    # session instead of drifting to a home channel. Passing the caller's OWN
+    # session id as `session_id` is the anchor form — not a delivery target —
+    # and only clears the target.
     if target_session_id and target_session_id == reply_session_id:
+        target_session_id = ""
+    if reply_session_id:
         reply_instruction = (
             "If a reply is required, use 'tell' with "
-            f"agent='{sender}' and session_id='{target_session_id}' — "
+            f"agent='{sender}' and session_id='{reply_session_id}' — "
             "that routes the reply into this exact session."
         )
-        target_session_id = ""
     else:
-        # Replies use profile discovery. A gateway session ID is not a CLI
-        # session target, and presenting it here causes `tell` to misroute
-        # replies into the CLI notice queue instead of the sender's
-        # messaging DM.
+        # No live session origin (cron/kanban): profile discovery. The bare
+        # profile wake lands in the target's DM (send_cmd's -t expansion).
         reply_instruction = f"If a reply is required, use 'tell' with agent='{sender}'."
     wrapped = (
         f"Incoming message from {sender} follows:\n"
@@ -72,7 +69,18 @@ def tell_tool(
     logger.info("%s", echo)
     echo_callback(echo)
 
-    target = f"{agent}:cli:{target_session_id}" if target_session_id else agent
+    # Use-time resolution (agent-wake-routing rule 2): a named session id is
+    # rolled forward to its live successor and delivered to its CHAT; a
+    # chatless session keeps the cli: notice-queue shape; anything
+    # unresolvable falls back to the bare profile (the target's DM).
+    target = agent
+    if target_session_id:
+        try:
+            from hermes_cli.kanban_db import session_wake_target
+
+            target = session_wake_target(agent, target_session_id) or agent
+        except (ImportError, ValueError, OSError):
+            target = agent
     # Fire-and-forget: the message is echoed + logged above (the mandatory
     # transparency contract), then dispatched detached so the caller's tool
     # loop never blocks on delivery. ONE `-t` call does both halves — the
@@ -90,10 +98,11 @@ TELL_SCHEMA = {
     "name": "tell",
     "description": (
         "Send a wrapped message to another Hermes agent profile. By default this wakes its "
-        "Telegram DM session; session_id targets one full session directly. Passing your OWN "
-        "session id as session_id anchors the conversation: replies are routed back into that "
-        "exact session. Replies otherwise route by the sender's agent profile. Every tell is "
-        "also posted as a visible message in the target's chat."
+        "Telegram DM session; session_id targets one full session directly (resolved at use "
+        "time: a stale id rolls forward to its live successor). Replies are ALWAYS routed "
+        "back into the sender's session — the message names the session id to use. Passing "
+        "your OWN session id as session_id is the anchor form (it only names the reply "
+        "target). Every tell is also posted as a visible message in the target's chat."
     ),
     "parameters": {
         "type": "object",
@@ -109,10 +118,10 @@ TELL_SCHEMA = {
             "session_id": {
                 "type": "string",
                 "description": (
-                    "Optional full session ID. Your OWN session id routes replies back into "
-                    "that session (cron/journal/kanban closure); a session id belonging to the "
-                    "target agent delivers directly into that session instead of profile DM "
-                    "routing."
+                    "Optional full session ID. A session id belonging to the target agent "
+                    "delivers directly into that session (its live successor) instead of the "
+                    "DM default; your OWN session id is the anchor form and only names the "
+                    "reply target."
                 ),
             },
         },

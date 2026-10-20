@@ -1521,17 +1521,21 @@ def _resolve_session_chat(
         if not db_path.exists():
             return None
         conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
         try:
             row = conn.execute(
-                "SELECT session_key, chat_id FROM sessions WHERE id = ?",
+                "SELECT * FROM sessions WHERE id = ?",
                 (session_id,),
             ).fetchone()
         finally:
             conn.close()
         if row is None:
             return None
-        session_key, chat_id_col = row[0], row[1]
-        # session_key format: agent:<agent>:<platform>:<chat_type>:<chat>
+        session_key, chat_id_col = row["session_key"], row["chat_id"]
+        thread_col = (
+            str(row["thread_id"] or "").strip() if "thread_id" in row.keys() else ""
+        )
+        # session_key format: agent:<agent>:<platform>:<chat_type>:<chat>[:<thread>]
         parts = (session_key or "").split(":")
         if len(parts) < 5:
             return None
@@ -1540,7 +1544,10 @@ def _resolve_session_chat(
         chat_id = (chat_id_col or (parts[4] if len(parts) > 4 else "") or "").strip()
         if not platform or not chat_id:
             return None
-        return platform, chat_id, chat_type, ""
+        # The thread_id column is authoritative; the key's tail is the
+        # fallback (topic/group sessions carry the thread there too).
+        thread_id = thread_col or (parts[5] if len(parts) > 5 else "")
+        return platform, chat_id, chat_type, thread_id
     except (OSError, sqlite3.Error, ImportError, ValueError):
         return None
 

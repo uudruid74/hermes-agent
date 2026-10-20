@@ -38,18 +38,20 @@ _USAGE_EXIT = 2
 _FAILURE_EXIT = 1
 _SUCESS_EXIT = 0
 
-# Agent-to-agent DM fallback chat id (Evan's Telegram DM), used ONLY for
-# profiles with no configured home channel. A BARE PROFILE NAME passed to
-# `-t` is expanded to `profile:<platform>:<home channel>` where the home
-# channel is read from the profile's own config.yaml
-# (`platforms.telegram.home_channel`, written by `/sethome`) — see
-# `_resolve_agent_wake_target` / `_profile_home_channel_target`. Keeping the
+# Agent-to-agent DM chat id (Evan's Telegram DM). A BARE PROFILE NAME passed
+# to `-t` is expanded to `profile:telegram:<DM>` — the target's real DM
+# session (Evan 2026-10-20: "a bare agent name should have ended up in
+# gopher's DM, not the home session"; matches `hermes send -t`'s own
+# contract: "wakes its Telegram DM session"). The /sethome home channel is
+# NOT the wake target: it is the human-visible surface for the mandatory `-u`
+# copy of cli: session wakes (see `_wake_copy_target`). Keeping the
 # agent→platform mapping in ONE place (here) means callers (tell tool, pente
 # MCP, cron jobs) can pass a bare agent name and never touch session ids or
-# platform details. Restored by t_a427292d (revert of the e3a5cc511c
-# bare-platform fallback): without it a bare-profile wake resolves to the
-# platform home channel, keys a fresh per-user group session, and the wake
-# never reaches the target's real DM session.
+# platform details. History: e3a5cc511c introduced a bare-platform fallback
+# that keyed a fresh per-user group session the target never saw; t_a427292d
+# restored the DM fallback; the home-channel expansion survived that fix and
+# routed bare-profile wakes into the home channel instead of the DM (the
+# 2026-10-20 tell misroute).
 _AGENT_DM_CHAT_ID = "8900123006"
 
 
@@ -178,14 +180,13 @@ def _resolve_agent_wake_target(user_flag: str) -> str:
     wake target (agent wake).
 
     ``hermes send -t gopher "msg"`` is an AGENT WAKE — it resolves gopher →
-    ``gopher:<platform>:<home channel>`` and routes through that profile's
-    gateway bridge exactly like the old ``tell`` tool did. The home channel
-    comes from the profile's own config.yaml (see
-    ``_profile_home_channel_target``). Full targets (with colons) and
-    platform names (``telegram``, ``discord``…) pass through untouched, so
-    existing wake-target shapes are preserved. Profile names never collide
-    with platform names. The same expansion also names the delivery target
-    for the mandatory ``-u`` copy of a wake (see ``_wake_copy_target``).
+    ``gopher:telegram:<DM chat>`` and routes through that profile's
+    gateway bridge into the target's REAL DM session (Evan 2026-10-20:
+    "a bare agent name should have ended up in gopher's DM, not the home
+    session"). Full targets (with colons) and platform names
+    (``telegram``, ``discord``…) pass through untouched, so existing
+    wake-target shapes are preserved. Profile names never collide with
+    platform names.
     """
     clean = user_flag.strip()
     if ":" in clean:
@@ -193,7 +194,7 @@ def _resolve_agent_wake_target(user_flag: str) -> str:
     from hermes_cli.profiles import profile_exists
 
     if profile_exists(clean):
-        return f"{clean}:{_profile_home_channel_target(clean)}"
+        return f"{clean}:telegram:{_AGENT_DM_CHAT_ID}"
     return clean
 
 
@@ -211,13 +212,21 @@ def _wake_copy_target(wake_target: str) -> Optional[str]:
     exists — the caller must report that, not bury it.
     """
     clean = wake_target.strip()
-    if clean.lower().startswith("cli:"):
+    if clean.lower().startswith("cli:") or ":cli:" in clean.lower():
+        # A cli: session wake has no chat of its own, so its copy goes to the
+        # owning profile's HOME CHANNEL (/sethome) — kept as the human-visible
+        # surface even though bare-profile WAKES now target the DM (Evan
+        # 2026-10-20).
         from hermes_cli.profiles import get_active_profile_name, profile_exists
 
-        active = get_active_profile_name()
-        return _resolve_agent_wake_target(active) if profile_exists(active) else None
-    if ":cli:" in clean.lower():
-        return _resolve_agent_wake_target(clean.split(":", 1)[0])
+        owner = (
+            get_active_profile_name()
+            if clean.lower().startswith("cli:")
+            else clean.split(":", 1)[0]
+        )
+        if not owner or not profile_exists(owner):
+            return None
+        return f"{owner}:{_profile_home_channel_target(owner)}"
     return _resolve_agent_wake_target(clean)
 
 

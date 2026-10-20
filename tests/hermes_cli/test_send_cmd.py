@@ -314,7 +314,10 @@ def test_load_hermes_env_bridges_config_yaml_scalars(tmp_path, monkeypatch):
 # Bare-profile wake resolution (per-profile home channel) — t_6a22e29b
 # ---------------------------------------------------------------------------
 
-def test_bare_profile_resolves_configured_home_channel(monkeypatch, tmp_path):
+def test_bare_profile_resolves_dm_not_home_channel(monkeypatch, tmp_path):
+    """Evan 2026-10-20: "a bare agent name should have ended up in gopher's
+    DM, not the home session" — a configured /sethome home channel must NOT
+    be the wake target of a bare-profile wake."""
     import hermes_cli.profiles
 
     home = tmp_path / "gopher"
@@ -336,7 +339,7 @@ def test_bare_profile_resolves_configured_home_channel(monkeypatch, tmp_path):
 
     assert (
         send_cmd._resolve_agent_wake_target("gopher")
-        == "gopher:telegram:-1004406953125:1"
+        == f"gopher:telegram:{send_cmd._AGENT_DM_CHAT_ID}"
     )
 
 
@@ -517,17 +520,22 @@ def test_wake_copy_target_routes_each_shape(monkeypatch):
         send_cmd, "_resolve_agent_wake_target", lambda a: f"{a}:telegram:5551"
     )
     monkeypatch.setattr(
-        hermes_cli.profiles, "profile_exists", lambda name: name == "neo"
+        send_cmd, "_profile_home_channel_target", lambda p: f"telegram:home-{p}"
+    )
+    monkeypatch.setattr(
+        hermes_cli.profiles, "profile_exists", lambda name: name in ("neo", "zephyr")
     )
     monkeypatch.setattr(
         hermes_cli.profiles, "get_active_profile_name", lambda: "neo"
     )
 
     # cli session wake in another profile → that profile's home channel.
-    assert send_cmd._wake_copy_target("zephyr:cli:sess-1") == "zephyr:telegram:5551"
+    assert (
+        send_cmd._wake_copy_target("zephyr:cli:sess-1") == "zephyr:telegram:home-zephyr"
+    )
     # bare cli wake in the current profile → its home channel.
-    assert send_cmd._wake_copy_target("cli:sess-1") == "neo:telegram:5551"
-    # bare profile wake → its expanded home-channel wake target.
+    assert send_cmd._wake_copy_target("cli:sess-1") == "neo:telegram:home-neo"
+    # bare profile wake → its DM expansion (the wake target's own chat).
     assert send_cmd._wake_copy_target("zephyr") == "zephyr:telegram:5551"
     # unresolvable current profile → no copy target (reported, not buried).
     monkeypatch.setattr(

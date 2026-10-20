@@ -13,6 +13,36 @@ def _spawned():
     return SimpleNamespace()
 
 
+def _target_profile_with_session(monkeypatch, tmp_path, profile, session_id, chat=None):
+    """A tmp target profile whose state.db holds one session (chatless unless
+    ``chat`` gives (session_key, chat_id, chat_type, thread_id))."""
+    import hermes_cli.profiles
+    from hermes_state import SessionDB
+
+    home = tmp_path / profile
+    home.mkdir(exist_ok=True)
+    session_db = SessionDB(db_path=home / "state.db")
+    session_db.create_session(session_id=session_id, source="cli")
+    if chat:
+        import sqlite3
+
+        session_key, chat_id, chat_type, thread_id = chat
+        conn = sqlite3.connect(str(home / "state.db"))
+        conn.execute(
+            "UPDATE sessions SET session_key=?, chat_id=?, chat_type=?, thread_id=? "
+            "WHERE id=?",
+            (session_key, chat_id, chat_type, thread_id, session_id),
+        )
+        conn.commit()
+        conn.close()
+    session_db.close()
+    monkeypatch.setattr(
+        hermes_cli.profiles, "profile_exists", lambda name: name == profile
+    )
+    monkeypatch.setattr(hermes_cli.profiles, "get_profile_dir", lambda _name: home)
+    return home
+
+
 def test_tell_wraps_message_and_targets_agent_profile(monkeypatch):
     monkeypatch.setenv("USERNAME", "zephyr")
     monkeypatch.setenv("HERMES_AGENT_NAME", "WrongAgent")
@@ -50,8 +80,15 @@ def test_tell_wraps_message_and_targets_agent_profile(monkeypatch):
     assert result == {"dispatched": True, "note": "notified gopher"}
 
 
-def test_tell_routes_to_explicit_session_but_reply_names_only_sender(monkeypatch):
+def test_tell_routes_to_explicit_session_and_names_sender_session(monkeypatch, tmp_path):
+    """Evan 2026-10-20: "the tell response path was supposed to name a
+    specific session id to be consistent" — the reply instruction always
+    names the SENDER's session, and a named target session is delivered to
+    directly (its live successor)."""
     monkeypatch.setenv("USERNAME", "zephyr")
+    _target_profile_with_session(
+        monkeypatch, tmp_path, "neo", "cron_daily_20260922_120000"
+    )
     calls = []
 
     def fake_spawn(command, **_kwargs):
@@ -76,7 +113,42 @@ def test_tell_routes_to_explicit_session_but_reply_names_only_sender(monkeypatch
         "neo:cli:cron_daily_20260922_120000",
     ]
     assert "agent='zephyr'" in command[-1]
-    assert "session_id=" not in command[-1]
+    assert "session_id='20260922_121500_receiver'" in command[-1]
+
+
+def test_tell_named_gateway_session_targets_chat_not_cli_queue(monkeypatch, tmp_path):
+    """The t_a427292d landmine: a gateway session id delivered through the
+    cli: notice queue misroutes. The named session resolves to its CHAT."""
+    monkeypatch.setenv("USERNAME", "zephyr")
+    _target_profile_with_session(
+        monkeypatch,
+        tmp_path,
+        "zephyr",
+        "20261017_121500_receiver",
+        chat=(
+            "agent:zephyr:telegram:group:-100555:99",
+            "-100555",
+            "group",
+            "99",
+        ),
+    )
+    calls = []
+
+    def fake_spawn(command, **_kwargs):
+        calls.append(command)
+        return _spawned()
+
+    monkeypatch.setattr(tell_tool, "spawn_detached", fake_spawn)
+
+    tell_tool.tell_tool(
+        agent="zephyr",
+        message="Into your session.",
+        session_id="20261017_121500_receiver",
+        origin_session_id="cron_journal_20261017_090000",
+        echo_callback=lambda _message: None,
+    )
+
+    assert calls[0][:4] == ["hermes", "send", "-t", "zephyr:telegram:-100555:99"]
 
 
 def test_tell_reply_reaches_explicit_session_via_send_cli(monkeypatch, tmp_path):
@@ -98,8 +170,8 @@ def test_tell_reply_reaches_explicit_session_via_send_cli(monkeypatch, tmp_path)
     monkeypatch.setattr(send_cmd, "_load_hermes_env", lambda: None)
     monkeypatch.setattr(
         send_cmd,
-        "_resolve_agent_wake_target",
-        lambda agent: f"{agent}:telegram:5550001111:7" if ":" not in agent else agent,
+        "_profile_home_channel_target",
+        lambda _profile: "telegram:5550001111:7",
     )
     calls = []
     copies = []
@@ -149,7 +221,8 @@ def test_tell_reply_reaches_explicit_session_via_send_cli(monkeypatch, tmp_path)
     assert len(notices) == 1
     assert "Round trip reply." in notices[0]["text"]
     assert "agent='zephyr'" in notices[0]["text"]
-    assert "session_id=" not in notices[0]["text"]
+    # The reply instruction names the SENDER's session (Evan 2026-10-20).
+    assert "session_id='20260922_121500_receiver'" in notices[0]["text"]
     # One `-t` call produced both halves: the session wake above and the
     # visible copy, which `hermes send -t` posts down the `-u` path.
     assert len(calls) == 1
@@ -304,7 +377,7 @@ def test_agent_runtime_routes_tell_to_mandatory_origin_callback(monkeypatch):
     assert result["dispatched"] is True
 
 
-def test_agent_runtime_reply_instruction_names_only_sender(monkeypatch):
+def test_agent_runtime_reply_instruction_names_sender_session(monkeypatch):
     from agent.agent_runtime_helpers import invoke_tool
 
     monkeypatch.setenv("USERNAME", "neo")
@@ -335,14 +408,12 @@ def test_agent_runtime_reply_instruction_names_only_sender(monkeypatch):
         skip_tool_execution_middleware=True,
     )
 
-    assert sent[0][:4] == [
-        "hermes",
-        "send",
-        "-t",
-        "zephyr:cli:20260922_121500_receiver",
-    ]
+    # The named session names no session row — never fabricated: the wake
+    # falls back to the bare profile (the target's DM), and the reply
+    # instruction names the SENDER's session (Evan 2026-10-20).
+    assert sent[0][:4] == ["hermes", "send", "-t", "zephyr"]
     assert "agent='neo'" in sent[0][-1]
-    assert "session_id=" not in sent[0][-1]
+    assert "session_id='cron_journal_20260922_120000'" in sent[0][-1]
 
 
 def test_agent_runtime_refuses_tell_without_origin_callback(monkeypatch):
@@ -452,9 +523,12 @@ def test_tell_own_session_id_from_env_anchors_reply(monkeypatch):
     assert "session_id='cron_journal_20261017_090000'" in calls[0][-1]
 
 
-def test_tell_foreign_session_id_still_targets_directly(monkeypatch):
+def test_tell_foreign_session_id_still_targets_directly(monkeypatch, tmp_path):
     monkeypatch.setenv("USERNAME", "gopher")
     monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    _target_profile_with_session(
+        monkeypatch, tmp_path, "zephyr", "20261017_121500_receiver"
+    )
     calls = []
 
     def fake_spawn(command, **_kwargs):
@@ -474,7 +548,7 @@ def test_tell_foreign_session_id_still_targets_directly(monkeypatch):
     assert calls[0][:4] == [
         "hermes", "send", "-t", "zephyr:cli:20261017_121500_receiver",
     ]
-    assert "session_id=" not in calls[0][-1]
+    assert "session_id='cron_journal_20261017_090000'" in calls[0][-1]
 
 
 # ---------------------------------------------------------------------------

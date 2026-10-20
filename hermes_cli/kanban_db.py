@@ -3757,6 +3757,40 @@ def resolve_live_session_id(profile: str, captured_id: str) -> Optional[str]:
         state.close()
 
 
+def session_wake_target(profile: str, session_id: str) -> Optional[str]:
+    """Resolve a NAMED session id to its wake target at USE time.
+
+    Reply routing (Evan 2026-10-20: "the tell response path was supposed to
+    name a specific session id to be consistent"): the named id is rolled
+    forward to its live successor and delivered to its CHAT —
+    ``<profile>:<platform>:<chat>[:<thread>]`` — the shape proven to land in
+    the target's session. A chatless (CLI/cron) session keeps the
+    ``<profile>:cli:<id>`` notice-queue shape. An id that names no session
+    row (fabricated) or whose chat went quiet resolves to ``None`` so the
+    caller falls back to the bare profile (the target's DM) — never a
+    fabricated session (agent-wake-routing rule 2).
+    """
+    session_id = str(session_id or "").strip()
+    if not session_id or not profile:
+        return None
+    live = resolve_live_session_id(profile, session_id)
+    if not live:
+        return None
+    try:
+        from hermes_cli.kanban import _resolve_session_chat
+
+        chat = _resolve_session_chat(profile, live)
+    except (ImportError, ValueError, OSError):
+        chat = None
+    if not chat:
+        return f"{profile}:cli:{live}"
+    platform, chat_id, _chat_type, thread_id = chat
+    target = f"{profile}:{platform}:{chat_id}"
+    if thread_id:
+        target = f"{target}:{thread_id}"
+    return target
+
+
 def resolve_worker_live_session_id(profile: str, task_id: str) -> Optional[str]:
     """The worker's live bound session (``sessions.task_id``), if any."""
     try:
