@@ -221,6 +221,29 @@ def test_kanban_answer_verb_rejects_unknown_target(kb_env):
     assert rc == 1
 
 
+def test_every_clarify_dispatch_door_passes_agent_and_task_id():
+    """RC5 (t_125c8b8d retest3): the SEQUENTIAL tool door called
+    ``clarify_tool`` without ``agent``/``task_id`` while the concurrent
+    ``invoke_tool`` door passed both — so a worker run degraded to the bare
+    interactive callback (no queue row, no dispatcher routing) depending on
+    which execution path ran. Both doors must carry the same contract; this
+    test reads the call sites so the doors cannot drift apart again."""
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2]
+    for rel in ("agent/tool_executor.py", "agent/agent_runtime_helpers.py"):
+        src = (root / rel).read_text(encoding="utf-8")
+        for m in re.finditer(r"_clarify_tool\(", src):
+            depth, end = 1, m.end()
+            while depth and end < len(src):
+                depth += {"(": 1, ")": -1}.get(src[end], 0)
+                end += 1
+            call = src[m.start():end]
+            assert "agent=agent" in call, f"{rel}: clarify call missing agent="
+            assert "task_id=" in call, f"{rel}: clarify call missing task_id="
+
+
 # ---------------------------------------------------------------------------
 # `plan clarify` from a raw kanban card (t_31094219 re-test, 2026-10-20).
 # Evan: "It is supposed to work from a kanban task." The plan command must

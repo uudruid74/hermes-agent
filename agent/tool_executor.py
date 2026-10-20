@@ -1590,11 +1590,19 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         elif function_name == "clarify":
             def _execute(next_args: dict) -> Any:
                 from tools.clarify_tool import clarify_tool as _clarify_tool
+                # Same contract as the concurrent path (invoke_tool): agent +
+                # task_id are REQUIRED, not optional — they write the durable
+                # clarify_queue ask and open the dispatcher routing. Without
+                # them the ask degrades to the bare interactive callback and a
+                # headless worker's 120s stand-down reads like a real answer
+                # (t_125c8b8d retest3 — the sequential door was the hole).
                 return _clarify_tool(
                     question=next_args.get("question", ""),
                     choices=next_args.get("choices"),
                     multi_select=next_args.get("multi_select", False),
                     callback=agent.clarify_callback,
+                    agent=agent,
+                    task_id=effective_task_id,
                 )
             function_result, function_args, middleware_trace, _execution_blocked = _managed_values(_run_agent_tool_execution_middleware(
                 agent,
