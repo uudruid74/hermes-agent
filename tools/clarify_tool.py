@@ -307,6 +307,21 @@ def clarify_tool(
         if row:
             session_task_id = row["task_id"] if isinstance(row, dict) else row[0]
         queue_task_id = task_id or session_task_id
+        # Link the ask to the REAL kanban task when one exists: the tool
+        # kwarg may carry a session/isolation id (t_936962bd retest4 stored
+        # the session id in task_id — `hermes kanban answer t_…` and the
+        # dashboard then found nothing). Prefer a candidate naming a tasks
+        # row.
+        try:
+            for cand in (task_id, session_task_id):
+                c = str(cand or "").strip()
+                if c and db.execute("SELECT 1 FROM tasks WHERE id=?", (c,)).fetchone():
+                    queue_task_id = c
+                    break
+        except sqlite3.Error as exc:
+            import sys
+
+            print(f"CLARIFY_DBG: task link resolution failed: {exc}", file=sys.stderr)
         agent_name = getattr(agent, "agent_name", "unknown")
         db.execute(
             "INSERT INTO clarify_queue(id,session_id,task_id,agent_name,question,choices,multi_select,status,created_at) VALUES(?,?,?,?,?,?,?,?,?)",

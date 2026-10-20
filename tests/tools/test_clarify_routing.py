@@ -189,6 +189,83 @@ def test_no_task_means_no_dispatcher(kb_env):
     )
 
 
+def test_queue_row_links_the_real_task_id(kb_env, monkeypatch):
+    """t_936962bd retest4: the tool kwarg carried a SESSION id and the ask
+    row linked IT — so `WHERE task_id='t_…'` and `hermes kanban answer t_…`
+    found nothing. The row must link the real kanban task."""
+    # the worker session's task link names the kanban card
+    import contextlib
+
+    import hermes_state
+
+    fake_sdb = SimpleNamespace(
+        _read_ctx=lambda: contextlib.nullcontext(
+            SimpleNamespace(
+                execute=lambda *a, **k: SimpleNamespace(
+                    fetchone=lambda: ("t_e4812748",)
+                )
+            )
+        ),
+        close=lambda: None,
+        find_task_session_id=lambda tid: None,
+    )
+    monkeypatch.setattr(hermes_state, "SessionDB", lambda *a, **k: fake_sdb)
+    monkeypatch.setattr("tools.clarify_tool.DISPATCHER_ANSWER_TIMEOUT_S", 2)
+    agent = SimpleNamespace(
+        agent_name="ornith", session_id="sess_link1", clarify_callback=None
+    )
+    result = {}
+
+    def run():
+        result["r"] = clarify_tool(
+            question="link me",
+            callback=lambda q, c, multi_select=False: "ans",
+            agent=agent,
+            task_id="20261020_104830_f21427",  # a session/isolation id
+        )
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(timeout=15)
+    conn = sqlite3.connect(kb_env.db_path)
+    try:
+        row = conn.execute(
+            "SELECT task_id FROM clarify_queue WHERE question='link me'"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row is not None, "the ask row was never written"
+    assert row[0] == "t_e4812748", f"ask linked to {row[0]!r}, not the kanban task"
+
+
+def test_human_creator_falls_back_to_origin_dispatcher(kb_env):
+    """t_936962bd retest4: CLI-created cards carry created_by='user' — not a
+    profile — and the ask used to fall through to the interactive callback
+    (headless stand-down) instead of reaching the card's origin session."""
+    conn = sqlite3.connect(kb_env.db_path)
+    conn.execute("UPDATE tasks SET created_by='user' WHERE id='t_e4812748'")
+    conn.execute(
+        "INSERT INTO task_comments(task_id, author, body, created_at) "
+        "VALUES(?,?,?,?)",
+        (
+            "t_e4812748",
+            "system",
+            '__kanban_origin__{"platform": "session", "chat_id": '
+            '"20261020_001937_450e6ab9", "thread_id": "", "chat_type": "", '
+            '"profile": "gopher"}',
+            int(time.time()),
+        ),
+    )
+    conn.commit()
+    conn.close()
+    target = _route_clarify_to_dispatcher(
+        "t_e4812748", None, "ask_origin", "Q?", "ornith"
+    )
+    assert target == "gopher"
+    assert kb_env.wakes, "the origin dispatcher was never woken"
+    assert "Q?" in " ".join(kb_env.wakes[0])
+
+
 def test_kanban_answer_verb_records_the_answer(kb_env):
     conn = sqlite3.connect(kb_env.db_path)
     conn.execute(

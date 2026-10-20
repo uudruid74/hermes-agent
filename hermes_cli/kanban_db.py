@@ -3870,7 +3870,13 @@ def _review_ask_target(
         return assignee or None
     creator = str(row["created_by"] or "").strip()
     if creator and creator.casefold() != assignee.casefold():
-        return creator
+        if creator.casefold() not in {"user", "human", "cli", "system"}:
+            return creator
+        # A human/CLI creator label (`user`) is not a wake target — the
+        # dispatcher is the agent session the card came from (origin routing
+        # below), else the human stays the dispatcher. (t_936962bd retest4:
+        # the ask resolved to 'user' and fell through to the interactive
+        # callback instead of reaching the card's creator.)
     origin = get_origin_routing(conn, task_id)
     if origin:
         profile = str(origin.get("profile") or "").strip()
