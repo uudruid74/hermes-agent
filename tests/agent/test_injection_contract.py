@@ -200,6 +200,31 @@ class TestArchiveTrailDedup:
             ]
             assert len(carriers) == 3, [(r["id"], r.get("tool_calls")) for r in carriers]
 
+    def test_identical_content_with_distinct_reasoning_survives(self):
+        """Zephyr 2026-10-20 residual: identical visible content but
+        different thinking (reasoning_content) is distinct messages. The
+        identity is introspected over EVERY persisted body column."""
+        with TemporaryDirectory() as tmp:
+            db = _db(tmp)
+            batch = [
+                {
+                    "role": "assistant", "content": "Done.", "reasoning_content": "think A",
+                    "timestamp": 100.0,
+                },
+                {
+                    "role": "assistant", "content": "Done.", "reasoning_content": "think B",
+                    "timestamp": 100.0,
+                },
+            ]
+            db.append_messages_batch("s4", [dict(m) for m in batch])
+            for _ in range(3):
+                db.archive_and_compact("s4", [dict(m) for m in batch])
+            all_rows = db.get_messages("s4", include_inactive=True)
+            done_rows = [
+                r for r in all_rows if not r["active"] and r["content"] == "Done."
+            ]
+            assert len(done_rows) == 2, [(r["id"], r.get("reasoning_content")) for r in done_rows]
+
     def test_identical_content_at_distinct_timestamps_survives(self):
         """Identical text at different clocks is distinct messages (the
         repeated 'Continue' turn class) — only same-clock copies collapse."""

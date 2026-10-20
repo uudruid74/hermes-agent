@@ -7081,6 +7081,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         call_id: Any,
         text: Any,
         tool_calls_json: Optional[str],
+        reasoning: Optional[str] = None,
+        reasoning_content: Optional[str] = None,
+        api_content: Optional[str] = None,
     ) -> tuple:
         """Return the row's unit-id (see the writer-discipline note above)."""
         if call_id:
@@ -7088,6 +7091,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         body = text if isinstance(text, str) else ""
         calls = tool_calls_json or ""
         edge = _UNIT_FINGERPRINT_CHARS
+
+        def _fp(value: Any) -> tuple:
+            s = value if isinstance(value, str) else ""
+            return (len(s), s[:edge], s[-edge:])
+
         return (
             "body",
             role or "unknown",
@@ -7097,6 +7105,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             len(calls),
             calls[:edge],
             calls[-edge:],
+            # Zephyr 2026-10-20 residual: rows identical in visible body but
+            # different in thinking/sidecar are DISTINCT messages — the
+            # fingerprint must see them or the second is dropped as a
+            # "verbatim re-copy".
+            _fp(reasoning),
+            _fp(reasoning_content),
+            _fp(api_content),
         )
 
     def _row_unit_index_for(self, conn, session_id: str) -> Dict[str, Any]:
@@ -7121,7 +7136,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             f"substr(content, -{edge}) AS ctail, "
             f"length(tool_calls) AS tlen, "
             f"substr(tool_calls, 1, {edge}) AS thead, "
-            f"substr(tool_calls, -{edge}) AS ttail "
+            f"substr(tool_calls, -{edge}) AS ttail, "
+            f"length(reasoning) AS rlen, "
+            f"substr(reasoning, 1, {edge}) AS rhead, "
+            f"substr(reasoning, -{edge}) AS rtail, "
+            f"length(reasoning_content) AS rclen, "
+            f"substr(reasoning_content, 1, {edge}) AS rchead, "
+            f"substr(reasoning_content, -{edge}) AS rctail, "
+            f"length(api_content) AS alen, "
+            f"substr(api_content, 1, {edge}) AS ahead, "
+            f"substr(api_content, -{edge}) AS atail "
             "FROM messages WHERE session_id = ?",
             (session_id,),
         ):
@@ -7142,6 +7166,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 row["tlen"] or 0,
                 row["thead"] or "",
                 row["ttail"] or "",
+                (row["rlen"] or 0, row["rhead"] or "", row["rtail"] or ""),
+                (row["rclen"] or 0, row["rchead"] or "", row["rctail"] or ""),
+                (row["alen"] or 0, row["ahead"] or "", row["atail"] or ""),
             )
             entry["bodies"].setdefault(base, set()).add(ts)
         cache[session_id] = entry
@@ -7321,8 +7348,25 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         ts_fabricated = False
             # One-row -> one-unit-id: skip rows whose unit is already
             # represented (durable, or already inserted in this batch).
+            # The fingerprint must see reasoning/sidecar (Zephyr 2026-10-20
+            # residual) or a thinking-different twin gets dropped here.
+            _reasoning = (
+                _scrub_surrogates(msg.get("reasoning")) if role == "assistant" else None
+            )
+            _reasoning_content = (
+                _scrub_surrogates(msg.get("reasoning_content"))
+                if role == "assistant"
+                else None
+            )
+            _api_content_fp = msg.get("api_content")
             _unit_id = self._row_unit_id(
-                role, msg.get("tool_call_id"), _encoded, tool_calls_json
+                role,
+                msg.get("tool_call_id"),
+                _encoded,
+                tool_calls_json,
+                _reasoning,
+                _reasoning_content,
+                _api_content_fp if isinstance(_api_content_fp, str) else None,
             )
             if _unit_id[0] == "call":
                 _unit_dup = _unit_id in batch_calls or (
@@ -7702,27 +7746,27 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # the "ghost-twin preamble" trail (8 dead copies of one 48KB row
             # in Gopher's session, 4,402 trail rows / 6.6MB).
             #
-            # The identity is the FULL message body — (role, tool_call_id,
-            # content, tool_calls, api_content, display_metadata,
-            # codex_message_items, timestamp) — NOT just (role, call-id,
-            # content). Zephyr 2026-10-20: assistant tool-call rows carry
-            # content='' and tool_call_id NULL, so the narrower key collapsed
-            # genuinely distinct messages (32,814 rows measured on Gopher's
-            # trail); identical CONTENT at different timestamps (a repeated
-            # "Continue" turn, 84x in one session) is likewise distinct
-            # messages. Only rows that are identical in EVERY persisted body
-            # field AND share their (harvested original) clock are copies of
-            # one row. Keep the original (lowest id) per identity; content
-            # stays discoverable via search_messages through the survivor.
+            # The identity is EVERY persisted column except id/session/flags
+            # — introspected from the schema so it cannot drift (Zephyr
+            # 2026-10-20 re-verification: hand-listed identities keep leaving
+            # columns behind — reasoning_content/reasoning/display_kind alone
+            # accounted for 207 more distinct rows destroyed DB-wide). Only
+            # rows identical in EVERY field AND sharing their (harvested
+            # original) clock are copies of one row; two assistant turns with
+            # identical visible content but different thinking are distinct
+            # messages. Keep the original (lowest id) per identity; content
+            # stays discoverable through the survivor.
+            body_cols = [
+                r[1]
+                for r in conn.execute("PRAGMA table_info(messages)").fetchall()
+                if r[1] not in ("id", "session_id", "active", "compacted")
+            ]
             conn.execute(
                 "DELETE FROM messages WHERE session_id = ? AND active = 0 "
                 "AND compacted = 1 AND id NOT IN ("
                 "  SELECT MIN(id) FROM messages"
                 "  WHERE session_id = ? AND active = 0 AND compacted = 1"
-                "  GROUP BY role, COALESCE(tool_call_id, ''), COALESCE(content, ''),"
-                "           COALESCE(tool_calls, ''), COALESCE(api_content, ''),"
-                "           COALESCE(display_metadata, ''), COALESCE(codex_message_items, ''),"
-                "           COALESCE(timestamp, 0)"
+                f"  GROUP BY {', '.join(body_cols)}"
                 ")",
                 (session_id, session_id),
             )
