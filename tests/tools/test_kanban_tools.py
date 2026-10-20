@@ -773,15 +773,23 @@ def test_board_param_none_falls_back_to_env(worker_env):
 # ---------------------------------------------------------------------------
 # kanban_create auto-subscribe behaviour
 #
-# When a worker calls kanban_create from inside a session that has a
-# persistent delivery channel, the originating session should be
-# subscribed to the new task's completion/block events automatically.
-# - Gateway sessions: HERMES_SESSION_PLATFORM + HERMES_SESSION_CHAT_ID set.
-# - TUI sessions: HERMES_SESSION_KEY (or HERMES_SESSION_ID) set, with
-#   the platform/chat_id ContextVars intentionally empty.
+# When a worker calls kanban_create from inside a session, the task's
+# origin is recorded and (for TUI sessions) the session is subscribed.
+#
+# Auto-subscribe behaviour after the notification-watcher rip-out (Evan,
+# 2026-10-19). `_maybe_auto_subscribe` now does two things:
+# - Origin routing is stored for EVERY scope — it is the delivery source of
+#   truth the state-change hook and plan-binding messages route by.
+# - A subscription row is written for TUI sessions ONLY: HERMES_SESSION_KEY
+#   set, platform/chat_id ContextVars empty. The TUI panel poller
+#   (tui_gateway/server.py) reads platform="tui" rows and posts task events
+#   into the running session.
+# - Chat sessions (HERMES_SESSION_PLATFORM + HERMES_SESSION_CHAT_ID) get NO
+#   row — chat rows fed the deleted watcher and are write-only since.
 # - CLI / cron / test sessions: no delivery channel -> no subscription.
 # - Config gate kanban.auto_subscribe_on_create: false -> no subscription
-#   even when the session has a delivery channel.
+#   row even for TUI (origin routing is still stored — routing is not a
+#   notification preference).
 # ---------------------------------------------------------------------------
 
 def _list_subs_for_task(task_id):
@@ -814,8 +822,9 @@ def _sub_index(subs):
 
 
 def test_create_auto_subscribe_uses_username_only(monkeypatch, worker_env):
-    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
-    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-42")
+    monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
+    monkeypatch.setenv("HERMES_SESSION_KEY", "tui-session-key")
     monkeypatch.setenv("HERMES_SESSION_ID", "20260921_010203_abcdef")
     monkeypatch.setenv("HERMES_SESSION_PROFILE", "wrong-session-route")
 
@@ -830,11 +839,42 @@ def test_create_auto_subscribe_uses_username_only(monkeypatch, worker_env):
     assert result["subscribed"] is True
     subs = _sub_index(_list_subs_for_task(result["task_id"]))
     assert len(subs) == 1
+    assert subs[0]["platform"] == "tui"
+    assert subs[0]["chat_id"] == "tui-session-key"
     assert subs[0]["notifier_profile"] == "test-worker"
 
     from hermes_cli import kanban_db as kb
     with kb.connect() as conn:
         created_origin = kb.get_origin_routing(conn, result["task_id"])
+    assert created_origin is not None
+    assert created_origin["platform"] == "session"
+    assert created_origin["chat_id"] == "20260921_010203_abcdef"
+
+
+def test_chat_sessions_get_origin_but_no_subscription_row(monkeypatch, worker_env):
+    """Chat-platform sessions get delivery via the wake/origin path — the
+    chat subscription rows fed the deleted watcher and must not come
+    back (write-only rows are how the duplicate deliveries happened)."""
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-42")
+    monkeypatch.setenv("HERMES_SESSION_KEY", "tui-session-key")
+    monkeypatch.setenv("HERMES_SESSION_ID", "20260921_010203_abcdef")
+
+    from tools import kanban_tools as kt
+
+    result = json.loads(kt._handle_create({
+        "title": "chat scoped create",
+        "assignee": "peer",
+    }))
+
+    assert result["ok"] is True
+    assert result["subscribed"] is False, result
+    assert _list_subs_for_task(result["task_id"]) == []
+
+    from hermes_cli import kanban_db as kb
+    with kb.connect() as conn:
+        created_origin = kb.get_origin_routing(conn, result["task_id"])
+    assert created_origin is not None
     assert created_origin["platform"] == "session"
     assert created_origin["chat_id"] == "20260921_010203_abcdef"
 
@@ -891,10 +931,9 @@ def test_auto_subscribe_retargets_existing_origin(monkeypatch, worker_env):
 
 def test_create_respects_auto_subscribe_on_create_false(monkeypatch, worker_env, tmp_path):
     """The config gate kanban.auto_subscribe_on_create=false must
-    suppress auto-subscription even when the session has a delivery
-    channel. This is the knob that addresses the upstream design
-    concern from PR #19718 (reverted in #19721) — users who want
-    explicit kanban_notify-subscribe calls per task get that."""
+    suppress the subscription row even when the session has a delivery
+    channel (TUI). Origin routing is still stored — it is delivery
+    addressing, not a notification preference."""
     # worker_env already created <tmp>/.hermes; use a fresh sibling
     # home to avoid mkdir() colliding with the worker's directory.
     home = tmp_path / "gate-home" / ".hermes"
@@ -903,8 +942,10 @@ def test_create_respects_auto_subscribe_on_create_false(monkeypatch, worker_env,
         "kanban:\n  auto_subscribe_on_create: false\n"
     )
     monkeypatch.setenv("HERMES_HOME", str(home))
-    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
-    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "channel-1")
+    monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
+    monkeypatch.setenv("HERMES_SESSION_KEY", "tui-session-key")
+    monkeypatch.setenv("HERMES_SESSION_ID", "20260921_010203_abcdef")
 
     from tools import kanban_tools as kt
     out = kt._handle_create({
@@ -917,6 +958,11 @@ def test_create_respects_auto_subscribe_on_create_false(monkeypatch, worker_env,
 
     assert _list_subs_for_task(d["task_id"]) == []
 
+    from hermes_cli import kanban_db as kb
+    with kb.connect() as conn:
+        created_origin = kb.get_origin_routing(conn, d["task_id"])
+    assert created_origin is not None
+
 
 def test_maybe_auto_subscribe_swallows_add_notify_sub_failure(monkeypatch, worker_env):
     """If add_notify_sub itself raises (e.g. DB locked, schema drift),
@@ -924,8 +970,9 @@ def test_maybe_auto_subscribe_swallows_add_notify_sub_failure(monkeypatch, worke
     kanban_create. The function returns False and the parent create
     still succeeds with subscribed=False."""
     from tools import kanban_tools as kt
-    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
-    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-42")
+    monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
+    monkeypatch.setenv("HERMES_SESSION_KEY", "tui-session-key")
 
     from hermes_cli import kanban_db as kb
 

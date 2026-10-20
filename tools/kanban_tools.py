@@ -1364,49 +1364,46 @@ def _handle_create(args: dict, **kw) -> str:
 def _maybe_auto_subscribe(
     conn: Any, task_id: str, *, origin_session_id: str | None
 ) -> bool:
-    """Auto-subscribe the calling session to task completion / block events.
+    """Store the task's origin routing and subscribe TUI sessions to its feed.
 
-    Returns True if a subscription row was written, False otherwise (no
-    session context, config gate disabled, or best-effort failure). The
-    caller surfaces this in the ``subscribed`` field of the kanban_create
-    response so an orchestrator can decide whether to fall back to an
-    explicit ``kanban_notify-subscribe`` or to polling.
+    Origin routing is stored for every scope: it is the delivery source of
+    truth the state-change hook and plan-binding messages route by.
+
+    The notification subscription is TUI-only. The TUI panel poller
+    (``tui_gateway/server.py``) reads ``platform="tui"`` rows (``chat_id`` =
+    ``HERMES_SESSION_KEY``) and posts the task's terminal events into the
+    running session. Chat-platform rows (telegram/discord/...) existed for
+    the gateway notification watcher, which was deleted on Evan's directive
+    (2026-10-19) — chat delivery rides the wake event and routes by the task
+    origin, so those rows are write-only and are no longer created.
+
+    Returns True when a subscription row was written, False otherwise (chat
+    session, no session context, config gate disabled, or best-effort
+    failure). The caller surfaces this in the ``subscribed`` field of the
+    kanban_create response.
 
     Gated by ``kanban.auto_subscribe_on_create`` in config.yaml (default
-    True). Disable to mirror pre-feature behaviour, e.g. when the
-    originating user/chat opted out via the per-platform notification
-    toggle (see ``hermes dashboard``).
+    True). The gate covers the subscription only — origin routing is
+    delivery addressing, not a notification preference.
 
-    Subscription paths:
-
-    - **Gateway** (telegram/discord/slack/etc): ``HERMES_SESSION_PLATFORM``,
-      ``HERMES_SESSION_CHAT_ID``, and ``HERMES_SESSION_CHAT_TYPE`` are set in
-      ContextVars by the messaging gateway before agent dispatch. The
-      notification poller already keys off these, so we just register a row.
-
-    - **TUI** (herm desktop / herm TUI): the platform/chat_id ContextVars
-      are intentionally cleared (TUI is a single-channel local UI, not
-      a multi-tenant chat surface), but the agent subprocess inherits
-      ``HERMES_SESSION_KEY`` from the parent session. We subscribe with
-      ``platform="tui"`` and ``chat_id=<key>``; the TUI notification
-      poller (``tui_gateway/server.py``) reads ``kanban_notify_subs``
-      for these rows and posts the completion message into the running
-      session.
-
-    - **CLI / cron / test / unattached**: no persistent delivery channel,
-      no-op.
+    HERMES_SESSION_ID is intentionally NOT a session fallback for the
+    subscription: ACP / the agent subprocess export it for telemetry
+    regardless of the parent, so treating it as a notification target would
+    auto-subscribe every CLI invocation — the over-eager behaviour that got
+    #19718 reverted upstream. The TUI poller keys on HERMES_SESSION_KEY.
 
     Failure mode: any exception inside the function is logged at WARNING
     with the offending exception + diagnostic env vars and swallowed.
     We never want a notification bookkeeping failure to fail the
     kanban_create that the agent is mid-conversation about.
     """
+    subscribe = True
     try:
         cfg = load_config()
         if not cfg_get(cfg, "kanban", "auto_subscribe_on_create", default=True):
-            return False
+            subscribe = False
     except Exception:
-        # If config can't load we still default to True — this is the
+        # If config can't load we still default to True — the
         # user-friendly behaviour that mirrors the pre-gate implementation.
         pass
 
@@ -1414,77 +1411,44 @@ def _maybe_auto_subscribe(
     chat_id = ""
     try:
         from gateway.session_context import get_session_env
-        platform = get_session_env("HERMES_SESSION_PLATFORM", "")
-        chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
-        if not platform or not chat_id:
-            # TUI / desktop fallback: platform/chat_id ContextVars are
-            # cleared for TUI sessions, but the parent process exports
-            # HERMES_SESSION_KEY into the subprocess env. Treat that
-            # as a "tui" subscription so the TUI notification poller
-            # (tui_gateway/server.py) can pick it up.
-            #
-            # HERMES_SESSION_ID is intentionally NOT a fallback here:
-            # it is set by ACP / the agent subprocess for telemetry
-            # regardless of whether the parent is a TUI or a CLI, so
-            # treating it as a notification target would auto-subscribe
-            # every CLI invocation, which is exactly the over-eager
-            # behaviour that got #19718 reverted upstream. The TUI
-            # poller keys on HERMES_SESSION_KEY.
-            session_key = (
-                get_session_env("HERMES_SESSION_KEY", "")
-                or os.environ.get("HERMES_SESSION_KEY", "")
-            )
-            if not session_key:
-                return False  # CLI / cron / test — no persistent channel
-            platform = "tui"
-            chat_id = session_key
-        thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or None
-        user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
-        chat_type = get_session_env("HERMES_SESSION_CHAT_TYPE", "") or None
-        message_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "") or ""
-        notifier_profile = (os.environ.get("USERNAME") or "").strip()
-        delivery_metadata: dict[str, Any] = {}
-        if thread_id:
-            delivery_metadata["thread_id"] = thread_id
-        if chat_type:
-            delivery_metadata["chat_type"] = chat_type
-        if (
-            platform.lower() == "telegram"
-            and thread_id
-            and (chat_type or "").lower() in {"dm", "direct", "private"}
-        ):
-            delivery_metadata["telegram_dm_topic_reply_fallback"] = True
-            if str(thread_id) not in {"", "1"}:
-                delivery_metadata["direct_messages_topic_id"] = str(thread_id)
-            if message_id:
-                delivery_metadata["telegram_reply_to_message_id"] = str(message_id)
 
         # Lazy-import to keep the module-level dependency light
         from hermes_cli import kanban_db as _kb
-        _kb.add_notify_sub(
-            conn, task_id=task_id,
-            platform=platform, chat_id=chat_id,
-            chat_type=chat_type,
-            thread_id=thread_id, user_id=user_id,
-            notifier_profile=notifier_profile,
-            delivery_metadata=delivery_metadata or None,
-        )
-        # Store origin routing as a system comment so the watcher can
-        # always find the right channel — even if the subscription is
-        # later lost/overwritten, the origin comment survives as the
-        # source of truth. Origin routing is session-addressed; the delivery
-        # channel above remains a separate subscription concern.
+
+        # Origin routing first — every scope, gate-independent. The wake and
+        # plan-binding message paths resolve delivery with it at use time; the
+        # row survives subscription loss because it is a system comment.
         try:
             _kb.store_origin_routing(
                 conn, task_id=task_id,
                 platform="session", chat_id=origin_session_id or "",
-                profile=notifier_profile or "",
+                profile=(os.environ.get("USERNAME") or "").strip(),
                 overwrite=True,
             )
         except ValueError as exc:
             logger.warning(
                 "origin routing not stored for %s: %s", task_id, exc
             )
+
+        platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+        chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
+        if platform and chat_id:
+            return False  # chat session — delivery rides the wake/origin path
+        # TUI / desktop fallback: platform/chat_id ContextVars are
+        # cleared for TUI sessions, but the parent process exports
+        # HERMES_SESSION_KEY into the subprocess env. The TUI notification
+        # poller (tui_gateway/server.py) keys on it.
+        session_key = (
+            get_session_env("HERMES_SESSION_KEY", "")
+            or os.environ.get("HERMES_SESSION_KEY", "")
+        )
+        if not session_key or not subscribe:
+            return False
+        _kb.add_notify_sub(
+            conn, task_id=task_id,
+            platform="tui", chat_id=session_key,
+            notifier_profile=(os.environ.get("USERNAME") or "").strip(),
+        )
         return True
     except Exception as _exc:
         logger.warning(

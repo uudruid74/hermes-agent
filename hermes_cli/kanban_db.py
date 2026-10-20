@@ -11157,8 +11157,8 @@ def unseen_events_for_sub(
     """Return ``(new_cursor, events)`` for a given subscription.
 
     Only events with ``id > last_event_id`` are returned. The subscription's
-    cursor is NOT advanced here; call :func:`advance_notify_cursor` after
-    the gateway has successfully delivered the notifications.
+    cursor is NOT advanced here — :func:`claim_unseen_events_for_sub` layers
+    an atomic claim over this peek for the TUI poller.
     """
     row = conn.execute(
         "SELECT last_event_id FROM kanban_notify_subs "
@@ -11243,23 +11243,6 @@ def claim_unseen_events_for_sub(
             (int(new_cursor), task_id, platform, chat_id, thread_id or "", int(old_cursor)),
         )
         return old_cursor, new_cursor, events
-
-
-def advance_notify_cursor(
-    conn: sqlite3.Connection,
-    *,
-    task_id: str,
-    platform: str,
-    chat_id: str,
-    thread_id: Optional[str] = None,
-    new_cursor: int,
-) -> None:
-    with write_txn(conn):
-        conn.execute(
-            "UPDATE kanban_notify_subs SET last_event_id = ? "
-            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
-            (int(new_cursor), task_id, platform, chat_id, thread_id or ""),
-        )
 
 
 def rewind_notify_cursor(
