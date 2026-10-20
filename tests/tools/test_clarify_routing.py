@@ -245,128 +245,24 @@ def test_every_clarify_dispatch_door_passes_agent_and_task_id():
 
 
 # ---------------------------------------------------------------------------
-# `plan clarify` from a raw kanban card (t_31094219 re-test, 2026-10-20).
-# Evan: "It is supposed to work from a kanban task." The plan command must
-# resolve the card's dispatcher WITHOUT an enclosing plan binding.
+# `plan clarify` is GONE (t_630b00b0, Evan 2026-10-20: "Get the god damn
+# 'plan clarify' out of there"). There is ONE clarify surface -- the bare
+# `clarify` tool tested above -- matching the standard Hermes tool call.
 # ---------------------------------------------------------------------------
 
 
-def _open_conn(db_path):
-    import sqlite3 as _sq
-
-    return _sq.connect(db_path)
-
-
-def _stub_worker_session(monkeypatch, task_id):
-    import contextlib
-
-    import hermes_state
-
-    fake_sdb = SimpleNamespace(
-        _read_ctx=lambda: contextlib.nullcontext(
-            SimpleNamespace(
-                execute=lambda *a, **k: SimpleNamespace(
-                    fetchone=lambda: (task_id,) if task_id else None
-                )
-            )
-        ),
-        close=lambda: None,
-        find_task_session_id=lambda tid: None,
-    )
-    monkeypatch.setattr(hermes_state, "SessionDB", lambda *a, **k: fake_sdb)
-
-
-def test_plan_clarify_from_raw_card_routes_to_dispatcher(kb_env, monkeypatch):
+def test_plan_clarify_is_gone():
     import tools.plan_binding_adapter as pba
+    from tools import plan
 
-    # The exact failure shape from the t_31094219 run: no plan binding.
-    monkeypatch.setattr(
-        pba, "_current", lambda conn, agent: (None, None, "ERROR: No active task")
-    )
-    monkeypatch.setattr(
-        pba,
-        "_legacy",
-        lambda: SimpleNamespace(_get_kanban_db=lambda: _open_conn(kb_env.db_path)),
-    )
-    _stub_worker_session(monkeypatch, "t_e4812748")
+    assert not hasattr(pba, "cmd_clarify")
+    assert not hasattr(pba, "_raw_card_clarify")
+    # The plan schema no longer offers the command at all.
+    enum = plan.PLAN_SCHEMA["parameters"]["properties"]["command"]["enum"]
+    assert "clarify" not in enum
 
-    agent = SimpleNamespace(
-        agent_name="ornith", session_id="sess_p1", clarify_callback=None
-    )
-    result = {}
+    class _Bare:
+        clarify_callback = None
 
-    def run():
-        result["r"] = pba.cmd_clarify(agent, "PLAN-CLARIFY — which three tools?")
-
-    t = threading.Thread(target=run, daemon=True)
-    t.start()
-    ask_id = None
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline and not ask_id:
-        ask_id = _pending_ask_id(kb_env.db_path)
-        if not ask_id:
-            time.sleep(0.1)
-    assert ask_id, "plan clarify on a raw card never wrote the ask"
-    wake_text = " ".join(kb_env.wakes[0])
-    assert "PLAN-CLARIFY" in wake_text
-    assert f"hermes kanban answer {ask_id}" in wake_text
-
-    conn = sqlite3.connect(kb_env.db_path)
-    conn.execute(
-        "UPDATE clarify_queue SET status='answered', answer=?, answered_at=? "
-        "WHERE id=?",
-        ("Belt, watch, glasses", int(time.time()), ask_id),
-    )
-    conn.commit()
-    conn.close()
-
-    t.join(timeout=15)
-    # cmd_clarify returns the dispatcher's answer text — not the JSON envelope.
-    assert result["r"] == "Belt, watch, glasses"
-
-
-def test_plan_clarify_without_card_still_errors(kb_env, monkeypatch):
-    import tools.plan_binding_adapter as pba
-
-    monkeypatch.setattr(
-        pba, "_current", lambda conn, agent: (None, None, "ERROR: No active task")
-    )
-    monkeypatch.setattr(
-        pba,
-        "_legacy",
-        lambda: SimpleNamespace(_get_kanban_db=lambda: _open_conn(kb_env.db_path)),
-    )
-    _stub_worker_session(monkeypatch, None)
-    agent = SimpleNamespace(
-        agent_name="ornith", session_id="sess_p2", clarify_callback=None
-    )
-    out = pba.cmd_clarify(agent, "Q?")
-    assert out == "ERROR: No active task"
-    assert not kb_env.wakes
-
-
-def test_plan_clarify_raw_card_refuses_double_ask(kb_env, monkeypatch):
-    import tools.plan_binding_adapter as pba
-
-    monkeypatch.setattr(
-        pba, "_current", lambda conn, agent: (None, None, "ERROR: No active task")
-    )
-    monkeypatch.setattr(
-        pba,
-        "_legacy",
-        lambda: SimpleNamespace(_get_kanban_db=lambda: _open_conn(kb_env.db_path)),
-    )
-    _stub_worker_session(monkeypatch, "t_e4812748")
-    conn = sqlite3.connect(kb_env.db_path)
-    conn.execute(
-        "INSERT INTO clarify_queue(id,session_id,task_id,agent_name,question,"
-        "status,created_at) VALUES(?,?,?,?,?,?,?)",
-        ("pending1", "s", "t_e4812748", "ornith", "Q?", "pending", int(time.time())),
-    )
-    conn.commit()
-    conn.close()
-    agent = SimpleNamespace(
-        agent_name="ornith", session_id="sess_p3", clarify_callback=None
-    )
-    out = pba.cmd_clarify(agent, "Q2?")
-    assert "pending clarify ask" in out
+    result = plan.plan(_Bare(), "clarify")
+    assert "Unknown plan command 'clarify'" in result

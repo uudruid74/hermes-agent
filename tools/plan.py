@@ -1210,7 +1210,6 @@ from tools.plan_binding_adapter import (
     cmd_advance as _binding_cmd_advance,
     cmd_approve as _cmd_approve,
     cmd_archive as _cmd_archive_adapter,
-    cmd_clarify as _cmd_clarify,
     cmd_continue as _cmd_continue,
     cmd_fail as _cmd_fail,
     cmd_handoff as _cmd_handoff,
@@ -1239,7 +1238,6 @@ def plan(
     resume: Optional[str] = None,
     reason: Optional[str] = None,
     response: Optional[str] = None,
-    question: Optional[str] = None,
     task_id: Optional[str] = None,
     board: Optional[str] = None,
     cron: Optional[str] = None,
@@ -1298,11 +1296,6 @@ def plan(
             return "ERROR: 'review' requires decision"
         return _cmd_review(agent, task_id, decision, response)
 
-    elif command == "clarify":
-        if not question:
-            return "ERROR: 'clarify' requires question"
-        return _cmd_clarify(agent, question)
-
     elif command == "repeat":
         return _cmd_repeat(
             agent,
@@ -1351,7 +1344,7 @@ def plan(
         return _cmd_archive_adapter(agent, task_id)
 
     else:
-        return f"ERROR: Unknown plan command '{command}'. Valid: new, advance, review, repeat, handoff, continue, dispatch, remind, fail, test-complete, approve, block, archive, cron, clarify"
+        return f"ERROR: Unknown plan command '{command}'. Valid: new, advance, review, repeat, handoff, continue, dispatch, remind, fail, test-complete, approve, block, archive, cron"
 
 
 # --- Schema ---
@@ -1361,7 +1354,7 @@ PLAN_SCHEMA = {
     "description": (
         "Mandatory Action Protocol — create and manage multistep plans. "
         "Commands: new (present plan for approval), advance (submit a completed-step summary for review), "
-        "review (approve, deny, yolo-enable, or answer a worker's clarify ask), "
+        "review (approve, deny, yolo-enable, or answer a worker's tool-limit ask), "
         "repeat (re-open a step as a corrective child plan), "
         "handoff (record in-progress work), continue (resume a task in this session), "
         "dispatch (create kanban task), remind (show current plan), "
@@ -1376,8 +1369,8 @@ PLAN_SCHEMA = {
         "properties": {
             "command": {
                 "type": "string",
-                "description": "Command: new, advance, review, repeat, handoff, continue, dispatch, remind, fail, test-complete, approve, block, archive, cron, or clarify",
-                "enum": ["new", "advance", "review", "repeat", "handoff", "continue", "dispatch", "remind", "fail", "test-complete", "approve", "block", "archive", "cron", "clarify"],
+                "description": "Command: new, advance, review, repeat, handoff, continue, dispatch, remind, fail, test-complete, approve, block, archive, or cron",
+                "enum": ["new", "advance", "review", "repeat", "handoff", "continue", "dispatch", "remind", "fail", "test-complete", "approve", "block", "archive", "cron"],
             },
             "title": {
                 "type": "string",
@@ -1427,11 +1420,7 @@ PLAN_SCHEMA = {
             },
             "response": {
                 "type": "string",
-                "description": "Required for a denied 'review', limited to 1024 characters: the denial message, or the answer to a worker's pending clarify/tool-limit ask. Optional for 'approved'.",
-            },
-            "question": {
-                "type": "string",
-                "description": "The clarifying question for 'clarify'. Routed to the plan's dispatcher when the plan was externally dispatched; the human answers otherwise.",
+                "description": "Required for a denied 'review', limited to 1024 characters: the denial message, or the answer to a worker's pending tool-limit ask. Optional for 'approved'.",
             },
             "task_id": {
                 "type": "string",
@@ -1491,7 +1480,6 @@ registry.register(
         resume=args.get("resume"),
         reason=args.get("reason"),
         response=args.get("response"),
-        question=args.get("question"),
         task_id=args.get("task_id"),
         board=args.get("board"),
         cron=args.get("cron"),
