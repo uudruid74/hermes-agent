@@ -3836,7 +3836,18 @@ def wake_target_for(conn: sqlite3.Connection, task_id: str, recipient: str) -> s
         if platform == "session":
             live = resolve_live_session_id(recipient, chat_id)
             if live and not _is_acting_session(live):
-                return f"{recipient}:cli:{live}"
+                # A session origin rolls up to its CHAT target — the shape
+                # proven to land as a user turn in the gateway's ACTIVE
+                # session for that chat (t_de2a9b4a row 505784). The bare
+                # ``:cli:`` shape does NOT inject into the named session: the
+                # wake copy posts to the profile's HOME session
+                # (send_cmd._wake_copy_target) — invisible whenever home is
+                # not the dispatcher's working session (t_ce9ae675: the wake
+                # sat in gopher's stale home session 2d4caf while he worked
+                # in 450e6ab9; t_58fced08 only worked because neo's home IS
+                # his working session). Chatless sessions keep ``:cli:``.
+                target = session_wake_target(recipient, chat_id)
+                return target or f"{recipient}:cli:{live}"
         elif platform:
             target = f"{recipient}:{platform}:{chat_id}"
             if thread_id:
