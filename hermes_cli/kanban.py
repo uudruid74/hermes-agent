@@ -618,6 +618,20 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_attach_rm = sub.add_parser("attach-rm", help="Delete an attachment by id")
     p_attach_rm.add_argument("attachment_id", type=int)
 
+    p_answer = sub.add_parser(
+        "answer",
+        help="Answer a worker's pending clarify ask (clarify_queue)",
+    )
+    p_answer.add_argument(
+        "target",
+        help="Clarify ask id (from the wake message) or a task id (answers "
+             "its newest pending ask)",
+    )
+    p_answer.add_argument(
+        "text",
+        help="Answer text — delivered to the parked worker verbatim",
+    )
+
     p_complete = sub.add_parser("complete", help="Mark one or more tasks done")
     p_complete.add_argument("task_ids", nargs="+",
                             help="One or more task ids (only --result applies to all of them)")
@@ -1079,6 +1093,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "unlink":   _cmd_unlink,
             "claim":    _cmd_claim,
             "comment":  _cmd_comment,
+            "answer":   _cmd_answer,
             "attach":   _cmd_attach,
             "attachments": _cmd_attachments,
             "attach-rm": _cmd_attach_rm,
@@ -3211,6 +3226,49 @@ def _cmd_comment(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         kb.add_comment(conn, args.task_id, author, body)
     print(f"Comment added to {args.task_id}")
+    return 0
+
+
+def _cmd_answer(args: argparse.Namespace) -> int:
+    """Answer a worker's parked clarify ask.
+
+    The wake message names the ask id; a task id is accepted too (answers its
+    newest pending ask). The worker's ``clarify`` call polls the queue row and
+    returns this text as the dispatcher's answer, verbatim.
+    """
+    import time
+
+    target = str(getattr(args, "target", "") or "").strip()
+    text = str(getattr(args, "text", "") or "").strip()
+    if not target or not text:
+        print(
+            "usage: hermes kanban answer <clarify-id|task-id> <text>",
+            file=sys.stderr,
+        )
+        return 2
+    with kb.connect_closing() as conn:
+        row = conn.execute(
+            "SELECT id FROM clarify_queue WHERE id=? AND status='pending' "
+            "ORDER BY created_at DESC LIMIT 1",
+            (target,),
+        ).fetchone()
+        if row is None:
+            row = conn.execute(
+                "SELECT id FROM clarify_queue WHERE task_id=? AND status='pending' "
+                "ORDER BY created_at DESC LIMIT 1",
+                (target,),
+            ).fetchone()
+        if row is None:
+            print(f"no pending clarify ask matching {target!r}", file=sys.stderr)
+            return 1
+        ask_id = row[0] if not isinstance(row, dict) else row["id"]
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE clarify_queue SET status='answered', answer=?, "
+                "answered_at=? WHERE id=?",
+                (text, int(time.time()), ask_id),
+            )
+    print(f"answered clarify ask {ask_id} — the parked worker picks it up")
     return 0
 
 

@@ -22,6 +22,12 @@ from typing import List, Optional, Callable
 # A 5th "Other (type your answer)" option is always appended by the UI.
 MAX_CHOICES = 4
 
+# How long a dispatcher-routed clarify waits for the answer recorded in
+# clarify_queue (``hermes kanban answer`` / the dashboard). Bounded so a
+# vanished dispatcher can't hang a worker forever — on expiry the outcome is
+# reported as an explicit NON-answer, never as a user response.
+DISPATCHER_ANSWER_TIMEOUT_S = 900
+
 
 def _flatten_choice(c) -> str:
     """Coerce a single choice into its user-facing display string.
@@ -109,6 +115,117 @@ def _parse_multi_select_response(raw_response) -> List[str]:
     return [s.strip() for s in raw.split(",") if s.strip()]
 
 
+def _route_clarify_to_dispatcher(
+    task_id,
+    session_task_id,
+    clarify_id: str,
+    question: str,
+    agent_name: str,
+) -> Optional[str]:
+    """Route a worker's clarify ask to the task's dispatcher (F11 base).
+
+    Raw kanban cards never had this path — the ask went straight to the
+    interactive callback, which in a headless worker times out and its
+    stand-down fallback reads like a real user answer (t_e4812748, where the
+    worker claimed "dispatcher answered" on the fallback string). The ask now
+    goes through ``send_dispatcher_message`` — the durable ``review-clarify``
+    event FIRST, then the use-time wake-ping to the creator/origin — matching
+    the plan-card F2 channel.
+
+    Returns the dispatcher's wake recipient, or None when no dispatcher
+    resolves (self-dispatch, human creator, no task) — the caller then keeps
+    the legacy interactive path.
+    """
+    import sqlite3
+    import sys
+
+    from hermes_cli.kanban_db import (
+        _review_ask_target,
+        kanban_db_path,
+        send_dispatcher_message,
+    )
+
+    try:
+        conn = sqlite3.connect(str(kanban_db_path()), timeout=5)
+    except sqlite3.Error as exc:
+        print(f"CLARIFY_DBG: dispatcher routing db open failed: {exc}", file=sys.stderr)
+        return None
+    try:
+        conn.row_factory = sqlite3.Row
+        tid = None
+        for cand in (task_id, session_task_id):
+            cand = str(cand or "").strip()
+            if cand and conn.execute(
+                "SELECT 1 FROM tasks WHERE id=?", (cand,)
+            ).fetchone():
+                tid = cand
+                break
+        if not tid:
+            return None
+        recipient = _review_ask_target(conn, tid, direction="to-dispatcher")
+        if not recipient:
+            return None
+        # Only an agent profile can be woken; a human creator stays on the
+        # interactive path (the human IS the dispatcher there).
+        from hermes_cli.profiles import profile_exists
+
+        if not profile_exists(recipient):
+            return None
+        ask = (
+            f"{tid} → your worker ({agent_name}) is asking for clarification.\n\n"
+            f"Question: {question}\n\n"
+            f"Answer it with:\n  hermes kanban answer {clarify_id} \"<your answer>\"\n"
+            "(or the dashboard). The worker is parked until the answer arrives."
+        )
+        ok, detail = send_dispatcher_message(
+            conn,
+            tid,
+            direction="to-dispatcher",
+            kind="clarify",
+            text=ask,
+            actor=agent_name or "worker",
+        )
+        if not ok:
+            print(f"CLARIFY_DBG: dispatcher ask failed: {detail}", file=sys.stderr)
+            return None
+        print(f"CLARIFY_DBG: {detail}", file=sys.stderr)
+        return recipient
+    except sqlite3.Error as exc:
+        print(f"CLARIFY_DBG: dispatcher routing failed: {exc}", file=sys.stderr)
+        return None
+    finally:
+        conn.close()
+
+
+def _wait_for_dispatcher_answer(
+    clarify_id: str, db_path: str, timeout_s: Optional[float] = None
+) -> Optional[str]:
+    """Poll clarify_queue for the dispatcher's recorded answer."""
+    import sqlite3
+    import time
+
+    if timeout_s is None:
+        timeout_s = DISPATCHER_ANSWER_TIMEOUT_S
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        row = None
+        try:
+            chk = sqlite3.connect(db_path, timeout=2)
+            try:
+                row = chk.execute(
+                    "SELECT answer FROM clarify_queue WHERE id=? AND status='answered'",
+                    (clarify_id,),
+                ).fetchone()
+            finally:
+                chk.close()
+        except sqlite3.Error:
+            row = None
+        if row and row[0] is not None:
+            return str(row[0])
+        time.sleep(1.0)
+    return None
+
+
 def clarify_tool(
     question: str,
     choices: Optional[List[str]] = None,
@@ -167,6 +284,7 @@ def clarify_tool(
 
     # Write to clarify_queue so dashboard can pick it up
     clarify_id = None
+    session_task_id = None
     if agent is not None:
         import uuid, time, os
         from hermes_cli.kanban_db import kanban_db_path
@@ -175,14 +293,18 @@ def clarify_tool(
         db.execute("PRAGMA journal_mode=WAL")
         clarify_id = uuid.uuid4().hex[:12]
         session_id = getattr(agent, "session_id", None) or os.environ.get("HERMES_SESSION_ID")
-        queue_task_id = task_id
-        if queue_task_id is None:
-            from hermes_state import SessionDB
-            sdb = SessionDB()
-            with sdb._read_ctx() as ctx:
-                row = ctx.execute("SELECT task_id FROM sessions WHERE id=?", (session_id,)).fetchone()
-            if row:
-                queue_task_id = row["task_id"] if isinstance(row, dict) else row[0]
+        from hermes_state import SessionDB
+        sdb = SessionDB()
+        row = None
+        read_ctx = sdb._read_ctx()
+        if read_ctx is not None:
+            with read_ctx as ctx:
+                row = ctx.execute(  # type: ignore[union-attr]
+                    "SELECT task_id FROM sessions WHERE id=?", (session_id,)
+                ).fetchone()
+        if row:
+            session_task_id = row["task_id"] if isinstance(row, dict) else row[0]
+        queue_task_id = task_id or session_task_id
         agent_name = getattr(agent, "agent_name", "unknown")
         db.execute(
             "INSERT INTO clarify_queue(id,session_id,task_id,agent_name,question,choices,multi_select,status,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
@@ -194,11 +316,47 @@ def clarify_tool(
         import sys
         print(f"CLARIFY_DBG: inserted {clarify_id} for agent={agent_name}, session={session_id}", file=sys.stderr)
 
+    # Raw-card dispatcher routing (t_e4812748 root cause, 2026-10-20): a
+    # worker's clarify on a kanban task must reach the task's creator. The
+    # F11 base writes the durable ask FIRST, then wake-pings the dispatcher.
+    # With a dispatcher in play the interactive callback is not the addressee
+    # and must not decide the answer.
+    dispatcher = None
+    if clarify_id:
+        dispatcher = _route_clarify_to_dispatcher(
+            task_id,
+            session_task_id,
+            clarify_id,
+            question,
+            getattr(agent, "agent_name", "unknown") if agent is not None else "unknown",
+        )
+
     # Race: callback (WebSocket/CLI) vs DB poll (dashboard).
     # The dashboard writes answers to clarify_queue; the callback blocks on
     # a WebSocket event.  Whichever provides an answer first wins.
     raw_response = None
-    if clarify_id:
+    if dispatcher and clarify_id:
+        from hermes_cli.kanban_db import kanban_db_path
+
+        # Dispatcher-routed ask: the answer arrives out-of-band in the queue
+        # (`hermes kanban answer` / the dashboard). On expiry the outcome is
+        # an explicit NON-answer — a fallback must never masquerade as one
+        # (the t_e4812748 worker claimed success on the stand-down string).
+        raw_response = _wait_for_dispatcher_answer(clarify_id, str(kanban_db_path()))
+        if raw_response is None:
+            return json.dumps({
+                "question": question,
+                "choices_offered": choices,
+                "user_response": "",
+                "error": (
+                    f"Clarify ask routed to dispatcher {dispatcher}, but no "
+                    "answer arrived within the wait window. This is a TIMEOUT, "
+                    "NOT a user answer — do not treat it as one and do not "
+                    "improvise an answer. Stand down and report the unanswered "
+                    "question verbatim."
+                ),
+            }, ensure_ascii=False)
+    elif clarify_id:
         import threading
         _cb_result = [None]
         _cb_done = threading.Event()
@@ -345,7 +503,8 @@ registry.register(
         choices=args.get("choices"),
         multi_select=args.get("multi_select", False),
         callback=kw.get("callback"),
-        agent=kw.get("agent")),
+        agent=kw.get("agent"),
+        task_id=kw.get("task_id")),
     check_fn=check_clarify_requirements,
     emoji="❓",
 )
