@@ -246,7 +246,7 @@ class TestArmIsolation:
         import agent.internal_compression_fallback as head
 
         assert hasattr(head, "_tool_trail_lines")
-        assert hasattr(head, "_carry_tool_trail")
+        assert hasattr(head, "_select_trail_lines")
 
     def test_build_signatures_match_between_arms(self):
         import inspect

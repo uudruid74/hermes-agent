@@ -278,6 +278,9 @@ class TestPersistence:
         assert restored is not None
         msg = restored.history[0]
         assert isinstance(msg.pop("timestamp", None), (int, float))
+        # Durable row identity (t_235275a0 [#xx] handles) rides the restored
+        # dicts like `timestamp`; it is transport-stripped before the wire.
+        msg.pop("_row_id", None)
         assert restored.history == [{
             "role": "assistant",
             "content": "hello",
