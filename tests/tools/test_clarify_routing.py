@@ -108,21 +108,20 @@ def test_worker_clarify_queues_row_and_wakes_dispatcher(kb_env):
             time.sleep(0.1)
     assert ask_id, "the durable clarify_queue row was never written"
 
-    # The wake carried the question and the answer instruction.
+    # The wake carried the question and the /review answer instruction
+    # (Evan 2026-10-20: the answer channel is /review — NOT a new command).
     assert kb_env.wakes, "the dispatcher was never woken"
     wake_text = " ".join(kb_env.wakes[0])
     assert "which three tools" in wake_text
-    assert f"hermes kanban answer {ask_id}" in wake_text
+    assert f"/review t_e4812748 <your answer>" in wake_text
+    assert "hermes kanban answer" not in wake_text
 
-    # The dispatcher answers out-of-band (the `kanban answer` verb).
-    conn = sqlite3.connect(kb_env.db_path)
-    conn.execute(
-        "UPDATE clarify_queue SET status='answered', answer=?, answered_at=? "
-        "WHERE id=?",
-        ("Belt, watch, glasses", int(time.time()), ask_id),
-    )
-    conn.commit()
-    conn.close()
+    # The dispatcher answers through the review command (/review flow).
+    from hermes_cli.plan_slash_helpers import plan_review_command
+
+    ok, msg = plan_review_command("t_e4812748 Belt, watch, glasses")
+    assert ok, msg
+    assert "delivered" in msg.lower()
 
     t.join(timeout=15)
     out = json.loads(result["r"])
@@ -191,7 +190,7 @@ def test_no_task_means_no_dispatcher(kb_env):
 
 def test_queue_row_links_the_real_task_id(kb_env, monkeypatch):
     """t_936962bd retest4: the tool kwarg carried a SESSION id and the ask
-    row linked IT — so `WHERE task_id='t_…'` and `hermes kanban answer t_…`
+    row linked IT — so `WHERE task_id='t_…'` and the /review answer
     found nothing. The row must link the real kanban task."""
     # the worker session's task link names the kanban card
     import contextlib
@@ -266,7 +265,12 @@ def test_human_creator_falls_back_to_origin_dispatcher(kb_env):
     assert "Q?" in " ".join(kb_env.wakes[0])
 
 
-def test_kanban_answer_verb_records_the_answer(kb_env):
+def test_review_command_answers_the_pending_ask(kb_env):
+    """The /review flow records the answer and the parked worker gets it
+    verbatim — the channel spec's \"the response string is literally what the
+    worker receives\"."""
+    from hermes_cli.plan_slash_helpers import plan_review_command
+
     conn = sqlite3.connect(kb_env.db_path)
     conn.execute(
         "INSERT INTO clarify_queue(id,session_id,task_id,agent_name,question,"
@@ -275,12 +279,8 @@ def test_kanban_answer_verb_records_the_answer(kb_env):
     )
     conn.commit()
     conn.close()
-    from hermes_cli import kanban as kb_cli
-
-    rc = kb_cli._cmd_answer(
-        argparse.Namespace(target="t_e4812748", text="Belt, watch, glasses")
-    )
-    assert rc == 0
+    ok, msg = plan_review_command("t_e4812748 Belt, watch, glasses")
+    assert ok, msg
     conn = sqlite3.connect(kb_env.db_path)
     try:
         row = conn.execute(
@@ -290,12 +290,54 @@ def test_kanban_answer_verb_records_the_answer(kb_env):
         conn.close()
     assert row == ("answered", "Belt, watch, glasses")
 
+def test_review_command_prompts_for_the_answer(kb_env):
+    """Dual-mode render: a pending ask reads as \"answer this clarifying
+    question about task X\" and teaches the /review answer form."""
+    from hermes_cli.plan_slash_helpers import plan_review_command
 
-def test_kanban_answer_verb_rejects_unknown_target(kb_env):
+    conn = sqlite3.connect(kb_env.db_path)
+    conn.execute(
+        "INSERT INTO clarify_queue(id,session_id,task_id,agent_name,question,"
+        "status,created_at) VALUES(?,?,?,?,?,?,?)",
+        ("ask2", "s", "t_e4812748", "ornith", "which three tools?", "pending",
+         int(time.time())),
+    )
+    conn.commit()
+    conn.close()
+    ok, text = plan_review_command("t_e4812748")
+    assert ok, text
+    assert "answer this clarifying question about task t_e4812748" in text
+    assert "which three tools?" in text
+    assert "/review t_e4812748 <your answer>" in text
+    assert "hermes kanban answer" not in text
+
+def test_review_command_rejects_answer_without_pending_ask(kb_env):
+    from hermes_cli.plan_slash_helpers import plan_review_command
+
+    ok, text = plan_review_command("t_e4812748 stray answer text")
+    assert not ok
+    assert "no pending clarifying question" in text
+
+def test_review_command_rejects_unknown_task(kb_env):
+    from hermes_cli.plan_slash_helpers import plan_review_command
+
+    ok, text = plan_review_command("t_nope hi")
+    assert not ok
+    assert "not found" in text
+
+def test_kanban_answer_verb_is_gone():
+    """`hermes kanban answer` was invented during the clarify saga without
+    Evan's permission (2026-10-20: \"NO NEW COMMANDS\"). The answer channel
+    is /review — the unapproved verb must not exist anywhere."""
     from hermes_cli import kanban as kb_cli
 
-    rc = kb_cli._cmd_answer(argparse.Namespace(target="t_nope", text="hi"))
-    assert rc == 1
+    assert not hasattr(kb_cli, "_cmd_answer")
+
+    parent = argparse.ArgumentParser()
+    sub = parent.add_subparsers(dest="top")
+    parser = kb_cli.build_parser(sub)
+    with pytest.raises(SystemExit):
+        parser.parse_args(["kanban", "answer", "t_e4812748", "hi"])
 
 
 def test_every_clarify_dispatch_door_passes_agent_and_task_id():

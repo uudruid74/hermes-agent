@@ -3,7 +3,7 @@
 Evan 2026-10-20: *"Get the god damn 'plan clarify' out of there and make
 clarify work the way I ask."* There is ONE clarify surface — the bare
 ``clarify`` tool (worker -> dispatcher via the clarify_queue ask, answered
-with ``hermes kanban answer``). What remains of the F2 flag channel is the
+through the ``/review`` command). What remains of the F2 flag channel is the
 tool-limit ask, answered through ``plan review``'s dual-mode.
 
 Covers:

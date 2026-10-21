@@ -2749,11 +2749,14 @@ class GatewaySlashCommandsMixin:
         return base
 
     async def _handle_review_command(self, event: "MessageEvent") -> str:
-        """/review <task_id> — Manual-backend review surface (t_6a55f4d6).
+        """/review <task_id> [answer] — the review command (t_6a55f4d6, F2).
 
-        In-progress plan: returns the current step + worker summary so the
-        human can reply `plan review`. Completed task: the final result.
-        Read-only; DB work runs off the event loop.
+        With answer text and a pending clarifying question on the task: the
+        clarify ANSWER — delivered to the parked worker verbatim (Evan
+        2026-10-20: this is the clarify answer channel, not a new command).
+        Otherwise read-only: in-progress plan returns the current step +
+        worker summary so the human can reply `plan review`; completed task
+        the final result. DB work runs off the event loop.
         """
         import asyncio
 
@@ -2762,8 +2765,9 @@ class GatewaySlashCommandsMixin:
         args = (event.get_command_args() or "").strip()
         if not args:
             return (
-                "Usage: /review <task_id> — a plan-backed task id "
-                "(`/kanban list` lists ids)."
+                "Usage: /review <task_id> [answer] — a plan-backed task id "
+                "(`/kanban list` lists ids); answer text resolves a pending "
+                "clarifying question."
             )
         ok, text = await asyncio.get_running_loop().run_in_executor(
             None, plan_review_command, args

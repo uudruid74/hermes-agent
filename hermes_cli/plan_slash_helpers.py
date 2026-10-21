@@ -104,18 +104,36 @@ def _render_final_review(task) -> str:
     )
 
 
-def plan_review_command(task_id: str) -> Tuple[bool, str]:
-    """``/review <task_id>`` — read-only Manual-backend review surface.
+def _pending_clarify_ask(conn, task_id: str):
+    """Newest unanswered ``clarify_queue`` ask parked against ``task_id``."""
+    return conn.execute(
+        "SELECT id, task_id, agent_name, question FROM clarify_queue "
+        "WHERE task_id=? AND status='pending' ORDER BY created_at DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
 
-    In-progress: returns the current step's pending review with the worker's
+
+def plan_review_command(args: str) -> Tuple[bool, str]:
+    """``/review <task_id> [answer]`` — the review command (F2 dual-mode).
+
+    With answer text and a pending clarifying question on the task, this is
+    the **clarify answer** channel (Evan 2026-10-20: a worker's clarify is
+    answered with ``/review`` — NOT ``hermes kanban answer``, NOT ``kanban
+    review``, NOT ``plan review``, NOT anything new). The response is recorded
+    on the durable ask and returned to the parked worker verbatim.
+
+    With no answer text this is the read-only Manual-backend review surface:
+    in-progress returns the current step's pending review with the worker's
     summary so the human can reply ``plan review`` (the existing cmd_review
     loop — identical behavior, no second review system built). Completed:
     returns the task's final result. Upstream /review semantics (independent
     reviewer subagent) are out of scope — F8, implementation is ours.
     """
-    task_id = (task_id or "").strip()
+    parts = (args or "").strip().split(None, 1)
+    task_id = parts[0] if parts else ""
+    response = parts[1].strip() if len(parts) > 1 else ""
     if not task_id:
-        return False, "Usage: /review <task_id>"
+        return False, "Usage: /review <task_id> [answer]"
     try:
         conn = _open_conn()
     except (OSError, sqlite3.Error) as exc:
@@ -124,6 +142,38 @@ def plan_review_command(task_id: str) -> Tuple[bool, str]:
         task = _task_row(conn, task_id)
         if task is None:
             return False, f"Task {task_id} not found"
+        # F2 dual-mode: a pending clarify ask turns this review command into
+        # a clarify ANSWER instead of a step review — "the response string is
+        # literally what the worker receives" (the channel spec).
+        ask = _pending_clarify_ask(conn, task_id)
+        if ask is not None:
+            if not response:
+                return True, (
+                    f"Task {task_id} has a pending clarifying question from "
+                    f"{ask['agent_name']} — answer this clarifying question "
+                    f"about task {task_id}:\n\n{ask['question']}\n\n"
+                    f"Answer it with the review command:\n"
+                    f"  /review {task_id} <your answer>\n"
+                    "(or the dashboard). The worker is parked until the "
+                    "answer arrives."
+                )
+            from hermes_cli.kanban_db import write_txn
+
+            with write_txn(conn):
+                conn.execute(
+                    "UPDATE clarify_queue SET status='answered', answer=?, "
+                    "answered_at=? WHERE id=?",
+                    (response, int(time.time()), ask["id"]),
+                )
+            return True, (
+                f"Clarify answer delivered to worker for {task_id} "
+                f"(ask {ask['id']})."
+            )
+        if response:
+            return (
+                False,
+                f"Task {task_id} has no pending clarifying question to answer.",
+            )
         status = task["status"]
         if status == "done":
             return True, _render_final_review(task)

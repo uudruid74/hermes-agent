@@ -23,7 +23,7 @@ from typing import List, Optional, Callable
 MAX_CHOICES = 4
 
 # How long a dispatcher-routed clarify waits for the answer recorded in
-# clarify_queue (``hermes kanban answer`` / the dashboard). Bounded so a
+# clarify_queue (``/review <task_id> <answer>`` / the dashboard). Bounded so a
 # vanished dispatcher can't hang a worker forever — on expiry the outcome is
 # reported as an explicit NON-answer, never as a user response.
 DISPATCHER_ANSWER_TIMEOUT_S = 900
@@ -174,7 +174,7 @@ def _route_clarify_to_dispatcher(
         ask = (
             f"{tid} → your worker ({agent_name}) is asking for clarification.\n\n"
             f"Question: {question}\n\n"
-            f"Answer it with:\n  hermes kanban answer {clarify_id} \"<your answer>\"\n"
+            f"Answer it with the review command:\n  /review {tid} <your answer>\n"
             "(or the dashboard). The worker is parked until the answer arrives."
         )
         ok, detail = send_dispatcher_message(
@@ -309,7 +309,7 @@ def clarify_tool(
         queue_task_id = task_id or session_task_id
         # Link the ask to the REAL kanban task when one exists: the tool
         # kwarg may carry a session/isolation id (t_936962bd retest4 stored
-        # the session id in task_id — `hermes kanban answer t_…` and the
+        # the session id in task_id — the `/review` answer and the
         # dashboard then found nothing). Prefer a candidate naming a tasks
         # row.
         try:
@@ -378,8 +378,8 @@ def clarify_tool(
         from hermes_cli.kanban_db import kanban_db_path
 
         # Dispatcher-routed ask: the answer arrives out-of-band in the queue
-        # (`hermes kanban answer` / the dashboard). On expiry the outcome is
-        # an explicit NON-answer — a fallback must never masquerade as one
+        # (`/review <task_id> <answer>` / the dashboard). On expiry the outcome
+        # is an explicit NON-answer — a fallback must never masquerade as one
         # (the t_e4812748 worker claimed success on the stand-down string).
         raw_response = _wait_for_dispatcher_answer(clarify_id, str(kanban_db_path()))
         if raw_response is None:

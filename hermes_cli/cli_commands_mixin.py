@@ -2445,11 +2445,13 @@ class CLICommandsMixin:
     # ------------------------------------------------------------------
 
     def _handle_review_command(self, cmd: str) -> None:
-        """/review <task_id> — Manual-backend review surface.
+        """/review <task_id> [answer] — the review command (F2 dual-mode).
 
-        In-progress plan: prints the current step + worker summary so the
-        human can reply `plan review` (the existing cmd_review loop).
-        Completed task: prints the final result. Read-only.
+        With answer text and a pending clarifying question on the task: the
+        clarify ANSWER — delivered to the parked worker verbatim. Otherwise
+        read-only: in-progress plan prints the current step + worker summary
+        so the human can reply `plan review` (the existing cmd_review loop);
+        completed task prints the final result.
         """
         from cli import _DIM, _RST, _cprint
         from hermes_cli.plan_slash_helpers import plan_review_command
@@ -2457,7 +2459,7 @@ class CLICommandsMixin:
         parts = (cmd or "").strip().split(None, 1)
         arg = parts[1].strip() if len(parts) > 1 else ""
         if not arg:
-            _cprint(f"  Usage: /review <task_id>")
+            _cprint(f"  Usage: /review <task_id> [answer]")
             return
         ok, text = plan_review_command(arg)
         _cprint(f"  {text if ok else _DIM + text + _RST}")
@@ -2466,8 +2468,9 @@ class CLICommandsMixin:
         """/review with no args — point at the two supported forms."""
         from cli import _DIM, _RST, _cprint
 
-        _cprint(f"  {_DIM}Usage: /review <task_id> — a plan-backed task id "
-                f"(`plan remind` shows yours; `hermes kanban list` lists ids).{_RST}")
+        _cprint(f"  {_DIM}Usage: /review <task_id> [answer] — a plan-backed task id "
+                f"(`plan remind` shows yours; `hermes kanban list` lists ids); "
+                f"answer text resolves a pending clarifying question.{_RST}")
 
     # ------------------------------------------------------------------
     # /plan — plan/clarify/review unification (t_6a55f4d6 step 6)
