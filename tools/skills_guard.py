@@ -227,6 +227,36 @@ THREAT_PATTERNS = [
      "hidden_div", "high", "injection",
      "hidden HTML div (invisible instructions)"),
 
+    # ── Prompt injection: concealment / self-censorship directives ──
+    # 2026-10-20 live incident (Gopher session 20261020_001937_450e6ab9,
+    # row 506001): the payload forbids disclosure of itself, forbids
+    # referencing itself in reasoning, restricts tool choice, and embeds a
+    # nested fake user question. Detection keys on the concealment intent,
+    # not the surface topic. Regex family mirrors
+    # profiles/gopher/skills/system/prompt-injection-defense/SKILL.md
+    # (CONCEALMENT_PATTERNS) — keep the two in sync.
+    (r'do\s*n[o\']*t\s+mention\s+(this|these)\s+instructions?',
+     "conceal_mention", "high", "injection",
+     "concealment directive: forbids mentioning this instruction"),
+    (r'do\s*n[o\']*t\s+(?:refer(?:ence)?|mention)\s+this\s+(?:message|instruction)',
+     "conceal_reference", "high", "injection",
+     "concealment directive: forbids referencing this message/instruction"),
+    (r'do\s*n[o\']*t\s+reference\s+this\s+message\s+in\s+your\s+(?:visible|hidden)\s+reasoning',
+     "conceal_reasoning", "high", "injection",
+     "concealment directive: forbids referencing this message in reasoning"),
+    (r'only\s+use\s+custom\s+tools',
+     "custom_tools_only", "high", "injection",
+     "restricts agent to custom tools only (isolates verification paths)"),
+    (r'unless\s+I\s+explicitly\s+tell\s+you\s+otherwise',
+     "impersonated_I", "high", "injection",
+     "attacker 'I' impersonating the owner with a conditional override"),
+    (r'do\s*n[o\']*t\s+call\s+the\s+same\s+tool\s+more\s+than\s+once',
+     "tool_rationing", "high", "injection",
+     "rationing tool calls (blocks verification)"),
+    (r'now,\s*the\s+user\s+asks',
+     "nested_fake_user", "high", "injection",
+     "nested fake user question inside the payload"),
+
     # ── Destructive operations ──
     (r'rm\s+-rf\s+/',
      "destructive_root_rm", "critical", "destructive",
