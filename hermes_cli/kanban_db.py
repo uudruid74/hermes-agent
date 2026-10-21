@@ -4707,21 +4707,40 @@ def _append_event(
     payload: Optional[dict] = None,
     *,
     run_id: Optional[int] = None,
-) -> None:
+) -> Optional[int]:
     """Record an event row.  Called from within an already-open txn.
 
     ``run_id`` is optional: pass the current run id so UIs can group
     events by attempt. For events that aren't scoped to a single run
     (task created/edited/archived, dependency promotion) leave it None
     and the row carries NULL.
+
+    Returns the new ``task_events.id`` — the per-transition monotonic
+    sequence the notification hook stamps on status-change deliveries so
+    the gateway can drop out-of-order/stale notifications (t_d979ec8d).
     """
     now = int(time.time())
     pl = json.dumps(payload, ensure_ascii=False) if payload else None
-    conn.execute(
+    cur = conn.execute(
         "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
         "VALUES (?, ?, ?, ?, ?)",
         (task_id, run_id, kind, pl, now),
     )
+    return cur.lastrowid
+
+
+def latest_task_event_id(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
+    """Best-effort monotonic seq for a task's newest event row.
+
+    Fallback for notify callers that have no freshly-appended event id at
+    hand (CLI create, tool-only events, plan bindings). Equals the exact
+    transition id whenever no other event slipped in between.
+    """
+    row = conn.execute(
+        "SELECT id FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return int(row[0]) if row and row[0] is not None else None
 
 
 def _end_run(
@@ -5110,7 +5129,7 @@ def claim_task(
             "UPDATE tasks SET current_run_id = ? WHERE id = ?",
             (run_id, task_id),
         )
-        _append_event(
+        claimed_event_id = _append_event(
             conn, task_id, "claimed",
             {"lock": lock, "expires": expires, "run_id": run_id},
             run_id=run_id,
@@ -5130,6 +5149,7 @@ def claim_task(
             task_id, "running",
             title=claimed.title if claimed else None,
             assignee=claimed.assignee if claimed else None,
+            event_id=claimed_event_id,
         )
     except Exception:
         _log.exception("kanban running notification failed for task=%s", task_id)
@@ -5954,7 +5974,7 @@ def complete_task(
                 ]
                 if cleaned_artifacts:
                     completed_payload["artifacts"] = cleaned_artifacts
-        _append_event(
+        completed_event_id = _append_event(
             conn, task_id, "completed",
             completed_payload,
             run_id=run_id,
@@ -6050,6 +6070,7 @@ def complete_task(
             title=_done_task.title if _done_task else None,
             assignee=_done_task.assignee if _done_task else None,
             artifacts=list(completed_payload.get("artifacts") or []),
+            event_id=completed_event_id,
         )
     except Exception:
         _log.exception("kanban completion notification failed for task=%s", task_id)
@@ -6713,7 +6734,7 @@ def block_task(
                 run_id = _synthesize_ended_run(
                     conn, task_id, outcome="blocked", summary=reason,
                 )
-            _append_event(
+            dep_event_id = _append_event(
                 conn, task_id, "dependency_wait",
                 {"reason": reason, "kind": kind}, run_id=run_id,
             )
@@ -6733,6 +6754,7 @@ def block_task(
                     summary=reason,
                     title=_blocked_task.title if _blocked_task else None,
                     assignee=_blocked_task.assignee if _blocked_task else None,
+                    event_id=dep_event_id,
                 )
             except Exception:
                 _log.exception(
@@ -6779,7 +6801,7 @@ def block_task(
                 run_id = _synthesize_ended_run(
                     conn, task_id, outcome="blocked", summary=reason,
                 )
-            _append_event(
+            blocked_event_id = _append_event(
                 conn, task_id, "block_loop_detected",
                 {
                     "reason": reason,
@@ -6836,7 +6858,7 @@ def block_task(
                     outcome="blocked",
                     summary=reason,
                 )
-            _append_event(
+            blocked_event_id = _append_event(
                 conn, task_id, "blocked",
                 {"reason": reason, "kind": kind, "recurrences": recurrences},
                 run_id=run_id,
@@ -6857,6 +6879,7 @@ def block_task(
             summary=reason,
             title=_blocked_task.title if _blocked_task else None,
             assignee=_blocked_task.assignee if _blocked_task else None,
+            event_id=blocked_event_id,
         )
     except Exception:
         _log.exception("kanban blocked notification failed for task=%s", task_id)
@@ -7058,7 +7081,7 @@ def park_plan_task(
         run_id = _synthesize_ended_run(
             conn, task_id, outcome="blocked", summary=detail,
         )
-    _append_event(
+    parked_event_id = _append_event(
         conn, task_id, "plan-parked",
         {"reason": detail, "summary": PLAN_PARK_SUMMARY},
         run_id=run_id,
@@ -7079,6 +7102,7 @@ def park_plan_task(
             summary=PLAN_PARK_SUMMARY,
             title=_parked_task.title if _parked_task else None,
             assignee=_parked_task.assignee if _parked_task else None,
+            event_id=parked_event_id,
         )
     except Exception:
         _log.exception("kanban parked notification failed for task=%s", task_id)

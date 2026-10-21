@@ -132,18 +132,22 @@ def test_iteration_limit_parks_manual_plan_in_attention(monkeypatch):
     ).fetchone()
     assert event["kind"] == "plan-parked"
     assert "Step 1 ended at the tool-call limit (200/200) with no submission" in event["payload"]
-    # Notification carries the fixed, greppable summary (Evan, 2026-10-03).
-    assert notified == [
-        (
-            task_id,
-            "attention",
-            {
-                "summary": "exceeded tool call limit",
-                "title": "Long step",
-                "assignee": "neo",
-            },
-        )
-    ]
+    # Notification carries the fixed, greppable summary (Evan, 2026-10-03)
+    # plus the transition's task_events.id as the delivery-ordering seq
+    # (t_d979ec8d) — assert its shape and compare the fixed fields exactly.
+    assert len(notified) == 1
+    n_task_id, n_status, n_kwargs = notified[0]
+    event_id = n_kwargs.pop("event_id")
+    assert isinstance(event_id, int)
+    assert (n_task_id, n_status, n_kwargs) == (
+        task_id,
+        "attention",
+        {
+            "summary": "exceeded tool call limit",
+            "title": "Long step",
+            "assignee": "neo",
+        },
+    )
 
 
 def test_iteration_limit_does_not_block_plan_with_pending_review(monkeypatch):

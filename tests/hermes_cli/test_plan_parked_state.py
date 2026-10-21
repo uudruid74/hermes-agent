@@ -233,16 +233,21 @@ def test_parked_notification_summary_is_the_fixed_string(monkeypatch):
         lambda task_id, status, **kwargs: notified.append((status, kwargs)),
     )
     task_id = _parked_task(conn)
-    assert notified == [
-        (
-            "attention",
-            {
-                "summary": "exceeded tool call limit",
-                "title": "Pente tell transport",
-                "assignee": "ornith",
-            },
-        )
-    ]
+    # The notification now carries the transition's task_events.id as the
+    # delivery-ordering seq (t_d979ec8d) — the exact value is the event row,
+    # so assert its shape and compare the fixed fields exactly.
+    assert len(notified) == 1
+    status, kwargs = notified[0]
+    event_id = kwargs.pop("event_id")
+    assert isinstance(event_id, int)
+    assert (status, kwargs) == (
+        "attention",
+        {
+            "summary": "exceeded tool call limit",
+            "title": "Pente tell transport",
+            "assignee": "ornith",
+        },
+    )
 
 
 def test_park_event_not_a_block_event():

@@ -102,6 +102,42 @@ def test_state_change_hook_kicks_dispatch(kanban_home, monkeypatch):
     assert len(calls) == 1, "every state change must kick one dispatch tick"
 
 
+def test_notification_delivers_before_dispatch_kick(kanban_home, monkeypatch):
+    """t_d979ec8d: deliver BEFORE kicking the dispatcher.
+
+    A kick-first order ran a whole dispatch tick before this transition's
+    own notification went out — and the tick's claims fire their own (newer)
+    notifications mid-tick, so subscribers saw 'running' before 'ready' and
+    carried the tick's latency on every message.
+    """
+    monkeypatch.setenv("HERMES_KANBAN_DISPATCH_KICKS", "1")
+    order: list[str] = []
+    monkeypatch.setattr(
+        kanban, "_send_kanban_human_notification",
+        lambda **kw: (order.append("deliver") or ("x", {"success": True})),
+    )
+    monkeypatch.setattr(kanban, "_send_kanban_wake", lambda **kw: ("x", {"success": True}))
+    monkeypatch.setattr(kanban, "_wake_task_worker_session", lambda *a, **k: False)
+
+    def fake_dispatch_once(conn, **kwargs):
+        order.append("kick")
+
+    monkeypatch.setattr(kb, "dispatch_once", fake_dispatch_once)
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="ordered", assignee="zephyr")
+        kb.store_origin_routing(
+            conn, tid,
+            platform="telegram", chat_id="chat1", thread_id="",
+            chat_type="dm", profile="neo",
+            allow_non_session=True, overwrite=True,
+        )
+    finally:
+        conn.close()
+    kanban._notify_kanban_status_change(tid, "done", summary="s", title="ordered")
+    assert order == ["deliver", "kick"]
+
+
 def test_cli_kick_actions_cover_mutations_not_reads():
     assert "create" in kanban._DISPATCH_KICK_ACTIONS
     assert "unblock" in kanban._DISPATCH_KICK_ACTIONS

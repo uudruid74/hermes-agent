@@ -1474,8 +1474,14 @@ def _send_kanban_human_notification(
     thread_id: str,
     message: str,
     notify_env: dict,
+    ordering: Optional[dict] = None,
 ) -> tuple[str, dict]:
-    """Queue a human notice on the origin profile's live gateway adapter."""
+    """Queue a human notice on the origin profile's live gateway adapter.
+
+    ``ordering`` (optional) stamps the delivery with the task's monotonic
+    transition seq so the gateway can drop stale/out-of-order notifications
+    (t_d979ec8d).
+    """
     from gateway.config import Platform
     from gateway.mcp_bridge import bridge_socket_path
     from model_tools import _run_async
@@ -1483,6 +1489,7 @@ def _send_kanban_human_notification(
 
     profile_home = notify_env.get("HERMES_HOME")
     bridge_path = bridge_socket_path(profile_home) if profile_home else bridge_socket_path()
+    ordering_kw = {"ordering": ordering} if ordering else {}
     result = _run_async(
         _send_delivery_via_bridge(
             Platform(platform),
@@ -1490,6 +1497,7 @@ def _send_kanban_human_notification(
             message,
             thread_id=thread_id or None,
             bridge_path=bridge_path,
+            **ordering_kw,
         )
     )
     return f"mcp_bridge:{bridge_path}", result
@@ -1845,12 +1853,49 @@ def _notify_kanban_status_change(
     title: Optional[str] = None,
     assignee: Optional[str] = None,
     artifacts: Optional[list[str]] = None,
+    event_id: Optional[int] = None,
 ) -> None:
     """Best-effort human delivery and LLM wake for a Kanban state change.
 
     This function is THE state-change choke point (CLI, tools, dispatcher and
     plan bindings all land here), so it also kicks the event-driven
-    dispatcher first — the transition just happened and may enable work.
+    dispatcher — AFTER delivery, never before (t_d979ec8d). Kicking first
+    ran a whole dispatch tick before this transition's own notification went
+    out; the tick's claims/reclaims fire their own (newer) notifications
+    mid-tick, so subscribers saw newer states before older ones (running
+    before ready) and every notification carried the tick's latency.
+    Deliver first, kick after: the subscriber stream follows event order.
+
+    ``event_id`` is the ``task_events.id`` of the transition being notified
+    — the monotonic per-task sequence stamped on the delivery so the gateway
+    can drop stale/out-of-order notifications.
+    """
+    try:
+        _deliver_kanban_notification(
+            task_id,
+            new_status,
+            summary=summary,
+            title=title,
+            assignee=assignee,
+            artifacts=artifacts,
+            event_id=event_id,
+        )
+    finally:
+        kick_dispatch()
+
+
+def _deliver_kanban_notification(
+    task_id: str,
+    new_status: str,
+    *,
+    summary: Optional[str] = None,
+    title: Optional[str] = None,
+    assignee: Optional[str] = None,
+    artifacts: Optional[list[str]] = None,
+    event_id: Optional[int] = None,
+) -> None:
+    """Delivery half of the state-change hook (the wrapper owns the dispatch
+    kick so this runs strictly before any nested notification).
 
     Both delivery paths resolve the task's origin profile once, then queue on
     that profile's live gateway bridge. ``artifacts`` (completed-task
@@ -1862,12 +1907,27 @@ def _notify_kanban_status_change(
     name only. Delivery failures are logged and fall back to a
     creator-session notice.
     """
-    kick_dispatch()
     try:
         conn = kb.connect()
         try:
             origin = kb.get_origin_routing(conn, task_id)
             task = kb.get_task(conn, task_id)
+            # Delivery ordering seq: the transition's own event id when the
+            # caller has it; otherwise the task's newest event row (the exact
+            # id unless another event slipped in first). A failed fallback
+            # must never cost the user the notification — it goes out
+            # unstamped (no gateway ordering guard) instead.
+            seq = int(event_id) if event_id is not None else None
+            if seq is None:
+                try:
+                    seq = kb.latest_task_event_id(conn, task_id)
+                except (OSError, sqlite3.Error, AttributeError, TypeError, ValueError):
+                    logger.warning(
+                        "kanban notify task=%s status=%s seq fallback failed",
+                        task_id,
+                        new_status,
+                        exc_info=True,
+                    )
         finally:
             conn.close()
     except Exception:
@@ -1912,6 +1972,7 @@ def _notify_kanban_status_change(
         "summary": summary_line or None,
         "assignee": assignee or "unassigned",
         "artifacts": artifact_files or None,
+        "seq": seq,
     })
 
     # Wake the task's live worker session (cli:<session_id>) when bound — the
@@ -1982,6 +2043,11 @@ def _notify_kanban_status_change(
             thread_id=thread_id,
             message=human_msg,
             notify_env=notify_env,
+            ordering=(
+                {"task_id": task_id, "seq": seq, "status": new_status}
+                if seq is not None
+                else None
+            ),
         )
         human_ok = bool(human_result.get("success"))
         log = logger.info if human_ok else logger.warning

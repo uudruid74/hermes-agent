@@ -1644,12 +1644,16 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     # registered plan handler.
                     decision=next_args.get("decision"),
                     step=next_args.get("step"),
-                    # `response` (renamed from reason's sibling, t_6a55f4d6
-                    # step 1) and `question` (the F2 clarify channel, step 3)
-                    # are declared in the schema — forward them or a routed
-                    # clarify ask silently loses its question.
+                    # `response` (the deny message / tool-limit ask answer,
+                    # t_6a55f4d6 step 1) is declared in the schema — forward
+                    # it or a routed ask silently loses its answer. `question`
+                    # used to ride here too (the F2 clarify channel) but plan
+                    # clarify was removed (t_630b00b0) and the answer channel
+                    # is /review now (t_dde3a92b): plan() has no `question`
+                    # parameter and forwarding one broke EVERY plan call with
+                    # "plan() got an unexpected keyword argument 'question'"
+                    # (t_d979ec8d).
                     response=next_args.get("response"),
-                    question=next_args.get("question"),
                     # Same whitelist gap: `new` accepts a parent_task_id to nest
                     # a sub-plan, and the schema declares it — but it was not
                     # forwarded here, so a nested plan silently became a root

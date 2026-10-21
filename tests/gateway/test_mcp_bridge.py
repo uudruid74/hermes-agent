@@ -219,6 +219,137 @@ def test_bridge_send_acknowledges_before_adapter_delivery():
     asyncio.run(_queued_bridge_send())
 
 
+# ---------------------------------------------------------------------------
+# Kanban delivery ordering (t_d979ec8d)
+# ---------------------------------------------------------------------------
+
+
+def _ordering_runner(adapter):
+    return SimpleNamespace(
+        adapters={Platform.TELEGRAM: adapter},
+        _background_tasks=set(),
+    )
+
+
+async def _ordered_send(runner, text, task_id, seq):
+    await _handle_send(
+        runner,
+        {
+            "platform": "telegram",
+            "chat_id": "8900123006",
+            "text": text,
+            "ordering": {"task_id": task_id, "seq": seq, "status": "x"},
+        },
+        cast(asyncio.StreamWriter, _Writer()),
+    )
+
+
+def test_bridge_kanban_ordering_drops_stale_notifications():
+    """A subscriber must never receive a state older than one already sent.
+
+    A lower-seq notification that arrives AFTER a higher-seq one was
+    delivered (the T7 late-and-reordered bug) is dropped at the gateway.
+    """
+    mcp_bridge._kanban_delivery_states.clear()
+    delivered: list[str] = []
+
+    async def fake_send(**kwargs):
+        delivered.append(kwargs["content"])
+        return SimpleNamespace(success=True, message_id="m1", error=None)
+
+    runner = _ordering_runner(SimpleNamespace(send=fake_send))
+
+    async def scenario():
+        await _ordered_send(runner, "done", "t_order", 5)
+        await asyncio.gather(*list(runner._background_tasks))
+        # Late straggler for an older state — must be dropped.
+        await _ordered_send(runner, "ready", "t_order", 3)
+        await asyncio.gather(*list(runner._background_tasks))
+
+    asyncio.run(scenario())
+    assert delivered == ["done"]
+
+
+def test_bridge_kanban_ordering_keeps_event_order():
+    mcp_bridge._kanban_delivery_states.clear()
+    delivered: list[str] = []
+
+    async def fake_send(**kwargs):
+        delivered.append(kwargs["content"])
+        return SimpleNamespace(success=True, message_id="m1", error=None)
+
+    runner = _ordering_runner(SimpleNamespace(send=fake_send))
+
+    async def scenario():
+        for seq, text in ((1, "ready"), (2, "running"), (3, "done")):
+            await _ordered_send(runner, text, "t_seq", seq)
+        await asyncio.gather(*list(runner._background_tasks))
+
+    asyncio.run(scenario())
+    assert delivered == ["ready", "running", "done"]
+
+
+def test_bridge_kanban_ordering_serializes_same_task_deliveries():
+    """A slow delivery must not be overtaken by a newer one for the same task.
+
+    Without the per-task serialization the fire-and-forget ``create_task``
+    fan-out lets the fast send complete first — delivery order flips even
+    when arrival order was correct.
+    """
+    mcp_bridge._kanban_delivery_states.clear()
+    delivered: list[str] = []
+    release = asyncio.Event()
+
+    async def gated_send(**kwargs):
+        if kwargs["content"] == "running":
+            await release.wait()
+        delivered.append(kwargs["content"])
+        return SimpleNamespace(success=True, message_id="m1", error=None)
+
+    runner = _ordering_runner(SimpleNamespace(send=gated_send))
+
+    async def scenario():
+        await _ordered_send(runner, "running", "t_race", 2)  # slow delivery
+        await _ordered_send(runner, "done", "t_race", 3)     # fast delivery
+        tasks = list(runner._background_tasks)
+        assert len(tasks) == 2
+        # Let both run: 'done' must NOT overtake the stalled 'running'.
+        await asyncio.sleep(0.01)
+        assert delivered == []          # both still queued behind the gate
+        release.set()
+        await asyncio.gather(*tasks)
+
+    asyncio.run(scenario())
+    assert delivered == ["running", "done"]
+
+
+def test_bridge_delivery_ordering_stamp_reaches_payload(monkeypatch):
+    """The kanban notify hook stamps {task_id, seq, status} onto the bridge
+    payload so the gateway guard can do its job."""
+
+    async def _payload_with_ordering(monkeypatch):
+        captured = {}
+
+        async def fake_bridge_command(payload, *, bridge_path, operation):
+            captured.update(payload)
+            return {"success": True, "queued": True}
+
+        monkeypatch.setattr(
+            "tools.send_message_tool._send_bridge_command", fake_bridge_command
+        )
+        result = await _send_delivery_via_bridge(
+            Platform.TELEGRAM,
+            "8900123006",
+            "task done",
+            bridge_path="/tmp/hermes/mcp_bridge.zephyr.sock",
+            ordering={"task_id": "t_1", "seq": 7, "status": "done"},
+        )
+        assert result == {"success": True, "queued": True}
+        assert captured["ordering"] == {"task_id": "t_1", "seq": 7, "status": "done"}
+
+    asyncio.run(_payload_with_ordering(monkeypatch))
+
+
 async def _failed_bridge_send():
     adapter = SimpleNamespace(
         send=AsyncMock(

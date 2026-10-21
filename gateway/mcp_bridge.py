@@ -28,6 +28,7 @@ import json
 import logging
 import os
 import socket as _socket
+from collections import OrderedDict
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +61,33 @@ _session_handles: dict[str, str] = {}
 # incoming data with a matching msg_id to this future.
 # {handle: {msg_id: asyncio.Future}}
 _response_queues: dict[str, dict[str, asyncio.Future]] = {}
+
+# Per-task delivery ordering for kanban status notifications (t_d979ec8d).
+# Each stamped notification carries a monotonic seq (its task_events row id);
+# deliveries for one task serialize through the entry's lock and a
+# notification whose seq is not newer than the last DELIVERED one is dropped,
+# so a subscriber never receives a state older than one they already got.
+# {task_id: {"seq": Optional[int], "lock": asyncio.Lock}}
+_KANBAN_DELIVERY_STATE_MAX = 4096
+_kanban_delivery_states: "OrderedDict[str, dict]" = OrderedDict()
+
+
+def _kanban_delivery_state(task_id: str) -> dict:
+    """Return (and prune) the ordering state entry for one task."""
+    state = _kanban_delivery_states.get(task_id)
+    if state is None:
+        state = {"seq": None, "lock": asyncio.Lock()}
+        _kanban_delivery_states[task_id] = state
+        while len(_kanban_delivery_states) > _KANBAN_DELIVERY_STATE_MAX:
+            for key, st in list(_kanban_delivery_states.items()):
+                if not st["lock"].locked():
+                    del _kanban_delivery_states[key]
+                    break
+            else:
+                break  # every entry is mid-delivery — keep them all
+    else:
+        _kanban_delivery_states.move_to_end(task_id)
+    return state
 
 
 async def start_bridge_server(runner) -> asyncio.AbstractServer:
@@ -320,7 +348,15 @@ async def _handle_send(runner, cmd: dict, writer: asyncio.StreamWriter) -> None:
     if platform_name == "ntfy":
         metadata["publish_topic"] = chat_id
 
-    async def _deliver() -> None:
+    # Optional kanban ordering stamp ({task_id, seq, status}). Only a valid
+    # (task_id, int seq) pair engages the per-task delivery guard below.
+    ordering = cmd.get("ordering") or {}
+    order_task = str(ordering.get("task_id") or "").strip()
+    order_seq = ordering.get("seq")
+    if not order_task or not isinstance(order_seq, int):
+        order_task, order_seq = "", None
+
+    async def _do_send() -> None:
         try:
             result = await adapter.send(
                 chat_id=chat_id,
@@ -343,6 +379,28 @@ async def _handle_send(runner, cmd: dict, writer: asyncio.StreamWriter) -> None:
                 chat_id,
                 getattr(result, "error", None) or "unknown error",
             )
+
+    async def _deliver() -> None:
+        if order_task:
+            state = _kanban_delivery_state(order_task)
+            async with state["lock"]:
+                last = state["seq"]
+                if last is not None and order_seq <= last:
+                    logger.info(
+                        "Bridge kanban notify dropped stale task=%s seq=%s "
+                        "(already delivered seq=%s)",
+                        order_task,
+                        order_seq,
+                        last,
+                    )
+                    return
+                # Mark before the send: under the per-task lock the watermark
+                # advances exactly once per delivered notification, and any
+                # lower-seq straggler that arrives later is dropped.
+                state["seq"] = order_seq
+                await _do_send()
+        else:
+            await _do_send()
 
     task = asyncio.create_task(_deliver())
     background_tasks = getattr(runner, "_background_tasks", None)

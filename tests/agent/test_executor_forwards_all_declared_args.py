@@ -141,6 +141,26 @@ def test_executor_forwards_all_declared_args(tool, forwarded):
     )
 
 
+def test_executor_forwards_only_declared_args(forwarded):
+    """The reverse guard (t_d979ec8d): forwarding an arg the schema does NOT
+    declare breaks every call with ``TypeError: unexpected keyword argument``.
+
+    ``plan`` grew exactly this fossil — ``question=`` survived after plan
+    clarify was removed (t_630b00b0) and every plan tool call died with
+    "plan() got an unexpected keyword argument 'question'".
+    """
+    for tool, keys in sorted(forwarded.items()):
+        module_name, attrs = SCHEMAS[tool]
+        declared = _declared_args(module_name, attrs)
+        extra = sorted(keys - declared)
+        assert not extra, (
+            f"{tool}: tool_executor.py forwards undeclared argument(s) {extra}. "
+            f"The schema does not declare them and the tool does not accept "
+            f"them — every call raises TypeError. Remove the forwarding or "
+            f"declare + accept the parameter at both ends."
+        )
+
+
 def test_guard_is_load_bearing(monkeypatch, forwarded):
     """Prove the check fails when an arg is dropped — not just that it passes.
 

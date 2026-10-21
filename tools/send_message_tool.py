@@ -925,8 +925,13 @@ async def _send_delivery_via_bridge(
     *,
     thread_id=None,
     bridge_path=None,
+    ordering=None,
 ):
-    """Queue an outbound send on the running gateway's live adapter."""
+    """Queue an outbound send on the running gateway's live adapter.
+
+    ``ordering`` (optional ``{task_id, seq, status}``) lets the gateway
+    serialize per-task deliveries and drop stale ones (t_d979ec8d).
+    """
     platform_name = platform.value if hasattr(platform, "value") else str(platform)
     payload = {
         "action": "send",
@@ -936,6 +941,8 @@ async def _send_delivery_via_bridge(
     }
     if thread_id is not None:
         payload["thread_id"] = thread_id
+    if ordering:
+        payload["ordering"] = ordering
 
     return await _send_bridge_command(
         payload,
