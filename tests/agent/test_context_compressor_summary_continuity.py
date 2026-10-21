@@ -345,7 +345,7 @@ def test_repeated_internal_fallback_keeps_prior_summary_single_level():
 
     assert previous_summary.count("DURABLE-PRIOR-FACT") == 1
     assert previous_summary.count(INTERNAL_FALLBACK_PREFIX) == 0
-    assert previous_summary.count("## Prior Context Summary") == 1
+    assert previous_summary.count("[PRIOR CONTEXT SUMMARY]") == 1
     assert previous_summary.count(VERBATIM_CONTEXT_MARKER) == 1
 
 
@@ -405,7 +405,7 @@ def test_refold_does_not_duplicate_section_skeleton():
         "## Blocked",
     ):
         assert folded_once.count(header) == 1
-    assert folded_once.count("## Prior Context Summary") == 1
+    assert folded_once.count("[PRIOR CONTEXT SUMMARY]") == 1
     assert folded_once.count(_PCS_END_MARKER) == 1
 
 

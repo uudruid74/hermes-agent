@@ -540,8 +540,11 @@ class SessionManager:
         # otherwise re-fire the pre-request defensive repair on every request
         # for the rest of the session (see hermes_state.get_messages_as_conversation).
         try:
+            # include_row_ids: the compressed payload's ``[#xx]`` recovery
+            # handles are these row ids (t_235275a0); the key is
+            # underscore-prefixed and stripped before the wire.
             history = db.get_messages_as_conversation(
-                session_id, repair_alternation=True
+                session_id, repair_alternation=True, include_row_ids=True
             )
         except Exception:
             logger.warning("Failed to load messages for ACP session %s", session_id, exc_info=True)

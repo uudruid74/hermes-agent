@@ -10,7 +10,7 @@ import math
 import re
 import time
 from collections import Counter
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 from agent.llmslim_selector import (
     SelectionUnit,
@@ -39,10 +39,13 @@ _PAYLOAD_MARKERS = (
     _PAYLOAD_MARKER,
     "[PRIOR CONTEXT",
 )
-VERBATIM_CONTEXT_MARKER = (
-    "## Verbatim Recent Context\n"
-    "The messages after this summary marker are preserved verbatim."
-)
+# Verbatim-tail promise line — the summary's own boundary marker.  t_235275a0
+# ("No Sections") drops the ``## Verbatim Recent Context`` heading from the
+# form below and keeps the sentence as the marker: the payload carries no
+# ``##`` header, the promise stays in the DB row, and the model view strips
+# the line by policy either way (its real boundary is the END-OF-CONTEXT line
+# appended by ``context_compressor``).
+VERBATIM_CONTEXT_MARKER = "The messages after this summary marker are preserved verbatim."
 # Underscores delimit identifier components for lexical scoring.
 _TOKEN_RE = re.compile(r"(?:[^\W_]|['-]){2,}", re.UNICODE)
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|\n{2,}")
@@ -695,14 +698,18 @@ def _persistent_protected(
 
 
 def _protected_summary_block(units: list[_Unit]) -> str:
-    """The Protected area's own section, emitted above the Heap."""
+    """The Protected/global area: the byte-stable prefix, emitted above the Heap.
+
+    Ruling 5 (t_0a90cfdd): byte-stable across compactions (it rides the
+    prompt cache), never boosted, never fed tool units.  t_235275a0 drops
+    the ``## Protected Context`` header with every other section header
+    ("No Sections") — the absence is byte-stable too, and the header was
+    model-invisible anyway (strip policy).
+    """
     if not units:
         return ""
-    return "\n\n".join(
-        [
-            "## Protected Context",
-            "\n".join(unit.text for unit in sorted(units, key=lambda item: item.order)),
-        ]
+    return "\n".join(
+        _render_unit(unit) for unit in sorted(units, key=lambda item: item.order)
     )
 
 
@@ -1309,6 +1316,13 @@ def _parse_exit_code(content: str) -> int | None:
     match = re.search(r'"exit_code"\s*:\s*(-?\d+)', content)
     if match:
         return int(match.group(1))
+    # The one-line stub form (``[terminal] ran `cmd` -> exit 0, 1 lines
+    # output``) keeps the exit code in its arrow suffix — by the time a
+    # masked row reaches the compressor the JSON is long gone, and ruling 1
+    # (t_235275a0) wants exit codes preserved on the collapsed line.
+    match = re.search(r"->\s*exit(?:_code)?\s*[:=]?\s*(-?\d+)", content)
+    if match:
+        return int(match.group(1))
     return None
 
 
@@ -1344,6 +1358,8 @@ def _terminal_marker_units(
     pending: dict[str, str] = {}
     results: dict[str, int] = {}
     result_offsets: dict[str, int] = {}
+    result_rows: dict[str, int | None] = {}
+    result_stamps: dict[str, float | None] = {}
     for offset, message in enumerate(messages):
         role = message.get("role")
         if role == "assistant":
@@ -1372,6 +1388,8 @@ def _terminal_marker_units(
                 if exit_code is not None:
                     results[cid] = exit_code
                     result_offsets[cid] = offset
+                    result_rows[cid] = _row_id_of(message)
+                    result_stamps[cid] = _stamp_of(message)
 
     units: list[_Unit] = []
     for cid, command in pending.items():
@@ -1382,7 +1400,10 @@ def _terminal_marker_units(
         if not label or not _marker_keep_label(label):
             continue
         exit_code = results[cid]
-        text = f"{marker}\n{_render_exit_tombstone(command, exit_code)}"
+        # Unit format (t_235275a0): role-tagged like every other emitted
+        # unit; the ``=== label ===`` span survives byte-exact as a
+        # substring (the marker is the evidence layer).
+        text = f"[TOOL]: {marker}\n{_render_exit_tombstone(command, exit_code)}"
         units.append(
             _Unit(
                 text=text,
@@ -1390,6 +1411,8 @@ def _terminal_marker_units(
                 token_count=estimate_tokens_rough(text),
                 is_marker=True,
                 role="tool",
+                row_id=result_rows.get(cid),
+                stamp=result_stamps.get(cid),
             )
         )
     return units
@@ -1466,14 +1489,8 @@ def _message_units(
         # source row's id and original stamp so the emitted line can render
         # ``[#xx]`` (resolvable via ``session_search(around_message_id=xx)``)
         # and a timestamp that is never the compaction clock.
-        raw_id = message.get("id")
-        row_id = raw_id if isinstance(raw_id, int) and not isinstance(raw_id, bool) else None
-        raw_ts = message.get("timestamp")
-        stamp = (
-            float(raw_ts)
-            if isinstance(raw_ts, (int, float)) and not isinstance(raw_ts, bool)
-            else None
-        )
+        row_id = _row_id_of(message)
+        stamp = _stamp_of(message)
         for unit_offset, chunk in enumerate(_chunks(content)):
             text = f"[{role_label}]: {chunk}"
             units.append(
@@ -1780,17 +1797,17 @@ def _fit_tail_start(
 
 
 def _plan_summary(plan_context: str, notes: list[str]) -> str:
-    parts = [INTERNAL_FALLBACK_PREFIX, "## Active Plan", plan_context.strip()]
+    parts = [INTERNAL_FALLBACK_PREFIX, plan_context.strip()]
     if notes:
-        parts.extend(["## Session Notes", "\n".join(f"- {note}" for note in notes)])
+        parts.append("\n".join(f"- {note}" for note in notes))
     parts.append(VERBATIM_CONTEXT_MARKER)
     return "\n\n".join(parts)
 
 
 def _minimal_plan_summary(minimal_plan_context: str, notes: list[str]) -> str:
-    parts = [INTERNAL_FALLBACK_PREFIX, "## Active Plan", minimal_plan_context.strip()]
+    parts = [INTERNAL_FALLBACK_PREFIX, minimal_plan_context.strip()]
     if notes:
-        parts.extend(["## Session Notes", "\n".join(f"- {note}" for note in notes)])
+        parts.append("\n".join(f"- {note}" for note in notes))
     parts.append(VERBATIM_CONTEXT_MARKER)
     return "\n\n".join(parts)
 
@@ -2243,10 +2260,27 @@ def _mmr_order(
     return chosen
 
 
+def _render_stream(*groups: Sequence["_Unit | _TrailLine"]) -> str:
+    """One chronological stream of rendered units (t_235275a0 "No Sections").
+
+    Every emitted unit carries ``[#id]`` + role tag + the row's own stamp
+    (ruling 3).  Groups (heap selection, marker spine, tool trail, …) merge
+    into a single order-keyed run so the payload is a chronological stream,
+    never a sectioned manifest.
+    """
+    units = [unit for group in groups for unit in group]
+    return "\n".join(
+        _render_unit(unit) for unit in sorted(units, key=lambda item: item.order)
+    )
+
+
 def _with_lexrank_section(
-    summary: str, selected: list[_Unit], protected: list[_Unit] | None = None
+    summary: str,
+    selected: list[_Unit],
+    protected: list[_Unit] | None = None,
+    extras: Sequence["_Unit | _TrailLine"] = (),
 ) -> str:
-    """Append the heap block below the Plan and Protected, above the marker.
+    """Append the heap stream below the Plan and Protected, above the marker.
 
     Order is Plan, Protected, Heap, verbatim tail (Evan, 2026-09-18):
     *"separate messages for plan, protected, and heap."*  Plan holds the
@@ -2260,18 +2294,9 @@ def _with_lexrank_section(
     protected_block = _protected_summary_block(protected or [])
     if protected_block:
         blocks.append(protected_block)
-    if selected:
-        blocks.append(
-            "\n\n".join(
-                [
-                    "## Relevant Earlier Context",
-                    "\n".join(
-                        _render_unit(unit)
-                        for unit in sorted(selected, key=lambda item: item.order)
-                    ),
-                ]
-            )
-        )
+    stream = _render_stream(selected, extras)
+    if stream:
+        blocks.append(stream)
     if not blocks:
         return summary
     block = "\n\n".join(blocks)
@@ -2324,6 +2349,7 @@ def _add_plan_lexrank_area(
     selection_telemetry: dict[str, Any] | None = None,
     marker_recent_count: int = 0,
     tool_units: list[_Unit] | None = None,
+    extras: Sequence["_Unit | _TrailLine"] = (),
 ) -> tuple[str, int]:
     """Spend the leftover plan budget on the ranked middle (Evan, 2026-09-15).
 
@@ -2355,7 +2381,7 @@ def _add_plan_lexrank_area(
         tool_units or []
     )
     # Stage 1 (t_57cb0d4e): markers do NOT enter the ranked heap — the spine
-    # (see _carry_marker_spine) is their selection path, under its own
+    # (see _select_spine_units) is their selection path, under its own
     # ceiling. Feeding them here re-coupled retention to the heap's leftover
     # budget and ran them through the score≈0 / 256-cap funnel (4-of-37
     # survived); the double-entry also duplicated marker lines across the
@@ -2408,7 +2434,7 @@ def _add_plan_lexrank_area(
         ranked,
         target_tokens=target_tokens,
         initial=summary,
-        render=lambda chosen: _with_lexrank_section(summary, chosen, protected),
+        render=lambda chosen: _with_lexrank_section(summary, chosen, protected, extras),
         fits=lambda text: _fits(messages, head_count, tail_start, text, target_tokens),
         accept=lambda unit: unit.is_marker
         or not _heap_repeat_covered(unit.text, outside_tiers),
@@ -2420,7 +2446,9 @@ def _add_plan_lexrank_area(
 
 
 def _lexrank_summary(
-    selected: list[_Unit], protected: list[_Unit] | None = None
+    selected: list[_Unit],
+    protected: list[_Unit] | None = None,
+    extras: Sequence["_Unit | _TrailLine"] = (),
 ) -> str:
     context = [unit for unit in selected if not unit.is_note]
     notes = [unit for unit in selected if unit.is_note]
@@ -2428,23 +2456,14 @@ def _lexrank_summary(
     protected_block = _protected_summary_block(protected or [])
     if protected_block:
         parts.append(protected_block)
-    if context:
-        parts.extend(
-            [
-                "## Relevant Earlier Context",
-                "\n".join(
-                    _render_unit(unit)
-                    for unit in sorted(context, key=lambda item: item.order)
-                ),
-            ]
-        )
+    # t_235275a0 ("No Sections"): one chronological stream of unit-format
+    # lines, no ``##`` headers anywhere.  The summary's tail boundary is the
+    # ``--- END OF CONTEXT SUMMARY ---`` line context_compressor appends.
+    stream = _render_stream(context, extras)
+    if stream:
+        parts.append(stream)
     if notes:
-        parts.extend(
-            [
-                "## Session Notes",
-                "\n".join(f"- {unit.text}" for unit in notes),
-            ]
-        )
+        parts.append("\n".join(f"- {unit.text}" for unit in notes))
     parts.append(VERBATIM_CONTEXT_MARKER)
     return "\n\n".join(parts)
 
@@ -2456,9 +2475,60 @@ def _lexrank_summary(
 # stopped INSIDE the stale fold, orphaned its text as payload sections, and
 # the fresh copy landed beside it — measured 0.85-0.90 block duplication on
 # the ornith window (Phase-3 fidelity gate, t_c9cb4bec).
-_PCS_HEADER = "## Prior Context Summary"
+#
+# t_235275a0 ("No Sections"): the fold header moves from the section form to
+# a bracket marker — both sentinels are already on the model-view strip list,
+# so the fold stays DB-side scaffolding and the emitted payload carries zero
+# ``##`` headers.  Payloads persisted by earlier builds still parse: the
+# legacy section header is recognized by ``_find_fold_start``.
+_PCS_HEADER = "[PRIOR CONTEXT SUMMARY]"
+_PCS_LEGACY_HEADERS = ("## Prior Context Summary",)
 _PCS_END_MARKER = "[END OF PRIOR CONTEXT SUMMARY]"
 _SECTION_HEADER_RE = re.compile(r"^#{1,6}\s+\S")
+# ``[#xx]`` recovery handle on a rendered unit line (ruling 3).
+_HANDLE_RE = re.compile(r"\[#(\d+)\]")
+# Unit-line decorations around a rendered unit's own text.
+_UNIT_DECOR_RE = re.compile(r"^(?:\[#\d+\]\s+)?(?:\[[A-Z]+\]:\s+)?")
+
+
+def _strip_unit_decor(line: str) -> str:
+    """Strip the ``[#id] `` / ``[ROLE]: `` wrapper from a rendered line."""
+    return _UNIT_DECOR_RE.sub("", line)
+
+
+def _manifest_line_key(line: str) -> tuple[str, str, str] | None:
+    """``(tool, target, outcome)`` for a tool-action line in any format.
+
+    Handles the ledger bullet form (``- tool: target — outcome``), the unit
+    form (``[#1] [TOOL]: tool: target — outcome (…)``) and the call-reference
+    form (``tell → tool_call_id <cid>``).  The stamp is not part of the key —
+    the same action re-emitted under a different clock is the same fact
+    (fold-copy ratchet, t_fede7b73; overlap rule, t_235275a0).
+    """
+    body = _strip_unit_decor(line.strip())
+    if body.startswith("- "):
+        body = body[2:].strip()
+    if " — " not in body:
+        return None
+    identity, outcome = body.split(" — ", 1)
+    identity = re.sub(r"\s*\([^()]*\)\s*$", "", identity).strip()
+    outcome = re.sub(r"\s*\([^()]*\)\s*$", "", outcome).strip()
+    match = re.match(r"^(?P<tool>[a-z][\w-]*)\s*[:→]\s*(?P<target>.*)$", identity)
+    if not match:
+        return None
+    tool = match.group("tool").strip().lower()
+    target = re.sub(r"\s+", " ", match.group("target")).strip()
+    return tool, target, outcome
+
+
+def _find_fold_start(summary: str) -> tuple[int, int]:
+    """``(index, header length)`` of the earliest fold header, either form."""
+    best = (-1, 0)
+    for header in (_PCS_HEADER, *_PCS_LEGACY_HEADERS):
+        index = summary.find(header)
+        if index >= 0 and (best[0] < 0 or index < best[0]):
+            best = (index, len(header))
+    return best
 
 
 def _normalized_fold_line(line: str) -> str:
@@ -2512,6 +2582,7 @@ def _canonical_prior_summary(previous_summary: str, current_summary: str) -> str
     transport_lines = {
         INTERNAL_FALLBACK_PREFIX,
         _PCS_HEADER,
+        *_PCS_LEGACY_HEADERS,
         _PCS_END_MARKER,
         "## Verbatim Recent Context",
         "The messages after this summary marker are preserved verbatim.",
@@ -2524,6 +2595,35 @@ def _canonical_prior_summary(previous_summary: str, current_summary: str) -> str
         for line in (current_summary or "").splitlines()
         if line.strip()
     }
+    # t_235275a0 ("No duplicate/overlapping manifest-style sections"):
+    # a folded line is dropped when it re-states a unit the current payload
+    # already carries (same ``[#N]`` row handle), when it re-states a tool
+    # action the current stream covers (same tool/target/outcome), or when it
+    # is a manifest line with no target at all — the worthless
+    # ``terminal:  — ok`` class the smoke-test block was full of.
+    current_handles = set(_HANDLE_RE.findall(current_summary or ""))
+    current_manifest = {
+        key
+        for key in (
+            _manifest_line_key(line) for line in (current_summary or "").splitlines()
+        )
+        if key is not None
+    }
+
+    def _fold_line_kept(line: str) -> bool:
+        stripped = line.strip()
+        if not stripped:
+            return True
+        for handle in _HANDLE_RE.findall(stripped):
+            if handle in current_handles:
+                return False
+        key = _manifest_line_key(stripped)
+        if key is None:
+            return True
+        if not key[1]:
+            return False
+        return key not in current_manifest
+
     blocks: list[str] = []
     seen: set[str] = set()
     for raw_block in re.split(r"\n{2,}", prior):
@@ -2536,6 +2636,11 @@ def _canonical_prior_summary(previous_summary: str, current_summary: str) -> str
             continue
         seen.add(block)
         block = _drop_repeated_fold_lines(block, current_lines)
+        if not block:
+            continue
+        block = "\n".join(
+            line for line in block.splitlines() if _fold_line_kept(line)
+        ).strip()
         if not block:
             continue
         blocks.append(block)
@@ -2589,10 +2694,10 @@ def _drop_stale_fold(summary: str) -> str:
     The sentinel makes the replacement exact and the re-fold idempotent.
     """
     while True:
-        start = summary.find(_PCS_HEADER)
+        start, header_len = _find_fold_start(summary)
         if start < 0:
             return summary
-        end = summary.find(_PCS_END_MARKER, start + len(_PCS_HEADER))
+        end = summary.find(_PCS_END_MARKER, start + header_len)
         if end < 0:
             return summary
         head = summary[:start].rstrip()
@@ -2681,45 +2786,45 @@ def _marker_spine_budget(target_tokens: int) -> int:
 
 
 def _marker_spine_block(units: list[_Unit]) -> str:
-    """Render the spine block: verbatim markers, chronological, one per line."""
+    """Render the spine: marker units in session order, unit format, no header."""
     if not units:
         return ""
-    lines = [unit.text for unit in sorted(units, key=lambda item: item.order)]
-    return "## Decision Markers\n" + "\n".join(lines)
+    return "\n".join(
+        _render_unit(unit) for unit in sorted(units, key=lambda item: item.order)
+    )
 
 
-def _carry_marker_spine(
-    summary: str,
+def _select_spine_units(
     spine: list[_Unit],
     budget_tokens: int,
     *,
     previous_summary: str = "",
-) -> str:
-    """Insert the spine block into ``summary`` under its ceiling.
+) -> list[_Unit]:
+    """Spine keep-set under its ceiling (the anti-bug-4 guard).
 
-    Units are added oldest-first while the ceiling holds — when the budget is
+    Units are kept oldest-first while the ceiling holds — when the budget is
     short, the OLDEST decision marks cut first, mirroring how the tail keeps
-    the newest work. The block rides below the Plan/Protected headers and
-    above the verbatim marker, outside the heap's budget entirely.
-
-    ``previous_summary`` dedupe (convergence guard, t_57cb0d4e): labels still
-    carried inside the prior payload's fold are already in the emitted text,
-    so re-admitting them here just regrows the block every cycle (measured:
-    6 -> 12 markers across chained iterations). A marker earns spine seats
-    only while it is NEW information.
+    the newest work.  ``previous_summary`` dedupe (convergence guard,
+    t_57cb0d4e): labels still carried inside the prior payload's fold are
+    already in the emitted text, so re-admitting them here just regrows the
+    block every cycle.  A marker earns spine seats only while it is NEW
+    information.  t_235275a0: the kept units render inside the one
+    chronological stream — no ``## Decision Markers`` section.
     """
     if not spine or budget_tokens <= 0:
-        return summary
-    carried = {
-        line.strip()
-        for line in (previous_summary or "").splitlines()
-        if line.strip().startswith("===") and line.strip().endswith("===")
-    }
+        return []
+    carried: set[str] = set()
+    for raw in (previous_summary or "").splitlines():
+        line = _strip_unit_decor(raw.strip())
+        if line.startswith("===") and line.endswith("==="):
+            carried.add(line)
     kept: list[_Unit] = []
     spent = 0
     seen_lines: set[str] = set()
     for unit in sorted(spine, key=lambda item: item.order):
-        line = unit.text.splitlines()[0].strip() if unit.text else ""
+        line = (
+            _strip_unit_decor(unit.text.splitlines()[0].strip()) if unit.text else ""
+        )
         if not line or line in seen_lines or line in carried:
             # Identical repeated labels (e.g. `=== EXIT $? ===` fired once per
             # pipeline stage) carry no additional decision information; the
@@ -2731,13 +2836,7 @@ def _carry_marker_spine(
         seen_lines.add(line)
         kept.append(unit)
         spent += unit.token_count
-    block = _marker_spine_block(kept)
-    if not block:
-        return summary
-    if VERBATIM_CONTEXT_MARKER in summary:
-        head, _, rest = summary.partition(VERBATIM_CONTEXT_MARKER)
-        return head.rstrip() + "\n\n" + block + "\n\n" + VERBATIM_CONTEXT_MARKER + rest
-    return summary.rstrip() + "\n\n" + block
+    return kept
 # ``description`` excluded from the widened keep gate (Evan ruling 2,
 # Wintermute's information test): see _marker_keep_label (t_57cb0d4e).
 
@@ -2815,6 +2914,13 @@ _ACTION_ARG_HINTS = (
     "note", "body", "text", "content", "code", "source", "destination", "input",
 )
 
+# Result-dict target hints for ``_target_from_result``: the object-ish subset
+# of the schema vocabulary (t_235275a0).
+_RESULT_TARGET_HINTS = (
+    "command", "path", "pattern", "query", "url", "file", "script",
+    "expression", "subject", "name", "title", "source", "destination",
+)
+
 
 @dataclass(frozen=True)
 class _TrailOccurrence:
@@ -2842,6 +2948,119 @@ class _TrailLine:
     salience: int
     row_id: int | None = None  # provenance of the first outcome row
     stamp: float | None = None
+
+
+def _row_id_of(message: dict[str, Any]) -> int | None:
+    """Session row id of a message dict — the ``[#xx]`` recovery handle.
+
+    ``get_messages`` rows carry ``id``; ``_rows_to_conversation`` stamps the
+    gateway's live history with ``_row_id`` (underscore-prefixed so every
+    transport strips it before the wire).  Accept either — production
+    messages reach the compressor as one or the other, and a silent ``None``
+    here is exactly the t_235275a0 smoke-test finding ("grep ``[#`` → 0").
+    """
+    for key in ("id", "_row_id"):
+        raw = message.get(key)
+        if isinstance(raw, int) and not isinstance(raw, bool):
+            return raw
+    return None
+
+
+def _stamp_of(message: dict[str, Any]) -> float | None:
+    """The row's own clock (never the compaction clock)."""
+    raw_ts = message.get("timestamp")
+    if isinstance(raw_ts, (int, float)) and not isinstance(raw_ts, bool):
+        return float(raw_ts)
+    return None
+
+
+# Result-stub target recovery (t_235275a0).  Production rows frequently carry
+# ``function.arguments == "{}"`` (the corrupted-args sanitizer's rewrite, and
+# the re-persisted stub copies), so the call arguments cannot name the
+# action's object and every emitted line degenerated to ``write_file:  — ok``
+# ("filenames are pretty fucking important! Those lines are worthless without
+# it." — Evan).  The paired tool RESULT row keeps a one-line stub that DOES
+# carry the object (``[terminal] ran `cmd` -> exit 0``,
+# ``[write_file] wrote to /path (N lines)``, ``[patch] replace in /path (...)``,
+# ``[read_file] read /path from line N (...)``,
+# ``[search_files] content search for 'x' in /path -> N matches``), so the
+# target is recovered from the stub when the arguments are empty.  Schema
+# vocabulary only — the shapes are Hermes' own result-stub format.
+_STUB_TARGET_RES: tuple[re.Pattern[str], ...] = (
+    # [terminal] ran `cmd` -> exit N / [execute_code] `code` (N lines output)
+    re.compile(r"^\[[^\]]+\][^`]*?`([^`]+)`"),
+    # [read_file] read <path> from line N (…)
+    re.compile(r"^\[[^\]]+\]\s+read\s+(.+?)\s+from line\b"),
+    # [write_file] wrote to <path> (…)
+    re.compile(r"^\[[^\]]+\]\s+wrote to\s+(.+?)\s*\("),
+    # [patch] replace in <path> (…) / [patch] patch in <path> (…)
+    re.compile(r"^\[[^\]]+\]\s+\w+\s+in\s+(.+?)\s*\("),
+    # [search_files] content search for 'pattern' in <path> -> N matches
+    re.compile(r"\bin\s+(\S+)\s*->"),
+    # [skill_view] name=<name> (…)
+    re.compile(r"\bname=(\S+)"),
+    # [web_extract] <url> (…)
+    re.compile(r"^\[[^\]]+\]\s+(https?://\S+)"),
+    # [set_session] note=<text> (N chars result)
+    re.compile(r"\bnote=(.+?)\s*\(\d[\d,]* chars result\)\s*$"),
+)
+
+
+def _target_from_result(content: Any) -> str:
+    """Recover the action's target from a tool RESULT row's content.
+
+    Handles the three production result shapes: a decoded dict, a JSON
+    string (write_file's summary), and the one-line stub the row mask leaves
+    behind (``[terminal] ran `cmd` -> exit 0``).  Corruption markers may sit
+    in front of the stub, so every line is tried, not just the first.
+    """
+    data: dict[str, Any] | None = content if isinstance(content, dict) else None
+    if data is None and isinstance(content, str):
+        stripped = content.strip()
+        if stripped.startswith("{"):
+            try:
+                parsed = json.loads(stripped)
+            except (ValueError, TypeError):
+                parsed = None
+            if isinstance(parsed, dict):
+                data = parsed
+    if data is not None:
+        for key in ("resolved_path", "path"):
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        files = data.get("files_modified")
+        if isinstance(files, list) and files:
+            first = files[0]
+            if isinstance(first, str) and first.strip():
+                return first.strip()
+        # Object-ish schema names only — a result dict's "message"/"note"/
+        # "text"/"content" fields are OUTCOMES, never the action's object (the
+        # longest-string fallback that helps call arguments would surface
+        # ``"ok"`` here).
+        for name in _RESULT_TARGET_HINTS:
+            value = data.get(name)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
+    text = _content_text(content).strip()
+    if not text:
+        return ""
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if not line.strip().startswith("["):
+            continue
+        # The stub may span lines — a terminal command embeds newlines and the
+        # closing backtick lands lines later — so match from the stub head to
+        # the end of the content instead of line-by-line.
+        span = "\n".join(lines[index:])
+        for pattern in _STUB_TARGET_RES:
+            match = pattern.search(span)
+            if match:
+                target = re.sub(r"\s+", " ", match.group(1)).strip()
+                if target:
+                    return target
+    return ""
 
 
 def _tool_target(args: dict[str, Any]) -> str:
@@ -2901,6 +3120,24 @@ def _outcome_of(content: Any) -> tuple[str, str]:
     return "void", "no result"
 
 
+def _trail_identity(tool: str, display: str) -> str:
+    """``tool: target`` — or ``tool → tool_call_id …`` for call references.
+
+    A message-send tool's body is CONTENT, not the action's object (the
+    t_235275a0 smoke-test line ``tell: Forensic read of … — ok`` swallowed
+    the whole body into the target slot); the settled form points at the
+    call instead: ``tell → tool_call_id <cid>``.
+    """
+    if display.startswith("tool_call_id "):
+        return f"{tool} → {display}"
+    return f"{tool}: {display}"
+
+
+# Tools whose action-object is the message itself — rendered as a call
+# reference, never by swallowing the body (t_235275a0).
+_CALLREF_TARGET_TOOLS = frozenset({"tell"})
+
+
 def _tool_trail_scan(
     rows: list[dict[str, Any]], start_index: int = 0
 ) -> list[_TrailOccurrence]:
@@ -2911,14 +3148,18 @@ def _tool_trail_scan(
     position. Echo-marker commands are skipped — the marker spine is their
     ONLY selection path ("nothing is double-emitted"). Unpaired rows are
     skipped rather than hallucinated (same rule as the spine).
+
+    Target recovery (t_235275a0): when the call arguments carry no object
+    (``arguments == "{}"`` on production rows), the paired result stub is
+    parsed for the filename/command; failing that the line references the
+    tool_call_id rather than emitting a bare tool name.
     """
     pending: dict[str, tuple[str, str, str, float | None]] = {}
     occurrences: list[_TrailOccurrence] = []
     seen_calls: set[str] = set()
     for offset, message in enumerate(rows):
         role = message.get("role")
-        raw_ts = message.get("timestamp")
-        ts = float(raw_ts) if isinstance(raw_ts, (int, float)) else None
+        ts = _stamp_of(message)
         if role == "assistant":
             for call in message.get("tool_calls") or []:
                 if not isinstance(call, dict):
@@ -2945,12 +3186,15 @@ def _tool_trail_scan(
                 if not cid or cid in seen_calls:
                     continue
                 seen_calls.add(cid)
-                target = _tool_target(args)
-                # One-line collapse (VCC-style): a multi-line argument value
-                # must not break the rendered ledger/unit line.
-                display = re.sub(r"\s+", " ", target).strip()
-                if len(display) > _TRAIL_TARGET_MAX:
-                    display = display[:_TRAIL_TARGET_MAX].rstrip() + "…"
+                if fn_name in _CALLREF_TARGET_TOOLS:
+                    target = display = f"tool_call_id {cid}"
+                else:
+                    target = _tool_target(args)
+                    # One-line collapse (VCC-style): a multi-line argument
+                    # value must not break the rendered ledger/unit line.
+                    display = re.sub(r"\s+", " ", target).strip()
+                    if len(display) > _TRAIL_TARGET_MAX:
+                        display = display[:_TRAIL_TARGET_MAX].rstrip() + "…"
                 pending[cid] = (fn_name, target, display, ts)
         elif role == "tool":
             cid = str(message.get("tool_call_id") or "")
@@ -2959,7 +3203,16 @@ def _tool_trail_scan(
                 continue
             fn_name, target, display, call_ts = entry
             outcome_class, outcome = _outcome_of(message.get("content"))
-            raw_id = message.get("id")
+            if not display:
+                # Empty call arguments (the corrupted-args sanitizer and the
+                # re-persisted stub copies both leave ``"{}"``): recover the
+                # object from the result stub so the line keeps its
+                # filename/command (t_235275a0).
+                target = display = _target_from_result(message.get("content"))
+            if not display:
+                # Nothing recoverable: reference the call — NOT a bare tool
+                # name ("those lines are worthless without it").
+                target = display = f"tool_call_id {cid}"
             occurrences.append(
                 _TrailOccurrence(
                     tool=fn_name,
@@ -2970,11 +3223,7 @@ def _tool_trail_scan(
                     order=(start_index + offset, 0),
                     t_first=call_ts if call_ts is not None else ts,
                     t_second=ts,
-                    row_id=(
-                        raw_id
-                        if isinstance(raw_id, int) and not isinstance(raw_id, bool)
-                        else None
-                    ),
+                    row_id=_row_id_of(message),
                 )
             )
     return occurrences
@@ -3006,23 +3255,17 @@ def _tool_trail_lines(occurrences: list[_TrailOccurrence]) -> list[_TrailLine]:
             segment = runs[start:start + 2]
             fused = [occurrence for run in segment for occurrence in run]
             labels = "→".join(run[0].outcome for run in segment)
-            stamps = [
-                stamp
-                for occurrence in fused
-                for stamp in (occurrence.t_first, occurrence.t_second)
-                if stamp is not None
-            ]
-            interval = (
-                f"{_trail_ts(min(stamps))}–{_trail_ts(max(stamps))}" if stamps else ""
-            )
             display = fused[0].target_display
-            text = f"- {tool}: {display} — {labels}"
-            if interval:
-                text += f" ({interval})"
+            # Unit format (t_235275a0, ruling 3): ``[#id] [ROLE]: text
+            # (HH:MM:SS)`` — the handle and the row's own stamp ride
+            # ``_render_unit``; the fused span lives in the ``→``-joined
+            # outcome labels (``exit 1→exit 0``), never a second clock.
+            key = f"{_trail_identity(tool, display)} — {labels}"
+            text = f"[TOOL]: {key}"
             lines.append(
                 _TrailLine(
                     text=text,
-                    key=f"{tool}: {display} — {labels}",
+                    key=key,
                     order=fused[0].order,
                     token_count=estimate_tokens_rough(text),
                     salience=_trail_salience(text),
@@ -3094,7 +3337,7 @@ def _collapsed_tool_units(
     return units
 
 
-def _render_unit(unit: "_Unit") -> str:
+def _render_unit(unit: "_Unit | _TrailLine") -> str:
     """Emit a heap unit with its recovery handle and original stamp (ruling 3).
 
     ``[#xx]`` is the session row id (``session_search(around_message_id=xx)``
@@ -3108,53 +3351,75 @@ def _render_unit(unit: "_Unit") -> str:
 
 
 def _tool_trail_block(lines: list[_TrailLine]) -> str:
-    """Render the trail block: one line per action, chronological."""
+    """Render the trail lines in unit format, chronological, no header.
+
+    Every line carries its ``[#id]`` handle, ``[TOOL]`` role tag and the
+    row's own stamp (t_235275a0 ruling 3) via ``_render_unit`` — the same
+    ``[#id] [ROLE]: text (HH:MM:SS)`` form as every other emitted unit.
+    """
     if not lines:
         return ""
-    ordered = sorted(lines, key=lambda item: item.order)
-    return "## Actions & Outcomes\n" + "\n".join(item.text for item in ordered)
+    return "\n".join(
+        _render_unit(item) for item in sorted(lines, key=lambda item: item.order)
+    )
 
 
 def _carried_trail_keys(previous_summary: str) -> set[str]:
-    """Line keys already carried by the previous payload's trail block.
+    """Action keys already carried by the previous payload.
 
     Same convergence guard as the marker spine's label dedupe: the fold
-    carries the old block forward, so re-admitting its lines would regrow
-    the trail every cycle. Keys are the rendered line minus its interval.
+    carries old tool lines forward, so re-admitting them would regrow the
+    trail every cycle.  Keys are the rendered action identity minus its
+    stamp/interval, extracted from BOTH the legacy ledger form
+    (``- tool: target — outcome (…)``) and the unit form
+    (``[#id] [TOOL]: tool: target — outcome (…)``) anywhere in the payload
+    (t_235275a0: no section header bounds the trail anymore).
     """
     keys: set[str] = set()
-    _, found, rest = (previous_summary or "").partition("## Actions & Outcomes")
-    if not found:
-        return keys
-    next_header = re.search(r"^## .+$", rest, re.M)
-    body = rest[: next_header.start()] if next_header else rest
-    for raw in body.splitlines():
+    for raw in (previous_summary or "").splitlines():
         line = raw.strip()
-        if not line.startswith("- ") or " — " not in line:
+        if not line or " — " not in line:
             continue
-        keys.add(re.sub(r" \([^()]*\)$", "", line[2:]).strip())
+        body = _strip_unit_decor(line)
+        if body.startswith("- "):
+            body = body[2:].strip()
+        if _manifest_line_key(body) is None:
+            continue
+        keys.add(re.sub(r" \([^()]*\)$", "", body).strip())
     return keys
 
 
-def _carry_tool_trail(
-    summary: str,
+def _trail_line_unit(line: _TrailLine) -> _Unit:
+    """The trail line as a stream unit (same text, provenance, and order)."""
+    return _Unit(
+        text=line.text,
+        order=line.order,
+        token_count=line.token_count,
+        role="tool",
+        row_id=line.row_id,
+        stamp=line.stamp,
+    )
+
+
+def _select_trail_lines(
     trail: list[_TrailLine],
     budget_tokens: int,
     *,
     previous_summary: str = "",
     selection_telemetry: dict[str, Any] | None = None,
-) -> str:
-    """Insert the trail block into ``summary`` under its ceiling.
+) -> list[_TrailLine]:
+    """Trail keep-set under its ceiling (the anti-bug-4 guard).
 
     Selection order is Stage-2 salience first with recency as the
     tiebreak — the cut drops lowest-salience/oldest first — while the
-    emitted block stays chronological (curated content keeps session
+    emitted stream stays chronological (curated content keeps session
     order). Lines the previous payload already carries are skipped (the
-    convergence guard above). The block rides below the spine and above
-    the verbatim marker, outside the heap's budget entirely.
+    convergence guard above). t_235275a0: the kept lines render inside the
+    one chronological stream as ``[#id] [TOOL]: …`` units — no
+    ``## Actions & Outcomes`` section.
     """
     if not trail or budget_tokens <= 0:
-        return summary
+        return []
     carried = _carried_trail_keys(previous_summary)
     kept: list[_TrailLine] = []
     spent = 0
@@ -3171,18 +3436,12 @@ def _carry_tool_trail(
         seen.add(line.key)
         kept.append(line)
         spent += line.token_count
-    block = _tool_trail_block(kept)
-    if not block:
-        return summary
     if selection_telemetry is not None:
         info = selection_telemetry.setdefault("tool_trail", {})
         info["emitted_lines"] = len(kept)
         info["emitted_tokens"] = spent
         info["carried_skipped"] = len(carried)
-    if VERBATIM_CONTEXT_MARKER in summary:
-        head, _, rest = summary.partition(VERBATIM_CONTEXT_MARKER)
-        return head.rstrip() + "\n\n" + block + "\n\n" + VERBATIM_CONTEXT_MARKER + rest
-    return summary.rstrip() + "\n\n" + block
+    return kept
 
 
 _OMISSION_MARKER_PREFIX = (
@@ -3370,6 +3629,21 @@ def build_internal_fallback(
     }
     selection_telemetry["collapsed_tool_units"] = len(tool_units)
 
+    # Guaranteed-seat selection (the t_490b92fc §11 coupling invariant) runs
+    # BEFORE the heap budget loops so every render — including the loop's fit
+    # probes — measures the final stream: caps honored AND accounted.  The
+    # kept lines merge into the chronological stream as units (t_235275a0:
+    # no ``## Actions & Outcomes`` section).
+    trail_extras = [
+        _trail_line_unit(line)
+        for line in _select_trail_lines(
+            trail_lines,
+            _tool_trail_budget(target_tokens),
+            previous_summary=previous_summary,
+            selection_telemetry=selection_telemetry,
+        )
+    ]
+
     notes = _session_notes(messages, memory_context, previous_summary)
 
     # Protected is selected from the whole window, once, so every path below
@@ -3464,6 +3738,14 @@ def build_internal_fallback(
             messages[head_count:tail_start], start_index=head_count
         )
         spine_units = all_spine_units[-marker_recent_count:] if marker_recent_count > 0 else []
+        extras = [
+            *_select_spine_units(
+                spine_units,
+                _marker_spine_budget(target_tokens),
+                previous_summary=previous_summary,
+            ),
+            *trail_extras,
+        ]
         # Gate measures the summary WITH the capped fold (Stage 0.3): plan +
         # notes compete against the folded summary's real weight. Tail-shrink
         # fallback is unchanged (Stage 0.2: _fit_tail_start works once the
@@ -3489,21 +3771,14 @@ def build_internal_fallback(
                 selection_telemetry=selection_telemetry,
                 marker_recent_count=marker_recent_count,
                 tool_units=tool_units,
+                extras=extras,
             )
             # Stage 0.3: the fold is applied ONCE — `gated_summary` above — and
             # the heap's budget math (`_fits` inside
             # `_add_plan_lexrank_area`) runs against that same folded text via
             # `summary`. make_result folds no-ops (canonical dedup) because
-            # the summary already carries the fold.
-            summary = _carry_marker_spine(
-                summary, spine_units, _marker_spine_budget(target_tokens),
-                previous_summary=previous_summary,
-            )
-            summary = _carry_tool_trail(
-                summary, trail_lines, _tool_trail_budget(target_tokens),
-                previous_summary=previous_summary,
-                selection_telemetry=selection_telemetry,
-            )
+            # the summary already carries the fold.  Spine and trail seats are
+            # already inside the stream (see `extras` above).
             return make_result(summary, head_count, fitted_tail_start, "plan")
 
         # The full plan is itself too large to fit — degrade to
@@ -3514,6 +3789,20 @@ def build_internal_fallback(
             system_head,
             protect_last_n,
         )
+        # Spine rides the minimal branch too (§11 part 2: both branches),
+        # recency-bounded the same as the primary path.  Selected up front so
+        # the heap's fit probes measure the final stream.
+        _all_spine = _terminal_marker_units(
+            messages[system_head:tail_start], start_index=system_head
+        )
+        minimal_extras = [
+            *_select_spine_units(
+                _all_spine[-marker_recent_count:] if marker_recent_count > 0 else [],
+                _marker_spine_budget(target_tokens),
+                previous_summary=previous_summary,
+            ),
+            *trail_extras,
+        ]
         summary, fitted_tail_start = _fitted_plan_summary(
             messages,
             head_count=system_head,
@@ -3534,23 +3823,9 @@ def build_internal_fallback(
             selection_telemetry=selection_telemetry,
             marker_recent_count=marker_recent_count,
             tool_units=tool_units,
+            extras=minimal_extras,
         )
-        # Spine rides the minimal branch too (§11 part 2: both branches),
-        # recency-bounded the same as the primary path.
-        _all_spine = _terminal_marker_units(
-            messages[system_head:tail_start], start_index=system_head
-        )
-        summary = _carry_marker_spine(
-            _with_prior_summary(summary, previous_summary, target_tokens),
-            _all_spine[-marker_recent_count:] if marker_recent_count > 0 else [],
-            _marker_spine_budget(target_tokens),
-            previous_summary=previous_summary,
-        )
-        summary = _carry_tool_trail(
-            summary, trail_lines, _tool_trail_budget(target_tokens),
-            previous_summary=previous_summary,
-            selection_telemetry=selection_telemetry,
-        )
+        summary = _with_prior_summary(summary, previous_summary, target_tokens)
         return make_result(
             summary,
             system_head,
@@ -3575,6 +3850,14 @@ def build_internal_fallback(
     spine_units = (
         all_spine_units[-marker_recent_count:] if marker_recent_count > 0 else []
     )
+    extras = [
+        *_select_spine_units(
+            spine_units,
+            _marker_spine_budget(target_tokens),
+            previous_summary=previous_summary,
+        ),
+        *trail_extras,
+    ]
     marker_notes = {note for note in notes if _PRUNED_SKILL_RE.fullmatch(note)}
     if marker_notes:
         middle_units = [
@@ -3596,19 +3879,11 @@ def build_internal_fallback(
     candidates = middle_units + note_units
     if not candidates:
         selection_telemetry["no_op_reason"] = "no_candidates"
-        summary = _lexrank_summary([], protected)
         # The spine and the trail still emit here: an empty heap pool must not
         # cost the markers their guaranteed seat (§11 part 2) nor the ledger
-        # its floor — these are the rows the heap cannot carry.
-        summary = _carry_marker_spine(
-            summary, spine_units, _marker_spine_budget(target_tokens),
-            previous_summary=previous_summary,
-        )
-        summary = _carry_tool_trail(
-            summary, trail_lines, _tool_trail_budget(target_tokens),
-            previous_summary=previous_summary,
-            selection_telemetry=selection_telemetry,
-        )
+        # its floor — these are the rows the heap cannot carry.  Both seats
+        # ride `extras`, so no separate carry step exists to skip.
+        summary = _lexrank_summary([], protected, extras)
         return make_result(
             summary,
             head_count,
@@ -3640,26 +3915,18 @@ def build_internal_fallback(
     selected, summary = _allocate_two_pass(
         ranked,
         target_tokens=target_tokens,
-        initial=_lexrank_summary([], protected),
-        render=lambda chosen: _lexrank_summary(chosen, protected),
+        initial=_lexrank_summary([], protected, extras),
+        render=lambda chosen: _lexrank_summary(chosen, protected, extras),
         fits=lambda text: _fits(messages, head_count, tail_start, text, target_tokens),
         accept=lambda unit: unit.is_note
         or unit.is_marker
         or not _heap_repeat_covered(unit.text, outside_tiers),
     )
-    # Spine emission (planless branch, §11 part 2): the markers' guaranteed
-    # seat, outside the heap's leftover — the exact coupling the invariant
-    # forbids. Emitted before make_result folds and accounts the result.
+    # Guaranteed-seat emission (planless branch, §11 part 2): the markers'
+    # seat and the trail's floor ride `extras` inside the stream, outside the
+    # heap's leftover — the exact coupling the invariant forbids.  The fold is
+    # applied here so the final gate below measures the real payload.
     summary = _with_prior_summary(summary, previous_summary, target_tokens)
-    summary = _carry_marker_spine(
-        summary, spine_units, _marker_spine_budget(target_tokens),
-        previous_summary=previous_summary,
-    )
-    summary = _carry_tool_trail(
-        summary, trail_lines, _tool_trail_budget(target_tokens),
-        previous_summary=previous_summary,
-        selection_telemetry=selection_telemetry,
-    )
     _record_selected_units(selection_telemetry, selected)
     _log_inviolable_dropout(summary, ranked)
     if _fits(messages, head_count, tail_start, summary, target_tokens):

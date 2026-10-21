@@ -74,7 +74,13 @@ def _payload() -> list[dict]:
     return msgs
 
 
-_BINDING_BUDGET = 400
+# Binding budget: tight enough that the artifact loses the budget race when
+# the lock is off (the mutation check). Retuned 400 -> 385 for t_235275a0:
+# dropping the payload's section headers made the same content measurably
+# leaner, which un-bound the race at 400 (the fixture's documented trap:
+# "the budget never binds, and every unit is selected regardless of the
+# lock"). 385 sits mid-range of the verified binding window (375-390).
+_BINDING_BUDGET = 385
 
 
 def _run(target_tokens: int):

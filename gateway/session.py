@@ -3391,8 +3391,13 @@ class SessionStore:
             # user;user wedge (e.g. a turn that persisted no assistant row)
             # would otherwise re-trigger the pre-request repair on every
             # request forever — heal it once at the restore boundary.
+            # include_row_ids: the compressed payload's ``[#xx]`` recovery
+            # handles ARE these row ids (t_235275a0 — the smoke block had
+            # zero handles because the live history carried none). The key is
+            # underscore-prefixed, so every transport strips it before the
+            # wire (conversation_loop drops it centrally for the rest).
             return self._db.get_messages_as_conversation(
-                session_id, repair_alternation=True
+                session_id, repair_alternation=True, include_row_ids=True
             )
         except Exception as e:
             logger.debug("Could not load messages from DB: %s", e)

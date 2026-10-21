@@ -127,11 +127,11 @@ def test_split_marker_tiers_recent_first_ranked_chrono():
         ]
     )
     recent, ranked = _split_marker_tiers(units, recent_count=1)
-    assert [u.text for u in recent] == ["=== third thing done now ===\n[exit 0]"]
+    assert [u.text for u in recent] == ["[TOOL]: === third thing done now ===\n[exit 0]"]
     # ranked tier stays chronological
     assert [u.text for u in ranked] == [
-        "=== first thing done now ===\n[exit 0]",
-        "=== second thing done now ===\n[exit 0]",
+        "[TOOL]: === first thing done now ===\n[exit 0]",
+        "[TOOL]: === second thing done now ===\n[exit 0]",
     ]
 
 
@@ -190,7 +190,7 @@ def test_marker_and_tombstone_survive_compaction():
     # recent markers ([b, c]); the ceiling then cuts oldest-first.
     fallback, _ = _fallback_with_markers(marker_recent_count=2)
     summary = fallback.summary
-    assert "## Decision Markers" in summary
+    assert "[TOOL]: === undo (875,965) ===" in summary
     # Byte-exact marker + adjacent tombstone.
     assert "=== undo (875,965) ===\n[exit 0]" in summary
     assert "[exit 0]" in summary

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from unittest.mock import patch
 
 from agent.context_compressor import ContextCompressor
@@ -74,13 +75,15 @@ def test_real_fallback_payload_never_emits_unmarked_mid_word_fragment():
     )
 
     assert fallback is not None
-    emitted_middle = fallback.summary.partition("## Relevant Earlier Context")[2].partition(
-        "## Verbatim Recent Context"
+    emitted_middle = fallback.summary.partition("[CONTEXT WINDOW COMPRESSED]")[2].partition(
+        "The messages after this summary marker are preserved verbatim."
     )[0]
+    unit_decor = ("[ASSISTANT]:",)
     emitted_tokens = [
         token.strip("…")
         for token in emitted_middle.split()
-        if token != "[ASSISTANT]:"
+        if token not in unit_decor
+        and not re.fullmatch(r"\[#\d+\]|\(\d{2}:\d{2}:\d{2}\)", token)
     ]
     assert emitted_tokens
     assert set(emitted_tokens) <= source_tokens
@@ -316,7 +319,9 @@ def test_relevant_session_notes_receive_a_ranking_boost_but_are_budgeted():
     )
 
     assert fallback is not None
-    assert "## Session Notes" in fallback.summary
+    assert "\n- SQLite session note: preserve the schema rollback command." in (
+        fallback.summary
+    )
     assert "schema rollback command" in fallback.summary
     assert "Unrelated old weather" not in fallback.summary
 

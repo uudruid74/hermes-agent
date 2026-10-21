@@ -393,5 +393,5 @@ def test_notes_are_exempt_from_the_repeat_gate() -> None:
     assert "never restart the database automatically" in res.summary, (
         "the note was treated as a repeat of the verbatim tail"
     )
-    # And it is emitted in the notes section, not mixed into the heap.
-    assert "## Session Notes" in res.summary
+    # And it is emitted as a note line, not mixed into the heap.
+    assert f"\n- {note}" in res.summary

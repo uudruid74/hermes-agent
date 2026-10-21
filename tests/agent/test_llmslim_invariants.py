@@ -20,6 +20,23 @@ def _message(role: str, content, **extra) -> dict:
     return {"role": role, "content": content, **extra}
 
 
+def _protected_block(summary: str) -> str:
+    """The Protected prefix block of the emitted payload.
+
+    The payload no longer labels its regions (t_235275a0 "No Sections"), so
+    the block is located structurally: the first blank-line-delimited block
+    after the transport marker whose lines all look like emitted units
+    (``[ROLE]:`` / ``[#id] [ROLE]:``).  The Protected area renders before the
+    Heap stream, so this is the region under test.
+    """
+    body = summary.split(INTERNAL_FALLBACK_PREFIX, 1)[-1]
+    for block in body.split("\n\n"):
+        lines = [line for line in block.splitlines() if line.strip()]
+        if lines and all(line.startswith("[") for line in lines):
+            return block
+    return ""
+
+
 def _semantic_window() -> list[dict]:
     return [
         _message("system", "system prompt"),
@@ -201,10 +218,8 @@ def test_protected_area_does_not_duplicate_units_in_semantic_middle() -> None:
         session_subject="Dax",
     )
 
-    assert "## Protected Context" in result.summary
-    protected_body = result.summary.split("## Protected Context", 1)[1].split(
-        "## Relevant Earlier Context", 1
-    )[0]
+    protected_body = _protected_block(result.summary)
+    assert protected_body
     protected_lines = [line for line in protected_body.splitlines() if line.startswith("[")]
     assert protected_lines
     assert all(result.summary.count(line) == 1 for line in protected_lines)
@@ -244,10 +259,8 @@ def test_protected_area_respects_step5_size_budget() -> None:
         session_subject="Dax",
     )
 
-    assert "## Protected Context" in result.summary
-    protected_body = result.summary.split("## Protected Context", 1)[1].split(
-        "## Relevant Earlier Context", 1
-    )[0]
+    protected_body = _protected_block(result.summary)
+    assert protected_body
     protected_lines = [line for line in protected_body.splitlines() if line.startswith("[")]
     assert protected_lines
     assert len(protected_lines) <= 2, (
@@ -286,9 +299,7 @@ def test_active_plan_replaces_raw_head_and_fills_protected_remainder() -> None:
 
     assert result.head_count == 1
     assert plan in result.summary
-    protected_body = result.summary.split("## Protected Context", 1)[1].split(
-        "## Relevant Earlier Context", 1
-    )[0]
+    protected_body = _protected_block(result.summary)
     protected_lines = [line for line in protected_body.splitlines() if line.startswith("[")]
     # Total area size is 1 + ceil(4/2) = 3; the Plan occupies one slot.
     assert 0 < len(protected_lines) <= 2

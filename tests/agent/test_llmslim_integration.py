@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from unittest.mock import patch
 
 from agent.context_compressor import ContextCompressor
@@ -77,8 +78,11 @@ def test_plan_path_uses_the_same_semantic_middle_selector() -> None:
         )
 
     assert result.mode == "plan"
-    assert "## Active Plan" in result.summary
-    assert "## Relevant Earlier Context" in result.summary
+    # t_235275a0 "No Sections": the plan context and the semantic middle
+    # render without section headings — the regions are ordered, unlabeled.
+    assert "Task: migrate SQLite" in result.summary
+    assert not re.search(r"(?m)^#{1,6}\s", result.summary)
+    assert "[USER]: SQLite migration" in result.summary
 
 
 def test_fallback_reports_retention_and_effectiveness_telemetry() -> None:
