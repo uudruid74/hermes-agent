@@ -61,6 +61,16 @@ _RECENCY_WEIGHT = 0.20
 # Floor for a pruned-skill reload marker so it stays selectable when budget
 # is free, without outranking real context (see the scoring loop).
 _NOTE_SCORE_FLOOR = 1.25
+# Collapsed tool-result boost (Evan, 2026-10-21 — t_0a90cfdd): *"output these
+# 'collapsed' tool call results into the LexRank system with the rest of the
+# data - with a little boost at that since these results are likely
+# important."*  Bounded floor form (ruling 5 — never a raw score add;
+# t_57cb0d4e burned 12,703 tok on unbounded promotion).  Every scorer signal
+# is in [0, 1], so the natural ceiling is 1.0: the 1.05 floor lifts collapsed
+# tool results above ordinary prose, and the +0.2*rel form (ceiling 1.25)
+# keeps even the most relevant result at or below the session-notes floor
+# (1.25 + 0.4*rel) — notes > tool results > prose, bounded at both ends.
+_TOOL_SCORE_FLOOR = 1.05
 _MAX_UNIT_CHARS = 1_200
 _MAX_CANDIDATE_UNITS = 256
 _ASSEMBLY_RESERVE_TOKENS = 24
@@ -251,6 +261,14 @@ class _Unit:
     is_marker: bool = False
     role: str = "unknown"
     semantic_chunk: int | None = None
+    # Provenance for the ``[#xx]`` recovery handle and the rendered timestamp
+    # (Evan, 2026-10-21 — t_0a90cfdd): the session row id of the message the
+    # unit was built from (``session_search(around_message_id=xx)`` opens it;
+    # row id is the ghost-twin-safe key) and the row's own timestamp — never
+    # the compaction clock.  ``None`` means "no such row" (synthesized units,
+    # fixture rows without ids) and renders without decorations.
+    row_id: int | None = None
+    stamp: float | None = None
 
 
 # Text-bearing fields per the tool schemas (terminal: ``output``; file
@@ -1444,6 +1462,18 @@ def _message_units(
         role = str(message.get("role") or "unknown")
         role_label = role.upper()
         content = _prune_reingested_payload(_content_text(message.get("content")))
+        # Provenance (Evan, 2026-10-21 — t_0a90cfdd): every unit carries the
+        # source row's id and original stamp so the emitted line can render
+        # ``[#xx]`` (resolvable via ``session_search(around_message_id=xx)``)
+        # and a timestamp that is never the compaction clock.
+        raw_id = message.get("id")
+        row_id = raw_id if isinstance(raw_id, int) and not isinstance(raw_id, bool) else None
+        raw_ts = message.get("timestamp")
+        stamp = (
+            float(raw_ts)
+            if isinstance(raw_ts, (int, float)) and not isinstance(raw_ts, bool)
+            else None
+        )
         for unit_offset, chunk in enumerate(_chunks(content)):
             text = f"[{role_label}]: {chunk}"
             units.append(
@@ -1452,6 +1482,8 @@ def _message_units(
                     order=(start_index + message_offset, unit_offset),
                     token_count=estimate_tokens_rough(text),
                     role=role.casefold(),
+                    row_id=row_id,
+                    stamp=stamp,
                 )
             )
     return units
@@ -1829,6 +1861,9 @@ def _record_selected_units(
 ) -> None:
     telemetry["selected_count"] = len(selected)
     telemetry["selected_tokens"] = sum(unit.token_count for unit in selected)
+    telemetry["tool_units_selected"] = sum(
+        1 for unit in selected if unit.role == "tool"
+    )
     telemetry["instruction_units_kept"] = sum(
         instruction_score(unit.text, role=unit.role) > 0 for unit in selected
     )
@@ -1860,8 +1895,15 @@ def _semantic_rank_candidates(
     candidates: list[_Unit],
     reference_units: list[_Unit],
     telemetry: dict[str, Any] | None = None,
+    *,
+    tool_boost: bool = False,
 ) -> list[tuple[_Unit, float]]:
-    """Rank a prepared middle with dependency-free LLMSlim semantics."""
+    """Rank a prepared middle with dependency-free LLMSlim semantics.
+
+    ``tool_boost`` (Evan, 2026-10-21 — t_0a90cfdd) applies the bounded
+    collapsed-tool-result floor at heap-selection time only; the byte-stable
+    Protected/global area ranks without it (ruling 5).
+    """
 
     selection_units = [
         SelectionUnit(
@@ -1897,8 +1939,18 @@ def _semantic_rank_candidates(
             item.instruction > 0 for item in scored
         )
         telemetry["entity_units_found"] = sum(item.entity > 0 for item in scored)
+    # Provenance rides through selection (t_0a90cfdd): llmslim's SelectionUnit
+    # carries no row fields, so the source-row metadata is carried around the
+    # score step keyed by ``order`` (a split part shares its source row via
+    # the leading order components).
+    provenance = {unit.order: (unit.row_id, unit.stamp) for unit in candidates}
     ranked: list[tuple[_Unit, float]] = []
     for item in scored:
+        row_id, stamp = (
+            provenance.get(item.unit.order)
+            or provenance.get(item.unit.order[:2])
+            or (None, None)
+        )
         unit = _Unit(
             text=item.unit.text,
             order=item.unit.order,
@@ -1907,12 +1959,17 @@ def _semantic_rank_candidates(
             is_marker=item.unit.is_marker,
             role=item.unit.role,
             semantic_chunk=item.chunk_index,
+            row_id=row_id,
+            stamp=stamp,
         )
         score = item.score
         if _PRUNED_SKILL_RE.search(unit.text):
             score = max(score, _NOTE_SCORE_FLOOR)
         elif unit.is_note:
             score = max(score, 1.25 + 0.4 * item.relevance)
+        elif tool_boost and unit.role == "tool":
+            # Bounded preference bump (ruling 2 + 5): floor form, heap only.
+            score = max(score, _TOOL_SCORE_FLOOR + 0.2 * item.relevance)
         ranked.append((unit, score))
 
     ordered = sorted(
@@ -1936,6 +1993,7 @@ def _rank_units(
     protected_units: list[_Unit] | None = None,
     semantic: bool = False,
     selection_telemetry: dict[str, Any] | None = None,
+    tool_boost: bool = False,
 ) -> list[tuple[_Unit, float]]:
     """Rank candidate units by centrality + relevance + recency, best first.
 
@@ -1947,6 +2005,9 @@ def _rank_units(
     newest work, which is what the Heap wants ("close to the live turn").
     The Protected selector passes the whole window instead, so relevance
     becomes "close to the centre of the session" (Evan, 2026-09-18).
+
+    ``tool_boost`` applies the bounded collapsed-tool-result floor (heap
+    selection only — the Protected/global selector never opts in).
     """
     candidates = middle_units + note_units
     if not candidates:
@@ -1975,16 +2036,19 @@ def _rank_units(
     for unit in candidates:
         if _is_boilerplate_only(unit.text) or _is_fragment(unit.text):
             continue
-        # Notes, pruned-skill reload markers, and terminal decision markers are
-        # protected content: they are short by nature and were never the junk
-        # this filter targets.  A length floor applied to them empties the
-        # emitted block and takes the whole fallback down with it.  Terminal
-        # markers (the agent's own `=== label ===` + exit tombstone) are a
-        # decision spine, not prose — they must compete on rank, not be
-        # filtered for being terse.
+        # Notes, pruned-skill reload markers, terminal decision markers, and
+        # collapsed tool results are protected content: they are short by
+        # nature and were never the junk this filter targets.  A length floor
+        # applied to them empties the emitted block and takes the whole
+        # fallback down with it.  Terminal markers (the agent's own
+        # `=== label ===` + exit tombstone) are a decision spine, not prose —
+        # they must compete on rank, not be filtered for being terse.  The
+        # VCC-style collapsed tool line ("tool: target — exit 0") is terse by
+        # construction (t_0a90cfdd) and must reach the pool the same way.
         protected = (
             unit.is_note
             or unit.is_marker
+            or unit.role == "tool"
             or bool(_PRUNED_SKILL_RE.search(unit.text))
         )
         if not protected:
@@ -2068,6 +2132,7 @@ def _rank_units(
             candidates,
             reference_units,
             telemetry=selection_telemetry,
+            tool_boost=tool_boost,
         )
 
     all_vectors = _tfidf_vectors(
@@ -2103,6 +2168,10 @@ def _rank_units(
             score = max(score, _NOTE_SCORE_FLOOR)
         elif unit.is_note:
             score = 1.25 + 0.4 * relevant
+        elif tool_boost and unit.role == "tool":
+            # Bounded preference bump (Evan rulings 2 + 5, t_0a90cfdd):
+            # floor form, heap only — never a raw score add.
+            score = max(score, _TOOL_SCORE_FLOOR + 0.2 * relevant)
         scores.append(score)
 
     ordered = sorted(
@@ -2197,7 +2266,8 @@ def _with_lexrank_section(
                 [
                     "## Relevant Earlier Context",
                     "\n".join(
-                        unit.text for unit in sorted(selected, key=lambda item: item.order)
+                        _render_unit(unit)
+                        for unit in sorted(selected, key=lambda item: item.order)
                     ),
                 ]
             )
@@ -2253,6 +2323,7 @@ def _add_plan_lexrank_area(
     protected: list[_Unit] | None = None,
     selection_telemetry: dict[str, Any] | None = None,
     marker_recent_count: int = 0,
+    tool_units: list[_Unit] | None = None,
 ) -> tuple[str, int]:
     """Spend the leftover plan budget on the ranked middle (Evan, 2026-09-15).
 
@@ -2276,11 +2347,13 @@ def _add_plan_lexrank_area(
     # boundary is ``head_count`` and the whole middle ranks, as before.
     rank_start = _plan_step_change_index(messages, head_count, tail_start)
     middle_messages = messages[rank_start:tail_start]
-    if not middle_messages:
+    if not middle_messages and not tool_units:
         if selection_telemetry is not None:
             selection_telemetry["no_op_reason"] = "no_candidates"
         return summary, tail_start
-    middle_units = _message_units(middle_messages, start_index=rank_start)
+    middle_units = _message_units(middle_messages, start_index=rank_start) + list(
+        tool_units or []
+    )
     # Stage 1 (t_57cb0d4e): markers do NOT enter the ranked heap — the spine
     # (see _carry_marker_spine) is their selection path, under its own
     # ceiling. Feeding them here re-coupled retention to the heap's leftover
@@ -2304,6 +2377,7 @@ def _add_plan_lexrank_area(
         protected_units=protected,
         semantic=True,
         selection_telemetry=selection_telemetry,
+        tool_boost=True,
     )
     if not ranked:
         if selection_telemetry is not None:
@@ -2358,7 +2432,10 @@ def _lexrank_summary(
         parts.extend(
             [
                 "## Relevant Earlier Context",
-                "\n".join(unit.text for unit in sorted(context, key=lambda item: item.order)),
+                "\n".join(
+                    _render_unit(unit)
+                    for unit in sorted(context, key=lambda item: item.order)
+                ),
             ]
         )
     if notes:
@@ -2751,6 +2828,7 @@ class _TrailOccurrence:
     order: tuple[int, ...]
     t_first: float | None
     t_second: float | None
+    row_id: int | None = None  # session row id of the outcome row ([#xx] handle)
 
 
 @dataclass(frozen=True)
@@ -2762,6 +2840,8 @@ class _TrailLine:
     order: tuple[int, ...]
     token_count: int
     salience: int
+    row_id: int | None = None  # provenance of the first outcome row
+    stamp: float | None = None
 
 
 def _tool_target(args: dict[str, Any]) -> str:
@@ -2866,7 +2946,9 @@ def _tool_trail_scan(
                     continue
                 seen_calls.add(cid)
                 target = _tool_target(args)
-                display = target
+                # One-line collapse (VCC-style): a multi-line argument value
+                # must not break the rendered ledger/unit line.
+                display = re.sub(r"\s+", " ", target).strip()
                 if len(display) > _TRAIL_TARGET_MAX:
                     display = display[:_TRAIL_TARGET_MAX].rstrip() + "…"
                 pending[cid] = (fn_name, target, display, ts)
@@ -2877,6 +2959,7 @@ def _tool_trail_scan(
                 continue
             fn_name, target, display, call_ts = entry
             outcome_class, outcome = _outcome_of(message.get("content"))
+            raw_id = message.get("id")
             occurrences.append(
                 _TrailOccurrence(
                     tool=fn_name,
@@ -2887,6 +2970,11 @@ def _tool_trail_scan(
                     order=(start_index + offset, 0),
                     t_first=call_ts if call_ts is not None else ts,
                     t_second=ts,
+                    row_id=(
+                        raw_id
+                        if isinstance(raw_id, int) and not isinstance(raw_id, bool)
+                        else None
+                    ),
                 )
             )
     return occurrences
@@ -2938,6 +3026,12 @@ def _tool_trail_lines(occurrences: list[_TrailOccurrence]) -> list[_TrailLine]:
                     order=fused[0].order,
                     token_count=estimate_tokens_rough(text),
                     salience=_trail_salience(text),
+                    row_id=fused[0].row_id,
+                    stamp=(
+                        fused[0].t_second
+                        if fused[0].t_second is not None
+                        else fused[0].t_first
+                    ),
                 )
             )
     return lines
@@ -2965,6 +3059,52 @@ def _trail_salience(text: str) -> int:
 def _trail_ts(stamp: float) -> str:
     """UTC wall-clock for a row timestamp (interval provenance, NOTE A)."""
     return time.strftime("%H:%M:%S", time.gmtime(stamp))
+
+
+def _collapsed_tool_units(
+    rows: list[dict[str, Any]], start_index: int = 0
+) -> list[_Unit]:
+    """Collapse tool rows into LexRank units (Evan, 2026-10-21 — t_0a90cfdd).
+
+    *"Tool rows were not supposed to be excluded... They were supposed to be
+    collapsed (the way vcc does) not discarded."*  One unit per action
+    segment, VCC-style: tool name + target + outcome on one line, exit codes
+    preserved, error->fix pairs fused — the same collapse the trail ledger
+    renders, fed into the LexRank candidate pool instead of being thrown out.
+    ``role="tool"`` keeps llmslim's external-role policy intact (tool text
+    cannot self-promote through instruction wording); the small preference
+    boost is applied by the rankers, bounded by ``_TOOL_SCORE_FLOOR``.
+
+    Echo-marker commands are skipped here — the marker spine is their ONLY
+    selection path ("nothing is double-emitted").
+    """
+    units: list[_Unit] = []
+    for line in _tool_trail_lines(_tool_trail_scan(rows, start_index=start_index)):
+        text = f"[TOOL]: {line.key}"
+        units.append(
+            _Unit(
+                text=text,
+                order=line.order,
+                token_count=estimate_tokens_rough(text),
+                role="tool",
+                row_id=line.row_id,
+                stamp=line.stamp,
+            )
+        )
+    return units
+
+
+def _render_unit(unit: "_Unit") -> str:
+    """Emit a heap unit with its recovery handle and original stamp (ruling 3).
+
+    ``[#xx]`` is the session row id (``session_search(around_message_id=xx)``
+    opens the row); the clock is the row's own timestamp, never the compaction
+    clock.  Role tags already live in ``unit.text`` (``[ROLE]: `` prefixes).
+    Units without a source row (notes, fixtures) render plain.
+    """
+    handle = f"[#{unit.row_id}] " if unit.row_id is not None else ""
+    stamp = f" ({_trail_ts(unit.stamp)})" if unit.stamp is not None else ""
+    return f"{handle}{unit.text}{stamp}"
 
 
 def _tool_trail_block(lines: list[_TrailLine]) -> str:
@@ -3204,11 +3344,22 @@ def build_internal_fallback(
                 originals_by_call.get(str(row.get("tool_call_id") or ""), row)
             )
 
-    # The tool-trail class (Phase 2): admitted from the compressed middle
-    # plus the rows the rungs above destroyed. Rows the verbatim tail keeps
-    # raw are deliberately NOT digested — no duplication across regions.
+    # Tool rows are COLLAPSED into the LexRank pool, not discarded (Evan,
+    # 2026-10-21 — t_0a90cfdd: *"They were supposed to be collapsed (the way
+    # vcc does) not discarded"*).  The ranked region's actions become boosted
+    # heap units (``_collapsed_tool_units``); the trail ledger digests only
+    # the rows the heap cannot see — actions from before the newest Plan
+    # step-change (completed steps stay out of the ranking per Evan
+    # 2026-09-16, but their provenance is not noise) and the rows the tail
+    # rungs destroyed.  One channel per row: nothing dropped, and no
+    # duplication across regions — rows the verbatim tail keeps raw are
+    # deliberately NOT digested anywhere.
+    rank_start = _plan_step_change_index(messages, head_count, tail_start)
+    tool_units = _collapsed_tool_units(
+        messages[rank_start:tail_start], start_index=rank_start
+    )
     trail_lines = _tool_trail_lines(
-        _tool_trail_scan(messages[head_count:tail_start], start_index=head_count)
+        _tool_trail_scan(messages[head_count:rank_start], start_index=head_count)
         + _tool_trail_scan(captured_tail_rows, start_index=tail_start)
     )
     selection_telemetry["tool_trail"] = {
@@ -3217,6 +3368,7 @@ def build_internal_fallback(
         "floor_reserve": _tool_trail_reserve(target_tokens),
         "ceiling_tokens": _tool_trail_budget(target_tokens),
     }
+    selection_telemetry["collapsed_tool_units"] = len(tool_units)
 
     notes = _session_notes(messages, memory_context, previous_summary)
 
@@ -3336,6 +3488,7 @@ def build_internal_fallback(
                 protected=protected,
                 selection_telemetry=selection_telemetry,
                 marker_recent_count=marker_recent_count,
+                tool_units=tool_units,
             )
             # Stage 0.3: the fold is applied ONCE — `gated_summary` above — and
             # the heap's budget math (`_fits` inside
@@ -3380,6 +3533,7 @@ def build_internal_fallback(
             protected=protected,
             selection_telemetry=selection_telemetry,
             marker_recent_count=marker_recent_count,
+            tool_units=tool_units,
         )
         # Spine rides the minimal branch too (§11 part 2: both branches),
         # recency-bounded the same as the primary path.
@@ -3412,7 +3566,7 @@ def build_internal_fallback(
     # `_rank_units` contract already assumes.
     rank_start = _plan_step_change_index(messages, head_count, tail_start)
     middle_messages = messages[rank_start:tail_start]
-    middle_units = _message_units(middle_messages, start_index=rank_start)
+    middle_units = _message_units(middle_messages, start_index=rank_start) + tool_units
     # Stage 1 (t_57cb0d4e): markers bypass the ranker entirely — the spine is
     # their ONLY selection path, under its own ceiling. Nothing enters the
     # 256-cap / score≈0 funnel, and nothing is double-emitted.
@@ -3443,8 +3597,13 @@ def build_internal_fallback(
     if not candidates:
         selection_telemetry["no_op_reason"] = "no_candidates"
         summary = _lexrank_summary([], protected)
-        # The trail still emits here: a tool-only middle has no prose
-        # candidates but is exactly the case the ledger preserves.
+        # The spine and the trail still emit here: an empty heap pool must not
+        # cost the markers their guaranteed seat (§11 part 2) nor the ledger
+        # its floor — these are the rows the heap cannot carry.
+        summary = _carry_marker_spine(
+            summary, spine_units, _marker_spine_budget(target_tokens),
+            previous_summary=previous_summary,
+        )
         summary = _carry_tool_trail(
             summary, trail_lines, _tool_trail_budget(target_tokens),
             previous_summary=previous_summary,
@@ -3464,6 +3623,7 @@ def build_internal_fallback(
         protected_units=protected,
         semantic=True,
         selection_telemetry=selection_telemetry,
+        tool_boost=True,
     )
     # Same gate as the plan path: only the verbatim tail counts as a repeat
     # source.  Notes are exempt (they route separately below).

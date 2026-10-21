@@ -218,8 +218,15 @@ def _carry(lines, budget, telemetry):
 # ------------------------------------------------- emission through the build
 
 
-def test_build_emits_digest_for_middle_actions():
-    """The compressed middle's actions land in the one-line digest block."""
+def test_build_collapses_middle_actions_into_lexrank():
+    """t_0a90cfdd: the compressed middle's actions are LexRank units now.
+
+    Evan (2026-10-21): *"They were supposed to be collapsed (the way vcc
+    does) not discarded."*  Middle actions collapse into the chronological
+    heap; the ``## Actions & Outcomes`` digest is only the ledger for rows the
+    heap cannot see (rung-destroyed tail rows) — no duplication across
+    regions.
+    """
     messages = [
         _system("sys"),
         _user("start", 1.0),
@@ -232,9 +239,11 @@ def test_build_emits_digest_for_middle_actions():
     fallback = build_internal_fallback(
         messages, protect_head_count=2, protect_last_n=1, target_tokens=4_000
     )
-    assert "## Actions & Outcomes" in fallback.summary
-    assert "pytest tests/agent — exit 1→exit 0" in fallback.summary
-    assert fallback.selection_telemetry["tool_trail"]["emitted_lines"] == 1
+    summary = fallback.summary
+    assert "## Relevant Earlier Context" in summary
+    assert "pytest tests/agent — exit 1→exit 0" in summary
+    assert "## Actions & Outcomes" not in summary
+    assert fallback.selection_telemetry["tool_units_selected"] == 1
 
 
 def test_build_captures_rung_destroyed_tail_actions():
