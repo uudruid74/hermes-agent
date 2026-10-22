@@ -134,7 +134,13 @@ def _route_clarify_to_dispatcher(
 
     Returns the dispatcher's wake recipient, or None when no dispatcher
     resolves (self-dispatch, human creator, no task) — the caller then keeps
-    the legacy interactive path.
+    the legacy interactive path. Self-dispatch means the resolved recipient
+    IS the asker (``recipient == agent_name``): waking "the dispatcher" would
+    wake the asker's own session with slash-command text while the real
+    addressee — the human downstream of the asker's interactive callback —
+    never sees the choices (buttons). t_c02fc2cd plan approval lost exactly
+    that (Evan 2026-10-22: "I could click buttons before. Now I have to use
+    slash commands.").
     """
     import sqlite3
     import sys
@@ -164,6 +170,15 @@ def _route_clarify_to_dispatcher(
             return None
         recipient = _review_ask_target(conn, tid, direction="to-dispatcher")
         if not recipient:
+            return None
+        # Self-dispatch is not a route (contract above): the asker IS the
+        # resolved dispatcher, so the wake would land back in the asker's own
+        # session while the human addressee keeps slash-command text. Fall
+        # through to the legacy interactive path — the callback carries the
+        # choices, which the platforms render as BUTTONS (plan approval:
+        # Approve / Deny / Yolo).
+        asker = str(agent_name or "").strip()
+        if asker and recipient.casefold() == asker.casefold():
             return None
         # Only an agent profile can be woken; a human creator stays on the
         # interactive path (the human IS the dispatcher there).

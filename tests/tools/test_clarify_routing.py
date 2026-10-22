@@ -168,6 +168,55 @@ def test_self_dispatched_clarify_keeps_interactive_path(kb_env):
     assert not kb_env.wakes
 
 
+def test_creator_asked_clarify_keeps_the_button_path(kb_env, monkeypatch):
+    """t_c02fc2cd plan approval: the CREATOR raises the ask on a task it
+    delegated to a worker (created_by != assignee), so the dispatcher
+    resolves to the creator — the ASKER itself. The wake would land back in
+    the asker's own session as slash-command text and the human addressee
+    never sees the choices. The ask must keep the interactive path, where
+    the callback receives the choices and the platforms render BUTTONS
+    (Evan 2026-10-22: "I could click buttons before. Now I have to use
+    slash commands.")."""
+    # Without the guard the ask parks in the dispatcher-wait loop until the
+    # answer window expires — keep that window tiny so the pre-fix case
+    # fails fast (timeout non-answer) instead of hanging the suite.
+    monkeypatch.setattr("tools.clarify_tool.DISPATCHER_ANSWER_TIMEOUT_S", 2)
+    agent = SimpleNamespace(
+        agent_name="gopher", session_id="sess_self", clarify_callback=None
+    )
+    seen = {}
+
+    def cb(q, c, multi_select=False):
+        seen["question"], seen["choices"] = q, c
+        return "Approve"
+
+    out = json.loads(
+        clarify_tool(
+            question="Approve plan t_x?",
+            choices=["Approve", "Deny", "Yolo"],
+            callback=cb,
+            agent=agent,
+            task_id="t_e4812748",
+        )
+    )
+    assert out["user_response"] == "Approve"
+    # The options reached the UI layer intact — this is what renders buttons.
+    assert seen["choices"] == ["Approve", "Deny", "Yolo"]
+    # No text wake: the asker IS the dispatcher; the human is downstream of
+    # the asker's interactive callback.
+    assert not kb_env.wakes
+    # The durable ask is still answered for the /review / dashboard channel.
+    conn = sqlite3.connect(kb_env.db_path)
+    try:
+        row = conn.execute(
+            "SELECT status FROM clarify_queue WHERE task_id='t_e4812748' "
+            "ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row and row[0] == "answered"
+
+
 def test_human_creator_stays_interactive(kb_env):
     # 'ekl' is not a profile — no wake, the human at the terminal answers.
     conn = sqlite3.connect(kb_env.db_path)
