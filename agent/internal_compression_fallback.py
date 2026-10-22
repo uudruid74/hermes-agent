@@ -2463,7 +2463,10 @@ def _lexrank_summary(
     if stream:
         parts.append(stream)
     if notes:
-        parts.append("\n".join(f"- {unit.text}" for unit in notes))
+        # t_e4812748 bug 1: note lines keep their ``- `` bullet and gain the
+        # ``[#N]`` handle and stamp via ``_render_unit`` (synthesized notes
+        # without a source row render exactly as before).
+        parts.append("\n".join(f"- {_render_unit(unit)}" for unit in notes))
     parts.append(VERBATIM_CONTEXT_MARKER)
     return "\n\n".join(parts)
 
@@ -2586,6 +2589,12 @@ def _canonical_prior_summary(previous_summary: str, current_summary: str) -> str
         _PCS_END_MARKER,
         "## Verbatim Recent Context",
         "The messages after this summary marker are preserved verbatim.",
+        # t_e4812748 bug 2: the LLM-summarizer envelope pair and the
+        # context_compressor boundary line are transport too — a re-ingested
+        # prior must never re-nest its own wrappers inside the fold.
+        "[PRIOR CONTEXT — for reference only; not a new message]",
+        "[END OF PRIOR CONTEXT — COMPACTION SUMMARY BELOW]",
+        "--- END OF CONTEXT SUMMARY — respond to the message below, not the summary above ---",
     }
     current_blocks = {
         block.strip() for block in re.split(r"\n{2,}", current_summary) if block.strip()
@@ -3136,6 +3145,10 @@ def _trail_identity(tool: str, display: str) -> str:
 # Tools whose action-object is the message itself — rendered as a call
 # reference, never by swallowing the body (t_235275a0).
 _CALLREF_TARGET_TOOLS = frozenset({"tell"})
+# t_e4812748 bug 3: only these tools' targets are shell/code COMMANDS (their
+# informative end is the head, so over-cap displays head-truncate). Every
+# other target — paths, patterns, prose — keeps its tail when clipped.
+_COMMAND_TARGET_TOOLS = frozenset({"terminal", "execute_code", "shell", "bash"})
 
 
 def _tool_trail_scan(
@@ -3194,7 +3207,15 @@ def _tool_trail_scan(
                     # value must not break the rendered ledger/unit line.
                     display = re.sub(r"\s+", " ", target).strip()
                     if len(display) > _TRAIL_TARGET_MAX:
-                        display = display[:_TRAIL_TARGET_MAX].rstrip() + "…"
+                        # t_e4812748 bug 3: head-truncate COMMANDS only.
+                        # For paths and prose the informative end is the tail
+                        # ("/home/…/gopher/state...." lost the filename; a
+                        # tell target lost its conclusion) — keep the tail
+                        # for everything that is not a shell/code command.
+                        if fn_name in _COMMAND_TARGET_TOOLS:
+                            display = display[:_TRAIL_TARGET_MAX].rstrip() + "…"
+                        else:
+                            display = "…" + display[-_TRAIL_TARGET_MAX:].lstrip()
                 pending[cid] = (fn_name, target, display, ts)
         elif role == "tool":
             cid = str(message.get("tool_call_id") or "")
@@ -3270,11 +3291,12 @@ def _tool_trail_lines(occurrences: list[_TrailOccurrence]) -> list[_TrailLine]:
                     token_count=estimate_tokens_rough(text),
                     salience=_trail_salience(text),
                     row_id=fused[0].row_id,
-                    stamp=(
-                        fused[0].t_second
-                        if fused[0].t_second is not None
-                        else fused[0].t_first
-                    ),
+                    # t_e4812748 bug 4: the handle names fused[0]'s outcome
+                    # row, so the clock is that row's own (t_second) and never
+                    # another row's — a missing clock renders no clock at all
+                    # rather than the pair's call-side one (the old t_first
+                    # fallback printed a different row's time beside [#N]).
+                    stamp=fused[0].t_second,
                 )
             )
     return lines
@@ -3335,6 +3357,40 @@ def _collapsed_tool_units(
             )
         )
     return units
+
+
+_HANDLE_LEGEND_PREFIX = "[#N] = session row id"
+
+
+def _with_handle_legend(summary: str, session_id: str | None = None) -> str:
+    """One legend line naming the ``[#N]`` key with its ready-to-run command.
+
+    t_e4812748 bug 1b (Evan 2026-10-22): "the marker contains the command to
+    open a particular line — don't make small models like Ornith derive it".
+    The worked example uses a REAL handle from this payload. Idempotent: an
+    existing legend line is replaced, never duplicated. No handles → no
+    legend.
+    """
+    lines = summary.splitlines()
+    lines = [ln for ln in lines if not ln.startswith(_HANDLE_LEGEND_PREFIX)]
+    first = None
+    for ln in lines:
+        match = _HANDLE_RE.search(ln)
+        if match:
+            first = int(match.group(1))
+            break
+    if first is None:
+        return "\n".join(lines)
+    sid_arg = f"session_id='{session_id}', " if session_id else ""
+    legend = (
+        f"{_HANDLE_LEGEND_PREFIX} (rows may age out) — open one with "
+        f"session_search({sid_arg}around_message_id={first}, window=5); "
+        f"e.g. session_search({sid_arg}around_message_id={first}, window=5) "
+        f"opens [#N={first}] — same call with any [#N]'s number."
+    )
+    insert_at = 1 if lines and lines[0].strip() == INTERNAL_FALLBACK_PREFIX else 0
+    lines.insert(insert_at, legend)
+    return "\n".join(lines)
 
 
 def _render_unit(unit: "_Unit | _TrailLine") -> str:
@@ -3502,6 +3558,14 @@ def build_internal_fallback(
     the floor the Heap must beat to earn its cost.
     """
     raw_head_count = min(max(protect_head_count, 0), len(messages))
+    session_id = next(
+        (
+            str(message.get("session_id"))
+            for message in messages
+            if message.get("session_id")
+        ),
+        None,
+    )
     system_head = 1 if messages and messages[0].get("role") == "system" else 0
     protected_first_n = max(0, raw_head_count - system_head)
     protected_area_size = protected_first_n + (-(-max(protect_last_n, 0) // 2))
@@ -3679,6 +3743,10 @@ def build_internal_fallback(
         # at ~59K chars. The capped fold shrinks each cycle (smaller payload
         # -> smaller next fold), which is the convergence the report demands.
         summary = _with_prior_summary(summary, previous_summary, target_tokens)
+        # t_e4812748 bug 1b: the legend rides AFTER the fold so it also
+        # explains handles the fold carried in, and BEFORE the accounting so
+        # its tokens are counted like everything else.
+        summary = _with_handle_legend(summary, session_id)
         assembled_tokens = (
             estimate_messages_tokens_rough(
                 [

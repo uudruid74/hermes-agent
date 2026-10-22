@@ -8050,16 +8050,28 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         "The messages after this summary marker are preserved verbatim.",
         "[END OF PRIOR CONTEXT SUMMARY]",
         "[PRIOR CONTEXT SUMMARY]",
+        # t_e4812748 bug 2: the LLM envelope's end sentinel is the same class
+        # as the fold sentinels above — never model-window content.
+        "[END OF PRIOR CONTEXT — COMPACTION SUMMARY BELOW]",
     })
 
     @classmethod
     def _strip_payload_scaffolding(cls, text: str) -> str:
         if not text.lstrip().startswith(cls._PAYLOAD_VIEW_PREFIXES):
             return text
-        kept = [
-            line for line in text.split("\n")
-            if line.strip() not in cls._PAYLOAD_SCAFFOLD_LINES
-        ]
+        kept = []
+        marker_seen = False
+        for line in text.split("\n"):
+            if line.strip() in cls._PAYLOAD_SCAFFOLD_LINES:
+                continue
+            # One transport marker per payload (Evan, 2026-10-20): a NESTED
+            # marker from a merged/re-ingested payload is scaffolding too —
+            # only the first marker line (position 0) survives to the window.
+            if line.strip().startswith(cls._PAYLOAD_VIEW_PREFIXES):
+                if marker_seen:
+                    continue
+                marker_seen = True
+            kept.append(line)
         return re.sub(r"\n{3,}", "\n\n", "\n".join(kept))
 
     def get_messages_as_conversation(
