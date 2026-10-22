@@ -27,7 +27,7 @@ def _db():
             id TEXT PRIMARY KEY, title TEXT, body TEXT, assignee TEXT,
             status TEXT, workspace_kind TEXT, workspace_path TEXT,
             task_steps TEXT, task_stepno INTEGER, task_goal TEXT,
-            created_at INTEGER
+            created_at INTEGER, created_by TEXT
         );
         CREATE TABLE execution_bindings (
             profile TEXT, root_session_id TEXT, task_id TEXT,
@@ -39,7 +39,11 @@ def _db():
         );
         CREATE TABLE task_comments (
             id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, kind TEXT,
-            body TEXT, created_by TEXT, created_at INTEGER
+            author TEXT, body TEXT, created_by TEXT, created_at INTEGER
+        );
+        CREATE TABLE plan_authorizations (
+            plan_id TEXT PRIMARY KEY, approved_by_actor TEXT,
+            approved_by_session_id TEXT, origin_session_id TEXT
         );
         """
     )

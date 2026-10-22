@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 import time
 import uuid
@@ -493,12 +494,15 @@ def _create_plan(
             f"You have been assigned a new task.  Please call "
             f"'plan continue {task_id}' to begin the new task."
         )
+        task_row = conn.execute(
+            "SELECT * FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
         wrapped = (
             f"Incoming message from {creator_agent_name} follows:\n"
             "---\n"
             f"{worker_msg}\n"
             "---\n"
-            "If a reply is required, use the 'tell' command to reply."
+            f"{_reviewer_identity(conn, task_row)}"
         )
         # Fire-and-forget wake: the assignee is notified out-of-band, so the
         # creator's tool loop never blocks on delivery. Delivery status lives
@@ -628,6 +632,68 @@ def _dispatcher_for_task(conn, task_id: str) -> Optional[str]:
     if dispatcher and dispatcher.casefold() != assignee.casefold():
         return dispatcher
     return None
+
+
+_REVIEWER_NAME_RE = re.compile(
+    r"\bReviewer\*{0,2}\s*[:：]\s*\*{0,2}\s*([A-Za-z0-9][A-Za-z0-9_-]*)"
+)
+
+
+def _reviewer_session_id(
+    conn, task, name: str, owner: Optional[str]
+) -> Optional[str]:
+    """The session id the plan binding records for *name*, if any.
+
+    ``plan_authorizations`` is the plan's durable record of who ran it: the
+    session the plan was created from (``origin_session_id``) and the one
+    that approved it (``approved_by_session_id``).  ``tasks.session_id`` is
+    deliberately NOT used — claiming a plan rewrites that column to the
+    worker's session (execution_bindings claim path), so it names the
+    worker, never the reviewer.
+    """
+    row = conn.execute(
+        "SELECT approved_by_actor, approved_by_session_id, origin_session_id "
+        "FROM plan_authorizations WHERE plan_id = ?",
+        (task["id"],),
+    ).fetchone()
+    if row is None:
+        return None
+    name_cf = name.strip().casefold()
+    if str(row[0] or "").strip().casefold() == name_cf:
+        return str(row[1] or "").strip() or None
+    if owner and owner.strip().casefold() == name_cf:
+        return str(row[2] or "").strip() or None
+    return None
+
+
+def _reviewer_identity(conn, task) -> str:
+    """Worker-facing reviewer line: agent name AND session id.
+
+    2026-10-22, incident t_c02fc2cd: plan payloads never named the step
+    reviewer, so the worker's "if you know who it is" fallback routed a
+    step handoff to the wrong agent (Gopher).  Evan 2026-10-22 (t_cc94fc2d):
+    "plan remind and plan continue need to explicitly list the 'reviewer'
+    by agent name AND sessionid" — identity is lifted from the plan here so
+    the worker never re-reads it from a file.
+
+    Name: the plan text's ``Reviewer:`` line (the plan file's reviewer as
+    transferred into the body/steps), else the plan owner — the agent
+    ``plan review`` is gated on (``_dispatcher_for_task``).  Session id:
+    the plan binding's recorded session for that name, else the line says
+    so rather than inventing one.
+    """
+    owner = _dispatcher_for_task(conn, task["id"])
+    plan_text = "\n".join(
+        str(task[col] or "") for col in ("title", "body", "task_goal", "task_steps")
+    )
+    match = _REVIEWER_NAME_RE.search(plan_text)
+    name = match.group(1) if match else owner
+    if not name:
+        return "Reviewer: the human user (interactive session)"
+    session_id = _reviewer_session_id(conn, task, name, owner)
+    if session_id:
+        return f"Reviewer: {name} (session_id={session_id})"
+    return f"Reviewer: {name} (session_id not recorded)"
 
 
 def _send_user(
@@ -1312,6 +1378,7 @@ def _format_plan(conn, task, *, include_summaries: bool, minimal: bool = False) 
         current_step = steps[stepno - 1] if 0 < stepno <= len(steps) else ""
         lines = [
             f"Goal: {task['task_goal'] or ''}",
+            _reviewer_identity(conn, task),
             f"Current step {stepno}/{len(steps)}: {current_step}",
         ]
         if stepno in summaries:
@@ -1324,6 +1391,7 @@ def _format_plan(conn, task, *, include_summaries: bool, minimal: bool = False) 
         f"Task: {task['title'] or task['id']}",
         f"Status: {task['status']}",
         f"Goal: {task['task_goal'] or ''}",
+        _reviewer_identity(conn, task),
         f"Step {stepno}/{len(steps)}",
         "",
     ]
@@ -1534,6 +1602,7 @@ def cmd_remind(agent, task_id: Optional[str] = None) -> str:
     lines = [
         f"Task: {task['title'] or task['id']}",
         f"Goal: {task['task_goal'] or ''}",
+        _reviewer_identity(conn, task),
     ]
     # Terminal plans must never render as active (t_b4a93053, 2026-09-22):
     # close_plan NULLs task_stepno, and the old `stepno or 1` fallback made a
@@ -1714,7 +1783,7 @@ def cmd_approve(agent, task_id: str) -> str:
         "---\n"
         f"{worker_msg}\n"
         "---\n"
-        "If a reply is required, use the 'tell' command to reply."
+        f"{_reviewer_identity(conn, task)}"
     )
     # Fire-and-forget wake: the assignee is notified out-of-band, so the
     # creator's tool loop never blocks on delivery. Delivery status lives
