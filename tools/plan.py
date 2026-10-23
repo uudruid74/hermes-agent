@@ -622,22 +622,22 @@ def _cmd_dispatch(agent, title: str, goal: str, project: str, assignee: str,
         return "ERROR: 'project' (board) is required for dispatch"
 
     from hermes_cli.plan_limits import (
-        cap_steps, cap_text, goal_text_error, step_count_error, steps_text_error,
+        cap_goal, cap_steps, goal_text_error, step_count_error, steps_text_error,
     )
 
     over_limit = step_count_error(steps)
     if over_limit:
         return over_limit
     # Refuse rather than truncate (Evan, 2026-09-18).  A truncated goal is
-    # silently destroyed instructions: a 7,038-char brief was stored as 246
-    # chars and the worker spent 53 calls hunting for the rest.
+    # silently destroyed instructions: a 7,038-char dispatch brief was stored
+    # as 246 chars and the worker spent 53 calls hunting for the rest.
     over_limit = goal_text_error(goal)
     if over_limit:
         return over_limit
     over_limit = steps_text_error(steps)
     if over_limit:
         return over_limit
-    goal = cap_text(goal)
+    goal = cap_goal(goal)
     steps = cap_steps(steps) if steps else steps
 
     kdb = _get_kanban_db(project)
@@ -721,7 +721,7 @@ def _cmd_cron(agent, cron: str, root: str, title: str, goal: str,
     import uuid
 
     from hermes_cli.plan_limits import (
-        cap_steps, cap_text, goal_text_error, step_count_error, steps_text_error,
+        cap_goal, cap_steps, goal_text_error, step_count_error, steps_text_error,
     )
 
     over_limit = step_count_error(steps)
@@ -733,7 +733,7 @@ def _cmd_cron(agent, cron: str, root: str, title: str, goal: str,
     over_limit = steps_text_error(steps)
     if over_limit:
         return over_limit
-    goal = cap_text(goal)
+    goal = cap_goal(goal)
     steps = cap_steps(steps)
 
     agent_name = _get_agent_name(agent)
@@ -1211,8 +1211,10 @@ from tools.plan_binding_adapter import (
     cmd_approve as _cmd_approve,
     cmd_archive as _cmd_archive_adapter,
     cmd_continue as _cmd_continue,
+    cmd_export as _cmd_export,
     cmd_fail as _cmd_fail,
     cmd_handoff as _cmd_handoff,
+    cmd_import as _cmd_import,
     cmd_new as _cmd_new,
     cmd_remind as _cmd_remind,
     cmd_repeat as _cmd_repeat,
@@ -1248,11 +1250,14 @@ def plan(
     parent_task_id: Optional[str] = None,
     step: Optional[int] = None,
     decision: Optional[str] = None,
+    file: Optional[str] = None,
 ) -> str:
     """Mandatory Action Protocol — multistep plan management.
 
     Commands:
       new           — present a plan for approval
+      import        — create a plan from a flat markdown spec file (new + assign)
+      export        — write a plan back to markdown (spec + claim/denial history)
       advance       — submit one completed-step summary for review
       review        — dispatcher approves, denies, or yolo-enables a pending step
       repeat        — re-open a step as a corrective child plan (needs a plan)
@@ -1274,6 +1279,16 @@ def plan(
             agent, title, goal, steps, temp, board, kind, debug_plan_id,
             pre_approved, parent_task_id, assignee,
         )
+
+    elif command == "import":
+        if not file:
+            return "ERROR: 'import' requires file"
+        return _cmd_import(agent, file, assignee, board)
+
+    elif command == "export":
+        if not task_id:
+            return "ERROR: 'export' requires task_id"
+        return _cmd_export(agent, task_id, file)
 
     elif command == "cron":
         if not cron or not root or not title or not goal or not steps:
@@ -1344,7 +1359,7 @@ def plan(
         return _cmd_archive_adapter(agent, task_id)
 
     else:
-        return f"ERROR: Unknown plan command '{command}'. Valid: new, advance, review, repeat, handoff, continue, dispatch, remind, fail, test-complete, approve, block, archive, cron"
+        return f"ERROR: Unknown plan command '{command}'. Valid: new, import, export, advance, review, repeat, handoff, continue, dispatch, remind, fail, test-complete, approve, block, archive, cron"
 
 
 # --- Schema ---
@@ -1353,7 +1368,10 @@ PLAN_SCHEMA = {
     "name": "plan",
     "description": (
         "Mandatory Action Protocol — create and manage multistep plans. "
-        "Commands: new (present plan for approval), advance (submit a completed-step summary for review), "
+        "Commands: new (present plan for approval), "
+        "import (create a plan from a flat markdown spec file, then assign it), "
+        "export (write a plan back to markdown including claim/denial history), "
+        "advance (submit a completed-step summary for review), "
         "review (approve, deny, yolo-enable, or answer a worker's tool-limit ask), "
         "repeat (re-open a step as a corrective child plan), "
         "handoff (record in-progress work), continue (resume a task in this session), "
@@ -1369,8 +1387,8 @@ PLAN_SCHEMA = {
         "properties": {
             "command": {
                 "type": "string",
-                "description": "Command: new, advance, review, repeat, handoff, continue, dispatch, remind, fail, test-complete, approve, block, archive, or cron",
-                "enum": ["new", "advance", "review", "repeat", "handoff", "continue", "dispatch", "remind", "fail", "test-complete", "approve", "block", "archive", "cron"],
+                "description": "Command: new, import, export, advance, review, repeat, handoff, continue, dispatch, remind, fail, test-complete, approve, block, archive, or cron",
+                "enum": ["new", "import", "export", "advance", "review", "repeat", "handoff", "continue", "dispatch", "remind", "fail", "test-complete", "approve", "block", "archive", "cron"],
             },
             "title": {
                 "type": "string",
@@ -1408,7 +1426,7 @@ PLAN_SCHEMA = {
             },
             "assignee": {
                 "type": "string",
-                "description": "Agent profile name to assign (required for dispatch). For 'new': create the plan delegated to this agent — the task is created blocked (approval gate), assigned to them, NOT dispatched, and notifications route back to the creating agent's session. The worker then runs `plan continue <task_id>` from their session to bind and start it.",
+                "description": "Agent profile name to assign (required for dispatch). For 'new' and 'import': create the plan delegated to this agent — the task is created blocked (approval gate), assigned to them, NOT dispatched, and notifications route back to the creating agent's session. The worker then runs `plan continue <task_id>` from their session to bind and start it. For 'import' without an assignee the plan is yours (or claimable).",
             },
             "resume": {
                 "type": "string",
@@ -1424,7 +1442,11 @@ PLAN_SCHEMA = {
             },
             "task_id": {
                 "type": "string",
-                "description": "Task ID for 'continue', 'remind', 'review', 'approve', 'block', or 'archive' command. Optional for 'remind' and 'archive': when omitted, remind shows the ACTIVE plan and archive closes the ACTIVE plan. With neither a task_id nor an active plan, both fail — run 'continue <task_id>' to claim an assigned plan.",
+                "description": "Task ID for 'continue', 'export', 'remind', 'review', 'approve', 'block', or 'archive' command. Required for 'export'. Optional for 'remind' and 'archive': when omitted, remind shows the ACTIVE plan and archive closes the ACTIVE plan. With neither a task_id nor an active plan, both fail — run 'continue <task_id>' to claim an assigned plan.",
+            },
+            "file": {
+                "type": "string",
+                "description": "Path to a flat markdown plan spec for 'import' (# Title, global description, ## step title + expansion body per step). For 'export': output path — optional; without it the markdown is returned in the response.",
             },
             "board": {
                 "type": "string",
@@ -1490,6 +1512,7 @@ registry.register(
         parent_task_id=args.get("parent_task_id"),
         step=args.get("step"),
         decision=args.get("decision"),
+        file=args.get("file"),
     ),
     emoji="📋",
 )

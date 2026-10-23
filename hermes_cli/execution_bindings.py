@@ -318,13 +318,16 @@ def _set_step_denial(
     """Replace the stored denial reason for one Plan step.
 
     Mirrors ``_set_step_summary`` so a denial rides the same durable channel:
-    a fresh denial REPLACES the previous one for the same step (latest wins),
-    and the reason is capped by cutting its MIDDLE (B1 trim direction — never
-    cut heads; the reviewer's directive and its lead both survive).
-    """
-    from hermes_cli.plan_limits import cap_summary
+    a fresh denial REPLACES the previous one for the same step (latest wins).
 
-    reason = cap_summary(reason)
+    EXEMPT from ``cap_summary`` (plan-import-export-flat-file-spec, item 1):
+    reviewer verdicts are not prose — they must NOT pass through the 240-char
+    middle cut. This is why the worker re-derived corrections every cycle in
+    the run-7 forensics: the verdict was truncated mid-directive and the
+    remaining rules had to be recovered from memory. The reason is stored
+    VERBATIM; the input is already bounded by the review command's 1024-char
+    response cap (``plan_binding_adapter.cmd_review``).
+    """
     marker = f"[plan-step-denial:{step_no}] "
     row = conn.execute(
         "SELECT id FROM task_comments WHERE task_id = ? AND body LIKE ?",

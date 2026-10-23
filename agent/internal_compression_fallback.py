@@ -3149,6 +3149,11 @@ _CALLREF_TARGET_TOOLS = frozenset({"tell"})
 # informative end is the head, so over-cap displays head-truncate). Every
 # other target — paths, patterns, prose — keeps its tail when clipped.
 _COMMAND_TARGET_TOOLS = frozenset({"terminal", "execute_code", "shell", "bash"})
+# t_d3583771 (plan-import-export-flat-file-spec item 4): once the global
+# area carries the ground truth, plan tool calls are noise — they must never
+# become ledger lines or heap candidates. The plan block is their only
+# selection path (same rule as echo markers: nothing is double-emitted).
+_PLAN_NOISE_TOOLS = frozenset({"plan"})
 
 
 def _tool_trail_scan(
@@ -3181,6 +3186,8 @@ def _tool_trail_scan(
                 if not isinstance(fn, dict):
                     continue
                 fn_name = str(fn.get("name") or "tool")
+                if fn_name in _PLAN_NOISE_TOOLS:
+                    continue
                 args_raw = fn.get("arguments")
                 args: dict[str, Any] = {}
                 if isinstance(args_raw, str):

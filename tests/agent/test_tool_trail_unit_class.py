@@ -110,6 +110,24 @@ def test_signal_pure_admission_includes_void_and_error():
     assert [item.outcome_class for item in occ] == ["void", "error", "ok"]
 
 
+def test_plan_tool_calls_never_admit():
+    """t_d3583771 item 4: plan calls are noise once the plan block carries the
+    ground truth — no ledger lines and no heap candidates (the collapsed
+    units are built from the same scan)."""
+    rows = [
+        _calls("c1", "plan", {"command": "remind"}, 1.0),
+        _result("c1", "Task: demo", 2.0),
+        _calls("c2", "plan", {"command": "advance", "summary": "done"}, 3.0),
+        _result("c2", "paused for review", 4.0),
+        _calls("c3", "terminal", {"command": "make build"}, 5.0),
+        _result("c3", {"exit_code": 0, "output": "ok"}, 6.0),
+    ]
+    occ = _tool_trail_scan(rows)
+    assert [item.tool for item in occ] == ["terminal"]
+    assert _collapsed_tool_units(rows) != []
+    assert all("plan" not in unit.text for unit in _collapsed_tool_units(rows))
+
+
 # --------------------------------------------------- target + outcome shape
 
 

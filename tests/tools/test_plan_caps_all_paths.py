@@ -42,7 +42,8 @@ sys.path.insert(0, ".")
 
 REAL_BOARD = "/home/ekl/.hermes/kanban/kanban.db"
 
-LONG_GOAL = "Dispatch goal " + "Q" * 700 + " THE REAL END"
+# Per-field caps (t_d3583771): goal/global 2K chars, step title 128 bytes.
+LONG_GOAL = "Dispatch goal " + "Q" * 2100 + " THE REAL END"
 LONG_STEP = "s" * 400
 
 
@@ -122,11 +123,12 @@ def test_dispatch_refuses_a_goal_over_the_cap(board):
     Truncation destroyed a real brief: a 7,038-char dispatch goal was stored as
     246 chars and the worker spent 53 tool calls hunting for text that was never
     stored.  A refusal surfaces at the caller, which still holds the full text.
+    The goal cap is 2K since the per-field split (t_d3583771).
     """
     conn, plan = board
     result = plan._cmd_dispatch(None, "cap test", LONG_GOAL, "default", "neo")
     assert "ERROR" in result
-    assert "goal" in result and "240" in result
+    assert "goal" in result and "2048" in result
     assert "FILE" in result, "the error must point at the supported long-form path"
     assert _row(conn, "cap test") is None, "a refused dispatch must create NOTHING"
 
@@ -142,14 +144,22 @@ def test_dispatch_refuses_a_step_over_the_cap(board):
 
 
 def test_dispatch_accepts_text_exactly_at_the_cap(board):
-    """Boundary: exactly 240 chars (after whitespace compression) must pass."""
+    """Boundary: exactly 2048 goal chars and 128 step-title bytes must pass."""
+    from hermes_cli.plan_limits import PLAN_GOAL_MAX_CHARS, PLAN_STEP_TITLE_MAX_BYTES
+
     conn, plan = board
-    goal = "G" * 240
-    result = plan._cmd_dispatch(None, "at cap", goal, "default", "neo", steps=["s"])
+    goal = "G" * PLAN_GOAL_MAX_CHARS
+    title = "t" * PLAN_STEP_TITLE_MAX_BYTES
+    result = plan._cmd_dispatch(
+        None, "at cap", goal, "default", "neo", steps=[title]
+    )
     assert "ERROR" not in result, result
     row = _row(conn, "at cap")
     assert row is not None
-    assert len(row["task_goal"]) == 240
+    assert len(row["task_goal"]) == PLAN_GOAL_MAX_CHARS
+    assert [len(s.encode("utf-8")) for s in json.loads(row["task_steps"])] == [
+        PLAN_STEP_TITLE_MAX_BYTES
+    ]
 
 
 def test_dispatch_origin_routing_uses_username_only(board, monkeypatch):
@@ -225,9 +235,11 @@ def test_insert_request_caps_the_durable_write(board):
     and returns ``PLAN_STATE_UNAVAILABLE`` without a live profile, so it cannot
     be driven from a test harness.  ``_insert_request`` is where its text
     actually lands, and capping there means the durable row is bounded
-    regardless of which entry point produced it.
+    regardless of which entry point produced it.  Per-field caps
+    (t_d3583771): goal 2K chars, step titles 128 bytes.
     """
     conn, _plan_mod = board
+    from hermes_cli.plan_limits import PLAN_GOAL_MAX_CHARS, PLAN_STEP_TITLE_MAX_BYTES
     from tools import plan_binding_adapter as adapter
 
     adapter._insert_request(
@@ -248,15 +260,18 @@ def test_insert_request_caps_the_durable_write(board):
         "SELECT task_goal, task_steps FROM tasks WHERE id = 't_insertcap'"
     ).fetchone()
     assert row is not None
-    assert len(row["task_goal"]) == 240
-    assert [len(s) for s in json.loads(row["task_steps"])] == [240, 5]
+    assert len(row["task_goal"]) == PLAN_GOAL_MAX_CHARS
+    assert [len(s.encode("utf-8")) for s in json.loads(row["task_steps"])] == [
+        PLAN_STEP_TITLE_MAX_BYTES,
+        5,
+    ]
 
 
 def test_insert_request_cap_is_idempotent(board):
     """Applied at both the adapter and the kernel — must not double-truncate."""
     conn, _plan_mod = board
     from tools import plan_binding_adapter as adapter
-    from hermes_cli.plan_limits import cap_text
+    from hermes_cli.plan_limits import cap_goal
 
     adapter._insert_request(
         conn,
@@ -275,7 +290,7 @@ def test_insert_request_cap_is_idempotent(board):
     stored = conn.execute(
         "SELECT task_goal FROM tasks WHERE id = 't_insertcap2'"
     ).fetchone()["task_goal"]
-    assert cap_text(stored) == stored
+    assert cap_goal(stored) == stored
 
 
 # --------------------------------------------------------------------------

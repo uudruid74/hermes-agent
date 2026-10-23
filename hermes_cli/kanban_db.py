@@ -1358,6 +1358,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     block_recurrences    INTEGER NOT NULL DEFAULT 0,
     -- Plan tool columns for manual-task step tracking
     task_steps           TEXT,
+    -- Per-step expansions (JSON list, parallel to task_steps): the step's spec
+    -- section, immutable ground truth written at plan-author time
+    -- (plan import / flat-file spec, t_d3583771). Entries are '' when a step
+    -- carries no expansion. NULL/missing for legacy rows.
+    task_step_expansions TEXT,
     task_stepno          INTEGER,
     task_goal            TEXT,
     prev_temperature     TEXT,
@@ -2783,6 +2788,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     # Plan tool columns for manual-task step tracking (added after initial schema)
     if "task_steps" not in cols:
         _add_column_if_missing(conn, "tasks", "task_steps", "task_steps TEXT")
+    if "task_step_expansions" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "task_step_expansions", "task_step_expansions TEXT"
+        )
     if "task_stepno" not in cols:
         _add_column_if_missing(conn, "tasks", "task_stepno", "task_stepno INTEGER")
     if "task_goal" not in cols:

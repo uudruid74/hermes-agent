@@ -133,16 +133,19 @@ def test_approval_clears_denial(monkeypatch):
     assert "Denied:" not in rendered
 
 
-def test_denial_reason_capped(monkeypatch):
-    """A 1024-char denial must not grow the Protected region unboundedly."""
-    from hermes_cli.plan_limits import PLAN_TEXT_MAX_CHARS
-
+def test_denial_reason_is_verbatim_not_capped(monkeypatch):
+    """Denial exemption (t_d3583771, item 1): reviewer verdicts are not prose
+    and must NOT pass through ``cap_summary``. The run-7 forensics traced the
+    worker's repeated re-derivation of corrections to verdicts middle-cut at
+    240 chars. The review input is bounded at 1024 (cmd_review), so the
+    stored denial is the verdict exactly as written."""
     conn, sent, worker, dispatcher, task_id = _delegated_plan(monkeypatch)
     plan = __import__("tools.plan", fromlist=["plan"])
     plan.plan(worker, "advance", summary="try", step=1)
+    verdict = "x" * 1000 + " THE-END-MARKER"
     plan.plan(
         dispatcher, "review", task_id=task_id, decision="denied",
-        response="x" * 1000 + " THE-END-MARKER",
+        response=verdict,
     )
     row = conn.execute(
         "SELECT body FROM task_comments WHERE task_id=? "
@@ -150,5 +153,5 @@ def test_denial_reason_capped(monkeypatch):
         (task_id,),
     ).fetchone()
     denial = row[0].removeprefix("[plan-step-denial:1] ")
-    assert len(denial) <= PLAN_TEXT_MAX_CHARS
-    assert denial.endswith("THE-END-MARKER"), "cap keeps the TAIL (fix directive)"
+    assert denial == verdict, "verdict must survive VERBATIM (no middle cut)"
+    assert "chars omitted" not in denial

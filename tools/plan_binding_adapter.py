@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import sqlite3
 import time
@@ -98,6 +99,7 @@ def _insert_request(
     conn, *, task_id: str, title: str, goal: str, steps: list[str], agent,
     board: Optional[str], kind: str, parent_task_id: Optional[str], pre_approved: bool,
     debug_plan_id: Optional[str], assignee: Optional[str] = None,
+    expansions: Optional[list[str]] = None,
 ) -> str:
     """Create a blocked Plan and its pending durable authorization atomically.
 
@@ -106,33 +108,45 @@ def _insert_request(
     a caller reaching the kernel directly gets the same bounded Plan rather
     than only callers that entered through ``plan``.  ``cap_text`` is
     idempotent, so applying it twice is a no-op.
+
+    ``expansions`` are per-step spec ground truth (``plan import``): stored
+    VERBATIM (never compressed or cut) in ``task_step_expansions``, parallel
+    to ``task_steps``.
     """
     from hermes_cli import plan_authorizations
-    from hermes_cli.plan_limits import cap_steps, cap_text
+    from hermes_cli.plan_limits import cap_expansions, cap_goal, cap_steps
 
-    goal = cap_text(goal)
+    goal = cap_goal(goal)
     steps = cap_steps(steps)
+    expansions = cap_expansions(expansions) if expansions else None
 
     legacy = _legacy()
     now = int(time.time())
     task_assignee = (assignee or "").strip() or legacy._get_agent_name(agent)
-    body = "\n".join(
-        [
-            f"## Plan: {title}",
-            f"**Agent:** {task_assignee}",
-            f"**Goal:** {goal}",
-            "",
-            "### Steps",
-            *[f"{index}. {step}" for index, step in enumerate(steps, 1)],
-        ]
-    )
+    body_lines = [
+        f"## Plan: {title}",
+        f"**Agent:** {task_assignee}",
+        f"**Goal:** {goal}",
+        "",
+        "### Steps",
+    ]
+    for index, step in enumerate(steps, 1):
+        body_lines.append(f"{index}. {step}")
+        expansion = (
+            expansions[index - 1] if expansions and index <= len(expansions) else ""
+        )
+        if expansion:
+            body_lines.append("   Spec:")
+            body_lines.extend(f"   {line}" for line in expansion.splitlines())
+    body = "\n".join(body_lines)
     conn.execute(
         """
         INSERT INTO tasks (
             id, title, body, status, assignee, created_at, task_steps,
-            task_stepno, task_goal, block_kind, prev_temperature,
-            previous_task, session_id, board, plan_kind, pre_approved, created_by
-        ) VALUES (?, ?, ?, 'blocked', ?, ?, ?, 1, ?, 'approval', ?, ?, ?, ?, ?, ?, ?)
+            task_step_expansions, task_stepno, task_goal, block_kind,
+            prev_temperature, previous_task, session_id, board, plan_kind,
+            pre_approved, created_by
+        ) VALUES (?, ?, ?, 'blocked', ?, ?, ?, ?, 1, ?, 'approval', ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             task_id,
@@ -141,6 +155,7 @@ def _insert_request(
             task_assignee,
             now,
             json.dumps(steps),
+            json.dumps(expansions) if expansions else None,
             goal,
             getattr(agent, "_session_temperature", None),
             parent_task_id,
@@ -251,6 +266,7 @@ def _create_plan(
     parent_task_id: Optional[str] = None,
     repeat_of: Optional[tuple[str, int]] = None,
     assignee: Optional[str] = None,
+    expansions: Optional[list[str]] = None,
 ) -> str:
     """Create, approve and activate a Plan.
 
@@ -261,7 +277,8 @@ def _create_plan(
     from hermes_cli import execution_bindings as bindings
     from hermes_cli.kanban_db import write_txn
     from hermes_cli.plan_limits import (
-        cap_steps, cap_text, goal_text_error, step_count_error, steps_text_error,
+        cap_expansions, cap_goal, cap_steps, expansion_text_error, goal_text_error,
+        step_count_error, steps_text_error,
     )
 
     creator_agent_name = _legacy()._get_agent_name(agent)
@@ -283,12 +300,24 @@ def _create_plan(
     over_limit = steps_text_error(steps)
     if over_limit:
         return over_limit
+    # Expansions are spec ground truth (plan import): refused when over the
+    # 2K cap, NEVER truncated.
+    over_limit = expansion_text_error(expansions)
+    if over_limit:
+        return over_limit
+    if expansions is not None and len(expansions) != len(steps):
+        return (
+            "ERROR: expansions must line up 1:1 with steps[] "
+            f"({len(expansions)} expansions, {len(steps)} steps)"
+        )
     # Bound the Plan at submission (Evan, 2026-09-16).  The Plan is the
     # Protected region of the context window, so its size is a permanent
     # per-turn cost; nothing previously capped it and a live goal reached
     # 6,907 chars.  `_insert_request` re-applies these idempotently.
-    goal = cap_text(goal)
+    goal = cap_goal(goal)
     steps = cap_steps(steps)
+    if expansions is not None:
+        expansions = cap_expansions(expansions)
     try:
         key = _identity(agent)
     except bindings.PlanStateUnavailable as exc:
@@ -342,6 +371,7 @@ def _create_plan(
                 title=title,
                 goal=goal,
                 steps=steps,
+                expansions=expansions,
                 agent=agent,
                 board=board,
                 kind=kind,
@@ -1359,10 +1389,35 @@ def cmd_test_complete(agent) -> str:
     return _terminal(agent, "test-complete", None)
 
 
+def _step_expansions(task) -> dict[int, str]:
+    """Indexed step expansions (1-based) from a task row; ``{}`` for legacy rows.
+
+    Expansions are spec ground truth stored verbatim in
+    ``task_step_expansions`` (JSON list parallel to ``task_steps``; empty
+    strings for steps that carry no expansion).
+    """
+    try:
+        raw = task["task_step_expansions"]
+    except (KeyError, IndexError):
+        return {}
+    if not raw:
+        return {}
+    try:
+        items = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    return {
+        index: str(item or "")
+        for index, item in enumerate(items or [], 1)
+        if item
+    }
+
+
 def _format_plan(conn, task, *, include_summaries: bool, minimal: bool = False) -> str:
     from hermes_cli import execution_bindings as bindings
 
     steps = json.loads(task["task_steps"] or "[]")
+    expansions = _step_expansions(task)
     stepno = task["task_stepno"] or 1
     summaries = (
         bindings.plan_step_summaries(conn, task["id"])
@@ -1381,6 +1436,11 @@ def _format_plan(conn, task, *, include_summaries: bool, minimal: bool = False) 
             _reviewer_identity(conn, task),
             f"Current step {stepno}/{len(steps)}: {current_step}",
         ]
+        # The current step's expansion IS the spec (t_d3583771): rendering it
+        # here turns "read the spec file" into "the plan already shows it".
+        if 0 < stepno <= len(steps) and expansions.get(stepno):
+            lines.append("Spec:")
+            lines.append(expansions[stepno])
         if stepno in summaries:
             lines.append(f"Summary: {summaries[stepno]}")
         if stepno in denials:
@@ -1397,6 +1457,9 @@ def _format_plan(conn, task, *, include_summaries: bool, minimal: bool = False) 
     ]
     for index, step in enumerate(steps, 1):
         lines.append(f"  {'→' if index == stepno else ' '} Step {index}: {step}")
+        if index == stepno and expansions.get(index):
+            lines.append("      Spec:")
+            lines.extend(f"      {line}" for line in expansions[index].splitlines())
         if index in summaries:
             lines.append(f"      Summary: {summaries[index]}")
         if index in denials:
@@ -1636,10 +1699,16 @@ def cmd_remind(agent, task_id: Optional[str] = None) -> str:
             f"{unbound}"
         )
     claim_warning = _unclaimed_plan_for_agent(conn, agent, exclude_task_id=task_id)
+    expansions = _step_expansions(task)
     if not steps:
         lines.append("Active Step: (no steps defined)")
     elif stepno is not None and 0 < stepno <= len(steps):
         lines.append(f"Active Step {stepno} of {len(steps)}: {steps[stepno - 1]}")
+        # The current step's expansion IS the spec (t_d3583771): remind shows
+        # it so the worker never re-reads an external spec file mid-run.
+        if expansions.get(stepno):
+            lines.append("Spec:")
+            lines.append(expansions[stepno])
     else:
         lines.append(f"Active Step: (out of range: {stepno} of {len(steps)})")
     if stepno in denials:
@@ -1798,3 +1867,259 @@ def cmd_approve(agent, task_id: str) -> str:
     # No binding activation on our side — surface the dispatch notice.
     # Evan's exact spec (2026-09-22): the creator sees ONLY the notify line.
     return f"{assigned} has been notified of task {task_id}"
+
+
+# ---------------------------------------------------------------------------
+# flat-file plan spec: import / export (t_d3583771)
+# ---------------------------------------------------------------------------
+
+_H1_RE = re.compile(r"^#\s+(.*)$")
+_H2_RE = re.compile(r"^##\s+(.*)$")
+# Run-record entry lines written by ``plan export`` (see ``_quote``).
+_RECORD_LINE_RE = re.compile(r"^>\s*\*\*(?:Summary|Denied|Claims and denials):")
+
+
+def _quote(text: str) -> str:
+    """Render text as a markdown blockquote (every line ``> ``-prefixed)."""
+    return "\n".join(f"> {line}".rstrip() for line in (text or "").splitlines())
+
+
+def _strip_run_record(body: list[str]) -> str:
+    """Drop export's trailing blockquote run-record from a step body.
+
+    The run record always starts with a ``> **Summary:**`` / ``> **Denied:**``
+    / ``> **Claims and denials:**`` line and runs to the end of the body. A
+    step body ending in authored blockquotes whose run does NOT start with a
+    record marker is kept verbatim.
+    """
+    end = len(body)
+    while end > 0 and not body[end - 1].strip():
+        end -= 1
+    start = end
+    while start > 0 and body[start - 1].lstrip().startswith(">"):
+        start -= 1
+    if start < end and _RECORD_LINE_RE.match(body[start].lstrip()):
+        return "\n".join(body[:start]).strip()
+    return "\n".join(body[:end]).strip()
+
+
+def parse_plan_spec(text: str) -> tuple[str, str, list[str], list[str]]:
+    """Parse the flat markdown plan format.
+
+    Returns ``(title, global_description, step_titles, step_expansions)``:
+
+        # <Plan Title>
+
+        <global description — the goal and any run-wide context>
+
+        ## <Step 1 title>
+        <step 1 expansion — the spec section governing this step>
+
+    The first H1 before any step section is the title; later ``#`` lines are
+    body content (spec text is never silently dropped). A trailing blockquote
+    run marked as the run record (written by ``plan export``) is stripped
+    from each step body, so an exported plan re-imports as the original
+    spec.
+    """
+    title = ""
+    global_lines: list[str] = []
+    titles: list[str] = []
+    expansions: list[str] = []
+    section: Optional[list[str]] = None
+
+    def _finish_section() -> None:
+        nonlocal section
+        if section is not None:
+            expansions.append(_strip_run_record(section))
+            section = None
+
+    for line in (text or "").splitlines():
+        h1 = _H1_RE.match(line)
+        if h1 and not title and section is None and not titles:
+            title = h1.group(1).strip()
+            continue
+        h2 = _H2_RE.match(line)
+        if h2:
+            _finish_section()
+            titles.append(h2.group(1).strip())
+            section = []
+            continue
+        if section is not None:
+            section.append(line)
+        elif title:
+            global_lines.append(line)
+    _finish_section()
+    return title, "\n".join(global_lines).strip(), titles, expansions
+
+
+def _step_run_history(conn, task_id: str) -> dict[int, list[str]]:
+    """Full claim/denial history per step from the append-only event log."""
+    history: dict[int, list[str]] = {}
+    rows = conn.execute(
+        "SELECT kind, payload, created_at FROM task_events WHERE task_id = ? "
+        "AND kind IN ('plan-step-review-pending', 'plan-step-review-denied', "
+        "'plan-step-review-approved') ORDER BY id",
+        (task_id,),
+    ).fetchall()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        step = payload.get("step")
+        if not isinstance(step, int):
+            continue
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(row["created_at"]))
+        kind = row["kind"]
+        if kind == "plan-step-review-pending":
+            entry = (
+                f"claimed ({stamp}, {payload.get('worker', '')}): "
+                f"{payload.get('summary', '')}"
+            )
+        elif kind == "plan-step-review-denied":
+            entry = (
+                f"denied ({stamp}, {payload.get('reviewer', '')}): "
+                f"{payload.get('response', '')}"
+            )
+        else:
+            yolo = ", yolo" if payload.get("auto_approve_enabled") else ""
+            entry = f"approved ({stamp}, {payload.get('reviewer', '')}{yolo})"
+        history.setdefault(step, []).append(entry)
+    return history
+
+
+def render_plan_spec(conn, task) -> str:
+    """The plan as flat markdown: spec + per-step run record.
+
+    The run record carries every step's completion summary and denial
+    message plus the full history of claims and denials — a durable, diffable
+    record of what the worker claimed and what the reviewer rejected.
+    """
+    from hermes_cli import execution_bindings as bindings
+
+    task_id = task["id"]
+    steps = json.loads(task["task_steps"] or "[]")
+    expansions = _step_expansions(task)
+    summaries = bindings.plan_step_summaries(conn, task_id)
+    denials = bindings.plan_step_denials(conn, task_id)
+    history = _step_run_history(conn, task_id)
+
+    parts = [f"# {task['title'] or task_id}", "", (task["task_goal"] or "").strip()]
+    for index, step in enumerate(steps, 1):
+        parts.extend(["", f"## {step}", expansions.get(index, "")])
+        record: list[str] = []
+        if index in summaries:
+            record.append(_quote(f"**Summary:** {summaries[index]}"))
+        if index in denials:
+            record.append(_quote(f"**Denied:** {denials[index]}"))
+        entries = history.get(index) or []
+        if entries:
+            record.append(_quote("**Claims and denials:**"))
+            for entry in entries:
+                record.append(_quote(f"- {entry}"))
+        if record:
+            parts.append("")
+            parts.extend(record)
+    return "\n".join(parts).rstrip() + "\n"
+
+
+def cmd_import(
+    agent, file: str, assignee: Optional[str] = None, board: Optional[str] = None
+) -> str:
+    """Create a Plan from a flat markdown spec file (``new`` + ``assign``).
+
+    The file is the prep/authoring surface: written and worked out offline,
+    then imported. It becomes the spec for the run INSIDE the plan — each
+    step's expansion is immutable ground truth in the protected plan block,
+    so no read_file, no re-read, no collapse-to-receipt.
+    """
+    from hermes_cli.plan_limits import (
+        expansion_text_error, goal_text_error, step_count_error, steps_text_error,
+    )
+
+    if not file or not file.strip():
+        return "ERROR: 'import' requires file"
+    path = os.path.abspath(os.path.expanduser(file.strip()))
+    try:
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read()
+    except OSError as exc:
+        return f"ERROR: cannot read plan spec {path}: {exc}"
+    except UnicodeDecodeError as exc:
+        return f"ERROR: plan spec {path} is not valid UTF-8: {exc}"
+
+    title, goal, titles, expansions = parse_plan_spec(text)
+    if not title:
+        return "ERROR: plan spec has no '# <Plan Title>' heading. Nothing was created."
+    if not titles:
+        return (
+            "ERROR: plan spec has no '## <Step title>' sections. Nothing was created."
+        )
+    for index, step_title in enumerate(titles, 1):
+        if not step_title:
+            return (
+                f"ERROR: step {index} has an empty '## ' heading. "
+                "Nothing was created — give every step a title."
+            )
+    # Settled limits (Gopher tested, Evan approved 2026-10-23): 128-byte step
+    # titles, 2K expansion per step, 2K global. Hard refusals — spec text is
+    # never truncated.
+    for over_limit in (
+        step_count_error(titles),
+        goal_text_error(goal),
+        steps_text_error(titles),
+        expansion_text_error(expansions),
+    ):
+        if over_limit:
+            return over_limit
+    return _create_plan(
+        agent,
+        title=title,
+        goal=goal,
+        steps=titles,
+        expansions=expansions,
+        assignee=assignee,
+        board=board,
+    )
+
+
+def cmd_export(
+    agent, task_id: Optional[str] = None, file: Optional[str] = None
+) -> str:
+    """Write a Plan back to flat markdown (spec + run record).
+
+    Includes every step's completion summary and denial message; at plan
+    completion the run record is the full history of claims and denials —
+    what the worker claimed and what the reviewer rejected.
+    """
+    if not task_id:
+        return "ERROR: 'export' requires task_id"
+    conn = _legacy()._get_kanban_db()
+    task = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if task is None:
+        # Plan tasks live on any board — search them all (same rule as block).
+        for db_path in _legacy()._enumerate_kanban_dbs():
+            other = sqlite3.connect(db_path)
+            other.row_factory = sqlite3.Row
+            try:
+                task = other.execute(
+                    "SELECT * FROM tasks WHERE id = ?", (task_id,)
+                ).fetchone()
+            except sqlite3.Error:
+                task = None
+            if task is not None:
+                conn = other
+                break
+            other.close()
+    if task is None:
+        return f"ERROR: Task {task_id} not found"
+    text = render_plan_spec(conn, task)
+    if file and file.strip():
+        path = os.path.abspath(os.path.expanduser(file.strip()))
+        try:
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(text)
+        except OSError as exc:
+            return f"ERROR: cannot write plan export {path}: {exc}"
+        return f"Plan {task_id} exported to {path}"
+    return text
