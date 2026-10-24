@@ -249,3 +249,86 @@ def test_export_unknown_task_is_an_error(monkeypatch):
     creator = _Agent("neo", "20261023_080808_abcdef")
     result = plan_module.plan(creator, "export", task_id="t_missing1")
     assert result.startswith("ERROR:")
+
+
+# ---------------------------------------------- approval prompt + delivery
+
+
+def _big_spec(n: int = 10, pad: int = 800) -> str:
+    """n steps whose expansions blow past Telegram's 4,096-char cap."""
+    parts = ["# Pente tell transport", "", "Ship the run. Every rule binds.", ""]
+    for i in range(1, n + 1):
+        parts.append(f"## Step {i} title")
+        parts.append(f"EXPANSION-MARKER-{i} " + ("spec-ground-truth " * (pad // 18)))
+        parts.append("")
+    return "\n".join(parts)
+
+
+def test_approval_prompt_is_compact_and_body_keeps_expansions(monkeypatch, tmp_path):
+    """t_bbe67f44: the approval prompt embedded the FULL plan body (6,292
+    chars > Telegram's 4,096 cap), the send failed, and the gate archived
+    the plan. Evan 2026-10-24: "It should only send the small steps, not
+    the expansions." Prompt = title + goal + step titles; tasks.body keeps
+    the expansions verbatim."""
+    conn, _sent = _install(monkeypatch)
+    captured = {}
+
+    def _capture(question, **kw):
+        captured["question"] = question
+        captured["choices"] = kw.get("choices")
+        return '{"user_response":"Approve"}'
+
+    monkeypatch.setattr(plan_module, "clarify_tool", _capture)
+    creator = _Agent("neo", "20261024_010101_abcdef")
+    result = plan_module.plan(creator, "import", file=_write_spec(tmp_path, _big_spec()))
+    assert result.startswith("TASK APPROVED"), result
+
+    question = captured["question"]
+    # (a) the delivered prompt fits the platform cap with room to spare
+    assert len(question) < 4096, f"prompt is {len(question)} chars"
+    # the buttons ride the same prompt (Approve / Deny / Yolo)
+    assert captured["choices"] == ["Approve", "Deny", "Yolo"]
+    # title + numbered step TITLES are present
+    assert "## Plan: Pente tell transport" in question
+    for i in range(1, 11):
+        assert f"{i}. Step {i} title" in question
+    # expansions are excluded from the prompt…
+    assert "EXPANSION-MARKER-1" not in question
+    # (c) …but untouched in the stored body, and export still returns them
+    row = conn.execute("SELECT * FROM tasks").fetchone()
+    assert "EXPANSION-MARKER-1" in row["body"]
+    text = plan_module.plan(creator, "export", task_id=row["id"])
+    assert "EXPANSION-MARKER-1" in text
+
+
+def test_undeliverable_prompt_is_never_a_denial(monkeypatch, tmp_path):
+    """A transport failure means NO human was asked (Evan 2026-10-24):
+    "never archive it and never report denied". The plan stays blocked for
+    approval and the caller is told it was a delivery failure."""
+    conn, _sent = _install(monkeypatch)
+    from tools.clarify_gateway import CLARIFY_UNDELIVERABLE_MARKER
+
+    monkeypatch.setattr(
+        plan_module,
+        "clarify_tool",
+        lambda *_a, **_k: json.dumps({"user_response": CLARIFY_UNDELIVERABLE_MARKER}),
+    )
+    creator = _Agent("neo", "20261024_020202_abcdef")
+    result = plan_module.plan(
+        creator, "import", file=_write_spec(tmp_path), assignee="ornith"
+    )
+    assert "could not be delivered" in result, result
+    assert "Plan denied" not in result
+    row = conn.execute("SELECT * FROM tasks").fetchone()
+    assert row["status"] == "blocked", "transport failure must not archive the plan"
+    assert row["block_kind"] == "approval", "the plan must stay awaiting approval"
+
+
+def test_no_approval_prompt_embeds_a_full_body():
+    """Every approval prompt goes through render_approval_prompt — the
+    hand-maintained-middles class (decision/step, parent_task_id, `file`):
+    one shared renderer, no copy-pasted body embeddings left to drift."""
+    root = Path(__file__).resolve().parents[2]
+    for rel in ("tools/plan_binding_adapter.py", "tools/plan.py"):
+        src = (root / rel).read_text(encoding="utf-8")
+        assert 'f"Approve plan {task_id}?\\n\\n{' not in src, rel

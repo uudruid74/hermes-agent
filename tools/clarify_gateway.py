@@ -40,6 +40,13 @@ from typing import Callable, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 
+# Returned by the platform clarify callback when the prompt SEND failed
+# (transport error — e.g. Telegram's 4,096-char message cap). Consumers must
+# treat this as "no human was ever asked", NEVER as a human answer: a
+# transport failure is not a denial (Evan 2026-10-24).
+CLARIFY_UNDELIVERABLE_MARKER = "[clarify prompt could not be delivered]"
+
+
 # =========================================================================
 # Module-level state
 # =========================================================================

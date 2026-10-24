@@ -41,6 +41,48 @@ def _actor(agent):
     )
 
 
+def render_approval_prompt(task_id: str, title: str, goal: str, steps) -> str:
+    """The compact human-facing approval prompt: title + goal + step TITLES.
+
+    Expansions are deliberately EXCLUDED (Evan 2026-10-24: "It should only
+    send the small steps, not the expansions"): a fully expanded plan body
+    exceeds Telegram's 4,096-char message cap, the send fails, and the
+    approval gate mistook the transport failure for a denial (t_bbe67f44
+    was archived that way). The stored ``tasks.body`` keeps the expansions
+    for the workers — this is only the prompt. No truncation.
+    """
+    lines = [f"Approve plan {task_id}?", "", f"## Plan: {title}"]
+    goal = str(goal or "").strip()
+    if goal:
+        lines.append(f"**Goal:** {goal}")
+    lines.append("")
+    lines.append("### Steps")
+    for index, step in enumerate(steps or [], 1):
+        lines.append(f"{index}. {step}")
+    return "\n".join(lines)
+
+
+def undeliverable_approval_response(task_id: str, response) -> Optional[str]:
+    """Return the transport-failure message when ``response`` is not an answer.
+
+    A failed clarify SEND (the ``CLARIFY_UNDELIVERABLE_MARKER`` sentinel)
+    means no human was ever asked — it must never fall through the approve/
+    deny parsing and archive the plan as "denied" (the run-7 family: absence
+    of evidence treated as evidence). The plan stays blocked for approval.
+    """
+    from tools.clarify_gateway import CLARIFY_UNDELIVERABLE_MARKER
+
+    if CLARIFY_UNDELIVERABLE_MARKER in str(response or ""):
+        return (
+            f"Plan awaiting approval ({task_id}): the approval prompt could "
+            "not be delivered (transport failure). This is NOT a denial — "
+            "no human was asked. The plan remains blocked for approval; "
+            f"retry with plan(command=\"approve\", task_id=\"{task_id}\") "
+            "when delivery is restored."
+        )
+    return None
+
+
 def _request_completion_compression(agent) -> None:
     """Force one post-tool compaction after an active Plan terminates."""
     agent._force_compression_after_plan_completion = True
@@ -409,7 +451,7 @@ def _create_plan(
         try:
             response = json.loads(
                 _legacy().clarify_tool(
-                    f"Approve plan {task_id}?\n\n{plan_body}",
+                    render_approval_prompt(task_id, title, goal, steps),
                     choices=["Approve", "Deny", "Yolo"],
                     callback=callback,
                     agent=agent,
@@ -426,6 +468,11 @@ def _create_plan(
         if timed_out:
             agent._plan_approval_timed_out = task_id
             return f"Plan awaiting approval ({task_id}): no user response was received."
+        # A failed prompt SEND is not a human answer — never let it reach the
+        # approve/deny parse (which would archive the plan as "denied").
+        undelivered = undeliverable_approval_response(task_id, response)
+        if undelivered:
+            return undelivered
         # Three answers: Approve, Deny, Yolo. Evan's rule: yolo is a property
         # of the HUMAN's answer, never something an agent specifies. Order
         # matters — "Yolo" contains no "appr", so testing plain-approve first
@@ -1788,10 +1835,21 @@ def cmd_approve(agent, task_id: str) -> str:
     assigned = (task["assignee"] or "").strip()
     delegated = bool(assigned and assigned != creator_agent_name)
 
+    _approval_steps: list = []
+    try:
+        _approval_steps = json.loads(task["task_steps"] or "[]")
+    except (TypeError, ValueError):
+        _approval_steps = []
     response = callback(
-        f"Approve plan {task_id}?\n\n{task['body']}",
+        render_approval_prompt(
+            task_id, task["title"] or "", task["task_goal"] or "", _approval_steps
+        ),
         ["Approve", "Deny", "Yolo"],
     )
+    # A failed prompt SEND is not a human answer — never report it as one.
+    undelivered = undeliverable_approval_response(task_id, response)
+    if undelivered:
+        return undelivered
     _answer = str(response or "").strip().lower()
     _stop_asking = _answer.startswith("yolo")
     if not _answer or not (_stop_asking or _answer.startswith("appr")):

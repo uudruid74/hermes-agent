@@ -5040,7 +5040,7 @@ class TurnRunner:
                 # sentinel so the agent can fall back to a sensible
                 # default rather than hanging.
                 _clarify_mod.clear_session(ctx.session_key or "")
-                return "[clarify prompt could not be delivered]"
+                return _clarify_mod.CLARIFY_UNDELIVERABLE_MARKER
 
             timeout = _clarify_mod.get_clarify_timeout()
             response = _clarify_mod.wait_for_response(clarify_id, timeout=float(timeout))

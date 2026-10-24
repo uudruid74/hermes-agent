@@ -277,7 +277,7 @@ def _cmd_new(agent, title: str, goal: str, steps: List[str],
             return "ERROR: No clarify callback available. Cannot present plan for approval."
         try:
             clarification = json.loads(clarify_tool(
-                f"Approve plan {task_id}?\n\n{plan_text}",
+                render_approval_prompt(task_id, title, goal, steps),
                 choices=["Approve", "Deny"],
                 callback=clarify_cb,
                 agent=agent,
@@ -300,6 +300,10 @@ def _cmd_new(agent, title: str, goal: str, steps: List[str],
             f"Plan awaiting approval ({task_id}): no user response was received. "
             "The plan remains blocked for approval. Stand down."
         )
+    # A failed prompt SEND is not a human answer — never report it as a denial.
+    undelivered = undeliverable_approval_response(task_id, user_response)
+    if undelivered:
+        return undelivered
     if "appr" in response_lower:
         # User approved — activate task
         current_temp = getattr(agent, "_session_temperature", None)
@@ -1207,6 +1211,8 @@ def _cmd_archive(task_id: str) -> str:
 # Live Plan commands resolve identity only through execution bindings. The
 # legacy private helpers above remain provenance and are not dispatched.
 from tools.plan_binding_adapter import (
+    render_approval_prompt,
+    undeliverable_approval_response,
     cmd_advance as _binding_cmd_advance,
     cmd_approve as _cmd_approve,
     cmd_archive as _cmd_archive_adapter,
