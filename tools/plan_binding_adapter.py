@@ -610,6 +610,19 @@ def _current(conn, agent):
     return key, binding, None
 
 
+def active_plan_task_id(agent) -> Optional[str]:
+    """The Plan bound to this session's execution identity, or ``None``.
+
+    Turn-end stop-guard wiring (Evan 2026-10-24): a long-lived gateway
+    session on a Plan has no ``HERMES_KANBAN_TASK`` env var — the binding IS
+    the worker signal. An unavailable/unbound lookup means "not a plan
+    worker" here; the guard then falls back to the env-armed shape.
+    """
+    conn = _legacy()._get_kanban_db()
+    _key, binding, _error = _current(conn, agent)
+    return binding.task_id if binding is not None else None
+
+
 def block_active_plan_at_iteration_limit(agent, *, used: int, maximum: int) -> bool:
     """Park an unsubmitted active Plan step after its turn budget is exhausted.
 

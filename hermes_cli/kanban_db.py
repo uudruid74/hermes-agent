@@ -9721,6 +9721,18 @@ def _dispatch_once_locked(
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
+    # Detection sweep for plan-bound workers that stopped mid-step (Ornith
+    # 2026-10-24): the in-loop stop-guard only reaches a live turn; once the
+    # turn exits text-only nothing revives the worker. One bounded nudge per
+    # (task, step), recorded in task_events first so the sweep can never
+    # loop. The tick must survive a broken sweep.
+    if not dry_run:
+        try:
+            from hermes_cli import execution_bindings as _plan_bindings
+
+            _plan_bindings.sweep_stalled_plan_workers(conn)
+        except Exception:
+            _log.warning("plan stop-guard sweep failed", exc_info=True)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
     # Count tasks already running so max_spawn enforces concurrency rather

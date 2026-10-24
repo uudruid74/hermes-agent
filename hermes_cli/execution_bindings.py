@@ -1388,3 +1388,156 @@ def close_plan(
 
     _notify_root_plan_closed(conn, result, outcome=outcome)
     return result
+
+
+# ── Detection: stalled plan workers (dispatcher tick) ─────────────────────
+# The in-loop stop-guard only reaches a LIVE turn. Once the turn exits
+# text-only (finish_reason=stop) nothing revives the worker — Ornith sat
+# dead mid-step for 25 minutes on 2026-10-24 until a notification happened
+# by. This sweep is the detection half: one bounded nudge per (task, step),
+# recorded in ``task_events`` BEFORE the emit so it can never loop.
+
+PLAN_STOP_NUDGE_KIND = "plan_stop_nudge"
+PLAN_STOP_NUDGE_THRESHOLD_S = 600
+
+
+def _worker_last_finish_reason(
+    profile: str,
+    root_session_id: str,
+    *,
+    state_db_path_fn=None,
+) -> Optional[str]:
+    """The finish_reason of the worker session family's newest message row.
+
+    The family is the compression lineage of ``root_session_id`` (root plus
+    children chained through ``end_reason='compression'`` sessions). Returns
+    ``None`` on a missing/busy state.db or an empty family — callers treat
+    that as "not a text-only stop" (fail-safe: no nudge).
+    """
+    try:
+        if state_db_path_fn is not None:
+            db_path = state_db_path_fn(profile)
+        else:
+            from hermes_cli.profiles import get_profile_dir
+
+            db_path = get_profile_dir(profile) / "state.db"
+        if db_path is None:
+            return None
+        from pathlib import Path
+
+        if not Path(db_path).exists():
+            return None
+        state = sqlite3.connect(str(db_path))
+    except (OSError, sqlite3.Error, ImportError, ValueError):
+        return None
+    try:
+        row = state.execute(
+            "WITH RECURSIVE fam(id) AS ("
+            " SELECT id FROM sessions WHERE id = ?"
+            " UNION"
+            " SELECT s.id FROM sessions s JOIN fam f"
+            "   ON s.parent_session_id = f.id"
+            "  WHERE (SELECT end_reason FROM sessions WHERE id = f.id)"
+            "        = 'compression'"
+            ") "
+            "SELECT finish_reason FROM messages "
+            "WHERE session_id IN (SELECT id FROM fam) "
+            "ORDER BY id DESC LIMIT 1",
+            (root_session_id,),
+        ).fetchone()
+        return str(row[0]) if row and row[0] else None
+    except sqlite3.Error:
+        return None
+    finally:
+        state.close()
+
+
+def _emit_plan_stop_nudge(
+    conn: sqlite3.Connection, task_id: str, profile: str, text: str
+) -> None:
+    """Fire-and-forget wake of the stalled worker (mirrors the approval wake)."""
+    from hermes_cli._subprocess_compat import spawn_detached
+    from hermes_cli.kanban_db import wake_target_for
+
+    spawn_detached(
+        ["hermes", "send", "-t", wake_target_for(conn, task_id, profile), text]
+    )
+
+
+def sweep_stalled_plan_workers(
+    conn: sqlite3.Connection,
+    *,
+    threshold_seconds: int = PLAN_STOP_NUDGE_THRESHOLD_S,
+    now: Optional[int] = None,
+    emit_fn=None,
+    state_db_path_fn=None,
+) -> list:
+    """One dispatcher-tick detection pass over this board's plan bindings.
+
+    A binding whose plan is actionable (``manual``/``running``) with a step
+    open longer than ``threshold_seconds`` and no ``task_events`` row since
+    the step opened is a stall candidate. It is nudged exactly once per
+    (task, step) — and only when the worker's newest message really ended
+    text-only (``finish_reason=stop``) and no step review is pending (the
+    ball with the human is not a stall).
+    """
+    now_ts = int(time.time()) if now is None else int(now)
+    nudged: list = []
+    rows = conn.execute(
+        "SELECT profile, root_session_id, task_id, updated_at"
+        " FROM execution_bindings"
+    ).fetchall()
+    for profile, root_session_id, task_id, step_opened_at in rows:
+        task = conn.execute(
+            "SELECT status, task_stepno FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if task is None or task[0] not in {"manual", "running"}:
+            continue
+        step_no = int(task[1] or 1)
+        opened_at = int(step_opened_at or 0)
+        if now_ts - opened_at < threshold_seconds:
+            continue
+        # Any event after the step opened (heartbeat, submission, clarify
+        # flag, ...) is a sign of life — never nudge over one.
+        if conn.execute(
+            "SELECT 1 FROM task_events"
+            " WHERE task_id = ? AND created_at > ? LIMIT 1",
+            (task_id, opened_at),
+        ).fetchone():
+            continue
+        # Waiting on the human reviewer is not a stall.
+        if pending_step_review(conn, task_id) is not None:
+            continue
+        # One bounded nudge per (task, step) — recorded before emitting so
+        # the sweep can never loop.
+        if conn.execute(
+            "SELECT 1 FROM task_events"
+            " WHERE task_id = ? AND kind = ?"
+            " AND json_extract(payload, '$.step_no') = ? LIMIT 1",
+            (task_id, PLAN_STOP_NUDGE_KIND, step_no),
+        ).fetchone():
+            continue
+        if _worker_last_finish_reason(
+            profile, root_session_id, state_db_path_fn=state_db_path_fn
+        ) != "stop":
+            continue
+        _append_event(
+            conn,
+            task_id,
+            PLAN_STOP_NUDGE_KIND,
+            payload={"step_no": step_no, "profile": profile},
+            now=now_ts,
+        )
+        conn.commit()
+        idle_min = max(1, (now_ts - opened_at) // 60)
+        text = (
+            f"[plan stop-guard] Task {task_id} step {step_no} has been idle "
+            f"for {idle_min} minutes after a text-only turn end. If the step "
+            f"is done, call `plan advance` with your summary; if it cannot be "
+            f"done, call `plan fail`; if you are blocked, call "
+            f"`plan block(reason=...)`. Do not narrate intent — act now."
+        )
+        emit = emit_fn if emit_fn is not None else _emit_plan_stop_nudge
+        emit(conn, task_id, profile, text)
+        nudged.append(task_id)
+    return nudged
