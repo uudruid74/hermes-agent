@@ -1659,6 +1659,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     # forwarded here, so a nested plan silently became a root
                     # plan.
                     parent_task_id=next_args.get("parent_task_id"),
+                    # Same whitelist gap: `file` is declared in the schema and
+                    # honored by plan() (import/export, febeb3c713) — but not
+                    # forwarded here, so `import` reported "'import' requires
+                    # file" and `export` returned markdown instead of writing
+                    # the file.
+                    file=next_args.get("file"),
                 )
             function_result, function_args, middleware_trace, _execution_blocked = _managed_values(_run_agent_tool_execution_middleware(
                 agent,
