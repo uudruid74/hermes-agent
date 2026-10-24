@@ -480,3 +480,65 @@ def test_headless_self_plan_reports_blocked_no_reviewer(monkeypatch):
     assert "no reviewer" in result.lower()
     # The step must still be held (blocked), never silently advanced.
     assert _stepno(conn, task_id) == 1
+
+
+# ------------------------------------- review without task_id (Evan 2026-10-24)
+
+
+def test_review_without_task_id_gates_the_active_plan(monkeypatch):
+    """Acceptance a: with an ACTIVE binding and no task_id, review gates the
+    active plan's current step — never "requires task_id". (A flash-tier
+    model dropped task_id seven times running; omission must be harmless
+    when the caller holds the plan. Explicit task_id stays exactly as pinned
+    by test_approved_review_advances_and_notifies_worker.)"""
+    conn, sent, worker, dispatcher, task_id = _delegated_plan(monkeypatch)
+    plan.plan(worker, "advance", summary="inspection complete", step=1)
+    # The contract precondition: the reviewer holds the plan's binding while
+    # remaining its dispatcher — bound via the worker-bootstrap lineage API
+    # so the delegated assignee (and the dispatcher gate) stays intact.
+    from hermes_cli import execution_bindings as bindings
+
+    bindings.bootstrap_worker_binding(
+        conn, bindings.identity_for_agent(dispatcher), task_id
+    )
+    sent.clear()
+
+    result = plan.plan(dispatcher, "review", decision="approved")
+
+    assert result == f"Task {task_id} Step 1 approved. Worker notified."
+    assert _stepno(conn, task_id) == 2
+    assert len(sent) == 1 and sent[0][:4] == ["hermes", "send", "-t", "ornith"]
+
+
+def test_review_without_task_id_or_binding_is_actionable(monkeypatch):
+    """Acceptance c: no binding and no task_id fails with a clear, actionable
+    message — names task_id and the claim command, not the old opaque
+    "requires task_id"."""
+    conn, _sent, worker, dispatcher, task_id = _delegated_plan(monkeypatch)
+    plan.plan(worker, "advance", summary="inspection complete", step=1)
+
+    result = plan.plan(dispatcher, "review", decision="approved")
+
+    assert result.startswith("ERROR:"), result
+    assert "task_id" in result
+    assert "continue" in result.lower()
+    assert "requires task_id" not in result
+    # Nothing was gated: the step is still held.
+    assert _stepno(conn, task_id) == 1
+
+
+def test_plan_schema_descriptions_never_mix_required_and_optional():
+    """Schema-description class (one layer before the hand-maintained
+    whitelist): a property whose own description reads "optional" near the
+    command that needs it made a flash-tier model drop `task_id` for
+    'review' seven times (Evan 2026-10-24). One description must not carry
+    both "required for" and "optional for" — split the per-command rules."""
+    from tools.plan import PLAN_SCHEMA
+
+    props = (PLAN_SCHEMA.get("parameters") or {}).get("properties") or {}
+    assert props, "PLAN_SCHEMA lost its properties"
+    for name, prop in props.items():
+        desc = str(prop.get("description", "")).lower()
+        assert not (
+            "required for" in desc and "optional for" in desc
+        ), f"{name}: description mixes 'required for' + 'optional for'"

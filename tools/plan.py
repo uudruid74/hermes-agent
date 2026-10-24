@@ -1311,8 +1311,9 @@ def plan(
         )
 
     elif command == "review":
-        if not task_id:
-            return "ERROR: 'review' requires task_id"
+        # task_id is omittable (Evan 2026-10-24): with none given,
+        # cmd_review gates the ACTIVE plan on the caller's binding and says
+        # so when nothing is bound. Explicit task_id behaves as always.
         if not decision:
             return "ERROR: 'review' requires decision"
         return _cmd_review(agent, task_id, decision, response)
@@ -1407,7 +1408,7 @@ PLAN_SCHEMA = {
             "steps": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Ordered step list (required for new; optional for dispatch). Do NOT number the steps — no 'Step 1:', '1.' prefixes. The tool numbers and tracks steps itself; caller-supplied numbers are redundant variance that drifts from the tool's real position. Write each step as a self-contained instruction. For 'repeat': the corrective child plan's steps — `repeat` without steps only tells you what to fix, it does not re-open the step.",
+                "description": "Ordered step list. Always pass it for 'new'; for 'dispatch' you may omit it and the task is created claimable without pre-approved steps. Do NOT number the steps — no 'Step 1:', '1.' prefixes. The tool numbers and tracks steps itself; caller-supplied numbers are redundant variance that drifts from the tool's real position. Write each step as a self-contained instruction. For 'repeat': the corrective child plan's steps — `repeat` without steps only tells you what to fix, it does not re-open the step.",
             },
             "temp": {
                 "type": "string",
@@ -1444,11 +1445,11 @@ PLAN_SCHEMA = {
             },
             "response": {
                 "type": "string",
-                "description": "Required for a denied 'review', limited to 1024 characters: the denial message, or the answer to a worker's pending tool-limit ask. Optional for 'approved'.",
+                "description": "The denial message for a 'denied' review (say what must change — required when denying), or the answer to a worker's pending tool-limit/clarify ask. Limited to 1024 characters. For an 'approved' review it is only that ask-answer; leave it out otherwise.",
             },
             "task_id": {
                 "type": "string",
-                "description": "Task ID for 'continue', 'export', 'remind', 'review', 'approve', 'block', or 'archive' command. Required for 'export'. Optional for 'remind' and 'archive': when omitted, remind shows the ACTIVE plan and archive closes the ACTIVE plan. With neither a task_id nor an active plan, both fail — run 'continue <task_id>' to claim an assigned plan.",
+                "description": "Task ID for 'continue', 'export', 'remind', 'review', 'approve', 'block', 'archive'. Always pass it for 'continue', 'export', 'approve', 'block'. For 'remind', 'review', 'archive' you may OMIT it to act on the ACTIVE plan bound to this session: remind shows that plan, review gates its current step, archive closes it. For 'review' an explicit task_id instead gates that specific plan (use it when reviewing a delegated plan you did not bind). With neither a task_id nor an active plan, those commands fail naming the fix: run 'continue <task_id>' to claim an assigned plan.",
             },
             "file": {
                 "type": "string",

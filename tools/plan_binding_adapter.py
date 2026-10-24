@@ -1155,9 +1155,14 @@ def cmd_advance(agent, summary: str, step: Optional[int] = None) -> str:
 
 
 def cmd_review(
-    agent, task_id: str, decision: str, response: Optional[str] = None
+    agent, task_id: Optional[str], decision: str, response: Optional[str] = None
 ) -> str:
     """Approve, deny, or yolo the dispatcher-gated pending step review.
+
+    ``task_id`` is Optional: an omitted task_id gates the ACTIVE plan on the
+    caller's binding (the ``remind``/``archive`` contract, Evan 2026-10-24) —
+    a reviewer holding the gate is reviewing the step on their own binding,
+    and a flash-tier model drops the key when the schema reads ambiguous.
 
     ``response`` is dual-use (the F2 unification): the denial/request-changes
     message, or the answer to a worker's clarify/tool-limit ask when the plan
@@ -1175,6 +1180,17 @@ def cmd_review(
         return "ERROR: review response must be at most 1024 characters"
 
     conn = _legacy()._get_kanban_db()
+    if not task_id:
+        _key, binding, error = _current(conn, agent)
+        if binding is None:
+            if error and error.startswith("PLAN_STATE_UNAVAILABLE:"):
+                return error
+            return (
+                "ERROR: 'review' got no task_id and no plan is active in this "
+                "session. Pass task_id=<id> to gate a specific plan, or run "
+                "plan 'continue <task_id>' to bind one first."
+            )
+        task_id = binding.task_id
     task = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
     if task is None:
         return f"ERROR: Task {task_id} not found"
