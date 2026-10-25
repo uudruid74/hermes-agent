@@ -22,22 +22,28 @@ because the fields carry different kinds of text:
 * ``step title`` → 128 bytes (a title; the detail lives in the expansion).
 * ``step expansion`` → 2K chars, EXEMPT from the prose cap — it is spec
   ground truth and is stored verbatim (import/export feature).
-* ``step summary`` → 240 chars (prose; the claim's one-line receipt).
+* ``step summary`` → 1024 chars, REFUSED when longer (Evan 2026-10-25: the
+  reviewer reads the WHOLE summary — "Do not cut out the middle. Why would
+  I send incomplete information?!" The old 240-char middle-cut fed
+  reviewers 240-char holes while the full text only survived in event
+  payloads — run 7: 10/10 summaries mutilated — so verdicts AND the token
+  counts the runs exist to measure were both taken against cut text).
+  Stored verbatim; never compressed, never truncated.
 * ``denial`` → EXEMPT (see ``execution_bindings._set_step_denial``): reviewer
   verdicts are not prose and must survive verbatim.
 
-Truncation directions, deliberately different once; a third rule now
-governs summaries (council, 2026-10-14 — nemotron preservation forensics):
+Truncation directions, deliberately different once; summaries are now NEVER
+cut at all (Evan, 2026-10-25 — see ``summary_text_error``: refuse over 1024
+chars, store whole):
 
 * ``cap_head`` for goals and step titles — the lead states the objective.
   Keeping the LAST chars of a task goal would discard the task. Heads are
   never cut here either, so this already complies with the no-head-cut rule.
-* ``cap_middle`` for step summaries and proof claims — the conclusion lives
-  at the end AND the council found stored summaries head-cut mid-word
-  (payloads showed "Summary: ork in this rerun" — B1: head-truncation), so
-  the old tail-only cut is a bug. Shrinking now cuts the MIDDLE (head+tail
-  kept, omission marked): "Never cut heads; budget evicts whole units; if
-  shrinking, cut middle (head+tail)" (Evan, 2026-10-14).
+* ``cap_middle`` for summaries (RETIRED 2026-10-25) — the 2026-10-14
+  council replaced the tail-only cut with a middle cut after payloads
+  showed head-cut summaries ("Summary: ork in this rerun" — B1). Evan then
+  retired cutting for summaries entirely: refuse over 1024, store whole.
+  The B1 lesson stands for any future shrinker: never cut heads.
 
 Every function is idempotent: capping already-capped text is a no-op. That is
 what makes it safe to apply at both the adapter (the agent's submission path)
@@ -51,6 +57,12 @@ from typing import Iterable, Optional
 
 #: Maximum characters for a step summary or a proof claim (prose).
 PLAN_TEXT_MAX_CHARS = 240
+
+#: Maximum characters for a step summary. Whole text reaches the reviewer;
+#: over-limit input is REFUSED at the tool call, never truncated (Evan,
+#: 2026-10-25). This manifest is the single source for the limit — the plan
+#: tool's ``summary`` field names it.
+PLAN_SUMMARY_MAX_CHARS = 1024
 
 #: Maximum characters for a goal / global description (whitespace-compressed).
 PLAN_GOAL_MAX_CHARS = 2048
@@ -92,42 +104,6 @@ def _elide(text: str, *, keep_tail: bool, limit: int = PLAN_TEXT_MAX_CHARS) -> s
     return text[:limit].strip()
 
 
-def _elide_middle(text: str, limit: int = PLAN_TEXT_MAX_CHARS) -> str:
-    """Cut the MIDDLE of oversized Plan text; never cut the head (B1).
-
-    Keeps the lead (the council's "never cut heads" rule — the mid-word
-    starts like "Summary: ork in this rerun" are the bug being fixed) AND
-    the conclusion (the original reason summaries kept the tail). The
-    omitted span is marked so the reader knows the text was deliberately
-    compressed. Output stays ``<= limit``, so re-capping is a
-    no-op and the function is idempotent like its siblings.
-    """
-    if len(text) <= limit:
-        return text
-
-    def _split(omitted: int) -> tuple[str, int, int]:
-        marker = f" …[{omitted:,} chars omitted]… "
-        room = max(limit - len(marker), 0)
-        head = (room + 1) // 2
-        return marker, head, room - head
-
-    marker, head, tail = _split(len(text))
-    # The omitted count's digit width can change once the true span is known
-    # (same single-recompute pattern as _bound_summary_input).
-    marker, head, tail = _split(len(text) - head - tail)
-    if tail <= 0:
-        tail = 1
-        head = max(limit - len(marker) - tail, 0)
-    out = text[:head].rstrip() + marker + text[-tail:].lstrip()
-    # Final guard: a marker-width edge must never push the result past the cap.
-    if len(out) > limit:
-        over = len(out) - limit
-        head = max(head - (over + 1) // 2, 0)
-        tail = max(tail - (over // 2), 1)
-        out = text[:head] + marker + text[-tail:]
-    return out.strip()
-
-
 def _cap_bytes(text: str, max_bytes: int) -> str:
     """Head-cap UTF-8 text to ``max_bytes``, cutting on a char boundary."""
     encoded = text.encode("utf-8")
@@ -151,15 +127,27 @@ def cap_step_title(text: Optional[str]) -> str:
     return _cap_bytes(compress_whitespace(text or ""), PLAN_STEP_TITLE_MAX_BYTES)
 
 
-def cap_summary(text: Optional[str]) -> str:
-    """Whitespace-compress a step summary or proof; shrink by cutting the middle.
+def summary_text_error(summary: Optional[str]) -> Optional[str]:
+    """Refuse a step summary over ``PLAN_SUMMARY_MAX_CHARS`` (1024).
 
-    Head and tail survive (B1 trim direction, council 2026-10-14): the lead
-    names the subject and the conclusion lives at the end — both are kept and
-    the middle is elided with an explicit marker. The old tail-only cut left
-    stored summaries starting mid-word ("Summary: ork in this rerun").
+    A hard REFUSAL, never truncation (Evan, 2026-10-25): the reviewer's
+    verdict and the run's token measurements both need the WHOLE summary —
+    "Do not cut out the middle." The old ``cap_summary`` middle-cut stored
+    240-char holes (run 7: 10/10 summaries cut at 262 chars, full text only
+    in ``task_events`` payloads). Measured on the RAW text: no whitespace
+    compression — the model reads what was written; compression happens at
+    the heap, not before the read. The limit lives here (manifest) and is
+    named in the plan tool's ``summary`` field; the tool doors refuse and
+    store nothing.
     """
-    return _elide_middle(compress_whitespace(text or ""))
+    size = len(summary or "")
+    if size <= PLAN_SUMMARY_MAX_CHARS:
+        return None
+    return (
+        f"ERROR: summary is {size} chars; the limit is "
+        f"{PLAN_SUMMARY_MAX_CHARS}. Nothing was stored — summaries are "
+        f"never truncated. Shorten it and resubmit."
+    )
 
 
 def cap_expansion(text: Optional[str]) -> str:
@@ -199,7 +187,7 @@ def text_limit_error(
     as a file the worker reads, and the goal fit under the cap.
 
     Whitespace is compressed before measuring, so the check matches exactly what
-    ``cap_text``/``cap_summary`` would have stored.
+    ``cap_text`` would have stored.
     """
     compact = compress_whitespace(text or "")
     if len(compact) <= limit:

@@ -1416,7 +1416,7 @@ PLAN_SCHEMA = {
             },
             "summary": {
                 "type": "string",
-                "description": "Required for 'advance' and 'handoff'. For 'advance', summarize what was done in this step, including any files changed. This single summary is submitted to the dispatcher or user for review. For 'handoff', summarize what has been done and what remains to complete the current step.",
+                "description": "Required for 'advance' and 'handoff'. For 'advance', summarize what was done in this step, including any files changed. This single summary is submitted to the dispatcher or user for review. For 'handoff', summarize what has been done and what remains to complete the current step. Limited to 1024 characters — the limit lives in the limits manifest (plan_limits.PLAN_SUMMARY_MAX_CHARS) and the tool call is REFUSED over it; summaries are never truncated.",
             },
             "decision": {
                 "type": "string",

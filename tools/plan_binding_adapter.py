@@ -1040,6 +1040,11 @@ def _resolve_review(
 def cmd_advance(agent, summary: str, step: Optional[int] = None) -> str:
     """Submit one summary, then pause until dispatcher or user review."""
     from hermes_cli import execution_bindings as bindings
+    from hermes_cli.plan_limits import summary_text_error
+
+    oversize = summary_text_error(summary)
+    if oversize:
+        return oversize
 
     conn = _legacy()._get_kanban_db()
     key, binding, error = _current(conn, agent)
@@ -1383,6 +1388,11 @@ def cmd_repeat(
 
 def cmd_handoff(agent, summary: str) -> str:
     from hermes_cli import execution_bindings as bindings
+    from hermes_cli.plan_limits import summary_text_error
+
+    oversize = summary_text_error(summary)
+    if oversize:
+        return oversize
 
     conn = _legacy()._get_kanban_db()
     key, binding, error = _current(conn, agent)

@@ -17,18 +17,19 @@ from hermes_cli.plan_limits import (  # noqa: E402
     PLAN_GOAL_MAX_CHARS,
     PLAN_MAX_STEPS,
     PLAN_STEP_TITLE_MAX_BYTES,
+    PLAN_SUMMARY_MAX_CHARS,
     PLAN_TEXT_MAX_CHARS,
     cap_expansion,
     cap_goal,
     cap_step_title,
     cap_steps,
-    cap_summary,
     cap_text,
     compress_whitespace,
     expansion_text_error,
     goal_text_error,
     step_count_error,
     steps_text_error,
+    summary_text_error,
 )
 
 
@@ -47,24 +48,21 @@ def test_goal_keeps_the_HEAD_of_the_text():
     assert not capped.endswith("TRAILING")
 
 
-def test_summary_cut_keeps_HEAD_and_TAIL():
-    """B1 trim direction (council 2026-10-14): never cut heads — cut middle.
-
-    The old tail-only cap stored summaries starting mid-word ("Summary: ork
-    in this rerun"). Now the lead and the conclusion both survive and the
-    middle is elided with an explicit marker.
+def test_summary_is_refused_over_the_limit_never_cut():
+    """Evan 2026-10-25: summaries are NEVER truncated — the reviewer reads
+    the whole text. Over the 1024-char limit the tool call is refused
+    (the text_limit_error pattern: a hard refusal, not a silent cut).
     """
-    text = "LEADING" + "x" * 400 + "CONCLUSION"
-    capped = cap_summary(text)
-    assert len(capped) <= PLAN_TEXT_MAX_CHARS
-    assert capped.startswith("LEADING")
-    assert capped.endswith("CONCLUSION")
-    assert "chars omitted" in capped
+    assert summary_text_error("x" * PLAN_SUMMARY_MAX_CHARS) is None
+    err = summary_text_error("x" * (PLAN_SUMMARY_MAX_CHARS + 1))
+    assert err is not None and err.startswith("ERROR:")
+    assert str(PLAN_SUMMARY_MAX_CHARS) in err
+    assert "never truncated" in err
+    assert summary_text_error(None) is None
 
 
 def test_short_text_is_untouched_apart_from_whitespace():
     assert cap_text("fix the bug") == "fix the bug"
-    assert cap_summary("fix the bug") == "fix the bug"
     assert cap_text("  fix   the  bug ") == "fix the bug"
 
 
@@ -94,7 +92,6 @@ def test_caps_are_idempotent():
     """Applied at both the adapter and the kernel — must not double-truncate."""
     text = "word " * 200
     assert cap_text(cap_text(text)) == cap_text(text)
-    assert cap_summary(cap_summary(text)) == cap_summary(text)
     assert cap_step_title(cap_step_title(text)) == cap_step_title(text)
     goal = "word " * 500  # 2500 chars > PLAN_GOAL_MAX_CHARS
     assert cap_goal(cap_goal(goal)) == cap_goal(goal)

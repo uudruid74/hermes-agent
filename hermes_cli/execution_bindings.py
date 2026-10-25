@@ -234,18 +234,25 @@ def _set_step_summary(
 ) -> None:
     """Replace the stored summary for one Plan step.
 
-    The summary is whitespace-compressed and shrunk by cutting its MIDDLE
-    (B1 trim direction, council 2026-10-14 — never cut heads; the old
-    tail-only cut stored summaries starting mid-word). The Plan is the
-    Protected region, so an uncapped summary grows the context window
-    permanently. This one function is the choke point for every summary
-    write — ``advance`` (claim and proof paths), ``handoff``, and plan
-    closure all route through it — so the cap cannot be bypassed by taking
-    a different command.
-    """
-    from hermes_cli.plan_limits import cap_summary
+    The summary is stored WHOLE and verbatim (Evan, 2026-10-25): the
+    reviewer's approve/deny verdict and the run's token measurements both
+    require reading exactly what the worker wrote — "Do not cut out the
+    middle." The old 240-char middle-cut stored holes while the full text
+    only survived in task_events payloads (run 7: 10/10 summaries cut).
 
-    summary = cap_summary(summary)
+    This one function is the choke point for every summary write —
+    ``advance`` (claim and proof paths), ``handoff``, and plan closure all
+    route through it. Size is bounded at the tool door
+    (``plan_limits.summary_text_error``: 1024 chars, refused never
+    truncated); the choke re-checks so no future door can smuggle oversized
+    text past it.
+    """
+    from hermes_cli.plan_limits import summary_text_error
+
+    oversize = summary_text_error(summary)
+    if oversize:
+        raise ValueError(oversize)
+    summary = summary or ""
     marker = f"[plan-step-summary:{step_no}] "
     row = conn.execute(
         "SELECT id FROM task_comments WHERE task_id = ? AND body LIKE ?",
@@ -320,13 +327,10 @@ def _set_step_denial(
     Mirrors ``_set_step_summary`` so a denial rides the same durable channel:
     a fresh denial REPLACES the previous one for the same step (latest wins).
 
-    EXEMPT from ``cap_summary`` (plan-import-export-flat-file-spec, item 1):
-    reviewer verdicts are not prose — they must NOT pass through the 240-char
-    middle cut. This is why the worker re-derived corrections every cycle in
-    the run-7 forensics: the verdict was truncated mid-directive and the
-    remaining rules had to be recovered from memory. The reason is stored
-    VERBATIM; the input is already bounded by the review command's 1024-char
-    response cap (``plan_binding_adapter.cmd_review``).
+    Stored VERBATIM, never cut (the run-7 forensics: a verdict truncated
+    mid-directive made the worker re-derive the missing rules from memory
+    every cycle). Input is bounded upstream by the review command's
+    1024-char response cap (``plan_binding_adapter.cmd_review``).
     """
     marker = f"[plan-step-denial:{step_no}] "
     row = conn.execute(

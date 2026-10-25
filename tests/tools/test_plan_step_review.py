@@ -634,3 +634,44 @@ def test_attention_request_carries_active_step_expansion(monkeypatch):
     assert "[X] Step 1: first\n[-] Step 2: second" in message
     assert f"[-] Step 2: second\n\n{spec}\n[ ] Step 3: third" in message
     assert "first\n\n" not in message  # no spec under inactive steps
+
+
+def test_summary_reaches_the_reviewer_whole(monkeypatch):
+    """Evan 2026-10-25: the reviewer reads the WHOLE summary.
+
+    The old middle-cut stored 240-char holes while the full text only
+    survived in task_events payloads (run 7: 10/10 summaries mutilated) —
+    verdicts and token measurements were both taken against cut text.
+    """
+    conn, sent, worker, _dispatcher, task_id = _delegated_plan(monkeypatch)
+    middle = "UNIQUE-MIDDLE-SENTINEL-xyzzy"
+    summary = "Head of the report. " + middle + " tail conclusion."
+    result = plan.plan(worker, "advance", summary=summary, step=1)
+    assert not result.startswith("ERROR:"), result
+    row = conn.execute(
+        "SELECT body FROM task_comments WHERE task_id=? "
+        "AND body LIKE '[plan-step-summary:1]%'",
+        (task_id,),
+    ).fetchone()
+    assert row is not None
+    assert middle in row["body"], "the stored summary must keep its middle"
+    assert "omitted" not in row["body"], "no elide marker — summaries are never cut"
+
+
+def test_summary_over_the_limit_is_refused_not_truncated(monkeypatch):
+    """Evan 2026-10-25: 1024-char limit at the tool call — DENY if longer.
+
+    A hard refusal (the text_limit_error pattern), never a silent cut:
+    over-limit input stores nothing and the worker is told the limit.
+    """
+    conn, _sent, worker, _dispatcher, task_id = _delegated_plan(monkeypatch)
+    result = plan.plan(worker, "advance", summary="x" * 1025, step=1)
+    assert result.startswith("ERROR:"), result
+    assert "1024" in result
+    assert "never truncated" in result
+    row = conn.execute(
+        "SELECT body FROM task_comments WHERE task_id=? "
+        "AND body LIKE '[plan-step-summary:%'",
+        (task_id,),
+    ).fetchone()
+    assert row is None, "an over-limit summary must store NOTHING"
