@@ -898,6 +898,7 @@ def _attention_request_text(task, pending, *, used: int, maximum: int) -> str:
     steps = json.loads(task["task_steps"] or "[]")
     step_no = int(pending["task_stepno"] or 1)
     last_summary = _last_step_summary(task["id"], step_no)
+    expansions = _step_expansions(task)
     lines = [
         f"{task['id']} → Needs Attention — exceeded tool call limit",
         "",
@@ -911,6 +912,14 @@ def _attention_request_text(task, pending, *, used: int, maximum: int) -> str:
     for index, step_text in enumerate(steps, 1):
         marker = "[X]" if index < step_no else "[-]" if index == step_no else "[ ]"
         lines.append(f"{marker} Step {index}: {step_text}")
+        if index == step_no:
+            # The active step's spec, verbatim (Evan 2026-10-25) — the worker
+            # hit the limit on this step and whoever resumes needs its rules
+            # without a plan remind round-trip.
+            expansion = expansions.get(index, "")
+            if expansion:
+                lines.append("")
+                lines.append(expansion)
     lines.extend(["", "Summary:", last_summary or "none", ""])
     lines.append(
         "---\n"
@@ -938,12 +947,20 @@ def _attention_request_text(task, pending, *, used: int, maximum: int) -> str:
 
 def _worker_review_message(task, result, reviewer: str, response: Optional[str]) -> str:
     steps = json.loads(task["task_steps"] or "[]")
+    # Spec ground truth rides with the title (Evan 2026-10-25: a worker
+    # receiving "Now complete Step N" must not need `plan remind` to learn
+    # what Step N requires). Expansions are stored verbatim
+    # (task_step_expansions) and appended verbatim; absent expansion →
+    # byte-identical message to the pre-expansion format.
+    expansions = _step_expansions(task)
     if result.decision == "denied":
         step_text = steps[result.reviewed_step - 1]
+        expansion = expansions.get(result.reviewed_step, "")
+        spec = f"\n\n{expansion}" if expansion else ""
         return (
             f"Advancement has been denied. Reason: {response}\n\n"
             f"Goal: {task['task_goal'] or ''}\n"
-            f"Step {result.reviewed_step}: {step_text}\n\n"
+            f"Step {result.reviewed_step}: {step_text}{spec}\n\n"
             "Please correct before attempting to advance again"
         )
     if result.closed:
@@ -956,11 +973,13 @@ def _worker_review_message(task, result, reviewer: str, response: Optional[str])
         if result.auto_approve_enabled
         else ""
     )
+    expansion = expansions.get(result.next_step_no, "")
+    spec = f"\n\n{expansion}" if expansion else ""
     return (
         f"Task {task['id']} Step {result.reviewed_step} Approved by {reviewer}. "
         f"Now complete Step {result.next_step_no}\n\n"
         f"Goal: {task['task_goal'] or ''}\n"
-        f"Step {result.next_step_no}: {result.next_step}\n\n"
+        f"Step {result.next_step_no}: {result.next_step}{spec}\n\n"
         "Please work this step and when this step is complete, use plan "
         f"to advance to the next{yolo_note}"
     )

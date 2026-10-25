@@ -64,7 +64,7 @@ def _install(monkeypatch):
     return conn, sent
 
 
-def _delegated_plan(monkeypatch, steps=("inspect", "implement")):
+def _delegated_plan(monkeypatch, steps=("inspect", "implement"), expansions=None):
     conn, sent = _install(monkeypatch)
     monkeypatch.setattr(
         plan, "clarify_tool", lambda *_args, **_kwargs: '{"user_response":"Approve"}'
@@ -81,6 +81,14 @@ def _delegated_plan(monkeypatch, steps=("inspect", "implement")):
         assignee="ornith",
     )
     task_id = conn.execute("SELECT id FROM tasks").fetchone()[0]
+    if expansions is not None:
+        # Fixture seed only: `plan new` carries no expansions (plan import is
+        # the real writer of task_step_expansions — covered by its own tests).
+        conn.execute(
+            "UPDATE tasks SET task_step_expansions = ? WHERE id = ?",
+            (json.dumps(list(expansions)), task_id),
+        )
+        conn.commit()
     assert plan.plan(worker, "continue", task_id=task_id).startswith("Task:")
     sent.clear()
     return conn, sent, worker, dispatcher, task_id
@@ -542,3 +550,87 @@ def test_plan_schema_descriptions_never_mix_required_and_optional():
         assert not (
             "required for" in desc and "optional for" in desc
         ), f"{name}: description mixes 'required for' + 'optional for'"
+
+
+# ── Step expansions ride the review/advance notification ─────────────────
+# Evan 2026-10-25: "He should not need to call remind after advance. The
+# advance notification should show the expanded step text." Expansions are
+# appended VERBATIM under the step title; a plan without expansions must
+# produce byte-identical messages to the pre-expansion format.
+
+
+def _review_approved_message(monkeypatch, *, expansions=None):
+    conn, sent, worker, dispatcher, task_id = _delegated_plan(
+        monkeypatch, expansions=expansions
+    )
+    plan.plan(worker, "advance", summary="inspection complete", step=1)
+    sent.clear()
+    plan.plan(dispatcher, "review", task_id=task_id, decision="approved")
+    assert len(sent) == 1
+    return task_id, sent[0][4]
+
+
+def test_approved_message_without_expansions_is_byte_identical(monkeypatch):
+    task_id, message = _review_approved_message(monkeypatch)
+    assert message == (
+        f"Task {task_id} Step 1 Approved by neo. Now complete Step 2\n\n"
+        "Goal: Ship verified work\n"
+        "Step 2: implement\n\n"
+        "Please work this step and when this step is complete, use plan "
+        "to advance to the next"
+    )
+
+
+def test_approved_message_carries_next_step_expansion_verbatim(monkeypatch):
+    spec = (
+        "Implement `advance(summary: str) -> str`. Returns "
+        '"Step N summary submitted. Pause and wait for verification." '
+        "DB: task_comments rows '[plan-step-summary:N] <summary>'. "
+        "Error branch: empty summary returns 'ERROR: summary required'. "
+        "Acceptance: summary row survives re-import."
+    )
+    task_id, message = _review_approved_message(
+        monkeypatch, expansions=["do the inspect thing", spec]
+    )
+    assert "Step 2: implement" in message
+    assert spec in message  # verbatim — no compression, no elision
+    # Under the title: the spec block follows the Step 2 line directly.
+    assert f"Step 2: implement\n\n{spec}\n\nPlease work this step" in message
+    assert "[…" not in message  # never middle-elided into the message
+
+
+def test_denied_message_carries_reviewed_step_expansion(monkeypatch):
+    spec = 'Inspect the parser. Report "SLOW PATH". Acceptance: findings list.'
+    conn, sent, worker, dispatcher, task_id = _delegated_plan(
+        monkeypatch, expansions=[spec, "implement spec"]
+    )
+    plan.plan(worker, "advance", summary="inspection complete", step=1)
+    sent.clear()
+    plan.plan(
+        dispatcher, "review", task_id=task_id, decision="denied", response="redo"
+    )
+    assert len(sent) == 1
+    message = sent[0][4]
+    assert message.startswith("Advancement has been denied. Reason: redo\n\n")
+    assert f"Step 1: inspect\n\n{spec}\n\nPlease correct" in message
+    assert "implement spec" not in message  # only the reviewed step
+
+
+def test_attention_request_carries_active_step_expansion(monkeypatch):
+    # The tool-limit message (_attention_request_text): the active step's
+    # spec under its listing line, other steps untouched.
+    from tools.plan_binding_adapter import _attention_request_text
+
+    spec = "Step 9 spec: build `score(board) -> int`. Returns 0 or 1."
+    conn, _sent, _worker, _dispatcher, task_id = _delegated_plan(
+        monkeypatch,
+        steps=("first", "second", "third"),
+        expansions=["", spec, ""],
+    )
+    conn.execute("UPDATE tasks SET task_stepno = 2 WHERE id = ?", (task_id,))
+    conn.commit()
+    task = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    message = _attention_request_text(task, task, used=200, maximum=200)
+    assert "[X] Step 1: first\n[-] Step 2: second" in message
+    assert f"[-] Step 2: second\n\n{spec}\n[ ] Step 3: third" in message
+    assert "first\n\n" not in message  # no spec under inactive steps
