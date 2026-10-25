@@ -7052,49 +7052,60 @@ def park_plan_task(
     task was not in a parkable state (or the expected run pointer moved).
     """
     now = int(time.time())
-    if expected_run_id is None:
-        cur = conn.execute(
-            """
-            UPDATE tasks
-               SET status        = 'attention',
-                   claim_lock    = NULL,
-                   claim_expires = NULL,
-                   worker_pid    = NULL
-             WHERE id = ?
-               AND status IN ('manual', 'running')
-            """,
-            (task_id,),
+    with write_txn(conn):
+        if expected_run_id is None:
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status        = 'attention',
+                       claim_lock    = NULL,
+                       claim_expires = NULL,
+                       worker_pid    = NULL
+                 WHERE id = ?
+                   AND status IN ('manual', 'running')
+                """,
+                (task_id,),
+            )
+        else:
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status        = 'attention',
+                       claim_lock    = NULL,
+                       claim_expires = NULL,
+                       worker_pid    = NULL
+                 WHERE id = ?
+                   AND status IN ('manual', 'running')
+                   AND current_run_id = ?
+                """,
+                (task_id, int(expected_run_id)),
+            )
+        if cur.rowcount != 1:
+            return False
+        run_id = _end_run(
+            conn, task_id,
+            outcome="blocked", status="attention",
+            summary=detail,
         )
-    else:
-        cur = conn.execute(
-            """
-            UPDATE tasks
-               SET status        = 'attention',
-                   claim_lock    = NULL,
-                   claim_expires = NULL,
-                   worker_pid    = NULL
-             WHERE id = ?
-               AND status IN ('manual', 'running')
-               AND current_run_id = ?
-            """,
-            (task_id, int(expected_run_id)),
+        if run_id is None and detail:
+            run_id = _synthesize_ended_run(
+                conn, task_id, outcome="blocked", summary=detail,
+            )
+        parked_event_id = _append_event(
+            conn, task_id, "plan-parked",
+            {"reason": detail, "summary": PLAN_PARK_SUMMARY},
+            run_id=run_id,
         )
-    if cur.rowcount != 1:
-        return False
-    run_id = _end_run(
-        conn, task_id,
-        outcome="blocked", status="attention",
-        summary=detail,
-    )
-    if run_id is None and detail:
-        run_id = _synthesize_ended_run(
-            conn, task_id, outcome="blocked", summary=detail,
-        )
-    parked_event_id = _append_event(
-        conn, task_id, "plan-parked",
-        {"reason": detail, "summary": PLAN_PARK_SUMMARY},
-        run_id=run_id,
-    )
+        _parked_task = get_task(conn, task_id)
+    # The commit above is what makes the park real — hook and notify run
+    # strictly after it (deliver-after-durable, t_d979ec8d family). The old
+    # shape notified from inside the uncommitted transaction: the notify
+    # read status='attention' from its own connection while the rest of the
+    # world still saw 'manual', the delivery path's fresh connection died on
+    # the migration lock this write held (misleadingly logged as a routing
+    # failure), and the park rolled back on close — so the reviewer was told
+    # "parked" and the row said 'manual' (Ornith t_7fed417c, 2026-10-24).
+    # ``True`` now means committed.
     _fire_kanban_lifecycle_hook(
         "kanban_task_parked",
         task_id,

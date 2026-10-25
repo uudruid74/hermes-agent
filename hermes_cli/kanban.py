@@ -1931,8 +1931,12 @@ def _deliver_kanban_notification(
         finally:
             conn.close()
     except Exception:
+        # connect() + origin + task read all land here. Attributing every
+        # failure to origin routing sent the t_7fed417c diagnosis to the
+        # wrong door (the real failure was a migration lock under the park's
+        # uncommitted write) — name the block, not one suspect.
         logger.exception(
-            "kanban notify task=%s status=%s could not resolve origin",
+            "kanban notify task=%s status=%s could not load task/origin state",
             task_id,
             new_status,
         )

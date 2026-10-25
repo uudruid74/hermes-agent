@@ -64,6 +64,9 @@ def _plan_task(conn: sqlite3.Connection, *, steps: bool = False) -> str:
             (_json.dumps(["work until complete"]), "finish the plan", task_id),
         )
     conn.execute("UPDATE tasks SET status = 'manual' WHERE id = ?", (task_id,))
+    # Commit the fixture's flips: park_plan_task commits before notifying and
+    # must see a clean transaction at entry to promise durability.
+    conn.commit()
     return task_id
 
 
@@ -188,6 +191,7 @@ def test_park_refuses_non_parkable_states():
     # complete_task only accepts running/ready/blocked, so the row is flipped
     # to ``done`` directly instead.
     conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (task_id,))
+    conn.commit()
     assert park_plan_task(conn, task_id, detail="late park") is False
     assert get_task(conn, task_id).status == "done"
 
@@ -262,3 +266,80 @@ def test_park_event_not_a_block_event():
     assert "plan-parked" in kinds
     assert "blocked" not in kinds
     assert "block_loop_detected" not in kinds
+
+
+# ── Durable-before-notify (Ornith t_7fed417c phantom park, 2026-10-24) ────
+# The park used to run on the caller's implicit transaction and announce
+# itself before committing: the notify saw 'attention' from its own
+# connection, the rest of the world saw 'manual', and closing the connection
+# rolled the park back. These tests pin the ordering with a FILE-backed DB
+# and separate connections — the only way to see what the world sees.
+
+
+def _file_db(tmp_path) -> sqlite3.Connection:
+    conn = sqlite3.connect(str(tmp_path / "kanban.db"))
+    conn.row_factory = sqlite3.Row
+    conn.executescript(SCHEMA_SQL)
+    return conn
+
+
+def _durable_status(tmp_path, task_id: str) -> tuple[str, int]:
+    """What a fresh connection sees: (status, plan-parked event count)."""
+    other = sqlite3.connect(str(tmp_path / "kanban.db"))
+    other.row_factory = sqlite3.Row
+    try:
+        status = other.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()["status"]
+        events = other.execute(
+            "SELECT count(*) AS n FROM task_events"
+            " WHERE task_id = ? AND kind = 'plan-parked'",
+            (task_id,),
+        ).fetchone()["n"]
+        return status, int(events)
+    finally:
+        other.close()
+
+
+def test_park_is_durable_before_the_notification_fires(tmp_path, monkeypatch):
+    conn = _file_db(tmp_path)
+    task_id = _plan_task(conn)
+    observed = {}
+
+    def _capture(_task_id, _status, **kwargs):
+        observed["durable"] = _durable_status(tmp_path, task_id)
+
+    monkeypatch.setattr(
+        "hermes_cli.kanban._notify_kanban_status_change", _capture
+    )
+    assert park_plan_task(conn, task_id, detail="boundary") is True
+    # At notify time the REST OF THE WORLD must already see the park.
+    assert observed["durable"] == ("attention", 1)
+    # And it survives the caller closing its connection (the old shape
+    # rolled the whole park back here).
+    conn.close()
+    assert _durable_status(tmp_path, task_id) == ("attention", 1)
+
+
+def test_second_park_is_refused_and_never_double_notified(
+    tmp_path, monkeypatch
+):
+    notified = []
+    monkeypatch.setattr(
+        "hermes_cli.kanban._notify_kanban_status_change",
+        lambda _task_id, status, **kwargs: notified.append(status),
+    )
+    conn = _file_db(tmp_path)
+    task_id = _plan_task(conn)
+    assert park_plan_task(conn, task_id, detail="first boundary") is True
+    conn.close()
+
+    # A fresh connection — the t_7fed417c shape where park ran twice 12
+    # minutes apart because the first park never persisted.
+    again = sqlite3.connect(str(tmp_path / "kanban.db"))
+    again.row_factory = sqlite3.Row
+    assert park_plan_task(again, task_id, detail="second boundary") is False
+    again.close()
+
+    assert notified == ["attention"]
+    assert _durable_status(tmp_path, task_id) == ("attention", 1)
