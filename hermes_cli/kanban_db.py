@@ -7048,9 +7048,24 @@ def park_plan_task(
     ``detail`` is the long human-readable diagnostic (step number, budget
     counts). It is preserved on the run row and in the task event; the
     *notification* summary for this transition is the fixed
-    :data:`PLAN_PARK_SUMMARY` string. Returns True on success, False when the
-    task was not in a parkable state (or the expected run pointer moved).
+    :data:`PLAN_PARK_SUMMARY` string. Returns True once the park is
+    **committed** and the notification was *attempted* (delivery is
+    best-effort — a failed notify leaves the durable park plus a warning,
+    never a lost park). Returns False when the task was not in a parkable
+    state (or the expected run pointer moved).
+
+    Precondition (fail-closed, t_7fed417c): the connection must NOT already
+    be inside a caller-owned transaction. Commit-before-notify cannot hold
+    there — write_txn would nest to a savepoint, the notify would again read
+    uncommitted state, and the phantom park returns silently. That shape is
+    a programming error, so it raises rather than returning a plausible lie.
     """
+    if conn.in_transaction:
+        raise ValueError(
+            "park_plan_task requires a clean connection: it commits before "
+            "notifying and cannot run inside a caller-owned transaction "
+            "(commit or roll back first)"
+        )
     now = int(time.time())
     with write_txn(conn):
         if expected_run_id is None:
@@ -7105,7 +7120,9 @@ def park_plan_task(
     # the migration lock this write held (misleadingly logged as a routing
     # failure), and the park rolled back on close — so the reviewer was told
     # "parked" and the row said 'manual' (Ornith t_7fed417c, 2026-10-24).
-    # ``True`` now means committed.
+    # ``True`` means committed AND notified-attempted (never delivered —
+    # that is best-effort). The entry guard above keeps the nested-txn
+    # variant of this failure mode loud.
     _fire_kanban_lifecycle_hook(
         "kanban_task_parked",
         task_id,

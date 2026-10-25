@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import sqlite3
 
+import pytest
+
 from hermes_cli import execution_bindings
 from hermes_cli.kanban_db import (
     PLAN_PARK_STATUS,
@@ -343,3 +345,19 @@ def test_second_park_is_refused_and_never_double_notified(
 
     assert notified == ["attention"]
     assert _durable_status(tmp_path, task_id) == ("attention", 1)
+
+
+def test_park_refuses_caller_owned_transaction(tmp_path):
+    # The nested-txn variant of the phantom park (Zephyr's trail note on
+    # ac59e1be61): inside a caller transaction write_txn nests to a
+    # savepoint, the commit does not happen, and 'True means committed'
+    # becomes a lie again — silently. Refuse loudly instead.
+    conn = _file_db(tmp_path)
+    task_id = _plan_task(conn)
+    conn.execute("UPDATE tasks SET title = title WHERE id = ?", (task_id,))
+    assert conn.in_transaction is True
+    with pytest.raises(ValueError):
+        park_plan_task(conn, task_id, detail="nested")
+    conn.rollback()
+    # No partial park: the row and the event log are untouched.
+    assert _durable_status(tmp_path, task_id) == ("manual", 0)
