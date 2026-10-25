@@ -3172,6 +3172,11 @@ def write_txn(conn: sqlite3.Connection):
     # Plan authorization and activation deliberately share one outer
     # transaction.  A nested caller gets a savepoint rather than attempting a
     # second BEGIN, so its success remains contingent on the outer commit.
+    # Asymmetry note (t_7fed417c, Zephyr 2026-10-25): park_plan_task rejects
+    # nested callers at entry for exactly this reason (a savepoint that never
+    # commits = the phantom park); block_task/complete_task still nest
+    # silently — family-wide guard is a deliberate future call, not an
+    # oversight.
     nested = conn.in_transaction
     savepoint = f"hermes_write_{id(conn):x}_{time.time_ns():x}" if nested else ""
     if nested:
