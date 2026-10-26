@@ -330,7 +330,7 @@ def _set_step_denial(
     Stored VERBATIM, never cut (the run-7 forensics: a verdict truncated
     mid-directive made the worker re-derive the missing rules from memory
     every cycle). Input is bounded upstream by the review command's
-    1024-char response cap (``plan_binding_adapter.cmd_review``).
+    1024-char reason cap (``plan_binding_adapter.cmd_review``).
     """
     marker = f"[plan-step-denial:{step_no}] "
     row = conn.execute(
@@ -1072,67 +1072,31 @@ def advance_plan(
     )
 
 
-# Closed approval-token set (t_853aa789): the guard matches whole answer
-# TOKENS, not prefixes — denial prose beginning "appr..." ("Approach is
-# wrong: ...", "approximate row count is off") must stay a legitimate denial.
-_APPROVAL_TOKENS = frozenset(
-    {
-        "approve",
-        "approved",
-        "approve it",
-        "approve this step",
-        "lgtm",
-        "yolo",
-        "yes",
-    }
-)
-
-
-def review_response_is_approval_token(text) -> bool:
-    """True when *text* would parse as an APPROVAL on the review channels.
-
-    D7 (t_cc772a4c addendum): event 23192 recorded a ``plan-step-review-denied``
-    whose response was literally "Approved" — the ``/review <id> <answer>``
-    clarify channel and ``plan review``'s decision enum share the word
-    "review", and a reviewer answering "Approved" was captured as a DENIAL
-    reason.  Any text that is plainly an approval answer must never be
-    stored as a denial reason — a self-contradicting review record is worse
-    than a refused one.
-
-    Tokens, not prefixes (t_853aa789): the trimmed answer is normalized
-    (lowercased, trailing punctuation stripped, whitespace collapsed) and
-    matched against the closed set ``_APPROVAL_TOKENS``.  The former prefix
-    rule (``startswith("appr")`` / ``startswith("yolo")``) false-positived
-    on ordinary denial prose and refused legitimate denials.
-    """
-    answer = " ".join(str(text or "").strip().lower().rstrip(".,!?;:").split())
-    return answer in _APPROVAL_TOKENS
-
-
 def review_plan_step(
     conn: sqlite3.Connection,
     *,
     task_id: str,
     decision: Literal["approved", "denied", "yolo"],
     reviewer: str,
-    response: Optional[str] = None,
+    reason: Optional[str] = None,
 ) -> PlanReviewResult:
     """Resolve the current pending review and advance only on approval.
 
-    ``response`` is dual-use: the denial/changes message for a step review,
-    or the answer delivered to the worker when the plan carries a pending
-    clarify/tool-limit flag (handled by the adapter's review command).
+    ``reason`` is the denial message for a ``denied`` review — its own field
+    end to end (Evan, 2026-10-26: decision and reason are separate fields and
+    a decision is never derived from reason text).  An approved review
+    carries no reason and a reason on one is refused here at the kernel so
+    no caller can write one.  A denial's reason is stored VERBATIM; there is
+    no refusal on its wording — approval-shaped prose on a denial is a
+    legitimate reason.
     """
     if decision not in {"approved", "denied", "yolo"}:
         raise ValueError("decision must be 'approved', 'denied', or 'yolo'")
-    # D7 (t_cc772a4c): a denial whose reason is an approval token is a
-    # self-contradicting record — refuse it at the kernel so no caller can
-    # write one (event 23192 recorded response="Approved" on a denial).
-    if decision == "denied" and review_response_is_approval_token(response):
+    # An APPROVED review carries no reason (approval needs no reason).
+    if decision in {"approved", "yolo"} and reason:
         raise ValueError(
-            f"denial reason {str(response)!r} is an approval token; refusing to "
-            "record a self-contradicting denial — if the step should pass, "
-            "review it as 'approved' or 'yolo'"
+            "approval needs no reason — an approved review carries no reason; "
+            "to require changes, deny the step with the reason"
         )
     with write_txn(conn):
         pending = pending_step_review(conn, task_id)
@@ -1167,11 +1131,11 @@ def review_plan_step(
                     "step": step_no,
                     "review_event_id": pending.event_id,
                     "reviewer": reviewer,
-                    "response": response or "",
+                    "reason": reason or "",
                 },
                 now=now,
             )
-            # Persist the response as a step denial so it renders in the plan
+            # Persist the reason as a step denial so it renders in the plan
             # block (remind/continue/per-turn injection) and survives the
             # full-compaction rewrite — the event log alone is not rendered
             # anywhere (Evan, 2026-10-09).
@@ -1179,7 +1143,7 @@ def review_plan_step(
                 conn,
                 task_id,
                 step_no,
-                response or "",
+                reason or "",
                 actor=reviewer,
                 now=now,
             )

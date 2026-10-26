@@ -280,18 +280,18 @@ def test_denied_review_requires_bounded_response_and_keeps_step_open(monkeypatch
         dispatcher, "review", task_id=task_id, decision="denied"
     )
     too_long = plan.plan(
-        dispatcher, "review", task_id=task_id, decision="denied", response="x" * 1025
+        dispatcher, "review", task_id=task_id, decision="denied", reason="x" * 1025
     )
     denied = plan.plan(
         dispatcher,
         "review",
         task_id=task_id,
         decision="denied",
-        response="The failure case was not reproduced.",
+        reason="The failure case was not reproduced.",
     )
 
-    assert missing == "ERROR: denied review requires a response"
-    assert too_long == "ERROR: review response must be at most 1024 characters"
+    assert missing == "ERROR: denied review requires a reason"
+    assert too_long == "ERROR: review reason must be at most 1024 characters"
     assert denied == f"Task {task_id} Step 1 denied. Worker notified."
     assert _stepno(conn, task_id) == 1
     message = sent[-1][4]
@@ -432,6 +432,129 @@ def test_self_created_denial_prompts_for_response(monkeypatch):
     assert "Please correct before attempting to advance again" in result
     assert _stepno(conn, task_id) == 1
     assert questions[-1][1] is None
+
+
+# ── Pins for the decision/reason field split (Evan, 2026-10-26) ───────────
+# "Text match is a shit way to do it. Approval/Deny should be a different
+# field than reason... The 'other, I'll describe' is always a denial because
+# approval doesn't need a reason."  The decision comes ONLY from the offered
+# choice; every other answer is a denial whose text is the reason VERBATIM.
+
+
+def _interactive_review(monkeypatch, answers, session):
+    """Self-created plan whose clarify answers come from *answers*."""
+    conn, _sent = _install(monkeypatch)
+    responses = iter(answers)
+    questions: list[tuple[str, list[str] | None]] = []
+
+    def clarify(question, choices=None, **_kwargs):
+        questions.append((question, choices))
+        return json.dumps({"user_response": next(responses)})
+
+    monkeypatch.setattr(plan, "clarify_tool", clarify)
+    worker = _Agent("ornith", session)
+    plan.plan(
+        worker, "new", title="Self plan", goal="Gate it", steps=["verify", "ship"]
+    )
+    task_id = conn.execute("SELECT id FROM tasks").fetchone()[0]
+    return conn, questions, worker, task_id
+
+
+def _denial_body(conn, task_id):
+    row = conn.execute(
+        "SELECT body FROM task_comments WHERE task_id=?"
+        " AND body LIKE '[plan-step-denial:1] %'",
+        (task_id,),
+    ).fetchone()
+    return None if row is None else row[0]
+
+
+def test_pin_free_text_answer_is_denial_with_verbatim_reason(monkeypatch):
+    """(a) the free-text "Other, I'll describe" answer -> recorded DENIED,
+    the text stored verbatim as the reason. On the old code the reason came
+    from a second "Why is this step denied?" prompt instead of the text."""
+    conn, questions, worker, task_id = _interactive_review(
+        monkeypatch,
+        ["Approve", "Missing regression coverage"],
+        "20260923_010108_abcdef",
+    )
+    result = plan.plan(worker, "advance", summary="claimed complete", step=1)
+    assert "Advancement has been denied. Reason: Missing regression coverage" in result
+    assert _denial_body(conn, task_id) == (
+        "[plan-step-denial:1] Missing regression coverage"
+    )
+    assert _stepno(conn, task_id) == 1
+    # The text IS the reason — no follow-up prompt collected it.
+    assert len(questions) == 2, questions
+
+
+def test_pin_appr_prefix_prose_is_denied_not_approved(monkeypatch):
+    """(b) the misparse that started this: "Approach is wrong: seed order is
+    inverted" must be a DENIED review (the old startswith("appr") code
+    silently approved it) with the reason verbatim."""
+    conn, _questions, worker, task_id = _interactive_review(
+        monkeypatch,
+        ["Approve", "Approach is wrong: seed order is inverted"],
+        "20260923_010109_abcdef",
+    )
+    result = plan.plan(worker, "advance", summary="claimed complete", step=1)
+    assert (
+        "Advancement has been denied. Reason: Approach is wrong: seed order is "
+        "inverted" in result
+    )
+    assert _stepno(conn, task_id) == 1
+    kinds = [
+        r[0]
+        for r in conn.execute(
+            "SELECT kind FROM task_events WHERE task_id=? AND kind IN"
+            " ('plan-step-review-approved','plan-step-review-denied')",
+            (task_id,),
+        )
+    ]
+    assert kinds == ["plan-step-review-denied"], kinds
+    assert _denial_body(conn, task_id) == (
+        "[plan-step-denial:1] Approach is wrong: seed order is inverted"
+    )
+
+
+def test_pin_exact_approve_choice_approves_without_reason(monkeypatch):
+    """(c) the answer IS the "Approve" choice -> approved, no reason."""
+    conn, _questions, worker, task_id = _interactive_review(
+        monkeypatch, ["Approve", "Approve"], "20260923_010110_abcdef"
+    )
+    result = plan.plan(worker, "advance", summary="claimed complete", step=1)
+    assert "Approved" in result
+    assert _stepno(conn, task_id) == 2
+    assert _denial_body(conn, task_id) is None
+    payload = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=?"
+        " AND kind='plan-step-review-approved'",
+        (task_id,),
+    ).fetchone()[0]
+    assert "reason" not in json.loads(payload)
+
+
+def test_pin_exact_yolo_choice_enables_auto_approve(monkeypatch):
+    """(d) the answer IS the "Yolo" choice -> yolo (this step approved AND
+    auto-approve enabled for the rest of the plan)."""
+    conn, _questions, worker, task_id = _interactive_review(
+        monkeypatch, ["Approve", "Yolo"], "20260923_010111_abcdef"
+    )
+    result = plan.plan(worker, "advance", summary="claimed complete", step=1)
+    assert "Approved" in result
+    assert "YOLO enabled" in result
+    assert _stepno(conn, task_id) == 2
+    row = conn.execute(
+        "SELECT plan_auto_approve FROM tasks WHERE id=?", (task_id,)
+    ).fetchone()
+    assert row[0] == 1, "yolo answer must enable plan_auto_approve"
+    payload = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=?"
+        " AND kind='plan-step-review-approved'",
+        (task_id,),
+    ).fetchone()[0]
+    assert json.loads(payload)["auto_approve_enabled"] is True
+    assert _denial_body(conn, task_id) is None
 
 
 def test_manifest_exposes_review_and_only_one_advance_summary():
@@ -610,7 +733,7 @@ def test_denied_message_carries_reviewed_step_expansion(monkeypatch):
     plan.plan(worker, "advance", summary="inspection complete", step=1)
     sent.clear()
     plan.plan(
-        dispatcher, "review", task_id=task_id, decision="denied", response="redo"
+        dispatcher, "review", task_id=task_id, decision="denied", reason="redo"
     )
     assert len(sent) == 1
     message = sent[0][4]
@@ -672,7 +795,7 @@ def test_review_deny_on_null_stepno_reopens_step_1(monkeypatch):
         "review",
         task_id=task_id,
         decision="denied",
-        response="add the missing test",
+        reason="add the missing test",
     )
     assert not result.startswith("ERROR:"), result
     row = conn.execute(

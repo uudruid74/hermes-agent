@@ -196,7 +196,7 @@ def test_export_includes_summaries_denials_and_full_history(monkeypatch, tmp_pat
     plan_module.plan(worker, "advance", summary="claimed one", step=1)
     plan_module.plan(
         dispatcher, "review", task_id=task_id, decision="denied",
-        response="first defect: missing import",
+        reason="first defect: missing import",
     )
     plan_module.plan(worker, "advance", summary="claimed again", step=1)
     plan_module.plan(dispatcher, "review", task_id=task_id, decision="approved")

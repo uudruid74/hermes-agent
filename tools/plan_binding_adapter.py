@@ -499,7 +499,7 @@ def _create_plan(
                 f"YOUR approval — you are its dispatcher.\n\n{prompt}\n\n"
                 "Approve, deny, or yolo it with:\n"
                 f"  plan review {task_id} approved|denied|yolo\n"
-                "A denial must include a response "
+                "A denial must include a reason "
                 f"('plan review {task_id} denied <reason>')."
             )
             ok, detail = send_dispatcher_message(
@@ -544,14 +544,14 @@ def _create_plan(
         undelivered = undeliverable_approval_response(task_id, response)
         if undelivered:
             return undelivered
-        # Three answers: Approve, Deny, Yolo. Evan's rule: yolo is a property
-        # of the HUMAN's answer, never something an agent specifies. Order
-        # matters — "Yolo" contains no "appr", so testing plain-approve first
-        # would fall through to the deny branch and ARCHIVE the plan. Match
-        # the stop-asking form first, then plain approve, else deny.
-        _answer = str(response).strip().lower()
-        _yolo = _answer.startswith("yolo")
-        _approve = _answer.startswith("appr")
+        # Three answers: Approve, Deny, Yolo. The decision comes ONLY from
+        # the offered choices (Evan, 2026-10-26): approved/yolo ONLY when the
+        # answer IS the offered Approve/Yolo choice; EVERY other answer — the
+        # "Deny" choice and the free-text "Other, I'll describe" answer alike
+        # — is a DENIAL whose text is stored verbatim as the reason. No
+        # startswith, no normalizing, no token set, no regex.
+        _yolo = response == "Yolo"
+        _approve = response == "Approve"
         try:
             with write_txn(conn):
                 if _yolo or _approve:
@@ -894,7 +894,7 @@ def _review_request_text(task, pending, *, auto_approved: bool = False) -> str:
             "this step using 'plan review'. Pass the task id and decision "
             "'approved', 'denied', or 'yolo' — 'yolo' approves this step AND "
             "auto-approves the remaining steps of this plan, so you will not be "
-            "asked again for this plan. A denial must include a response."
+            "asked again for this plan. A denial must include a reason."
         )
     return "\n".join(lines)
 
@@ -1001,7 +1001,7 @@ def _attention_request_text(task, pending, *, used: int, maximum: int) -> str:
     return "\n".join(lines)
 
 
-def _worker_review_message(task, result, reviewer: str, response: Optional[str]) -> str:
+def _worker_review_message(task, result, reviewer: str, reason: Optional[str]) -> str:
     steps = json.loads(task["task_steps"] or "[]")
     # Spec ground truth rides with the title (Evan 2026-10-25: a worker
     # receiving "Now complete Step N" must not need `plan remind` to learn
@@ -1014,7 +1014,7 @@ def _worker_review_message(task, result, reviewer: str, response: Optional[str])
         expansion = expansions.get(result.reviewed_step, "")
         spec = f"\n\n{expansion}" if expansion else ""
         return (
-            f"Advancement has been denied. Reason: {response}\n\n"
+            f"Advancement has been denied. Reason: {reason}\n\n"
             f"Goal: {task['task_goal'] or ''}\n"
             f"Step {result.reviewed_step}: {step_text}{spec}\n\n"
             "Please correct before attempting to advance again"
@@ -1048,7 +1048,7 @@ def _resolve_review(
     task_id: str,
     decision: Literal["approved", "denied", "yolo"],
     reviewer: str,
-    response: Optional[str],
+    reason: Optional[str],
     notify_worker: bool,
 ):
     from hermes_cli import execution_bindings as bindings
@@ -1059,11 +1059,11 @@ def _resolve_review(
             task_id=task_id,
             decision=cast(Literal["approved", "denied", "yolo"], decision),
             reviewer=reviewer,
-            response=response,
+            reason=reason,
         )
     except (bindings.ExecutionBindingError, ValueError) as exc:
-        # ValueError carries the D7 guard: a denial whose reason is an
-        # approval token is refused at the kernel instead of recorded.
+        # ValueError carries the kernel rule: an approved review with a
+        # reason is refused (approval needs no reason).
         return f"ERROR: {exc}", None
     task = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
     if result.closed and task["plan_kind"] == "debug":
@@ -1075,7 +1075,7 @@ def _resolve_review(
         session_db = getattr(agent, "_session_db", None)
         if source is not None and session_db is not None:
             session_db.update_agent_rating(source["assignee"], 0.5)
-    message = _worker_review_message(task, result, reviewer, response)
+    message = _worker_review_message(task, result, reviewer, reason)
     if notify_worker:
         failure = _send_user(
             str(task["assignee"]), message, conn=conn, task_id=task_id
@@ -1146,7 +1146,7 @@ def cmd_advance(agent, summary: str, step: Optional[int] = None) -> str:
             task_id=result.task_id,
             decision="approved",
             reviewer="yolo",
-            response=None,
+            reason=None,
             notify_worker=False,
         )
         if reviewed is None:
@@ -1219,20 +1219,28 @@ def cmd_advance(agent, summary: str, step: Optional[int] = None) -> str:
             f"verification. Review remains pending: {non_answer}. This is NOT "
             "a review decision — do not treat it as one."
         )
-    _answer = str(response).strip().lower()
-    # "Yolo" approves this step AND enables auto-approve for the remainder of
-    # the plan, so the reviewer is never asked again. Evan's rule: yolo is a
-    # property of the human's answer, never something an agent specifies.
-    # Order matters — "Yolo" contains no "appr", so test it before the plain
-    # approve.
-    if _answer.startswith("yolo"):
+    # Decision comes ONLY from the offered choices (Evan, 2026-10-26): the
+    # decision is approved/yolo ONLY when the answer IS the offered
+    # Approve/Yolo choice. The bare "Deny" choice is a decision-only denial —
+    # its reason is its own field and is collected on its own prompt below
+    # ("Approval/Deny should be a different field than reason"). EVERY other
+    # answer — the free-text "Other, I'll describe" answer — is a DENIAL
+    # whose text is the reason, stored VERBATIM. No startswith, no
+    # normalizing, no token set, no regex.
+    if response == "Yolo":
+        # "Yolo" approves this step AND enables auto-approve for the remainder
+        # of the plan, so the reviewer is never asked again. Evan's rule: yolo
+        # is a property of the human's answer, never something an agent
+        # specifies.
         decision = "yolo"
-    else:
-        decision = "approved" if _answer.startswith("appr") else "denied"
-    response = None
-    if decision == "denied":
+        reason = None
+    elif response == "Approve":
+        decision = "approved"
+        reason = None
+    elif response == "Deny":
+        decision = "denied"
         try:
-            response = str(
+            reason = str(
                 json.loads(
                     _legacy().clarify_tool(
                         "Why is this step denied?",
@@ -1243,34 +1251,43 @@ def cmd_advance(agent, summary: str, step: Optional[int] = None) -> str:
                 ).get("user_response", "")
             ).strip()
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
-            return f"ERROR: Denial response was not recorded: {exc}"
-        if not response:
-            return "ERROR: denied review requires a response"
+            return f"ERROR: Denial reason was not recorded: {exc}"
+        if not reason:
+            return "ERROR: denied review requires a reason"
         # D6 (t_cc772a4c): same non-answer guard — an expired "Why is this
         # step denied?" prompt must not become the recorded denial reason.
-        non_answer = non_answer_response(response)
+        non_answer = non_answer_response(reason)
         if non_answer:
             return (
                 f"ERROR: denied review requires a real reason — {non_answer} "
                 "is not one. Nothing was recorded; the denial reason is still "
                 "required."
             )
-        if len(response) > 1024:
-            return "ERROR: review response must be at most 1024 characters"
+    else:
+        # The free-text answer IS the reason — stored verbatim — and a
+        # denial because approval needs no reason.
+        decision = "denied"
+        reason = str(response)
+    if reason is not None and len(reason) > 1024:
+        return "ERROR: review reason must be at most 1024 characters"
     message, _reviewed = _resolve_review(
         agent,
         conn,
         task_id=result.task_id,
         decision=cast(Literal["approved", "denied", "yolo"], decision),
         reviewer="user",
-        response=response,
+        reason=reason,
         notify_worker=False,
     )
     return message
 
 
 def cmd_review(
-    agent, task_id: Optional[str], decision: str, response: Optional[str] = None
+    agent,
+    task_id: Optional[str],
+    decision: str,
+    reason: Optional[str] = None,
+    response: Optional[str] = None,
 ) -> str:
     """Approve, deny, or yolo the dispatcher-gated pending step review.
 
@@ -1279,20 +1296,28 @@ def cmd_review(
     a reviewer holding the gate is reviewing the step on their own binding,
     and a flash-tier model drops the key when the schema reads ambiguous.
 
-    ``response`` is dual-use (the F2 unification): the denial/request-changes
-    message, or the answer to a worker's clarify/tool-limit ask when the plan
-    carries a pending flag (see ``cmd_review``'s flag handling).
+    ``reason`` is the denial/request-changes message for a ``denied`` review —
+    its own field end to end (Evan, 2026-10-26: "Approval/Deny should be a
+    different field than reason"). An approved review carries no reason.
+    ``response`` is the ANSWER to a worker's clarify/tool-limit ask when the
+    plan carries a pending flag (the F2 channel) — an answer is never a
+    reason and a reason is never a decision.
     """
     from hermes_cli import execution_bindings as bindings
 
     decision = (decision or "").strip().lower()
     if decision not in {"approved", "denied", "yolo"}:
         return "ERROR: 'review' decision must be 'approved', 'denied', or 'yolo'"
-    response = (response or "").strip() or None
-    if decision == "denied" and response is None:
-        return "ERROR: denied review requires a response"
-    if response is not None and len(response) > 1024:
-        return "ERROR: review response must be at most 1024 characters"
+    reason = (reason or "").strip() or None
+    if reason is not None and len(reason) > 1024:
+        return "ERROR: review reason must be at most 1024 characters"
+    if decision in {"approved", "yolo"} and reason is not None:
+        return (
+            "ERROR: approval needs no reason — an approved review carries no "
+            "reason; to require changes, deny the step with that as the reason"
+        )
+    if decision == "denied" and reason is None:
+        return "ERROR: denied review requires a reason"
 
     conn = _legacy()._get_kanban_db()
     if not task_id:
@@ -1322,6 +1347,12 @@ def cmd_review(
     # and the flag cleared. No pending step review is required or touched.
     flag = bindings.get_clarify_flag(conn, task_id)
     if flag is not None:
+        if reason is not None:
+            return (
+                f"ERROR: Plan {task_id} has a pending ask from the worker — "
+                "answer it with 'response'; 'reason' is the review denial "
+                "message and is never an ask answer"
+            )
         if not response:
             return (
                 f"ERROR: Plan {task_id} has a pending {flag.get('kind', 'clarify')} "
@@ -1358,6 +1389,17 @@ def cmd_review(
             f"(Step {step_no}, {kind})."
         )
 
+    if response is not None:
+        # An answer is never a reason: 'response' is the F2 ask-answer field
+        # and nothing here is being asked. Refuse instead of silently
+        # dropping it or letting it become a denial reason.
+        return (
+            "ERROR: 'response' answers a worker's pending tool-limit/clarify "
+            f"ask and Plan {task_id} has none pending — nothing was recorded. "
+            "A review is decision + reason ('plan review "
+            f"{task_id} denied <reason>')."
+        )
+
     pending = bindings.pending_step_review(conn, task_id)
     if pending is None:
         # D3 (t_cc772a4c): a Plan awaiting approval has no step review — the
@@ -1376,14 +1418,6 @@ def cmd_review(
             and task["block_kind"] == "approval"
         ):
             approve = decision in ("approved", "yolo")
-            # D7 (t_cc772a4c): a denial whose reason is an approval token is a
-            # self-contradicting record — refuse before writing it.
-            if not approve and bindings.review_response_is_approval_token(response):
-                return (
-                    f"ERROR: denial reason {str(response)!r} is an approval "
-                    "token; nothing was recorded — if the plan should pass, "
-                    f"run 'plan review {task_id} approved' (or 'yolo')."
-                )
             try:
                 with write_txn(conn):
                     if decision == "yolo":
@@ -1396,7 +1430,7 @@ def cmd_review(
                         task_id,
                         "approved" if approve else "denied",
                         _actor(agent),
-                        reason=None if approve else response,
+                        reason=None if approve else reason,
                     )
                     if not approve:
                         conn.execute(
@@ -1420,7 +1454,7 @@ def cmd_review(
                 )
             else:
                 worker_message = (
-                    f"Plan {task_id} was denied by {reviewer}: {response}"
+                    f"Plan {task_id} was denied by {reviewer}: {reason}"
                 )
             suffix = ""
             if assignee:
@@ -1439,7 +1473,7 @@ def cmd_review(
         task_id=task_id,
         decision=cast(Literal["approved", "denied", "yolo"], decision),
         reviewer=reviewer,
-        response=response,
+        reason=reason,
         notify_worker=True,
     )
     if result is None:
@@ -2058,14 +2092,35 @@ def cmd_approve(agent, task_id: str) -> str:
     undelivered = undeliverable_approval_response(task_id, response)
     if undelivered:
         return undelivered
-    _answer = str(response or "").strip().lower()
-    _stop_asking = _answer.startswith("yolo")
-    if not _answer or not (_stop_asking or _answer.startswith("appr")):
+    # Decision comes ONLY from the offered choices (Evan, 2026-10-26):
+    # approved/yolo ONLY when the answer IS the offered Approve/Yolo choice;
+    # EVERY other answer is a DENIAL whose text is stored verbatim as the
+    # reason. No startswith, no normalizing, no token set, no regex.
+    if not response:
         return f"Plan awaiting approval ({task_id}): no approval was recorded."
+    _stop_asking = response == "Yolo"
+    if not (_stop_asking or response == "Approve"):
+        # The "Deny" choice and the free-text "Other, I'll describe" answer
+        # alike are denials; the answer text is the reason, verbatim (an
+        # empty answer is not an answer and keeps the plan awaiting).
+        from hermes_cli import plan_authorizations
+
+        try:
+            with write_txn(conn):
+                plan_authorizations.resolve_plan_in_txn(
+                    conn, task_id, "denied", _actor(agent), reason=str(response)
+                )
+                conn.execute(
+                    "UPDATE tasks SET status='archived', completed_at=? "
+                    "WHERE id=? AND status='blocked'",
+                    (int(time.time()), task_id),
+                )
+        except (bindings.ExecutionBindingError, sqlite3.Error, ValueError) as exc:
+            return f"ERROR: Failed to resolve Plan approval: {exc}"
+        return f"Plan denied ({task_id}): {response}."
     # "Yolo" also enables auto-approve for the whole plan, so the reviewer is
     # not asked again at each step. Evan's rule: yolo is a property of the
-    # human's answer, never something an agent specifies. "Yolo" contains no
-    # "appr", so it must be matched before the plain-approve test above.
+    # human's answer, never something an agent specifies.
     try:
         key = _identity(agent)
         current = bindings.get_binding(conn, key)
@@ -2243,9 +2298,11 @@ def _step_run_history(conn, task_id: str) -> dict[int, list[str]]:
                 f"{payload.get('summary', '')}"
             )
         elif kind == "plan-step-review-denied":
+            # The reason field is 'reason' end to end (2026-10-26); events
+            # written before the rename carry 'response' — legacy read only.
             entry = (
                 f"denied ({stamp}, {payload.get('reviewer', '')}): "
-                f"{payload.get('response', '')}"
+                f"{payload.get('reason', payload.get('response', ''))}"
             )
         else:
             yolo = ", yolo" if payload.get("auto_approve_enabled") else ""

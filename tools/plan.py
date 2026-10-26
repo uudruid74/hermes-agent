@@ -1323,9 +1323,11 @@ def plan(
         # task_id is omittable (Evan 2026-10-24): with none given,
         # cmd_review gates the ACTIVE plan on the caller's binding and says
         # so when nothing is bound. Explicit task_id behaves as always.
+        # decision + reason are the review fields (reason is never parsed
+        # into a decision); response answers a pending worker ask only.
         if not decision:
             return "ERROR: 'review' requires decision"
-        return _cmd_review(agent, task_id, decision, response)
+        return _cmd_review(agent, task_id, decision, reason=reason, response=response)
 
     elif command == "repeat":
         return _cmd_repeat(
@@ -1450,11 +1452,11 @@ PLAN_SCHEMA = {
             },
             "reason": {
                 "type": "string",
-                "description": "Failure reason for 'fail'. For 'repeat', the step's fix directive context.",
+                "description": "Failure reason for 'fail'. For 'repeat', the step's fix directive context. For 'review': the denial/changes message (say what must change) — required when decision is 'denied', stored VERBATIM and never refused for its wording. An approved review carries NO reason (approval needs no reason) — passing one is refused.",
             },
             "response": {
                 "type": "string",
-                "description": "The denial message for a 'denied' review (say what must change — required when denying), or the answer to a worker's pending tool-limit/clarify ask. Limited to 1024 characters. For an 'approved' review it is only that ask-answer; leave it out otherwise.",
+                "description": "The answer to a worker's pending tool-limit/clarify ask ('review' while the plan carries a pending ask). Never a review decision and never a denial reason — a review is decision + reason. Limited to 1024 characters.",
             },
             "task_id": {
                 "type": "string",

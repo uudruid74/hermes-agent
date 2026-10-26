@@ -405,10 +405,10 @@ def test_expired_review_ask_is_recorded_as_nothing(monkeypatch):
     )
 
 
-def test_denial_with_approval_token_reason_is_refused(monkeypatch):
-    """D7 (t_cc772a4c addendum): event 23192 recorded a denial whose response
-    was "Approved".  A self-contradicting review record must be REFUSED at the
-    kernel; a real denial reason still records."""
+def test_denial_with_approval_shaped_reason_records_verbatim(monkeypatch):
+    """Pin (e) (Evan, 2026-10-26): decision and reason are separate fields —
+    a denial whose reason is approval-shaped prose is RECORDED verbatim with
+    NO refusal. The deleted approval-token guard refused exactly this."""
     conn = _db()
     task_id = _seed_plan(conn)
     monkeypatch.setattr(plan, "_get_kanban_db", lambda board=None: conn)
@@ -420,13 +420,68 @@ def test_denial_with_approval_token_reason_is_refused(monkeypatch):
     submitted = plan_binding_adapter.cmd_advance(worker, summary="step one done")
     assert "Pause and wait" in submitted, submitted
     reviewer = _Agent("zephyr", REVIEWER_SESSION)
-    refused = plan_binding_adapter.cmd_review(reviewer, task_id, "denied", "Approved")
+    recorded = plan_binding_adapter.cmd_review(reviewer, task_id, "denied", "Approved")
+    assert not recorded.startswith("ERROR:"), recorded
+    assert "denied" in recorded.lower(), recorded
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=?"
+        " AND kind='plan-step-review-denied'",
+        (task_id,),
+    ).fetchone()
+    assert row is not None, "the denial must be recorded, not refused"
+    assert json.loads(row[0])["reason"] == "Approved"
+    body = conn.execute(
+        "SELECT body FROM task_comments WHERE task_id=?"
+        " AND body LIKE '[plan-step-denial:1] %'",
+        (task_id,),
+    ).fetchone()
+    assert body[0] == "[plan-step-denial:1] Approved"
+    # The log is append-only: the original pending event remains, but the
+    # latest review event is the denial — the review is resolved.
+    assert conn.execute(
+        "SELECT count(*) FROM task_events WHERE task_id=?"
+        " AND kind='plan-step-review-pending'",
+        (task_id,),
+    ).fetchone()[0] == 1
+
+
+def test_approved_review_with_reason_is_refused(monkeypatch):
+    """Pin (f) (Evan, 2026-10-26): approval needs no reason — an approved
+    review carrying one is refused and nothing is recorded."""
+    conn = _db()
+    task_id = _seed_plan(conn)
+    monkeypatch.setattr(plan, "_get_kanban_db", lambda board=None: conn)
+    monkeypatch.setattr(
+        "hermes_cli._subprocess_compat.spawn_detached",
+        lambda argv, **kw: SimpleNamespace(pid=1),
+    )
+    worker = _Agent("ornith", WORKER_SESSION)
+    submitted = plan_binding_adapter.cmd_advance(worker, summary="step one done")
+    assert "Pause and wait" in submitted, submitted
+    reviewer = _Agent("zephyr", REVIEWER_SESSION)
+    refused = plan_binding_adapter.cmd_review(
+        reviewer, task_id, "approved", "looks good to me"
+    )
     assert refused.startswith("ERROR:"), refused
-    assert "approval token" in refused
+    assert "approval needs no reason" in refused
+    # The kernel enforces the same rule directly — no caller can write one.
+    from hermes_cli import execution_bindings as bindings
+
+    try:
+        bindings.review_plan_step(
+            conn,
+            task_id=task_id,
+            decision="approved",
+            reviewer="zephyr",
+            reason="looks good to me",
+        )
+        raise AssertionError("kernel must refuse a reason on an approved review")
+    except ValueError as exc:
+        assert "approval needs no reason" in str(exc)
     assert (
         conn.execute(
             "SELECT count(*) FROM task_events WHERE task_id=?"
-            " AND kind='plan-step-review-denied'",
+            " AND kind IN ('plan-step-review-approved','plan-step-review-denied')",
             (task_id,),
         ).fetchone()[0]
         == 0
@@ -437,19 +492,6 @@ def test_denial_with_approval_token_reason_is_refused(monkeypatch):
         " AND kind='plan-step-review-pending'",
         (task_id,),
     ).fetchone()[0] == 1
-    # A genuine denial records normally.
-    ok = plan_binding_adapter.cmd_review(
-        reviewer, task_id, "denied", "the tests fail on disk"
-    )
-    assert "denied" in ok.lower(), ok
-    assert (
-        conn.execute(
-            "SELECT count(*) FROM task_events WHERE task_id=?"
-            " AND kind='plan-step-review-denied'",
-            (task_id,),
-        ).fetchone()[0]
-        == 1
-    )
 
 
 def test_child_close_restores_parked_parent_and_parent_advances(monkeypatch):

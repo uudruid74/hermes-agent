@@ -40,7 +40,7 @@ def test_deny_stores_reason_and_remind_renders_it(monkeypatch):
         "review",
         task_id=task_id,
         decision="denied",
-        response="Missing game_logic import — NameError on init().",
+        reason="Missing game_logic import — NameError on init().",
     )
     assert result == f"Task {task_id} Step 1 denied. Worker notified."
 
@@ -76,7 +76,7 @@ def test_active_plan_compression_context_includes_denial(monkeypatch):
     plan.plan(worker, "advance", summary="did the step", step=1)
     plan.plan(
         dispatcher, "review", task_id=task_id, decision="denied",
-        response="view() shadows builtin list — use fetchall() result directly.",
+ reason="view() shadows builtin list — use fetchall() result directly.",
     )
 
     contexts = plan_binding_adapter.active_plan_compression_context(worker)
@@ -91,12 +91,12 @@ def test_repeated_denial_replaces_reason(monkeypatch):
     plan = __import__("tools.plan", fromlist=["plan"])
     plan.plan(worker, "advance", summary="attempt 1", step=1)
     plan.plan(
-        dispatcher, "review", task_id=task_id, decision="denied", response="first defect"
+        dispatcher, "review", task_id=task_id, decision="denied", reason="first defect"
     )
     plan.plan(worker, "advance", summary="attempt 2", step=1)
     sent.clear()
     plan.plan(
-        dispatcher, "review", task_id=task_id, decision="denied", response="second defect — worse"
+        dispatcher, "review", task_id=task_id, decision="denied", reason="second defect — worse"
     )
 
     rows = conn.execute(
@@ -113,7 +113,7 @@ def test_approval_clears_denial(monkeypatch):
     plan = __import__("tools.plan", fromlist=["plan"])
     plan.plan(worker, "advance", summary="first try", step=1)
     plan.plan(
-        dispatcher, "review", task_id=task_id, decision="denied", response="defect A"
+        dispatcher, "review", task_id=task_id, decision="denied", reason="defect A"
     )
     plan.plan(worker, "advance", summary="fixed", step=1)
     sent.clear()
@@ -145,7 +145,7 @@ def test_denial_reason_is_verbatim_not_capped(monkeypatch):
     verdict = "x" * 1000 + " THE-END-MARKER"
     plan.plan(
         dispatcher, "review", task_id=task_id, decision="denied",
-        response=verdict,
+ reason=verdict,
     )
     row = conn.execute(
         "SELECT body FROM task_comments WHERE task_id=? "
