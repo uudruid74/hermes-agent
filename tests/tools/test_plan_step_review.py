@@ -18,6 +18,9 @@ class _SessionDB:
     def get_compression_root(self, session_id: str) -> str:
         return f"root:{session_id}"
 
+    def set_session_mood(self, session_id, delta):
+        return 0.0
+
     def set_session_task_id(self, session_id: str, task_id: str | None) -> None:
         self.task_ids.append((session_id, task_id))
 
@@ -634,6 +637,69 @@ def test_attention_request_carries_active_step_expansion(monkeypatch):
     assert "[X] Step 1: first\n[-] Step 2: second" in message
     assert f"[-] Step 2: second\n\n{spec}\n[ ] Step 3: third" in message
     assert "first\n\n" not in message  # no spec under inactive steps
+
+
+def _null_stepno(conn, task_id):
+    """Put a plan in the fail->continue / reviewer-reset state: task_stepno
+    NULL, which _steps_for_task documents as 'fresh/unstarted -> Step 1'."""
+    conn.execute("UPDATE tasks SET task_stepno = NULL WHERE id = ?", (task_id,))
+    conn.commit()
+
+
+def test_review_approve_on_null_stepno_advances_to_step_2(monkeypatch):
+    """Regression (bug doc 2026-10-25): the review CAS compared
+    ``task_stepno = 1`` and ``NULL = 1`` is never true in SQL, so every
+    review of a fail->continue plan raised 'plan ... changed during review'
+    forever. The read path treats NULL as Step 1; the guard must agree."""
+    conn, _sent, worker, dispatcher, task_id = _delegated_plan(monkeypatch)
+    _null_stepno(conn, task_id)
+    result = plan.plan(worker, "advance", summary="step one done", step=1)
+    assert not result.startswith("ERROR:"), result
+    result = plan.plan(dispatcher, "review", task_id=task_id, decision="approved")
+    assert not result.startswith("ERROR:"), result
+    row = conn.execute(
+        "SELECT task_stepno FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    assert row["task_stepno"] == 2
+
+
+def test_review_deny_on_null_stepno_reopens_step_1(monkeypatch):
+    conn, _sent, worker, dispatcher, task_id = _delegated_plan(monkeypatch)
+    _null_stepno(conn, task_id)
+    plan.plan(worker, "advance", summary="step one done", step=1)
+    result = plan.plan(
+        dispatcher,
+        "review",
+        task_id=task_id,
+        decision="denied",
+        response="add the missing test",
+    )
+    assert not result.startswith("ERROR:"), result
+    row = conn.execute(
+        "SELECT body FROM task_comments WHERE task_id=? "
+        "AND body LIKE '[plan-step-denial:1]%'",
+        (task_id,),
+    ).fetchone()
+    assert row is not None and "add the missing test" in row["body"]
+    # Denied leaves the same step active; NULL still reads as Step 1.
+    row = conn.execute(
+        "SELECT task_stepno FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    assert row["task_stepno"] in (None, 1)
+
+
+def test_close_on_null_stepno_does_not_raise(monkeypatch):
+    """Same guard shape in _close_plan_in_txn: a fail->continue plan reaches
+    close with task_stepno NULL and must close cleanly."""
+    conn, _sent, worker, _dispatcher, task_id = _delegated_plan(monkeypatch)
+    _null_stepno(conn, task_id)
+    result = plan.plan(worker, "fail", reason="cannot proceed")
+    assert not result.startswith("ERROR:"), result
+    row = conn.execute(
+        "SELECT status, task_stepno FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    assert row["status"] == "archived"
+    assert row["task_stepno"] is None
 
 
 def test_summary_reaches_the_reviewer_whole(monkeypatch):

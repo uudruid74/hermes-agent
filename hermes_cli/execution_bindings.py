@@ -660,9 +660,13 @@ def _close_plan_in_txn(
         "VALUES (?, ?, ?, ?)",
         (current.task_id, actor, note, now),
     )
+    # NULL-tolerant CAS (bug 2026-10-25): NULL task_stepno reads as Step 1 per
+    # _steps_for_task — a fail->continue plan reaches close in exactly that
+    # state and must not wedge ("changed during closure").
     changed = conn.execute(
         "UPDATE tasks SET status = ?, completed_at = ?, task_stepno = NULL "
-        "WHERE id = ? AND status = 'manual' AND task_stepno = ?",
+        "WHERE id = ? AND status = 'manual' "
+        "AND (task_stepno = ? OR task_stepno IS NULL)",
         (terminal_status, now, current.task_id, step_no),
     ).rowcount
     if changed != 1:
@@ -1171,9 +1175,15 @@ def review_plan_step(
                 auto_approve_enabled=decision == "yolo",
             )
         else:
+            # NULL-tolerant CAS (bug 2026-10-25, zephyr's doc): _steps_for_task
+            # documents NULL task_stepno as "fresh/unstarted -> Step 1", so the
+            # guard must accept NULL as the current step or every review of a
+            # fail->continue plan wedges here forever ("plan ... changed during
+            # review") — NULL = 1 is never true in SQL.
             changed = conn.execute(
                 "UPDATE tasks SET task_stepno = ? "
-                "WHERE id = ? AND status = 'manual' AND task_stepno = ?",
+                "WHERE id = ? AND status = 'manual' "
+                "AND (task_stepno = ? OR task_stepno IS NULL)",
                 (step_no + 1, task_id, step_no),
             ).rowcount
             if changed != 1:
