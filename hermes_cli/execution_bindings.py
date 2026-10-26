@@ -1072,6 +1072,22 @@ def advance_plan(
     )
 
 
+# Closed approval-token set (t_853aa789): the guard matches whole answer
+# TOKENS, not prefixes — denial prose beginning "appr..." ("Approach is
+# wrong: ...", "approximate row count is off") must stay a legitimate denial.
+_APPROVAL_TOKENS = frozenset(
+    {
+        "approve",
+        "approved",
+        "approve it",
+        "approve this step",
+        "lgtm",
+        "yolo",
+        "yes",
+    }
+)
+
+
 def review_response_is_approval_token(text) -> bool:
     """True when *text* would parse as an APPROVAL on the review channels.
 
@@ -1079,13 +1095,18 @@ def review_response_is_approval_token(text) -> bool:
     whose response was literally "Approved" — the ``/review <id> <answer>``
     clarify channel and ``plan review``'s decision enum share the word
     "review", and a reviewer answering "Approved" was captured as a DENIAL
-    reason.  The token rule mirrors the approval parsers
-    (``startswith("appr")`` / ``startswith("yolo")``): any text that would
-    have approved must never be stored as a denial reason — a
-    self-contradicting review record is worse than a refused one.
+    reason.  Any text that is plainly an approval answer must never be
+    stored as a denial reason — a self-contradicting review record is worse
+    than a refused one.
+
+    Tokens, not prefixes (t_853aa789): the trimmed answer is normalized
+    (lowercased, trailing punctuation stripped, whitespace collapsed) and
+    matched against the closed set ``_APPROVAL_TOKENS``.  The former prefix
+    rule (``startswith("appr")`` / ``startswith("yolo")``) false-positived
+    on ordinary denial prose and refused legitimate denials.
     """
-    answer = str(text or "").strip().lower()
-    return answer.startswith("appr") or answer.startswith("yolo")
+    answer = " ".join(str(text or "").strip().lower().rstrip(".,!?;:").split())
+    return answer in _APPROVAL_TOKENS
 
 
 def review_plan_step(

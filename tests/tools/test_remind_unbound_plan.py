@@ -27,7 +27,8 @@ def _db():
             id TEXT PRIMARY KEY, title TEXT, body TEXT, assignee TEXT,
             status TEXT, workspace_kind TEXT, workspace_path TEXT,
             task_steps TEXT, task_stepno INTEGER, task_goal TEXT,
-            created_at INTEGER, created_by TEXT
+            created_at INTEGER, created_by TEXT,
+            previous_task TEXT, dispatcher TEXT
         );
         CREATE TABLE execution_bindings (
             profile TEXT, root_session_id TEXT, task_id TEXT,

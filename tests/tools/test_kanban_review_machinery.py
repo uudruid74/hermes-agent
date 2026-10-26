@@ -74,6 +74,12 @@ def test_send_dispatcher_message_event_first_then_ping(monkeypatch):
         "spawn_detached",
         lambda argv, **kw: sent.append(argv) or SimpleNamespace(),
     )
+    # Wake-time profile gate (D1, t_cc772a4c): under pytest the conftest
+    # HERMES_HOME sandbox makes profile_exists('gopher') False, so the gate
+    # must be stubbed to the wakeable contract this test exercises.
+    monkeypatch.setattr(
+        "hermes_cli.profiles.profile_exists", lambda name: name == "gopher"
+    )
     ok, detail = kb.send_dispatcher_message(
         conn,
         tid,
@@ -95,6 +101,42 @@ def test_send_dispatcher_message_event_first_then_ping(monkeypatch):
     assert json.loads(event["payload"])["text"] == "please review"
     # ping went to the AI creator (gopher != assignee neo)
     assert sent and sent[0][3] == "gopher"
+
+
+def test_send_dispatcher_message_not_wakeable_profile_records_ask_no_spawn(
+    monkeypatch,
+):
+    """The D1 gate's other half: a resolved recipient that is NOT a wakeable
+    agent profile must still record the durable ask, return the
+    'not a wakeable agent profile' detail, and never spawn a wake."""
+    conn = _conn()
+    tid = _task(conn)
+    sent: list[list[str]] = []
+    from hermes_cli import _subprocess_compat
+
+    monkeypatch.setattr(
+        _subprocess_compat,
+        "spawn_detached",
+        lambda argv, **kw: sent.append(argv) or SimpleNamespace(),
+    )
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda name: False)
+    ok, detail = kb.send_dispatcher_message(
+        conn,
+        tid,
+        direction="to-dispatcher",
+        kind="review-requested",
+        text="please review",
+        actor="worker",
+    )
+    assert ok
+    assert "not a wakeable agent profile" in detail
+    assert not sent
+    event = conn.execute(
+        "SELECT kind, payload FROM task_events WHERE task_id=? ORDER BY id DESC LIMIT 1",
+        (tid,),
+    ).fetchone()
+    assert event["kind"] == "review-review-requested"
+    assert json.loads(event["payload"])["text"] == "please review"
 
 
 def test_send_dispatcher_message_self_dispatched_has_no_target(monkeypatch):

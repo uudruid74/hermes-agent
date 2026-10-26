@@ -3935,11 +3935,25 @@ def sticky_dispatcher_for_task(
     Returned names are agent-profile names only (human/CLI labels filtered);
     wake-time ``profiles.profile_exists`` validation happens where a wake
     target is produced.  No profile names are hardcoded.
+
+    Column-tolerant (t_853aa789): legacy/hand-rolled ``tasks`` schemas may
+    lack ``previous_task``/``dispatcher`` — one ``PRAGMA table_info`` pass
+    builds the SELECT from the columns actually present and reads absent
+    ones as NULL, so the chain degrades to its remaining links instead of
+    raising ``sqlite3.OperationalError`` into display paths (``plan remind``
+    via ``_reviewer_identity``).  Matches house style
+    (``_task_from_row`` guards with ``x in keys``).
     """
+    present = {
+        str(info[1])
+        for info in conn.execute("PRAGMA table_info(tasks)").fetchall()
+    }
+    select = ", ".join(
+        (col if col in present else "NULL") + f" AS {col}"
+        for col in ("created_by", "assignee", "previous_task", "dispatcher")
+    )
     row = conn.execute(
-        "SELECT created_by, assignee, previous_task, dispatcher FROM tasks"
-        " WHERE id = ?",
-        (task_id,),
+        f"SELECT {select} FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
     if row is None:
         return None
@@ -3955,9 +3969,7 @@ def sticky_dispatcher_for_task(
             break
         visited.add(nxt)
         node = conn.execute(
-            "SELECT created_by, assignee, previous_task, dispatcher FROM tasks"
-            " WHERE id = ?",
-            (nxt,),
+            f"SELECT {select} FROM tasks WHERE id = ?", (nxt,)
         ).fetchone()
     origin = get_origin_routing(conn, task_id)
     if origin:
