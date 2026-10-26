@@ -218,12 +218,12 @@ def _cmd_new(agent, title: str, goal: str, steps: List[str],
                     (id, title, body, status, assignee, created_at,
                      task_steps, task_stepno, task_goal, block_kind,
                      prev_temperature, previous_task, session_id, board,
-                     plan_kind, pre_approved)
+                     plan_kind, pre_approved, created_by)
                 VALUES
                     (:id, :title, :body, :status, :assignee, :created_at,
                      :task_steps, 1, :task_goal, :block_kind,
                      :prev_temp, :prev_task, :session_id, :board,
-                     :plan_kind, :pre_approved)
+                     :plan_kind, :pre_approved, :created_by)
             """, {
                 "id": task_id, "title": title, "body": plan_text,
                 "assignee": agent_name, "created_at": int(time.time()),
@@ -234,9 +234,18 @@ def _cmd_new(agent, title: str, goal: str, steps: List[str],
                 "board": _resolve_board(board),
                 "plan_kind": kind,
                 "pre_approved": int(bool(pre_approved)),
+                "created_by": agent_name,
                 "status": "manual" if kind == "debug" and pre_approved else "blocked",
                 "block_kind": None if kind == "debug" and pre_approved else "approval",
             })
+            # D2 (t_cc772a4c): durable sticky-dispatcher stamp — this INSERT
+            # historically wrote no created_by at all, so self-created child
+            # plans resolved no dispatcher and fell back to the human.
+            from hermes_cli.kanban_db import stamp_task_dispatcher
+
+            stamp_task_dispatcher(
+                conn, task_id, parent_task_id=debug_plan_id or current_task_id
+            )
             conn.commit()
             if kind == "debug":
                 source_task_id = debug_plan_id or current_task_id

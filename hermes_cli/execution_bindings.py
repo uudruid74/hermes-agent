@@ -715,6 +715,17 @@ def _close_plan_in_txn(
                 "WHERE id = ? AND status = 'blocked'",
                 (previous_task_id,),
             )
+        elif parent["status"] == "attention":
+            # Parked parent (tool-limit park; t_cc772a4c addendum): a child
+            # closing must restore its parent even while the parent is parked
+            # in ``attention`` — refusing here deadlocked the nesting chain
+            # (child can't close without review, parent can't advance without
+            # the binding).  Same restore semantics as the parked continue:
+            # the rebind lands the parent back in ``manual``.
+            conn.execute(
+                "UPDATE tasks SET status = 'manual' WHERE id = ? AND status = 'attention'",
+                (previous_task_id,),
+            )
         elif parent["status"] not in {"manual", "running"}:
             raise InvalidTaskState(
                 f"parent {previous_task_id} is not executable "
@@ -1061,6 +1072,22 @@ def advance_plan(
     )
 
 
+def review_response_is_approval_token(text) -> bool:
+    """True when *text* would parse as an APPROVAL on the review channels.
+
+    D7 (t_cc772a4c addendum): event 23192 recorded a ``plan-step-review-denied``
+    whose response was literally "Approved" — the ``/review <id> <answer>``
+    clarify channel and ``plan review``'s decision enum share the word
+    "review", and a reviewer answering "Approved" was captured as a DENIAL
+    reason.  The token rule mirrors the approval parsers
+    (``startswith("appr")`` / ``startswith("yolo")``): any text that would
+    have approved must never be stored as a denial reason — a
+    self-contradicting review record is worse than a refused one.
+    """
+    answer = str(text or "").strip().lower()
+    return answer.startswith("appr") or answer.startswith("yolo")
+
+
 def review_plan_step(
     conn: sqlite3.Connection,
     *,
@@ -1077,6 +1104,15 @@ def review_plan_step(
     """
     if decision not in {"approved", "denied", "yolo"}:
         raise ValueError("decision must be 'approved', 'denied', or 'yolo'")
+    # D7 (t_cc772a4c): a denial whose reason is an approval token is a
+    # self-contradicting record — refuse it at the kernel so no caller can
+    # write one (event 23192 recorded response="Approved" on a denial).
+    if decision == "denied" and review_response_is_approval_token(response):
+        raise ValueError(
+            f"denial reason {str(response)!r} is an approval token; refusing to "
+            "record a self-contradicting denial — if the step should pass, "
+            "review it as 'approved' or 'yolo'"
+        )
     with write_txn(conn):
         pending = pending_step_review(conn, task_id)
         if pending is None:
@@ -1323,6 +1359,25 @@ def continue_plan(
         if task["status"] not in ("manual", "archived", "blocked", "attention"):
             raise InvalidTaskState(
                 f"plan {plan_id} cannot continue from status {task['status']}"
+            )
+        # D5 (t_cc772a4c): the authorization gate must not fail open.  A plan
+        # carrying a durable authorization may only continue when that
+        # authorization is APPROVED (``_authorization_is_valid``: approved, or
+        # the pre-approved debug shortcut) — a PENDING one is exactly how
+        # t_b085ce41 ran unreviewed.  Rows with NO authorization row predate
+        # the authorization system (legacy plans; 238 live rows at fix time)
+        # and keep their existing continue behaviour.  This gates on
+        # authorization STATE, not task status: the delegated flow
+        # (780f7f99cc) deliberately continues a ``blocked`` plan whose
+        # authorization the creator already resolved as approved.
+        auth_row = conn.execute(
+            "SELECT state FROM plan_authorizations WHERE plan_id = ?",
+            (plan_id,),
+        ).fetchone()
+        if auth_row is not None and not _authorization_is_valid(conn, task):
+            raise PlanAuthorizationRequired(
+                f"plan {plan_id} authorization is "
+                f"{str(auth_row['state'] or 'unknown')}, not approved"
             )
         from_status: str = task["status"]
         _steps_for_task(task)

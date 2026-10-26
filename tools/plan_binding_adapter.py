@@ -62,6 +62,28 @@ def render_approval_prompt(task_id: str, title: str, goal: str, steps) -> str:
     return "\n".join(lines)
 
 
+def non_answer_response(response) -> Optional[str]:
+    """Return the non-answer notice when *response* is not a human answer.
+
+    Two sentinels must never be parsed as a review decision (D6,
+    t_cc772a4c): the gateway's stand-down string (clarify timeout or
+    session-boundary cancellation) and the transport-failure marker (the
+    clarify prompt was never delivered).  An empty response is the caller's
+    existing park-the-worker case and is handled before this runs.  Without
+    these checks an expired ask in the step-review path was recorded as a
+    DENIAL whose "reason" was the stand-down text itself — absence of
+    evidence treated as evidence (the run-7 family).
+    """
+    from tools.clarify_gateway import CLARIFY_UNDELIVERABLE_MARKER
+
+    text = str(response or "")
+    if CLARIFY_UNDELIVERABLE_MARKER in text:
+        return "the clarify prompt could not be delivered (transport failure)"
+    if text.strip().lower().startswith("user unavailable"):
+        return "no answer arrived (the prompt expired or the session reset)"
+    return None
+
+
 def undeliverable_approval_response(task_id: str, response) -> Optional[str]:
     """Return the transport-failure message when ``response`` is not an answer.
 
@@ -156,6 +178,7 @@ def _insert_request(
     to ``task_steps``.
     """
     from hermes_cli import plan_authorizations
+    from hermes_cli.kanban_db import stamp_task_dispatcher
     from hermes_cli.plan_limits import cap_expansions, cap_goal, cap_steps
 
     goal = cap_goal(goal)
@@ -181,6 +204,16 @@ def _insert_request(
             body_lines.append("   Spec:")
             body_lines.extend(f"   {line}" for line in expansion.splitlines())
     body = "\n".join(body_lines)
+    # D4 (t_cc772a4c): a child Plan created with no explicit board inherits
+    # its PARENT's board — t_b085ce41 landed on 'default' while its parent
+    # lived on 'pente'.  Explicit boards are honoured as given.
+    resolved_board = legacy._resolve_board(board)
+    if not (board or "").strip() and parent_task_id:
+        parent_row = conn.execute(
+            "SELECT board FROM tasks WHERE id = ?", (parent_task_id,)
+        ).fetchone()
+        if parent_row is not None and (parent_row["board"] or "").strip():
+            resolved_board = str(parent_row["board"]).strip()
     conn.execute(
         """
         INSERT INTO tasks (
@@ -202,7 +235,7 @@ def _insert_request(
             getattr(agent, "_session_temperature", None),
             parent_task_id,
             getattr(agent, "session_id", None),
-            legacy._resolve_board(board),
+            resolved_board,
             kind,
             int(bool(pre_approved)),
             legacy._get_agent_name(agent),
@@ -218,7 +251,7 @@ def _insert_request(
                 "steps": steps,
                 "kind": "manual",
                 "assign": task_assignee,
-                "board": legacy._resolve_board(board),
+                "board": resolved_board,
                 "root": None,
                 "cron": None,
                 "resume": None,
@@ -255,6 +288,10 @@ def _insert_request(
                 task_id,
                 exc,
             )
+    # D2 (t_cc772a4c): durable sticky-dispatcher stamp, written at creation
+    # so the dispatcher survives parent archival, board moves, and nesting
+    # depth.  Also inherits the parent's origin routing for use-time wakes.
+    stamp_task_dispatcher(conn, task_id, parent_task_id=parent_task_id)
     if kind == "debug" and debug_plan_id:
         linked = conn.execute(
             "UPDATE tasks SET debug_plan_id=? WHERE id=?",
@@ -445,6 +482,40 @@ def _create_plan(
         return f"ERROR: Failed to create Plan: {exc}"
 
     if not approved:
+        # D3 (t_cc772a4c): when the STICKY dispatcher is an agent other than
+        # the creator, the approval belongs to that dispatcher — durable ask
+        # + wake (``send_dispatcher_message``), answered through
+        # ``plan review <task_id> approved|denied|yolo``.  The interactive
+        # callback stays for the human gate (no agent dispatcher resolves, or
+        # self-dispatch: the resolved dispatcher IS the creator — the callback
+        # carries the choices/buttons, t_c02fc2cd).
+        from hermes_cli.kanban_db import send_dispatcher_message
+
+        dispatcher = _dispatcher_for_task(conn, task_id)
+        if dispatcher and dispatcher.casefold() != creator_agent_name.casefold():
+            prompt = render_approval_prompt(task_id, title, goal, steps)
+            text = (
+                f"{task_id} → {creator_agent_name} created a Plan that needs "
+                f"YOUR approval — you are its dispatcher.\n\n{prompt}\n\n"
+                "Approve, deny, or yolo it with:\n"
+                f"  plan review {task_id} approved|denied|yolo\n"
+                "A denial must include a response "
+                f"('plan review {task_id} denied <reason>')."
+            )
+            ok, detail = send_dispatcher_message(
+                conn,
+                task_id,
+                direction="to-dispatcher",
+                kind="approval",
+                text=text,
+                actor=creator_agent_name,
+            )
+            suffix = "" if ok else f" Delivery problem: {detail}."
+            return (
+                f"Plan awaiting approval ({task_id}): routed to dispatcher "
+                f"{dispatcher}.{suffix} Park and wait for the review — do not "
+                "work the plan until it arrives."
+            )
         callback = getattr(agent, "clarify_callback", None)
         if callback is None:
             return f"Plan awaiting approval ({task_id}): no approval callback is available."
@@ -697,31 +768,16 @@ def block_active_plan_at_iteration_limit(agent, *, used: int, maximum: int) -> b
 def _dispatcher_for_task(conn, task_id: str) -> Optional[str]:
     """Resolve the AI dispatcher that reviews this Plan's steps.
 
-    A delegated Plan has a creator distinct from its assignee — that creator
-    is the dispatcher.  A self-created Plan's creator IS its assignee, so
-    there is no AI dispatcher and the user becomes the approval gate.
-
-    Prefer the durable ``tasks.created_by`` column (stamped unconditionally
-    at insert); fall back to the origin-routing system comment for legacy
-    Plans created before ``created_by`` was populated.
+    Thin wrapper over the canonical STICKY resolver
+    (``hermes_cli.kanban_db.sticky_dispatcher_for_task``): the durable
+    ``tasks.dispatcher`` stamp first, then ``created_by``, the
+    ``previous_task`` ancestor walk, and finally origin routing.  A
+    self-created Plan's creator IS its assignee, so there is no AI
+    dispatcher and the user becomes the approval gate.
     """
-    task = conn.execute(
-        "SELECT created_by, assignee FROM tasks WHERE id = ?", (task_id,)
-    ).fetchone()
-    creator = str(task["created_by"] or "").strip() if task is not None else ""
-    assignee = str(task["assignee"] or "").strip() if task is not None else ""
-    if creator and creator.casefold() != assignee.casefold():
-        return creator
+    from hermes_cli.kanban_db import sticky_dispatcher_for_task
 
-    from hermes_cli.kanban_db import get_origin_routing
-
-    origin = get_origin_routing(conn, task_id)
-    if not origin:
-        return None
-    dispatcher = str(origin.get("profile") or "").strip()
-    if dispatcher and dispatcher.casefold() != assignee.casefold():
-        return dispatcher
-    return None
+    return sticky_dispatcher_for_task(conn, task_id)
 
 
 _REVIEWER_NAME_RE = re.compile(
@@ -1005,7 +1061,9 @@ def _resolve_review(
             reviewer=reviewer,
             response=response,
         )
-    except bindings.ExecutionBindingError as exc:
+    except (bindings.ExecutionBindingError, ValueError) as exc:
+        # ValueError carries the D7 guard: a denial whose reason is an
+        # approval token is refused at the kernel instead of recorded.
         return f"ERROR: {exc}", None
     task = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
     if result.closed and task["plan_kind"] == "debug":
@@ -1150,6 +1208,17 @@ def cmd_advance(agent, summary: str, step: Optional[int] = None) -> str:
             f"Step {pending.step_no} summary submitted. Pause and wait for "
             "verification. User review is pending."
         )
+    # D6 (t_cc772a4c): an expired or undelivered ask is a NON-answer — it must
+    # never fall through to the approve/deny parse below.  Before this guard
+    # the gateway's stand-down string was recorded as a DENIAL whose "reason"
+    # was the stand-down text itself.
+    non_answer = non_answer_response(response)
+    if non_answer:
+        return (
+            f"Step {pending.step_no} summary submitted. Pause and wait for "
+            f"verification. Review remains pending: {non_answer}. This is NOT "
+            "a review decision — do not treat it as one."
+        )
     _answer = str(response).strip().lower()
     # "Yolo" approves this step AND enables auto-approve for the remainder of
     # the plan, so the reviewer is never asked again. Evan's rule: yolo is a
@@ -1177,6 +1246,15 @@ def cmd_advance(agent, summary: str, step: Optional[int] = None) -> str:
             return f"ERROR: Denial response was not recorded: {exc}"
         if not response:
             return "ERROR: denied review requires a response"
+        # D6 (t_cc772a4c): same non-answer guard — an expired "Why is this
+        # step denied?" prompt must not become the recorded denial reason.
+        non_answer = non_answer_response(response)
+        if non_answer:
+            return (
+                f"ERROR: denied review requires a real reason — {non_answer} "
+                "is not one. Nothing was recorded; the denial reason is still "
+                "required."
+            )
         if len(response) > 1024:
             return "ERROR: review response must be at most 1024 characters"
     message, _reviewed = _resolve_review(
@@ -1282,6 +1360,78 @@ def cmd_review(
 
     pending = bindings.pending_step_review(conn, task_id)
     if pending is None:
+        # D3 (t_cc772a4c): a Plan awaiting approval has no step review — the
+        # dispatcher's decision HERE is the approval-gate answer channel.
+        # Mirrors the interactive gate: approve/yolo resolve the durable
+        # authorization and wake the assignee to `plan continue`; a denial
+        # resolves it denied and archives the blocked plan.
+        from hermes_cli import plan_authorizations
+        from hermes_cli.kanban_db import write_txn
+
+        auth = plan_authorizations.get_plan_authorization(conn, task_id)
+        if (
+            auth is not None
+            and auth.state == "pending"
+            and task["status"] == "blocked"
+            and task["block_kind"] == "approval"
+        ):
+            approve = decision in ("approved", "yolo")
+            # D7 (t_cc772a4c): a denial whose reason is an approval token is a
+            # self-contradicting record — refuse before writing it.
+            if not approve and bindings.review_response_is_approval_token(response):
+                return (
+                    f"ERROR: denial reason {str(response)!r} is an approval "
+                    "token; nothing was recorded — if the plan should pass, "
+                    f"run 'plan review {task_id} approved' (or 'yolo')."
+                )
+            try:
+                with write_txn(conn):
+                    if decision == "yolo":
+                        conn.execute(
+                            "UPDATE tasks SET plan_auto_approve = 1 WHERE id = ?",
+                            (task_id,),
+                        )
+                    plan_authorizations.resolve_plan_in_txn(
+                        conn,
+                        task_id,
+                        "approved" if approve else "denied",
+                        _actor(agent),
+                        reason=None if approve else response,
+                    )
+                    if not approve:
+                        conn.execute(
+                            "UPDATE tasks SET status='archived', completed_at=? "
+                            "WHERE id=? AND status='blocked'",
+                            (int(time.time()), task_id),
+                        )
+            except (sqlite3.Error, ValueError) as exc:
+                return f"ERROR: Failed to resolve Plan approval: {exc}"
+            verdict = "approved" if approve else "denied"
+            assignee = str(task["assignee"] or "").strip()
+            if approve:
+                worker_message = (
+                    f"Plan {task_id} approved by {reviewer}. Please call "
+                    f"'plan continue {task_id}' to begin"
+                    + (
+                        " (YOLO enabled: step reviews will auto-approve)."
+                        if decision == "yolo"
+                        else "."
+                    )
+                )
+            else:
+                worker_message = (
+                    f"Plan {task_id} was denied by {reviewer}: {response}"
+                )
+            suffix = ""
+            if assignee:
+                failure = _send_user(
+                    assignee, worker_message, conn=conn, task_id=task_id
+                )
+                if failure:
+                    suffix = f" Assignee notification failed: {failure}"
+            return (
+                f"Task {task_id} {verdict}: {task['title'] or ''}{suffix}"
+            ).rstrip()
         return f"ERROR: Plan {task_id} has no pending review"
     message, result = _resolve_review(
         agent,

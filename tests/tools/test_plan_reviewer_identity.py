@@ -205,3 +205,347 @@ def test_delegate_wake_drops_tell_guidance_and_names_reviewer(monkeypatch):
 
     continued = plan.plan(worker, "continue", task_id=task_id)
     assert REVIEWER_LINE in continued
+
+
+# ---------------------------------------------------------------------------
+# Sticky dispatcher routing (t_cc772a4c): plan approval and clarify routing
+# follow the ASSIGNMENT.  "If an agent you dispatch makes a plan, YOU should
+# approve it" and "when he is assigned to a plan, his dispatching agent
+# sticks" (Evan, 2026-10-25).  The chain is recursive — no hardcoded names.
+# ---------------------------------------------------------------------------
+
+STAND_DOWN = (
+    "User unavailable. Stand down and wait for the user to return. Do nothing else."
+)
+
+
+def _seed_dispatch_parent(conn, task_id="t_parent", board="pente"):
+    """The incident's parent: zephyr dispatched ornith; origin is zephyr's
+    session; ornith's binding points at it."""
+    from hermes_cli.kanban_db import store_origin_routing
+
+    conn.execute(
+        "INSERT INTO tasks (id, title, body, assignee, status, task_steps,"
+        " task_stepno, task_goal, created_at, created_by, board)"
+        " VALUES (?, 'Pente tell transport', '', 'ornith', 'manual', ?, 1,"
+        " 'pente tells', 0, 'zephyr', ?)",
+        (task_id, json.dumps(["init", "build", "verify"]), board),
+    )
+    store_origin_routing(
+        conn,
+        task_id,
+        platform="session",
+        chat_id=REVIEWER_SESSION,
+        profile="zephyr",
+    )
+    conn.execute(
+        "INSERT INTO execution_bindings (profile, root_session_id, task_id,"
+        " revision, bound_at, updated_at) VALUES ('ornith', ?, ?, 1, 0, 0)",
+        (WORKER_SESSION, task_id),
+    )
+    conn.commit()
+    return task_id
+
+
+def test_plan_approval_routes_to_dispatcher_and_continue_gates_on_it(monkeypatch):
+    """The incident, replayed: ornith's child plan must send the approval ask
+    to its DISPATCHER, not to the human callback; `plan review` is the answer
+    channel; and `plan continue` must refuse the plan while its authorization
+    is still pending (the t_b085ce41 fail-open)."""
+    conn = _db()
+    _seed_dispatch_parent(conn)
+    monkeypatch.setattr(plan, "_get_kanban_db", lambda board=None: conn)
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda name: True)
+    wakes = []
+    monkeypatch.setattr(
+        "hermes_cli._subprocess_compat.spawn_detached",
+        lambda argv, **kw: wakes.append(list(argv)) or SimpleNamespace(pid=1),
+    )
+    calls = []
+
+    def interactive_stub(question, choices=None, **kwargs):
+        calls.append((question, choices))
+        return '{"user_response":"Approve"}'
+
+    monkeypatch.setattr(plan, "clarify_tool", interactive_stub)
+
+    worker = _Agent("ornith", WORKER_SESSION)
+    out = plan.plan(
+        worker,
+        "new",
+        title="list and leaderboard",
+        goal="Implement the two remaining tell stubs",
+        steps=["Implement the list tell", "Implement the leaderboard tell"],
+    )
+    assert out.startswith("Plan awaiting approval"), out
+    task_id = out.split("Plan awaiting approval (", 1)[1].split(")", 1)[0]
+    # The ask went to the sticky dispatcher — and the human was not consulted.
+    assert "zephyr" in out
+    assert calls == [], "the human clarify path must not run when a dispatcher resolves"
+    event = conn.execute(
+        "SELECT kind, payload FROM task_events WHERE task_id=?"
+        " ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    assert event["kind"] == "review-approval"
+    assert (
+        f"plan review {task_id} approved|denied|yolo"
+        in json.loads(event["payload"])["text"]
+    )
+    assert wakes and "zephyr" in wakes[0], f"no dispatcher wake: {wakes}"
+    row = conn.execute(
+        "SELECT status, block_kind FROM tasks WHERE id=?", (task_id,)
+    ).fetchone()
+    assert (row[0], row[1]) == ("blocked", "approval")
+    # D5: the gate must not fail open — pending authorization refuses continue.
+    refused = plan_binding_adapter.cmd_continue(worker, task_id)
+    assert refused.startswith("ERROR:"), refused
+    assert "not approved" in refused
+    # The dispatcher answers through `plan review` — the durable gate.
+    reviewer = _Agent("zephyr", REVIEWER_SESSION)
+    reply = plan_binding_adapter.cmd_review(reviewer, task_id, "approved")
+    assert "approved" in reply.lower(), reply
+    assert (
+        conn.execute(
+            "SELECT state FROM plan_authorizations WHERE plan_id=?", (task_id,)
+        ).fetchone()[0]
+        == "approved"
+    )
+    # With the authorization approved, the worker may continue (the
+    # delegated 780f7f99cc behaviour is preserved).
+    continued = plan_binding_adapter.cmd_continue(worker, task_id)
+    assert not continued.startswith("ERROR:"), continued
+    assert (
+        conn.execute("SELECT status FROM tasks WHERE id=?", (task_id,)).fetchone()[0]
+        == "manual"
+    )
+
+
+def test_self_created_top_level_plan_keeps_interactive_buttons(monkeypatch):
+    """Self-dispatch is not a route: a worker's own top-level plan resolves NO
+    agent dispatcher, and the interactive callback keeps the choices (the
+    platforms render BUTTONS — Approve / Deny / Yolo)."""
+    conn = _db()
+    monkeypatch.setattr(plan, "_get_kanban_db", lambda board=None: conn)
+    seen = {}
+
+    def stub(question, choices=None, **kwargs):
+        seen["choices"] = choices
+        return '{"user_response":"Approve"}'
+
+    monkeypatch.setattr(plan, "clarify_tool", stub)
+    wakes = []
+    monkeypatch.setattr(
+        "hermes_cli._subprocess_compat.spawn_detached",
+        lambda argv, **kw: wakes.append(list(argv)) or SimpleNamespace(pid=1),
+    )
+    worker = _Agent("ornith", WORKER_SESSION)
+    out = plan.plan(worker, "new", title="My own plan", goal="g", steps=["one"])
+    assert out.startswith("TASK APPROVED"), out
+    assert seen["choices"] == ["Approve", "Deny", "Yolo"]
+    assert not wakes
+
+
+def test_child_plan_inherits_parent_board(monkeypatch):
+    """D4 (t_cc772a4c): a child plan created with no explicit board lands on
+    its PARENT's board, not 'default'."""
+    conn = _db()
+    _seed_dispatch_parent(conn, board="pente")
+    monkeypatch.setattr(plan, "_get_kanban_db", lambda board=None: conn)
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda name: True)
+    monkeypatch.setattr(
+        "hermes_cli._subprocess_compat.spawn_detached",
+        lambda argv, **kw: SimpleNamespace(pid=1),
+    )
+    worker = _Agent("ornith", WORKER_SESSION)
+    out = plan.plan(worker, "new", title="child plan", goal="g", steps=["one"])
+    task_id = out.split("(", 1)[1].split(")", 1)[0]
+    board = conn.execute(
+        "SELECT board FROM tasks WHERE id=?", (task_id,)
+    ).fetchone()[0]
+    assert board == "pente"
+
+
+def test_expired_review_ask_is_recorded_as_nothing(monkeypatch):
+    """D6 (t_cc772a4c): an expired ask is a NON-answer — it must never be
+    recorded as a review decision.  Before the guard the gateway's stand-down
+    string was recorded as a DENIAL whose "reason" was the stand-down text
+    itself (absence of evidence treated as evidence)."""
+    conn = _db()
+    monkeypatch.setattr(plan, "_get_kanban_db", lambda board=None: conn)
+    responses = iter(
+        [
+            '{"user_response":"Approve"}',
+            json.dumps({"user_response": STAND_DOWN}),
+        ]
+    )
+    monkeypatch.setattr(plan, "clarify_tool", lambda *a, **k: next(responses))
+    worker = _Agent("ornith", WORKER_SESSION)
+    out = plan.plan(worker, "new", title="Self plan", goal="g", steps=["one", "two"])
+    assert out.startswith("TASK APPROVED"), out
+    task_id = out.split("(", 1)[1].split(")", 1)[0]
+    advanced = plan_binding_adapter.cmd_advance(worker, summary="step one complete")
+    assert "Review remains pending" in advanced, advanced
+    kinds = [
+        r[0]
+        for r in conn.execute(
+            "SELECT kind FROM task_events WHERE task_id=? AND kind IN"
+            " ('plan-step-review-approved','plan-step-review-denied')",
+            (task_id,),
+        )
+    ]
+    assert kinds == [], f"a non-answer was recorded as a review decision: {kinds}"
+    assert (
+        conn.execute(
+            "SELECT count(*) FROM task_events WHERE task_id=?"
+            " AND kind='plan-step-review-pending'",
+            (task_id,),
+        ).fetchone()[0]
+        == 1
+    )
+
+
+def test_denial_with_approval_token_reason_is_refused(monkeypatch):
+    """D7 (t_cc772a4c addendum): event 23192 recorded a denial whose response
+    was "Approved".  A self-contradicting review record must be REFUSED at the
+    kernel; a real denial reason still records."""
+    conn = _db()
+    task_id = _seed_plan(conn)
+    monkeypatch.setattr(plan, "_get_kanban_db", lambda board=None: conn)
+    monkeypatch.setattr(
+        "hermes_cli._subprocess_compat.spawn_detached",
+        lambda argv, **kw: SimpleNamespace(pid=1),
+    )
+    worker = _Agent("ornith", WORKER_SESSION)
+    submitted = plan_binding_adapter.cmd_advance(worker, summary="step one done")
+    assert "Pause and wait" in submitted, submitted
+    reviewer = _Agent("zephyr", REVIEWER_SESSION)
+    refused = plan_binding_adapter.cmd_review(reviewer, task_id, "denied", "Approved")
+    assert refused.startswith("ERROR:"), refused
+    assert "approval token" in refused
+    assert (
+        conn.execute(
+            "SELECT count(*) FROM task_events WHERE task_id=?"
+            " AND kind='plan-step-review-denied'",
+            (task_id,),
+        ).fetchone()[0]
+        == 0
+    )
+    # The review is still pending — nothing was half-recorded.
+    assert conn.execute(
+        "SELECT count(*) FROM task_events WHERE task_id=?"
+        " AND kind='plan-step-review-pending'",
+        (task_id,),
+    ).fetchone()[0] == 1
+    # A genuine denial records normally.
+    ok = plan_binding_adapter.cmd_review(
+        reviewer, task_id, "denied", "the tests fail on disk"
+    )
+    assert "denied" in ok.lower(), ok
+    assert (
+        conn.execute(
+            "SELECT count(*) FROM task_events WHERE task_id=?"
+            " AND kind='plan-step-review-denied'",
+            (task_id,),
+        ).fetchone()[0]
+        == 1
+    )
+
+
+def test_child_close_restores_parked_parent_and_parent_advances(monkeypatch):
+    """The addendum deadlock, replayed: the child's final step must be
+    reviewable by the DISPATCHER (no human), the child's close must restore
+    the parent's binding even though the parent is parked in ``attention``,
+    and the parent must then advance toward its next step."""
+    from hermes_cli import plan_authorizations as pa
+
+    conn = _db()
+    parent = _seed_dispatch_parent(conn)
+    # Park the parent exactly like the live deadlock: attention at step 8 of 9.
+    conn.execute(
+        "UPDATE tasks SET status='attention', task_stepno=8, task_steps=? WHERE id=?",
+        (json.dumps([f"step {i}" for i in range(1, 10)]), parent),
+    )
+    # The child: ornith's nested plan at its final step; the binding lives on
+    # the child (revision 12 is the live shape).
+    conn.execute(
+        "INSERT INTO tasks (id, title, body, assignee, status, task_steps,"
+        " task_stepno, task_goal, created_at, created_by, previous_task, board)"
+        " VALUES ('t_child', 'list and leaderboard', '', 'ornith', 'manual', ?, 3,"
+        " 'implement the tells', 0, 'ornith', ?, 'pente')",
+        (json.dumps(["one", "two", "three"]), parent),
+    )
+    pa.create_pending_plan(
+        conn,
+        pa.PlanRequest(
+            plan_id="t_child",
+            payload={
+                "title": "list and leaderboard",
+                "goal": "implement the tells",
+                "steps": ["one", "two", "three"],
+                "kind": "manual",
+                "assign": "ornith",
+                "root": None,
+                "cron": None,
+                "resume": None,
+            },
+            execution_task_id="t_child",
+            execution_session_id=WORKER_SESSION,
+            parent_task_id=parent,
+            origin_session_id=WORKER_SESSION,
+        ),
+    )
+    pa.resolve_plan_in_txn(
+        conn,
+        "t_child",
+        "approved",
+        pa.ApprovalActor(session_id=REVIEWER_SESSION, actor="zephyr", via="plan"),
+    )
+    conn.execute(
+        "UPDATE execution_bindings SET task_id='t_child', revision=12"
+        " WHERE profile='ornith'"
+    )
+    conn.commit()
+    monkeypatch.setattr(plan, "_get_kanban_db", lambda board=None: conn)
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda name: True)
+    monkeypatch.setattr(
+        "hermes_cli._subprocess_compat.spawn_detached",
+        lambda argv, **kw: SimpleNamespace(pid=1),
+    )
+    worker = _Agent("ornith", WORKER_SESSION)
+    submitted = plan_binding_adapter.cmd_advance(worker, summary="step three done")
+    assert "Pause and wait" in submitted, submitted
+    # The DISPATCHER reviews the child's final step — the human is not needed.
+    reply = plan_binding_adapter.cmd_review(
+        _Agent("zephyr", REVIEWER_SESSION), "t_child", "approved"
+    )
+    assert "approved" in reply.lower(), reply
+    assert (
+        conn.execute("SELECT status FROM tasks WHERE id='t_child'").fetchone()[0]
+        == "done"
+    )
+    # The parked parent's binding is RESTORED.
+    assert (
+        conn.execute(
+            "SELECT task_id FROM execution_bindings WHERE profile='ornith'"
+        ).fetchone()[0]
+        == parent
+    )
+    assert (
+        conn.execute("SELECT status FROM tasks WHERE id=?", (parent,)).fetchone()[0]
+        == "manual"
+    )
+    # And the parent advances: step 8 submits, its review approves, step 9
+    # becomes the active step.
+    advanced = plan_binding_adapter.cmd_advance(worker, summary="step eight done")
+    assert advanced.startswith("Step 8"), advanced
+    approve = plan_binding_adapter.cmd_review(
+        _Agent("zephyr", REVIEWER_SESSION), parent, "approved"
+    )
+    assert "approved" in approve.lower(), approve
+    assert (
+        conn.execute(
+            "SELECT task_stepno FROM tasks WHERE id=?", (parent,)
+        ).fetchone()[0]
+        == 9
+    )

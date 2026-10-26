@@ -1367,6 +1367,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     task_goal            TEXT,
     prev_temperature     TEXT,
     previous_task        TEXT,
+    -- Sticky dispatcher (t_cc772a4c): the AI agent that dispatched this
+    -- task's assignee, resolved once at creation and durable for the whole
+    -- assignment (survives parent archival, board moves, nesting depth).
+    -- NULL on legacy rows: resolvers fall back to the created_by/previous_task
+    -- chain (see sticky_dispatcher_for_task).
+    dispatcher           TEXT,
     -- Debug plans attach their plan id to the coding task they exercise.
     plan_kind            TEXT NOT NULL DEFAULT 'normal',
     pre_approved         INTEGER NOT NULL DEFAULT 0,
@@ -2800,6 +2806,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(conn, "tasks", "prev_temperature", "prev_temperature TEXT")
     if "previous_task" not in cols:
         _add_column_if_missing(conn, "tasks", "previous_task", "previous_task TEXT")
+    if "dispatcher" not in cols:
+        # Sticky dispatcher (t_cc772a4c): NULL on legacy rows — resolvers
+        # fall back to the created_by / previous_task ancestor chain.
+        _add_column_if_missing(conn, "tasks", "dispatcher", "dispatcher TEXT")
     if "plan_kind" not in cols:
         _add_column_if_missing(
             conn, "tasks", "plan_kind", "plan_kind TEXT NOT NULL DEFAULT 'normal'"
@@ -3874,40 +3884,140 @@ def wake_target_for(conn: sqlite3.Connection, task_id: str, recipient: str) -> s
     return recipient
 
 
+# ---------------------------------------------------------------------------
+# Sticky dispatcher resolution (t_cc772a4c)
+# ---------------------------------------------------------------------------
+
+# Human/CLI creator labels that can never be woken as an agent.
+_NON_AGENT_ACTOR_LABELS = {"user", "human", "cli", "system"}
+
+# Ancestor walk bounds: depth cap plus a visited set (cycle guard).
+_DISPATCHER_WALK_MAX_DEPTH = 32
+
+
+def _dispatcher_candidate(name, assignee) -> Optional[str]:
+    """Accept *name* as a dispatcher for *assignee*, else None.
+
+    A candidate must be a real agent profile name (not a human/CLI label) and
+    must differ from the assignee (self-dispatch is not a route).  Wake-time
+    validation (``profiles.profile_exists``) happens where a wake target is
+    actually produced (``send_dispatcher_message``, ``clarify_tool``) — the
+    chain itself stays pure so display/review resolution works even when the
+    profile directory is not reachable from the caller's sandbox.
+    """
+    cand = str(name or "").strip()
+    if not cand or cand.casefold() in _NON_AGENT_ACTOR_LABELS:
+        return None
+    if assignee and cand.casefold() == str(assignee or "").strip().casefold():
+        return None
+    return cand
+
+
+def sticky_dispatcher_for_task(
+    conn: sqlite3.Connection, task_id: str
+) -> Optional[str]:
+    """Resolve the AI dispatcher that reviews this task's Plan — and sticks.
+
+    The dispatcher is fixed at assignment time and persists for the whole
+    assignment, through any nesting depth (Evan, 2026-10-25: "when he is
+    assigned to a plan, his dispatching agent sticks").  Resolution chain:
+
+    1. the task's own ``dispatcher`` stamp (durable, written at creation),
+    2. the task's own row: ``created_by`` when it is a real agent profile
+       differing from the assignee,
+    3. the ``previous_task`` ancestors (bounded depth, cycle-guarded): the
+       first one whose dispatcher stamp / ``created_by`` qualifies against
+       ITS OWN assignee,
+    4. the task's own origin-routing profile when it differs from the
+       assignee,
+    5. ``None`` — the human is the dispatcher (human gate).
+
+    Returned names are agent-profile names only (human/CLI labels filtered);
+    wake-time ``profiles.profile_exists`` validation happens where a wake
+    target is produced.  No profile names are hardcoded.
+    """
+    row = conn.execute(
+        "SELECT created_by, assignee, previous_task, dispatcher FROM tasks"
+        " WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    visited = {str(task_id)}
+    node: Optional[sqlite3.Row] = row
+    while node is not None:
+        for field in ("dispatcher", "created_by"):
+            cand = _dispatcher_candidate(node[field], node["assignee"])
+            if cand:
+                return cand
+        nxt = str(node["previous_task"] or "").strip()
+        if not nxt or nxt in visited or len(visited) > _DISPATCHER_WALK_MAX_DEPTH:
+            break
+        visited.add(nxt)
+        node = conn.execute(
+            "SELECT created_by, assignee, previous_task, dispatcher FROM tasks"
+            " WHERE id = ?",
+            (nxt,),
+        ).fetchone()
+    origin = get_origin_routing(conn, task_id)
+    if origin:
+        return _dispatcher_candidate(origin.get("profile"), row["assignee"])
+    return None
+
+
+def stamp_task_dispatcher(
+    conn: sqlite3.Connection, task_id: str, *, parent_task_id: Optional[str] = None
+) -> Optional[str]:
+    """Durable dispatcher stamp (D2), written at task creation.
+
+    Records the resolved dispatcher in ``tasks.dispatcher`` so it survives
+    parent archival, board moves, and nesting depth, and inherits the
+    parent's origin routing when the resolved dispatcher IS the parent's
+    origin profile — so use-time wakes reach the dispatcher's live session
+    instead of the bare home channel.  Returns the stamped dispatcher.
+    """
+    resolved = sticky_dispatcher_for_task(conn, task_id)
+    conn.execute(
+        "UPDATE tasks SET dispatcher = ? WHERE id = ?", (resolved, task_id)
+    )
+    if resolved and parent_task_id:
+        origin = get_origin_routing(conn, parent_task_id)
+        if origin and str(origin.get("profile") or "").strip().casefold() == (
+            resolved.casefold()
+        ):
+            store_origin_routing(
+                conn,
+                task_id,
+                platform=str(origin.get("platform") or "session"),
+                chat_id=str(origin.get("chat_id") or ""),
+                thread_id=str(origin.get("thread_id") or ""),
+                chat_type=str(origin.get("chat_type") or ""),
+                profile=resolved,
+                allow_non_session=origin.get("platform") != "session",
+            )
+    return resolved
+
+
 def _review_ask_target(
     conn: sqlite3.Connection, task_id: str, *, direction: str
 ) -> Optional[str]:
     """Resolve the profile a review ask should wake for ``direction``.
 
-    ``to-dispatcher`` (a worker handing work off): the AI creator when it
-    differs from the assignee, else the origin-routing profile, else None —
-    the caller falls back to the human (the human is the dispatcher for
-    self-dispatched tasks). ``to-worker`` (a reviewer requesting changes):
-    always the assignee.
+    ``to-dispatcher`` (a worker handing work off): the canonical STICKY
+    dispatcher (``sticky_dispatcher_for_task`` — stamp, own row, ancestor
+    walk, origin), else None — the caller falls back to the human (the human
+    is the dispatcher for self-dispatched tasks). ``to-worker`` (a reviewer
+    requesting changes): always the assignee.
     """
     row = conn.execute(
-        "SELECT created_by, assignee FROM tasks WHERE id = ?", (task_id,)
+        "SELECT assignee FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
     if row is None:
         return None
     assignee = str(row["assignee"] or "").strip()
     if direction == "to-worker":
         return assignee or None
-    creator = str(row["created_by"] or "").strip()
-    if creator and creator.casefold() != assignee.casefold():
-        if creator.casefold() not in {"user", "human", "cli", "system"}:
-            return creator
-        # A human/CLI creator label (`user`) is not a wake target — the
-        # dispatcher is the agent session the card came from (origin routing
-        # below), else the human stays the dispatcher. (t_936962bd retest4:
-        # the ask resolved to 'user' and fell through to the interactive
-        # callback instead of reaching the card's creator.)
-    origin = get_origin_routing(conn, task_id)
-    if origin:
-        profile = str(origin.get("profile") or "").strip()
-        if profile and profile.casefold() != assignee.casefold():
-            return profile
-    return None
+    return sticky_dispatcher_for_task(conn, task_id)
 
 
 def send_dispatcher_message(
@@ -3957,6 +4067,15 @@ def send_dispatcher_message(
         return True, (
             "ask recorded; no AI recipient resolves — the human reviewer "
             "(dashboard) is the fallback"
+        )
+    # D1 (t_cc772a4c): validate the profile before producing the wake target —
+    # a resolved name that is not a wakeable profile must not be sent to.
+    from hermes_cli.profiles import profile_exists
+
+    if not profile_exists(recipient):
+        return True, (
+            f"ask recorded; resolved recipient {recipient!r} is not a wakeable "
+            "agent profile — the human reviewer (dashboard) is the fallback"
         )
     target = wake_target_for(conn, task_id, recipient)
     from hermes_cli._subprocess_compat import spawn_detached

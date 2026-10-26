@@ -23,10 +23,12 @@ from types import SimpleNamespace
 
 import pytest
 
+from hermes_cli.kanban_db import _review_ask_target, sticky_dispatcher_for_task
 from tools.clarify_tool import (
     _route_clarify_to_dispatcher,
     clarify_tool,
 )
+from tools.plan_binding_adapter import _dispatcher_for_task
 
 
 @pytest.fixture()
@@ -434,3 +436,118 @@ def test_plan_clarify_is_gone():
 
     result = plan.plan(_Bare(), "clarify")
     assert "Unknown plan command 'clarify'" in result
+
+
+# ---------------------------------------------------------------------------
+# Sticky dispatcher resolution (t_cc772a4c): the dispatcher is fixed at
+# assignment time and sticks through nesting depth — "when he is assigned to
+# a plan, his dispatching agent sticks" (Evan, 2026-10-25).  The chain is
+# recursive (ancestor walk), never hardcoded.
+# ---------------------------------------------------------------------------
+
+def _seed_chain(db_path, rows):
+    """Insert bare tasks: rows of (id, created_by, assignee, previous_task)."""
+    conn = sqlite3.connect(db_path)
+    try:
+        for task_id, created_by, assignee, previous_task in rows:
+            conn.execute(
+                "INSERT INTO tasks(id, title, status, created_by, assignee,"
+                " previous_task, board, created_at)"
+                " VALUES(?,?,?,?,?,?,'default',?)",
+                (
+                    task_id,
+                    f"task {task_id}",
+                    "manual",
+                    created_by,
+                    assignee,
+                    previous_task,
+                    int(time.time()),
+                ),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _resolvers_agree(db_path, task_id):
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        return (
+            _dispatcher_for_task(conn, task_id),
+            _review_ask_target(conn, task_id, direction="to-dispatcher"),
+            sticky_dispatcher_for_task(conn, task_id),
+        )
+    finally:
+        conn.close()
+
+
+def test_sticky_dispatcher_walks_previous_task_to_the_parent(kb_env):
+    # Parent: zephyr dispatched ornith.  Child: ornith created its own plan
+    # while bound to the parent (created_by == assignee == ornith) — the
+    # child has NO dispatcher of its own and must inherit zephyr's.
+    _seed_chain(
+        kb_env.db_path,
+        [
+            ("t_parent", "zephyr", "ornith", None),
+            ("t_child", "ornith", "ornith", "t_parent"),
+        ],
+    )
+    assert _resolvers_agree(kb_env.db_path, "t_child") == ("zephyr",) * 3
+
+
+def test_sticky_dispatcher_holds_at_depth_three(kb_env):
+    _seed_chain(
+        kb_env.db_path,
+        [
+            ("t_parent", "zephyr", "ornith", None),
+            ("t_child", "ornith", "ornith", "t_parent"),
+            ("t_grandchild", "ornith", "ornith", "t_child"),
+        ],
+    )
+    assert _resolvers_agree(kb_env.db_path, "t_grandchild") == ("zephyr",) * 3
+
+
+def test_sticky_dispatcher_none_for_human_created_task(kb_env):
+    # Top-level, created_by='user', assignee=zephyr: a human creator is not a
+    # wake target — the human gate stays (Evan approves these himself).
+    _seed_chain(kb_env.db_path, [("t_human", "user", "zephyr", None)])
+    assert _resolvers_agree(kb_env.db_path, "t_human") == (None,) * 3
+
+
+def test_sticky_dispatcher_none_for_self_dispatch(kb_env):
+    # A worker's own top-level plan: creator IS the assignee, no ancestor,
+    # no origin — no AI dispatcher, the interactive callback keeps the
+    # choices/buttons.
+    _seed_chain(kb_env.db_path, [("t_self", "ornith", "ornith", None)])
+    assert _resolvers_agree(kb_env.db_path, "t_self") == (None,) * 3
+
+
+def test_sticky_dispatcher_cycle_guard_does_not_hang(kb_env):
+    # previous_task loop (including a self-loop) must terminate, not hang.
+    _seed_chain(
+        kb_env.db_path,
+        [
+            ("t_loop_a", "ornith", "ornith", "t_loop_b"),
+            ("t_loop_b", "ornith", "ornith", "t_loop_a"),
+            ("t_self_loop", "ornith", "ornith", "t_self_loop"),
+        ],
+    )
+    assert _resolvers_agree(kb_env.db_path, "t_loop_a") == (None,) * 3
+    assert _resolvers_agree(kb_env.db_path, "t_loop_b") == (None,) * 3
+    assert _resolvers_agree(kb_env.db_path, "t_self_loop") == (None,) * 3
+
+
+def test_sticky_dispatcher_durable_stamp_survives_parent_loss(kb_env):
+    # D2: the stamp is read FIRST, so the dispatcher sticks even when the
+    # ancestor chain is gone (parent archived/deleted, board moved, depth).
+    _seed_chain(kb_env.db_path, [("t_orphan", "ornith", "ornith", "t_gone")])
+    conn = sqlite3.connect(kb_env.db_path)
+    try:
+        conn.execute(
+            "UPDATE tasks SET dispatcher='zephyr' WHERE id='t_orphan'"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    assert _resolvers_agree(kb_env.db_path, "t_orphan") == ("zephyr",) * 3
