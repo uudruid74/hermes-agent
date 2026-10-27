@@ -255,7 +255,7 @@ def send_message_tool(args, **kw):
     if action == "unreact":
         return _handle_react(args, remove=True)
 
-    return _handle_send(args)
+    return _handle_send(args, mirror_role=kw.get("mirror_role") or "")
 
 
 def _handle_list():
@@ -376,7 +376,7 @@ def _resolve_injected_chat_type(platform, chat_id, adapter, config) -> str:
     return str(getattr(home, "chat_type", None) or "group")
 
 
-def _handle_send(args):
+def _handle_send(args, mirror_role=""):
     """Send a message to a platform target."""
     target = args.get("target", "")
     message = args.get("message", "")
@@ -617,6 +617,13 @@ def _handle_send(args):
                     source_label=source_label,
                     thread_id=thread_id,
                     user_id=user_id,
+                    # Role decision at the call site (bug 2026-10-27): a
+                    # delivery mirror (hermes send / wake visible-copy) is
+                    # NOT the target agent speaking -> "user", so the twin
+                    # collapses into the real user wake on replay instead of
+                    # poisoning the model's own voice (#2221). The agent's
+                    # interactive reply keeps the "assistant" default.
+                    role=mirror_role or "assistant",
                 ):
                     result["mirrored"] = True
             except Exception:

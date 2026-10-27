@@ -692,7 +692,11 @@ def cmd_send(args: argparse.Namespace) -> None:
     else:
         tool_args["target"] = target
 
-    result = _with_copy_error(send_message_tool(tool_args), copy_error)
+    # Every CLI `hermes send` is a delivery (wake, visible-copy, script post),
+    # not the target agent's own speech: mirror as role="user" (bug 2026-10-27).
+    result = _with_copy_error(
+        send_message_tool(tool_args, mirror_role="user"), copy_error
+    )
     exit_code = _emit_result(
         result,
         json_mode=getattr(args, "json", False),
