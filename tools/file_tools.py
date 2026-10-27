@@ -1945,11 +1945,25 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
 
             file_ops = _get_file_ops(task_id)
 
+            def _arg_echo(expected):
+                # Echo expected-vs-provided so one error round self-corrects
+                # (zephyr 2026-10-27: four identical "path required" rounds
+                # while sending 'patch' instead of 'path').
+                return provided_note(expected, {
+                    "mode": mode, "path": path, "old_string": old_string,
+                    "new_string": new_string, "patch": patch,
+                })
+
             if mode == "replace":
                 if not path:
-                    return tool_error("path required")
+                    return tool_error(
+                        "path required." + _arg_echo(["path", "old_string", "new_string"])
+                    )
                 if old_string is None or new_string is None:
-                    return tool_error("old_string and new_string required")
+                    return tool_error(
+                        "old_string and new_string required."
+                        + _arg_echo(["path", "old_string", "new_string"])
+                    )
                 # Pass the resolved ABSOLUTE path to the shell layer so it
                 # operates on the exact file the tool layer resolved — the
                 # shell's own cwd may differ (worktree-cwd bug), and a relative
@@ -1959,7 +1973,7 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 result = file_ops.patch_replace(_replace_target, old_string, new_string, replace_all)
             elif mode == "patch":
                 if not patch:
-                    return tool_error("patch content required")
+                    return tool_error("patch content required." + _arg_echo(["patch"]))
                 # Rewrite V4A headers to the resolved absolute paths so the
                 # shell layer patches the exact files the tool layer resolved
                 # (locked/reported). Without this a relative header re-resolves
@@ -2148,7 +2162,7 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
 # ---------------------------------------------------------------------------
 # Schemas + Registry
 # ---------------------------------------------------------------------------
-from tools.registry import registry, tool_error
+from tools.registry import provided_note, registry, tool_error
 
 
 def _check_file_reqs():

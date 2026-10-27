@@ -161,6 +161,23 @@ class TestPatchHandler:
 
 
     @patch("tools.file_tools._get_file_ops")
+    def test_argument_errors_echo_expected_and_provided(self, mock_get):
+        """One error round must self-correct (zephyr 2026-10-27).
+
+        Four identical `path required` rounds because the error never
+        echoed what WAS provided — the call carried 'patch' where mode='replace'
+        wants 'path'. Expected + Provided names the near-miss immediately.
+        """
+        from tools.file_tools import patch_tool
+        result = json.loads(patch_tool(
+            mode="replace", patch="*** Begin Patch\n...",
+            old_string="foo", new_string="bar",
+        ))
+        assert "path required" in result["error"]
+        assert "Expected parameters: path, old_string, new_string" in result["error"]
+        assert "Provided: mode, old_string, new_string, patch" in result["error"]
+
+    @patch("tools.file_tools._get_file_ops")
     def test_unknown_mode_errors(self, mock_get):
         from tools.file_tools import patch_tool
         result = json.loads(patch_tool(mode="invalid_mode"))

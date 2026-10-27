@@ -361,6 +361,22 @@ class TestSkillManageDispatcher:
         assert rec.get("created_by") in {None, "", False}
 
 
+    def test_argument_errors_echo_expected_and_provided(self, tmp_path):
+        """One error round must self-correct (zephyr 2026-10-27).
+
+        Five identical `content is required` rounds because the error never
+        echoed what WAS provided — the call carried 'file_content' where
+        create wants 'content'. Expected + Provided names the near-miss.
+        """
+        with _skill_dir(tmp_path):
+            raw = json.loads(skill_manage(
+                action="create", name="test-skill",
+                file_content=VALID_SKILL_CONTENT,
+            ))
+        assert "content is required for 'create'" in raw["error"]
+        assert "Expected parameters: action, name, content" in raw["error"]
+        assert "Provided: action, name, file_content" in raw["error"]
+
     def test_background_review_delete_refuses_bundled_even_with_absorbed_into(self, tmp_path):
         from tools.skill_provenance import (
             BACKGROUND_REVIEW,

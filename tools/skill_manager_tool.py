@@ -1561,21 +1561,48 @@ def skill_manage(
     if gate_result is not None:
         return gate_result
 
+    def _echo(expected):
+        # Echo expected-vs-provided so one error round self-corrects
+        # (zephyr 2026-10-27: five identical "content is required" rounds
+        # while sending 'file_content' instead of 'content').
+        return provided_note(expected, {
+            "action": action, "name": name, "content": content,
+            "old_string": old_string, "new_string": new_string,
+            "file_path": file_path, "file_content": file_content,
+            "category": category, "absorbed_into": absorbed_into,
+        })
+
     if action == "create":
         if not content:
-            return tool_error("content is required for 'create'. Provide the full SKILL.md text (frontmatter + body).", success=False)
+            return tool_error(
+                "content is required for 'create'. Provide the full SKILL.md text "
+                "(frontmatter + body)." + _echo(["action", "name", "content"]),
+                success=False,
+            )
         result = _create_skill(name, content, category)
 
     elif action == "edit":
         if not content:
-            return tool_error("content is required for 'edit'. Provide the full updated SKILL.md text.", success=False)
+            return tool_error(
+                "content is required for 'edit'. Provide the full updated SKILL.md text."
+                + _echo(["action", "name", "content"]),
+                success=False,
+            )
         result = _edit_skill(name, content)
 
     elif action == "patch":
         if not old_string:
-            return tool_error("old_string is required for 'patch'. Provide the text to find.", success=False)
+            return tool_error(
+                "old_string is required for 'patch'. Provide the text to find."
+                + _echo(["action", "name", "old_string", "new_string"]),
+                success=False,
+            )
         if new_string is None:
-            return tool_error("new_string is required for 'patch'. Use empty string to delete matched text.", success=False)
+            return tool_error(
+                "new_string is required for 'patch'. Use empty string to delete matched text."
+                + _echo(["action", "name", "old_string", "new_string"]),
+                success=False,
+            )
         result = _patch_skill(name, old_string, new_string, file_path, replace_all)
 
     elif action == "delete":
@@ -1583,14 +1610,26 @@ def skill_manage(
 
     elif action == "write_file":
         if not file_path:
-            return tool_error("file_path is required for 'write_file'. Example: 'references/api-guide.md'", success=False)
+            return tool_error(
+                "file_path is required for 'write_file'. Example: 'references/api-guide.md'"
+                + _echo(["action", "name", "file_path", "file_content"]),
+                success=False,
+            )
         if file_content is None:
-            return tool_error("file_content is required for 'write_file'.", success=False)
+            return tool_error(
+                "file_content is required for 'write_file'."
+                + _echo(["action", "name", "file_path", "file_content"]),
+                success=False,
+            )
         result = _write_file(name, file_path, file_content)
 
     elif action == "remove_file":
         if not file_path:
-            return tool_error("file_path is required for 'remove_file'.", success=False)
+            return tool_error(
+                "file_path is required for 'remove_file'."
+                + _echo(["action", "name", "file_path"]),
+                success=False,
+            )
         result = _remove_file(name, file_path)
 
     else:
@@ -1764,7 +1803,7 @@ SKILL_MANAGE_SCHEMA = {
 
 
 # --- Registry ---
-from tools.registry import registry, tool_error
+from tools.registry import provided_note, registry, tool_error
 
 registry.register(
     name="skill_manage",

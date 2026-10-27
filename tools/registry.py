@@ -941,6 +941,27 @@ def tool_error(message, **extra) -> str:
     return json.dumps(result, ensure_ascii=False)
 
 
+def provided_note(expected, provided) -> str:
+    """Suffix for argument errors: name the contract AND what arrived.
+
+    Models retry blindly when an error names the missing parameter but not
+    the near-miss they actually sent (zephyr, 2026-10-27: five identical
+    ``content is required`` rounds while sending ``file_content``, and four
+    ``path required`` rounds while sending ``patch``). Echoing both sides
+    self-corrects in one round.
+
+    >>> provided_note(["path", "old_string"], {"mode": "replace", "patch": "***"})
+    ' Expected parameters: path, old_string. Provided: mode, patch.'
+    >>> provided_note(["content"], {})
+    ' Expected parameters: content. Provided: nothing.'
+    """
+    given = [str(key) for key, value in provided.items() if value is not None]
+    return (
+        f" Expected parameters: {', '.join(expected)}. "
+        f"Provided: {', '.join(given) if given else 'nothing'}."
+    )
+
+
 def tool_result(data=None, **kwargs) -> str:
     """Return a JSON result string for tool handlers.
 
