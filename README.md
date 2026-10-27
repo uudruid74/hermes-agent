@@ -41,6 +41,7 @@ Every non-trivial job runs through `plan` — an ordered list of steps with a su
 - **Plans survive context compression.** The plan isn't in the chat window; it's in the board. When the window collapses, the plan doesn't.
 - **Ornith stays on task.** Ornith's job is to review other agents' work. Without a plan, that means wandering. With a plan, that means steps 1..7, in order, no more, no less.
 - **The gate is real.** "No state changes without a plan" is enforced, not requested. An agent that tries to skip ahead gets bounced back to the active step.
+- **Only the current step's expansion rides along.** Every `advance`, `deny`, and tool-limit notification carries the expansion text of *the step being acted on* — not the whole plan. The worker wakes holding the one instruction block that governs its next action, so its context window stays clean and a compressed history cannot strand it without its current marching orders. When the plan moves on, so does the expansion.
 - **The plan is the spec.** `plan import <file>` builds a plan from a flat markdown document (`# Title`, a global description, `## step title` + expansion body per step), so the run's ground truth lives *inside* the plan and compression can never drop it. `plan export <task_id>` writes the plan back out with every step's completion summary, denial message, and the full claim/denial history.
 
 ### 🚦 Two-Phase Advance & Dispatcher Review
