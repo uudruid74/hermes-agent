@@ -2014,11 +2014,25 @@ def cmd_remind(agent, task_id: Optional[str] = None) -> str:
         # manual plan render as "Active Step 1 of N", so a fresh worker
         # believed the plan was running and burned advances against
         # "No active task". Say where things actually stand instead.
+        # (2026-10-27, Evan): only the ASSIGNEE is invited to claim. A caller
+        # that is not the assignee must see the assigned agent's name, never
+        # "assigned to you", and must NOT be told to `continue` (claiming a
+        # plan you don't own steals the binding).
+        assignee = (task["assignee"] or "").strip()
+        caller_names = {n.casefold() for n in _agent_identity_names(agent) if n}
+        is_assignee = bool(assignee) and assignee.casefold() in caller_names
+        if is_assignee:
+            return (
+                f"Task {task_id} is assigned to you but NOT ACTIVE in this session "
+                f"(no execution binding — maybe the gateway restarted or the plan "
+                f"was reset). Run `plan continue {task_id}` to claim it, "
+                f"then implement Step {task['task_stepno'] or 1}.\n\n"
+                f"{unbound}"
+            )
         return (
-            f"Task {task_id} is assigned to you but NOT ACTIVE in this session "
-            f"(no execution binding — maybe the gateway restarted or the plan "
-            f"was reset). Run `plan continue {task_id}` to claim it, "
-            f"then implement Step {task['task_stepno'] or 1}.\n\n"
+            f"Task {task_id} is assigned to {assignee or 'another agent'}, "
+            f"not to you, and is NOT ACTIVE in this session. "
+            f"Do not claim it — only the assigned agent may continue it.\n\n"
             f"{unbound}"
         )
     claim_warning = _unclaimed_plan_for_agent(conn, agent, exclude_task_id=task_id)

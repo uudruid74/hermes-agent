@@ -93,6 +93,34 @@ def test_remind_explicit_task_id_unbound_says_not_active_not_step_1(monkeypatch)
     assert "Active Step 1 of" not in out  # the phantom is dead
 
 
+def test_remind_other_agents_task_names_assignee_no_claim_invite(monkeypatch):
+    """Non-assignee calling remind on someone else's plan: name the assignee,
+    never 'assigned to you', and never invite `plan continue` (claiming a plan
+    you don't own steals the binding — Evan 2026-10-27).
+    """
+    conn = _db()
+    _insert_plan(conn, task_id="t_neo_job", stepno=2)  # assignee: ornith
+    monkeypatch.setattr(plan_binding_adapter._legacy(), "_get_kanban_db", lambda board=None: conn)
+
+    # Caller is NOT the assignee (different profile name).
+    caller = type(
+        "Caller",
+        (),
+        {
+            "agent_name": "gopher",
+            "profile_name": "gopher",
+            "session_id": "gopher-session",
+            "_session_db": _FakeSessionDB(),
+        },
+    )()
+    out = plan_binding_adapter.cmd_remind(caller, task_id="t_neo_job")
+
+    assert "assigned to ornith" in out
+    assert "assigned to you" not in out
+    assert "plan continue" not in out  # only the assignee may claim
+    assert "Do not claim it" in out
+
+
 def test_remind_explicit_task_id_bound_renders_active_step(monkeypatch):
     """Bound plan keeps the normal active-step rendering."""
     conn = _db()
