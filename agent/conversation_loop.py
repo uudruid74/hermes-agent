@@ -7427,44 +7427,27 @@ def run_conversation(
                     _kanban_nudge = None
 
                 if _kanban_nudge:
-                    agent._kanban_stop_nudges = (
-                        getattr(agent, "_kanban_stop_nudges", 0) + 1
-                    )
-                    final_msg["finish_reason"] = "kanban_terminal_required"
-                    final_msg["_kanban_stop_synthetic"] = True
-                    messages.append(final_msg)
-                    messages.append({
-                        "role": "user",
-                        "content": _kanban_nudge,
-                        "_kanban_stop_synthetic": True,
-                    })
-                    agent._session_messages = messages
+                    # Auto-kick DISABLED (Evan 2026-10-27): "It's supposed to
+                    # tell you, not automatically kick him forward!" The guard
+                    # used to append a synthetic user turn and continue the
+                    # loop, forcing the worker onward — which fought manual
+                    # pause/restart ("it stopped me from restarting"). Report
+                    # the condition and ALLOW the exit.
                     logger.info(
-                        "kanban stop-loop nudge issued (attempt %d) task=%s",
-                        agent._kanban_stop_nudges,
-                        _bound_plan_task
-                        or os.environ.get("HERMES_KANBAN_TASK", ""),
+                        "kanban stop-guard: worker exiting without terminal "
+                        "tool task=%s (report-only, nudge disabled)",
+                        _bound_plan_task or os.environ.get("HERMES_KANBAN_TASK", ""),
                     )
                     if _bound_plan_task:
                         agent._emit_status(
-                            "⚠️ Plan worker tried to exit without "
-                            "plan advance/fail/block — nudging to finish"
+                            "⚠️ Plan worker exited without "
+                            "plan advance/fail/block — reported, not nudged"
                         )
                     else:
                         agent._emit_status(
-                            "⚠️ Kanban worker tried to exit without "
-                            "kanban_complete/kanban_block — nudging to finish"
+                            "⚠️ Kanban worker exited without "
+                            "kanban_complete/kanban_block — reported, not nudged"
                         )
-                    # Same finalizer contract as verify-on-stop: clear
-                    # final_response while continuing so a later budget
-                    # exhaustion path does not treat the narrated stop as
-                    # a completed answer.
-                    _pending_verification_response = final_response
-                    _pending_verification_response_previewed = (
-                        agent._interim_content_was_streamed(final_response or "")
-                    )
-                    final_response = None
-                    continue
 
                 messages.append(final_msg)
                 
