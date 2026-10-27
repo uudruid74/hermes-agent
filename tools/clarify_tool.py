@@ -431,13 +431,15 @@ def clarify_tool(
             }, ensure_ascii=False)
     elif clarify_id:
         import threading
-        _cb_result = [None]
+        _cb_result: list = [None, None]
         _cb_done = threading.Event()
         def _run_callback():
             try:
                 _cb_result[0] = _invoke_callback(callback, question, choices, multi_select)
-            except Exception:
-                pass
+            except Exception as exc:
+                # Surface the failure — a swallowed callback exception is an
+                # unanswered question masquerading as an empty answer.
+                _cb_result[1] = exc
             _cb_done.set()
         t = threading.Thread(target=_run_callback, daemon=True)
         t.start()
@@ -463,11 +465,20 @@ def clarify_tool(
             except Exception:
                 pass
         if raw_response is None:
+            if _cb_result[1] is not None:
+                return json.dumps(
+                    {"error": f"Failed to get user input: {_cb_result[1]}"},
+                    ensure_ascii=False)
             raw_response = _cb_result[0]
         # If callback is still blocking (dashboard answered via DB), the
         # thread will eventually time out or get cleaned up — that's fine.
     else:
-        raw_response = _invoke_callback(callback, question, choices, multi_select)
+        try:
+            raw_response = _invoke_callback(callback, question, choices, multi_select)
+        except Exception as exc:
+            return json.dumps(
+                {"error": f"Failed to get user input: {exc}"},
+                ensure_ascii=False)
     if raw_response is None:
         raw_response = ""
 
