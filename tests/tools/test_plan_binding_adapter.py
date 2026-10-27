@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 from types import SimpleNamespace
@@ -85,6 +86,67 @@ def test_new_approval_question_contains_full_plan(monkeypatch):
     assert "**Goal:** Keep the full plan visible" in seen["question"]
     assert "1. Inspect the prompt" in seen["question"]
     assert "2. Render every step" in seen["question"]
+
+
+def test_stop_guard_arms_only_for_open_work(monkeypatch):
+    """The turn-end guard must nag only when the bound plan has open work.
+
+    2026-10-27 (t_5718d6c2, Evan: "We hit this again"): a plan import with
+    no assignee bound the IMPORTING session, the plan then went `blocked`,
+    and the guard kept telling a dispatcher to call `plan advance` on a
+    plan that had nothing to advance. A bound plan whose status is not
+    'manual', or whose current step is already awaiting review, is not
+    open work for the bound session.
+    """
+    conn = _db()
+    monkeypatch.setattr(plan, "_get_kanban_db", lambda board=None: conn)
+    monkeypatch.setattr(
+        plan, "clarify_tool", lambda *_args, **_kwargs: '{"user_response":"Approve"}'
+    )
+    agent = _Agent()
+
+    result = plan.plan(
+        agent, "new", title="Open plan", goal="Work it", steps=["work"]
+    )
+    assert result.startswith("TASK APPROVED (t_")
+    task_id = conn.execute("SELECT id FROM tasks").fetchone()["id"]
+
+    # Open step, manual plan -> the guard arms and names the task.
+    assert plan_binding_adapter.active_plan_task_id(agent) == task_id
+
+    # Blocked plan -> nothing to advance -> the guard must not arm.
+    conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (task_id,))
+    assert plan_binding_adapter.active_plan_task_id(agent) is None
+
+    # Manual again, but the step is submitted for review -> not open work.
+    conn.execute("UPDATE tasks SET status='manual' WHERE id=?", (task_id,))
+    conn.execute(
+        "INSERT INTO task_events (task_id, kind, payload, created_at) "
+        "VALUES (?, 'plan-step-review-pending', ?, ?)",
+        (
+            task_id,
+            json.dumps(
+                {
+                    "step": 1,
+                    "summary": "worked the step",
+                    "worker": "Neo",
+                    "profile": "Neo",
+                    "root_session_id": "compression-root",
+                    "binding_revision": 1,
+                }
+            ),
+            int(time.time()),
+        ),
+    )
+    assert plan_binding_adapter.active_plan_task_id(agent) is None
+
+    # Review resolved -> the step is open work again.
+    conn.execute(
+        "INSERT INTO task_events (task_id, kind, payload, created_at) "
+        "VALUES (?, 'plan-step-review-approved', ?, ?)",
+        (task_id, '{"step": 1, "reviewer": "Evan"}', int(time.time())),
+    )
+    assert plan_binding_adapter.active_plan_task_id(agent) == task_id
 
 
 def test_iteration_limit_parks_manual_plan_in_attention(monkeypatch):

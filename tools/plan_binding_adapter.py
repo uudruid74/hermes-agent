@@ -665,6 +665,19 @@ def _create_plan(
         # No binding activation on our side — surface the dispatch notice.
         # Evan's exact spec (2026-09-22): the creator sees ONLY the notify line.
         return f"{assigned} has been notified of task {task_id}"
+    if not assigned:
+        # No assignee binds the IMPORTER as the worker. Say so loudly
+        # (Evan 2026-10-27, t_5718d6c2): the silent self-bind turned a
+        # dispatcher into "the worker" and the stop-guard then nagged them
+        # to advance a plan they never intended to run themselves.
+        return (
+            f"TASK APPROVED ({task_id}): {title}\n\n"
+            f">>> STEP 1: {steps[0]} <<<\n\n"
+            f"NOTE: no assignee was given, so this plan is bound to YOU "
+            f"({creator_agent_name}) as its worker — you work its steps and "
+            f"submit them with `plan advance`. Pass assignee=<worker profile> "
+            f"to delegate it to someone else."
+        )
     return f"TASK APPROVED ({task_id}): {title}\n\n>>> STEP 1: {steps[0]} <<<"
 
 
@@ -682,16 +695,35 @@ def _current(conn, agent):
 
 
 def active_plan_task_id(agent) -> Optional[str]:
-    """The Plan bound to this session's execution identity, or ``None``.
+    """The Plan bound to this session with OPEN work for it, or ``None``.
 
     Turn-end stop-guard wiring (Evan 2026-10-24): a long-lived gateway
     session on a Plan has no ``HERMES_KANBAN_TASK`` env var — the binding IS
     the worker signal. An unavailable/unbound lookup means "not a plan
     worker" here; the guard then falls back to the env-armed shape.
+
+    "Open work" narrows it (Evan 2026-10-27, "We hit this again"): the
+    guard must not nag when there is nothing to submit. A bound plan that
+    is not ``manual`` (blocked/parked/closed), or whose current step is
+    already awaiting review, resolves to ``None`` — the t_5718d6c2 false
+    positive told a dispatcher to ``plan advance`` a plan that was
+    ``blocked`` with no worker ever dispatched.
     """
+    from hermes_cli import execution_bindings as bindings
+
     conn = _legacy()._get_kanban_db()
     _key, binding, _error = _current(conn, agent)
-    return binding.task_id if binding is not None else None
+    if binding is None:
+        return None
+    task = conn.execute(
+        "SELECT status, task_stepno FROM tasks WHERE id = ?",
+        (binding.task_id,),
+    ).fetchone()
+    if task is None or task["status"] != "manual":
+        return None
+    if bindings.pending_step_review(conn, binding.task_id) is not None:
+        return None
+    return binding.task_id
 
 
 def block_active_plan_at_iteration_limit(agent, *, used: int, maximum: int) -> bool:

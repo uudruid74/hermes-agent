@@ -1444,7 +1444,7 @@ PLAN_SCHEMA = {
             },
             "assignee": {
                 "type": "string",
-                "description": "Agent profile name to assign (required for dispatch). For 'new' and 'import': create the plan delegated to this agent — the task is created blocked (approval gate), assigned to them, NOT dispatched, and notifications route back to the creating agent's session. The worker then runs `plan continue <task_id>` from their session to bind and start it. For 'import' without an assignee the plan is yours (or claimable).",
+                "description": "Agent profile name to assign (required for dispatch). For 'new' and 'import': create the plan delegated to this agent — the task is created blocked (approval gate), assigned to them, NOT dispatched, and notifications route back to the creating agent's session. The worker then runs `plan continue <task_id>` from their session to bind and start it. For 'import' without an assignee the plan is bound to YOU as its worker — you work its steps and submit them with `plan advance`. Pass assignee to delegate it.",
             },
             "resume": {
                 "type": "string",

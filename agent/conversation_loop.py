@@ -7434,10 +7434,16 @@ def run_conversation(
                         _bound_plan_task
                         or os.environ.get("HERMES_KANBAN_TASK", ""),
                     )
-                    agent._emit_status(
-                        "⚠️ Kanban worker tried to exit without "
-                        "kanban_complete/kanban_block — nudging to finish"
-                    )
+                    if _bound_plan_task:
+                        agent._emit_status(
+                            "⚠️ Plan worker tried to exit without "
+                            "plan advance/fail/block — nudging to finish"
+                        )
+                    else:
+                        agent._emit_status(
+                            "⚠️ Kanban worker tried to exit without "
+                            "kanban_complete/kanban_block — nudging to finish"
+                        )
                     # Same finalizer contract as verify-on-stop: clear
                     # final_response while continuing so a later budget
                     # exhaustion path does not treat the narrated stop as

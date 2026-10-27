@@ -99,6 +99,23 @@ def test_parse_keeps_h1_lines_inside_step_bodies():
 # ----------------------------------------------------------------- plan import
 
 
+def test_import_without_assignee_names_the_bound_worker(monkeypatch, tmp_path):
+    """No assignee = the plan binds the IMPORTER as its worker — say so loudly.
+
+    2026-10-27 (t_5718d6c2): the dispatcher imported without an assignee,
+    the plan silently bound their session, and the stop-guard then nagged
+    them to `plan advance` on work they never intended to run themselves.
+    """
+    conn, _sent = _install(monkeypatch)
+    _approve(monkeypatch)
+    creator = _Agent("neo", "20261023_030303_abcdef")
+    result = plan_module.plan(creator, "import", file=_write_spec(tmp_path))
+    assert result.startswith("TASK APPROVED")
+    assert "bound to YOU" in result
+    assert "neo" in result
+    assert "assignee" in result
+
+
 def test_import_creates_the_plan_with_expansions(monkeypatch, tmp_path):
     conn, _sent = _install(monkeypatch)
     _approve(monkeypatch)
