@@ -321,6 +321,25 @@ def clarify_tool(
                 ).fetchone()
         if row:
             session_task_id = row["task_id"] if isinstance(row, dict) else row[0]
+        if not session_task_id and agent is not None:
+            # Plan-bound workers carry their task in the execution binding,
+            # not in sessions.task_id (Evan 2026-10-27, t_3b2474c5): without
+            # this the dispatcher route is starved of a task id and the ask
+            # falls through to the interactive path — the human's DM. Same
+            # failure class as the stop-guard fix 42308a3c31: gate on the
+            # execution binding, not on one spawn-path column. A genuinely
+            # task-less identity (PlanStateUnavailable) keeps today's
+            # interactive behaviour.
+            from hermes_cli.execution_bindings import (
+                PlanStateUnavailable,
+                resolve_active_for_agent,
+            )
+            try:
+                binding = resolve_active_for_agent(agent)
+            except PlanStateUnavailable:
+                binding = None
+            if binding is not None:
+                session_task_id = binding.task_id
         queue_task_id = task_id or session_task_id
         # Link the ask to the REAL kanban task when one exists: the tool
         # kwarg may carry a session/isolation id (t_936962bd retest4 stored

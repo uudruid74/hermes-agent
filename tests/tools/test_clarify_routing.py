@@ -84,6 +84,88 @@ def _pending_ask_id(db_path, task_id="t_e4812748"):
     return row[0] if row else None
 
 
+def test_plan_bound_worker_clarify_routes_via_binding(kb_env):
+    """Evan 2026-10-27 (t_3b2474c5): a plan-bound worker carries its task in
+    the execution binding, NOT in sessions.task_id (which is NULL). Before
+    the binding fallback the dispatcher route was starved of a task id and
+    the ask fell through to the interactive path — landing on the human's
+    DM instead of reaching the dispatcher. The tool kwarg ``task_id`` is
+    deliberately absent here: that is exactly ornith's call shape."""
+    conn = sqlite3.connect(kb_env.db_path)
+    now = int(time.time())
+    conn.execute(
+        "INSERT INTO execution_bindings(profile, root_session_id, task_id, "
+        "revision, bound_at, updated_at) VALUES(?,?,?,?,?,?)",
+        ("ornith", "sess_root_w1", "t_e4812748", 1, now, now),
+    )
+    conn.commit()
+    conn.close()
+
+    class FakeSessionDB:
+        def get_compression_root(self, session_id):
+            return "sess_root_w1"
+
+    agent = SimpleNamespace(
+        agent_name="ornith",
+        profile_name="ornith",
+        session_id="sess_w1",
+        clarify_callback=None,
+        _session_db=FakeSessionDB(),
+    )
+    result = {}
+
+    def run():
+        result["r"] = clarify_tool(
+            question="TEST-CLARIFY — binding fallback routes me to the dispatcher",
+            callback=lambda q, c, multi_select=False: "IMPROVISED",
+            agent=agent,
+        )
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+
+    # Poll the queue row by content (not by task link): the row is written
+    # before routing regardless, and the red shape is precisely a row whose
+    # task_id is blank because no task id was ever resolved.
+    row = None
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and row is None:
+        c2 = sqlite3.connect(kb_env.db_path)
+        try:
+            row = c2.execute(
+                "SELECT id, task_id FROM clarify_queue ORDER BY created_at DESC LIMIT 1"
+            ).fetchone()
+        finally:
+            c2.close()
+        if row is None:
+            time.sleep(0.1)
+    assert row, "the durable clarify_queue row was never written"
+
+    # The bug shape: the interactive callback answered instantly and the
+    # dispatcher was never woken at all.
+    assert kb_env.wakes, (
+        "dispatcher never woken — the ask fell to the interactive path "
+        "(this is the human-DM bug)"
+    )
+    wake_text = " ".join(kb_env.wakes[0])
+    assert "binding fallback" in wake_text
+    assert "/review t_e4812748 <your answer>" in wake_text
+
+    # The queue row is linked to the REAL kanban task, not blank.
+    assert row[1] == "t_e4812748", f"queue row task_id is {row[1]!r}, not t_e4812748"
+
+    # The dispatcher answers through /review; the worker gets the real
+    # answer — never the interactive fallback string.
+    from hermes_cli.plan_slash_helpers import plan_review_command
+
+    ok, msg = plan_review_command("t_e4812748 yes — binding")
+    assert ok, msg
+    t.join(timeout=15)
+    out = json.loads(result["r"])
+    assert out["user_response"] == "yes — binding"
+    assert out["question"].startswith("TEST-CLARIFY")
+
+
 def test_worker_clarify_queues_row_and_wakes_dispatcher(kb_env):
     agent = SimpleNamespace(
         agent_name="ornith", session_id="sess_w1", clarify_callback=None
