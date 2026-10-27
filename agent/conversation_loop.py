@@ -895,10 +895,21 @@ def _canonicalize_api_tool_calls(api_messages) -> None:
                         ),
                     }}
                 except Exception:
-                    tc["function"]["arguments"] = _repair_tool_call_arguments(
-                        tc["function"]["arguments"],
-                        tc["function"].get("name", "?"),
-                    )
+                    # Copy-on-write here too (t_06eae500): tc["function"] is a
+                    # nested dict SHARED with the live history dict — the api
+                    # message is only a shallow copy. Assigning into it mutated
+                    # the persisted history's tool-call arguments in place (the
+                    # docstring's "the persisted history is untouched" held only
+                    # on the try path), so the next transcript rewrite re-inserted
+                    # the repaired/truncated arguments as a byte-different twin
+                    # of the row already stored with the original arguments.
+                    tc = {**tc, "function": {
+                        **tc["function"],
+                        "arguments": _repair_tool_call_arguments(
+                            tc["function"]["arguments"],
+                            tc["function"].get("name", "?"),
+                        ),
+                    }}
             new_tcs.append(tc)
         am["tool_calls"] = new_tcs
 

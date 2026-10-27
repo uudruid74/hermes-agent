@@ -143,3 +143,48 @@ class TestGatewayHistoryBuildForwardsSidecar:
         agent_history, _obs = _build_gateway_agent_history(history)
         assert agent_history[0]["api_content"] == "hi\n\nCTX"
 
+
+
+class TestReplayEntrySidecarFidelity:
+    """t_06eae500: replay entries carry the persisted sidecar columns.
+
+    A replay-derived dict that is ever re-persisted (compaction window
+    re-insert, flush identity drift) must write a byte-identical copy of the
+    stored row so archive_and_compact's no-duplicates DELETE collapses it —
+    a reduced entry shape leaves a near-twin trail (the 2026-10-27
+    session-replay-transcript-triplication bug)."""
+
+    def test_persisted_sidecar_columns_carry_through(self):
+        msg = {
+            "role": "assistant",
+            "content": "answer",
+            "tool_name": "terminal",
+            "effect_disposition": "safe",
+            "display_kind": "hidden",
+            "display_metadata": {"source": "compaction"},
+            "message_id": "tg-42",
+        }
+        entry = _build_replay_entry("assistant", "answer", msg)
+        assert entry["tool_name"] == "terminal"
+        assert entry["effect_disposition"] == "safe"
+        assert entry["display_kind"] == "hidden"
+        assert entry["display_metadata"] == {"source": "compaction"}
+        assert entry["message_id"] == "tg-42"
+
+    def test_observed_flag_stays_stripped(self):
+        # clean_msg deliberately strips "observed" from replay shapes — it is
+        # not a wire field and must not be re-introduced by the sidecar carry.
+        msg = {"role": "user", "content": "hi", "observed": True}
+        entry = _build_replay_entry("user", "hi", msg, preserve_timestamp=True)
+        assert "observed" not in entry
+
+    def test_absent_sidecar_columns_stay_absent(self):
+        entry = _build_replay_entry(
+            "assistant", "answer", {"role": "assistant", "content": "answer"}
+        )
+        assert entry == {"role": "assistant", "content": "answer"}
+
+    def test_platform_message_id_alias_carries_through(self):
+        msg = {"role": "user", "content": "hi", "platform_message_id": "tg-7"}
+        entry = _build_replay_entry("user", "hi", msg, preserve_timestamp=True)
+        assert entry["message_id"] == "tg-7"

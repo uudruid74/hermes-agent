@@ -7114,6 +7114,35 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             _fp(api_content),
         )
 
+    @staticmethod
+    def _row_core_id(
+        role: Optional[str],
+        text: Any,
+        tool_calls_json: Optional[str],
+    ) -> tuple:
+        """Core identity (role, content, tool_calls) — sidecar-blind.
+
+        Used by the re-copy rule (t_06eae500): a body row whose core AND
+        exact clock already exist durably is a RE-COPY of that row (a
+        genuine new message is stamped with its own creation clock — see
+        build_assistant_message / make_tool_result_message), so it is
+        dropped even when a lossy rebuild stripped its sidecar columns
+        and the sidecar-aware fingerprint above no longer matches.
+        """
+        body = text if isinstance(text, str) else ""
+        calls = tool_calls_json or ""
+        edge = _UNIT_FINGERPRINT_CHARS
+        return (
+            "core",
+            role or "unknown",
+            len(body),
+            body[:edge],
+            body[-edge:],
+            len(calls),
+            calls[:edge],
+            calls[-edge:],
+        )
+
     def _row_unit_index_for(self, conn, session_id: str) -> Dict[str, Any]:
         """Lazily build the per-session unit-id index used for write dedup.
 
@@ -7129,7 +7158,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if entry is not None:
             return entry
         edge = _UNIT_FINGERPRINT_CHARS
-        entry = {"calls": set(), "bodies": {}}
+        entry = {"calls": set(), "bodies": {}, "cores": {}}
         for row in conn.execute(
             "SELECT role, tool_call_id, timestamp, "
             f"length(content) AS clen, substr(content, 1, {edge}) AS chead, "
@@ -7171,6 +7200,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (row["alen"] or 0, row["ahead"] or "", row["atail"] or ""),
             )
             entry["bodies"].setdefault(base, set()).add(ts)
+            # Sidecar-blind core clock index for the re-copy rule
+            # (t_06eae500): same core + same exact clock = a re-copy of an
+            # already-durable row, however lossy the incoming shape.
+            core = (
+                "core",
+                row["role"] or "unknown",
+                row["clen"] or 0,
+                row["chead"] or "",
+                row["ctail"] or "",
+                row["tlen"] or 0,
+                row["thead"] or "",
+                row["ttail"] or "",
+            )
+            entry["cores"].setdefault(core, set()).add(ts)
         cache[session_id] = entry
         return entry
 
@@ -7252,6 +7295,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         unit_index = self._row_unit_index_for(conn, session_id)
         batch_calls: set = set()
         batch_bodies: Dict[tuple, set] = {}
+        batch_cores: Dict[tuple, set] = {}
         allow_cross_unit_dedup = _ts_harvest is None
         _dup_dropped_fabricated = 0
         _dup_dropped_real_clock = 0
@@ -7372,7 +7416,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 _unit_dup = _unit_id in batch_calls or (
                     allow_cross_unit_dedup and _unit_id in unit_index["calls"]
                 )
+                _core_id = None
             else:
+                _core_id = self._row_core_id(role, _encoded, tool_calls_json)
                 _unit_dup = self._row_body_unit_seen(
                     batch_bodies, _unit_id, message_timestamp, ts_fabricated
                 ) or (
@@ -7384,6 +7430,23 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         ts_fabricated,
                     )
                 )
+                if allow_cross_unit_dedup and not _unit_dup and not ts_fabricated:
+                    # Re-copy rule (t_06eae500): a REAL clock that exactly
+                    # matches a durable row's clock on the sidecar-blind core
+                    # identity is a re-copy of that row — a genuine new message
+                    # always carries its own creation clock (build_assistant_
+                    # message / make_tool_result_message stamp time.time() at
+                    # build). The sidecar-aware fingerprint above cannot see
+                    # these: lossy rebuilds (replay-entry reduction, repair
+                    # rewrites) drop sidecar columns and the copy slips past as
+                    # a "distinct" near-twin. Append flows only — rewrite flows
+                    # harvest shared clocks for same-content rows BY DESIGN
+                    # (t_4b1721cb) and must never merge on this rule.
+                    _unit_dup = self._row_body_unit_seen(
+                        batch_cores, _core_id, message_timestamp, False
+                    ) or self._row_body_unit_seen(
+                        unit_index["cores"], _core_id, message_timestamp, False
+                    )
             if _unit_dup:
                 if ts_fabricated:
                     _dup_dropped_fabricated += 1
@@ -7451,6 +7514,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             self._row_unit_note(
                 unit_index["calls"], unit_index["bodies"], _unit_id, message_timestamp
             )
+            if _core_id is not None:
+                batch_cores.setdefault(_core_id, set()).add(message_timestamp)
+                unit_index["cores"].setdefault(_core_id, set()).add(message_timestamp)
             if tool_calls is not None:
                 tool_calls_total += (
                     len(tool_calls) if isinstance(tool_calls, list) else 1

@@ -1072,6 +1072,24 @@ def _build_replay_entry(
     providers.
     """
     entry: Dict[str, Any] = {"role": role, "content": content}
+    # Persisted-sidecar fidelity (t_06eae500): carry every remaining persisted
+    # column the source row has, so a replay-derived dict that is ever
+    # re-persisted (compaction window re-insert, flush identity drift) writes a
+    # byte-identical copy of the stored row — which archive_and_compact's
+    # no-duplicates DELETE then collapses to MIN(id) instead of leaving a
+    # near-twin trail. Mirrors the key set _rows_to_conversation restores.
+    for _skey in (
+        "tool_name",
+        "effect_disposition",
+        "display_kind",
+        "display_metadata",
+    ):
+        _sval = msg.get(_skey)
+        if _sval:
+            entry[_skey] = _sval
+    _plat_id = msg.get("platform_message_id") or msg.get("message_id")
+    if _plat_id:
+        entry["message_id"] = _plat_id
     # api_content sidecar (persist-what-you-send, prompt-cache stability):
     # forward the exact bytes previously sent to the API for this message so
     # the agent's api_messages build can substitute them and keep the request

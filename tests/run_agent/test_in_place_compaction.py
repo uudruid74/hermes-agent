@@ -302,3 +302,69 @@ class TestCompactedTurnsStaySearchable:
                 "ZEBRAWORD", role_filter=["user", "assistant"], include_inactive=True
             )
             assert len(recovered) == 1
+
+
+class TestDurableAtCommitAndNoProgressGate:
+    """t_06eae500: the committed window is stamped durable in memory, and the
+    no-progress gate reads persistence-marker drift as NO progress (the window
+    was already written this turn — never re-archive it)."""
+
+    def test_committed_dicts_stamped_durable(self):
+        """After a successful in-place commit the compacted dicts carry the
+        _db_persisted marker so the end-of-turn flush skips them — the class-2
+        whole-window re-write that triplicated Zephyr's active set."""
+        from hermes_state import SessionDB
+        from agent.conversation_compression import compress_context
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "20261027_120000_stamps"
+            _seed(db, sid, "stamp-test")
+            agent = _make_agent(db, sid, in_place=True)
+            messages = [{"role": "user", "content": f"m{i}"} for i in range(8)]
+
+            compressed, _sp = compress_context(
+                agent, messages, approx_tokens=100_000, system_message="sys"
+            )
+            assert compressed
+            assert all(m.get("_db_persisted") is True for m in compressed)
+            # The DB holds exactly the committed dicts as the live set.
+            rows = db.get_messages(sid)
+            assert [r["content"] for r in rows] == [m["content"] for m in compressed]
+
+    def test_no_progress_gate_ignores_marker_drift(self):
+        """A pass that re-emits the committed window with the markers stripped
+        (compress()'s terminal sweep) is content-identical: no boundary rewrite,
+        no fresh copies of an already-persisted window."""
+        from hermes_state import SessionDB
+        from agent.conversation_compression import compress_context
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "20261027_120001_noprog"
+            _seed(db, sid, "no-progress")
+            agent = _make_agent(db, sid, in_place=True)
+            messages = [{"role": "user", "content": f"m{i}"} for i in range(8)]
+            compressed, _sp = compress_context(
+                agent, messages, approx_tokens=100_000, system_message="sys"
+            )
+            active_ids_before = [r["id"] for r in db.get_messages(sid)]
+
+            def _noop_compress(messages, current_tokens=None, focus_topic=None, force=False):
+                return [
+                    {k: v for k, v in m.items() if k != "_db_persisted"}
+                    for m in messages
+                ]
+
+            agent.context_compressor.compress = _noop_compress
+            agent.context_compressor._last_compress_aborted = False
+            out, _sp2 = compress_context(
+                agent, list(compressed), approx_tokens=50,
+                system_message="sys", force=True,
+            )
+            active_ids_after = [r["id"] for r in db.get_messages(sid)]
+            assert active_ids_after == active_ids_before, (
+                "no-progress pass re-archived an already-persisted window"
+            )
+            # And the committed window is still stamped durable.
+            assert all(m.get("_db_persisted") is True for m in compressed)

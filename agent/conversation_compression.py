@@ -101,6 +101,19 @@ COMPACTION_STATUS = (
 
 COMPACTION_DONE_STATUS = "✓ Context compaction complete — continuing turn..."
 
+# Intrinsic per-dict persistence marker (same contract as run_agent's
+# _DB_PERSISTED_MARKER and context_compressor's _DB_PERSISTED_MARKER — the
+# underscore prefix keeps it off the wire). Stamped on dicts that are durable
+# so every later persist scan skips them.
+_DB_PERSISTED_MARKER = "_db_persisted"
+
+
+def _without_persist_marker(msg: Any) -> Any:
+    """Return *msg* without its persistence marker (for semantic compares)."""
+    if isinstance(msg, dict):
+        return {k: v for k, v in msg.items() if k != _DB_PERSISTED_MARKER}
+    return msg
+
 
 def _emit_compaction_done(agent: Any) -> None:
     """Emit the structured terminal edge for a started compaction."""
@@ -3070,7 +3083,17 @@ def compress_context(
         # legacy/plugin engines may return an equal copy for a no-op, or mutate
         # the live list while returning an unchanged snapshot. Neither case may
         # rotate or rewrite the session.
-        if compressed == messages_before_compression:
+        # Persistence markers are bookkeeping, not transcript content: a
+        # committed window now carries _db_persisted stamps (the in-place
+        # durable-at-commit contract), and compress() strips them from its
+        # output copies — raw dict equality would read that marker drift as
+        # "progress" and re-archive a window that was already written this
+        # turn (t_06eae500). The raw comparison runs first (the commit-race
+        # harness synchronizes on it), the marker-stripped comparison is the
+        # fallback for marker drift.
+        if compressed == messages_before_compression or [
+            _without_persist_marker(m) for m in compressed
+        ] == [_without_persist_marker(m) for m in messages_before_compression]:
             if messages != messages_before_compression:
                 messages[:] = copy.deepcopy(messages_before_compression)
             logger.info(
@@ -3289,6 +3312,22 @@ def compress_context(
                     # See #38763.
                     agent._session_db.archive_and_compact(agent.session_id, compressed)
                     split_status = "in_place_committed"
+                    # Durable-at-commit (mirror of _sync_micro_compact_to_db,
+                    # t_06eae500): compress() strips _db_persisted from every
+                    # assembled dict (#57491 rotation requirement), so without
+                    # a re-stamp the end-of-turn flush sees the whole committed
+                    # window as new rows whenever dict identity drifts between
+                    # here and the flush (replay rebuilds, repair merges,
+                    # _select_cached_agent_history swaps) and re-appends it —
+                    # the class-2 whole-window re-write that triplicated
+                    # Zephyr's active set on 2026-10-27. The committed dicts
+                    # ARE in the DB now; stamp them so every later persist scan
+                    # skips them. On archive failure nothing is stamped and the
+                    # flush persists them for real (the micro-compaction
+                    # contract: old stamps keep the flush idempotent).
+                    for _committed in compressed:
+                        if isinstance(_committed, dict):
+                            _committed[_DB_PERSISTED_MARKER] = True
                     # Reset the flush identity set so the next turn's appends are
                     # diffed against the COMPACTED transcript: the compacted dicts
                     # are passed as conversation_history next turn and skipped by
