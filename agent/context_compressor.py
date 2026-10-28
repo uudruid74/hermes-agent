@@ -3051,13 +3051,17 @@ class ContextCompressor(ContextEngine):
             for tc in msg["tool_calls"]:
                 if isinstance(tc, dict):
                     args = tc.get("function", {}).get("arguments", "")
-                    if collapse_historical_tool_calls and args != "{}":
-                        tc = {
-                            **tc,
-                            "function": {**tc["function"], "arguments": "{}"},
-                        }
-                        modified = True
-                    elif len(args) > 500:
+                    # t_06eae500-followup (parameter-drop, 2026-10-28): NEVER blank a
+                    # real tool call's arguments to "{}". The collapse flag used to
+                    # overwrite ``arguments`` with "{}" for every historical call to
+                    # save tokens, and the compressor persisted that rewrite as the
+                    # durable active transcript. The model then replayed its own
+                    # history calling tools with empty arguments and converged on
+                    # argument-less calls (the assignee/command drop, 10-27). The
+                    # truncation below keeps JSON valid and preserves parameter
+                    # names while shrinking long string leaves — it never erases the
+                    # arguments wholesale.
+                    if len(args) > 500:
                         new_args = _truncate_tool_call_args_json(args)
                         if new_args != args:
                             tc = {**tc, "function": {**tc["function"], "arguments": new_args}}

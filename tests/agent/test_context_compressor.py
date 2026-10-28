@@ -1767,7 +1767,9 @@ class TestTokenBudgetTailProtection:
             collapse_historical_tool_calls=True,
         )
         assert pruned[2]["content"] == ""
-        assert pruned[2]["tool_calls"][0]["function"]["arguments"] == "{}"
+        # Arguments must SURVIVE collapse: blanking them to "{}" was the
+        # parameter-drop priming bug (t_06eae500-followup, 2026-10-28).
+        assert pruned[2]["tool_calls"][0]["function"]["arguments"] == old_args
         assert messages[2]["content"].startswith("historical tool commentary")
         assert messages[2]["tool_calls"][0]["function"]["arguments"] == old_args
         assert pruned[-3]["tool_calls"][0]["function"]["arguments"] == newest_args
