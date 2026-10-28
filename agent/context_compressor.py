@@ -35,7 +35,6 @@ from agent.context_engine import ContextEngine, sanitize_memory_context
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.internal_compression_fallback import (
     INTERNAL_FALLBACK_PREFIX,
-    _verbatim_tail_start,
     build_internal_fallback,
 )
 from agent.model_metadata import (
@@ -104,7 +103,6 @@ HISTORICAL_TASK_HEADING = "## Historical Task Snapshot"
 # end marker, and merged-summary delimiters) after the fallback helper returns.
 # This is additional to the helper's own 24-token structural reserve.
 _INTERNAL_FALLBACK_POST_ASSEMBLY_RESERVE_TOKENS = 128
-_LAST_N_TAIL_COLLAPSE_RATIO = 0.68
 
 
 SUMMARY_PREFIX = (
@@ -2832,7 +2830,6 @@ class ContextCompressor(ContextEngine):
         self, messages: List[Dict[str, Any]], protect_tail_count: int,
         protect_tail_tokens: int | None = None,
         min_prune_chars: int = 200,
-        collapse_historical_tool_calls: bool = False,
     ) -> tuple[List[Dict[str, Any]], int]:
         """Replace old tool result contents with informative 1-line summaries.
 
@@ -2843,10 +2840,7 @@ class ContextCompressor(ContextEngine):
 
         Also deduplicates identical tool results (e.g. reading the same file
         5x keeps only the newest full copy) and truncates large tool_call
-        arguments in assistant messages outside the protected tail. When
-        ``collapse_historical_tool_calls`` is true, every older tool call drops
-        its assistant commentary and arguments while the newest call batch and
-        matching results remain verbatim.
+        arguments in assistant messages outside the protected tail.
 
         Walks backward from the end, protecting the most recent messages that
         fall within ``protect_tail_tokens`` (when provided) OR the last
@@ -2885,32 +2879,13 @@ class ContextCompressor(ContextEngine):
                         args_str = getattr(fn, "arguments", "") if fn else ""
                         call_id_to_tool[cid] = (name, args_str)
 
-        latest_tool_call_idx = -1
-        latest_tool_call_ids: set[str] = set()
         latest_assistant_idx = -1
-        # The newest assistant turn's index is used in two places: Pass 3's
-        # tool-call-args truncation and Pass 3b's reasoning strip. It must
-        # be computed unconditionally — Pass 3b runs even when the collapse
-        # flag is off (ordinary Phase-1 prune), so its "keep newest thinking
-        # verbatim" guard depends on it.
+        # The newest assistant turn's index guards Pass 3b's reasoning strip:
+        # the newest assistant turn keeps its thinking verbatim, older blobs
+        # are stripped. Computed unconditionally — Pass 3b runs on every prune.
         for i in range(len(result) - 1, -1, -1):
             if latest_assistant_idx < 0 and result[i].get("role") == "assistant":
                 latest_assistant_idx = i
-                break
-        if collapse_historical_tool_calls:
-            for i in range(len(result) - 1, -1, -1):
-                tool_calls = result[i].get("tool_calls") or []
-                if result[i].get("role") != "assistant" or not tool_calls:
-                    continue
-                latest_tool_call_idx = i
-                for tc in tool_calls:
-                    cid = (
-                        tc.get("id", "")
-                        if isinstance(tc, dict)
-                        else getattr(tc, "id", "")
-                    )
-                    if cid:
-                        latest_tool_call_ids.add(cid)
                 break
 
         # Determine the prune boundary
@@ -2989,11 +2964,6 @@ class ContextCompressor(ContextEngine):
             msg = result[idx]
             if msg.get("role") != "tool":
                 return False
-            if (
-                collapse_historical_tool_calls
-                and msg.get("tool_call_id") in latest_tool_call_ids
-            ):
-                return False
             content = msg.get("content", "")
             if isinstance(content, list):
                 stripped = _strip_image_parts_from_parts(content)
@@ -3044,10 +3014,8 @@ class ContextCompressor(ContextEngine):
             msg = result[idx]
             if msg.get("role") != "assistant" or not msg.get("tool_calls"):
                 return False
-            if collapse_historical_tool_calls and idx == latest_tool_call_idx:
-                return False
             new_tcs = []
-            modified = collapse_historical_tool_calls and bool(msg.get("content"))
+            modified = False
             for tc in msg["tool_calls"]:
                 if isinstance(tc, dict):
                     args = tc.get("function", {}).get("arguments", "")
@@ -3069,8 +3037,6 @@ class ContextCompressor(ContextEngine):
                 new_tcs.append(tc)
             if modified:
                 replacement = {**msg, "tool_calls": new_tcs}
-                if collapse_historical_tool_calls:
-                    replacement["content"] = ""
                 result[idx] = replacement
             return modified
 
@@ -6233,27 +6199,13 @@ This compaction should PRIORITISE preserving all information related to the focu
 
         display_tokens = current_tokens if current_tokens else self.last_prompt_tokens or estimate_messages_tokens_rough(messages)
 
-        # A visible-message last-N tail can include an arbitrarily large run of
-        # tool traffic. Collapse that traffic before the ordinary token-budget
-        # prune so the fallback can re-measure a tail that has room to fit.
-        last_n_tail_start = _verbatim_tail_start(
-            messages,
-            self._protect_head_size(messages),
-            self.protect_last_n,
-        )
-        last_n_tail_tokens = estimate_messages_tokens_rough(
-            messages[last_n_tail_start:]
-        )
+        # (Evan, 2026-10-28) The last-N verbatim window is binding — it must
+        # never be touched. There is no opportunistic tail-collapse pre-pass
+        # here: an oversized tool tail is handled at compaction time by the
+        # fallback's emergency rung and ``_fit_tail_start`` (which drop whole
+        # turns), never by emptying commentary or truncating arguments on
+        # kept messages.
         pruned_count = 0
-        if last_n_tail_tokens > int(
-            self.tail_token_budget * _LAST_N_TAIL_COLLAPSE_RATIO
-        ):
-            messages, pruned_count = self._prune_old_tool_results(
-                messages,
-                protect_tail_count=1,
-                protect_tail_tokens=None,
-                collapse_historical_tool_calls=True,
-            )
 
         # Phase 1: Prune old tool results (cheap, no LLM call)
         messages, ordinary_pruned_count = self._prune_old_tool_results(

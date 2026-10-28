@@ -1694,9 +1694,11 @@ class TestTokenBudgetTailProtection:
         # Should have compressed (fewer messages than original)
         assert len(result) < len(messages)
 
-    def test_oversized_last_n_tail_collapses_tools_before_internal_fallback(self):
-        """Historical call arguments must not crowd the visible last-N tail (the
-    budget was set pre-fix so the whole protected tail would exceed 1800*1.5)."""
+    def test_oversized_last_n_tail_never_mutates_verbatim_window(self):
+        """The last-N verbatim window is binding (Evan 2026-10-28): an oversized
+        tool tail must never have its commentary emptied or its tool-call
+        arguments truncated/blanked. Over-budget tails are handled at compaction
+        time by dropping whole turns, never by corrupting kept messages."""
         with patch(
             "agent.context_compressor.get_model_context_length", return_value=100_000
         ):
@@ -1761,23 +1763,16 @@ class TestTokenBudgetTailProtection:
             ]
         )
 
-        pruned, _ = c._prune_old_tool_results(
-            messages,
-            protect_tail_count=1,
-            collapse_historical_tool_calls=True,
-        )
-        assert pruned[2]["content"] == ""
-        # Arguments must SURVIVE collapse: blanking them to "{}" was the
-        # parameter-drop priming bug (t_06eae500-followup, 2026-10-28).
-        assert pruned[2]["tool_calls"][0]["function"]["arguments"] == old_args
-        assert messages[2]["content"].startswith("historical tool commentary")
-        assert messages[2]["tool_calls"][0]["function"]["arguments"] == old_args
-        assert pruned[-3]["tool_calls"][0]["function"]["arguments"] == newest_args
-        assert pruned[-2]["content"] == newest
-
+        # The verbatim tail must survive byte-for-byte: the newest call keeps
+        # its real arguments (never "{}", never truncated) and its commentary.
         result = c.compress(messages, current_tokens=90_000)
 
-        tool_contents = [msg["content"] for msg in result if msg.get("role") == "tool"]
+        # No tool-call arguments anywhere in the result may be blanked to "{}"
+        # (the parameter-drop priming bug) — the verbatim window is binding.
+        for msg in result:
+            for tc in msg.get("tool_calls") or []:
+                assert tc["function"]["arguments"] != "{}"
+
         newest_call = next(
             msg for msg in result
             if msg.get("role") == "assistant"
@@ -1785,8 +1780,16 @@ class TestTokenBudgetTailProtection:
         )
         assert c._last_compress_aborted is False
         assert c._last_summary_fallback_used is True
-        assert newest in tool_contents
+        # The newest tool result survives verbatim (the tail floor is intact).
+        assert newest in [m["content"] for m in result if m.get("role") == "tool"]
         assert newest_call["tool_calls"][0]["function"]["arguments"] == newest_args
+        # The newest assistant commentary is untouched (not emptied).
+        assert newest_call.get("content") == ""
+        latest_review = next(
+            msg for msg in reversed(result)
+            if msg.get("role") == "assistant"
+        )
+        assert latest_review["content"] == "latest result reviewed"
 
     def test_prune_short_conv_protects_entire_tail(self, budget_compressor):
         """Regression guard for PR #17025.
