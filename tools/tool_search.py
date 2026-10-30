@@ -44,7 +44,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from tools.registry import provided_note, tool_error
+from tools.registry import tool_error
 
 logger = logging.getLogger("tools.tool_search")
 
@@ -1002,18 +1002,13 @@ def validate_deferred_call_args(name: str, args: Dict[str, Any]) -> Optional[str
         missing = [r for r in required if isinstance(r, str) and r not in args]
         if not missing:
             return None
-        example = ", ".join(
-            f'"{m}": {_example_value(params, m)}' for m in missing
-        )
+        # Minimal rejection (Evan, 2026-10-30): report failure and cause
+        # only — never echo the failed call, its arguments, the schema, or a
+        # corrected example. Call-shaped content in the tool result feeds the
+        # self-imitation spiral that turned one bad emission into 82.
         return tool_error(
-            f"tool_call to '{name}' is missing required argument(s): "
+            f"tool_call to '{name}' failed: missing required argument(s): "
             f"{', '.join(missing)}. The tool was NOT invoked."
-            f"{provided_note(required, args)}",
-            parameters=params,
-            hint=(
-                "Retry tool_call with 'arguments' matching the parameters "
-                f'schema above. Example: "arguments": {{{example}}}'
-            ),
         )
     except Exception:  # pragma: no cover — never block dispatch on validator bugs
         logger.debug("validate_deferred_call_args failed for %s", name, exc_info=True)

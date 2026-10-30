@@ -542,7 +542,7 @@ class TestDeferredCallSchemaProbe:
             toolset=toolset,
         )
 
-    def test_validator_returns_schema_for_missing_required(self):
+    def test_validator_rejects_minimally_for_missing_required(self):
         from tools.tool_search import validate_deferred_call_args
 
         self._register("mcp_probe_docs_get", "mcp-probe")
@@ -551,8 +551,10 @@ class TestDeferredCallSchemaProbe:
         parsed = json.loads(err)
         assert "document_id" in parsed["error"]
         assert "NOT invoked" in parsed["error"]
-        assert parsed["parameters"]["required"] == ["document_id"]
-        assert "document_id" in parsed["parameters"]["properties"]
+        # Minimal rejection (Evan, 2026-10-30): failure + cause only —
+        # no schema payload, no example, no call echo.
+        assert "parameters" not in parsed
+        assert "hint" not in parsed
 
 
     def test_validator_never_blocks_unvalidatable_tools(self):
@@ -628,7 +630,9 @@ class TestEmptyArgumentsRepair:
         assert err is None
         assert args == {"query": "real"}
 
-    def test_empty_args_error_echoes_expected_and_provided(self, monkeypatch):
+    def test_empty_args_error_is_minimal(self, monkeypatch):
+        """Rejection says failed + why only — no schema, example, or echo
+        (Evan, 2026-10-30: call-shaped tool results seed the spiral)."""
         from tools.tool_search import validate_deferred_call_args
         monkeypatch.setattr(
             "tools.registry.registry.get_schema",
@@ -637,29 +641,16 @@ class TestEmptyArgumentsRepair:
         err = validate_deferred_call_args(
             "mcp__sequential_thinking__sequentialthinking", {})
         assert err is not None
+        assert "failed" in err
         assert "missing required argument(s): thought" in err
-        assert "Expected parameters:" in err
-        assert "Provided: nothing" in err
+        assert "NOT invoked" in err
+        assert "Parameters schema" not in err
+        assert "Example" not in err
+        assert "Provided" not in err
 
-    def test_empty_args_error_carries_filled_example(self, monkeypatch):
-        """The repair nudge must contain the exact corrective call shape —
-        a schema dump alone was ignored 5x in a row (2026-10-30 04:19)."""
-        from tools.tool_search import validate_deferred_call_args
-        monkeypatch.setattr(
-            "tools.registry.registry.get_schema",
-            lambda name: _MCP_THINKING_SCHEMA,
-        )
-        err = validate_deferred_call_args(
-            "mcp__sequential_thinking__sequentialthinking", {})
-        assert err is not None
-        parsed = json.loads(err)
-        hint = parsed.get("hint", "")
-        assert '"arguments": {' in hint
-        assert '"thought": "<thought>"' in hint
-        assert '"nextThoughtNeeded": true' in hint
-
-    def test_argument_errors_class_pin_echo_both_sides(self, monkeypatch):
-        """CLASS test: every validator argument error echoes both sides."""
+    def test_argument_errors_class_pin_minimal(self, monkeypatch):
+        """CLASS test: every validator rejection carries failure + cause and
+        never echoes the call, schema, or a corrected example."""
         from tools.tool_search import validate_deferred_call_args
         monkeypatch.setattr(
             "tools.registry.registry.get_schema",
@@ -669,8 +660,10 @@ class TestEmptyArgumentsRepair:
             err = validate_deferred_call_args(
                 "mcp__sequential_thinking__sequentialthinking", provided)
             assert err is not None
-            assert "Expected parameters:" in err
-            assert "Provided:" in err
+            assert '"error"' in err
+            assert "NOT invoked" in err
+            assert "Parameters schema" not in err
+            assert "Example" not in err
 
     def test_complete_args_still_dispatch(self, monkeypatch):
         from tools.tool_search import validate_deferred_call_args

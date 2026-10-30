@@ -209,6 +209,72 @@ def _escape_invalid_chars_in_json_strings(raw: str) -> str:
     return "".join(out)
 
 
+def _salvage_truncated_json(raw: str) -> str:
+    """Complete truncated JSON instead of dead-ending to ``{}``.
+
+    Closes an open string (dropping a dangling trailing backslash), then
+    closes any still-open containers in reverse order. If the tail is a
+    dangling incomplete ``key``/``key:`` pair, trims back to the last
+    structural comma and retries. Returns ``""`` when nothing recoverable —
+    callers fall through to the remaining repair passes.
+
+    Truncation (stream cutoffs on large payloads) must recover the keys the
+    model DID write; blanking to ``{}`` made broken emissions fatal
+    (2026-10-30 empty-argument spiral).
+    """
+    out: list[str] = []
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    last_comma_at = -1
+    for ch in raw:
+        if in_string:
+            out.append(ch)
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            out.append(ch)
+            continue
+        if ch in "{[":
+            stack.append(ch)
+        elif ch in "}]":
+            if stack:
+                stack.pop()
+        elif ch == ",":
+            last_comma_at = len(out)
+        out.append(ch)
+    if in_string:
+        if escaped:
+            out.pop()  # dangling backslash would escape the closer
+        out.append('"')
+
+    def _close(seq: list[str]) -> str:
+        return "".join(seq) + "".join(
+            "}" if c == "{" else "]" for c in reversed(stack)
+        )
+
+    cand = _close(out)
+    try:
+        json.loads(cand)
+        return cand
+    except (json.JSONDecodeError, ValueError):
+        pass
+    if last_comma_at > 0:
+        cand2 = _close(out[:last_comma_at])
+        try:
+            json.loads(cand2)
+            return cand2
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return ""
+
+
 def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
     """Attempt to repair malformed tool_call argument JSON.
 
@@ -251,6 +317,16 @@ def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
     fixed = raw_stripped
     # 1. Strip trailing commas before } or ]
     fixed = re.sub(r',\s*([}\]])', r'\1', fixed)
+    # 1b. Salvage truncation: close an open string / open containers and
+    # drop a dangling pair. Recovers the keys the model DID write before
+    # any pass that would mangle an open string.
+    salvaged = _salvage_truncated_json(fixed)
+    if salvaged:
+        logger.warning(
+            "Salvaged truncated tool_call arguments for %s: %s → %s",
+            tool_name, raw_stripped[:80], salvaged[:80],
+        )
+        return salvaged
     # 2. Close unclosed structures
     open_curly = fixed.count('{') - fixed.count('}')
     open_bracket = fixed.count('[') - fixed.count(']')
