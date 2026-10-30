@@ -44,7 +44,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from tools.registry import tool_error
+from tools.registry import provided_note, tool_error
 
 logger = logging.getLogger("tools.tool_search")
 
@@ -1002,13 +1002,17 @@ def validate_deferred_call_args(name: str, args: Dict[str, Any]) -> Optional[str
         missing = [r for r in required if isinstance(r, str) and r not in args]
         if not missing:
             return None
+        example = ", ".join(
+            f'"{m}": {_example_value(params, m)}' for m in missing
+        )
         return tool_error(
             f"tool_call to '{name}' is missing required argument(s): "
-            f"{', '.join(missing)}. The tool was NOT invoked.",
+            f"{', '.join(missing)}. The tool was NOT invoked."
+            f"{provided_note(required, args)}",
             parameters=params,
             hint=(
                 "Retry tool_call with 'arguments' matching the parameters "
-                "schema above."
+                f'schema above. Example: "arguments": {{{example}}}'
             ),
         )
     except Exception:  # pragma: no cover — never block dispatch on validator bugs
@@ -1041,12 +1045,37 @@ def resolve_underlying_call(args: Dict[str, Any]) -> Tuple[Optional[str], Dict[s
             return None, {}, f"tool_call 'arguments' is not valid JSON: {e}"
     if not isinstance(raw_args, dict):
         return None, {}, "tool_call 'arguments' must be an object"
+    if not raw_args:
+        # Flatten tolerance (2026-10-30, Gopher incident: 82 calls with
+        # `"arguments": {}` in one session). Under emission stress models
+        # collapse the nested double-JSON and put the target tool's fields at
+        # the top level of the tool_call. Rescue those calls instead of
+        # dead-ending in an empty-args error. Only fires when the nested
+        # object is empty — a real nested payload always wins.
+        extras = {k: v for k, v in args.items() if k not in ("name", "arguments")}
+        if extras:
+            raw_args = extras
     if not is_deferrable_tool_name(name):
         return None, {}, (
             f"'{name}' is not a deferrable tool. If it appears in the model-facing tools "
             "list already, call it directly instead of via tool_call."
         )
     return name, raw_args, None
+
+
+def _example_value(params: Dict[str, Any], field_name: str) -> str:
+    """Type-appropriate placeholder value for repair-nudge examples."""
+    spec = (params.get("properties") or {}).get(field_name) or {}
+    kind = spec.get("type")
+    if kind in ("number", "integer"):
+        return "1"
+    if kind == "boolean":
+        return "true"
+    if kind == "array":
+        return "[]"
+    if kind == "object":
+        return "{}"
+    return f'"<{field_name}>"'
 
 
 __all__ = [

@@ -574,3 +574,112 @@ class TestDeferredCallSchemaProbe:
         ))
         assert result.get("ok") is True
         assert result.get("doc") == "abc"
+
+
+# ---------------------------------------------------------------------------
+# Empty-arguments repair (2026-10-30, Gopher incident: 82 tool_call emissions
+# with `"arguments": {}` in one session — the model collapses the nested
+# double-JSON and the error never echoed what it actually sent).
+# ---------------------------------------------------------------------------
+
+_MCP_THINKING_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "mcp__sequential_thinking__sequentialthinking",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "thought": {"type": "string"},
+                "nextThoughtNeeded": {"type": "boolean"},
+                "thoughtNumber": {"type": "integer"},
+                "totalThoughts": {"type": "integer"},
+            },
+            "required": ["thought", "nextThoughtNeeded", "thoughtNumber",
+                         "totalThoughts"],
+        },
+    },
+}
+
+
+class TestEmptyArgumentsRepair:
+    def test_flatten_tolerance_for_collapsed_nested_args(self, monkeypatch):
+        """Models under emission stress drop the nested `arguments` object and
+        put the target tool's fields at the top level. Those calls must
+        dispatch, not dead-end in an empty-args error."""
+        from tools import tool_search
+        monkeypatch.setattr(tool_search, "is_deferrable_tool_name", lambda n: True)
+        name, args, err = tool_search.resolve_underlying_call({
+            "name": "fabric_search", "query": "beans",
+        })
+        assert err is None
+        assert name == "fabric_search"
+        assert args == {"query": "beans"}
+
+    def test_nested_args_win_over_stray_siblings(self, monkeypatch):
+        """Flatten fallback must only fire when the nested object is empty —
+        a real nested payload is never overridden by sibling keys."""
+        from tools import tool_search
+        monkeypatch.setattr(tool_search, "is_deferrable_tool_name", lambda n: True)
+        _, args, err = tool_search.resolve_underlying_call({
+            "name": "fabric_search",
+            "arguments": {"query": "real"},
+            "scratch": "model side-note",
+        })
+        assert err is None
+        assert args == {"query": "real"}
+
+    def test_empty_args_error_echoes_expected_and_provided(self, monkeypatch):
+        from tools.tool_search import validate_deferred_call_args
+        monkeypatch.setattr(
+            "tools.registry.registry.get_schema",
+            lambda name: _MCP_THINKING_SCHEMA,
+        )
+        err = validate_deferred_call_args(
+            "mcp__sequential_thinking__sequentialthinking", {})
+        assert err is not None
+        assert "missing required argument(s): thought" in err
+        assert "Expected parameters:" in err
+        assert "Provided: nothing" in err
+
+    def test_empty_args_error_carries_filled_example(self, monkeypatch):
+        """The repair nudge must contain the exact corrective call shape —
+        a schema dump alone was ignored 5x in a row (2026-10-30 04:19)."""
+        from tools.tool_search import validate_deferred_call_args
+        monkeypatch.setattr(
+            "tools.registry.registry.get_schema",
+            lambda name: _MCP_THINKING_SCHEMA,
+        )
+        err = validate_deferred_call_args(
+            "mcp__sequential_thinking__sequentialthinking", {})
+        assert err is not None
+        parsed = json.loads(err)
+        hint = parsed.get("hint", "")
+        assert '"arguments": {' in hint
+        assert '"thought": "<thought>"' in hint
+        assert '"nextThoughtNeeded": true' in hint
+
+    def test_argument_errors_class_pin_echo_both_sides(self, monkeypatch):
+        """CLASS test: every validator argument error echoes both sides."""
+        from tools.tool_search import validate_deferred_call_args
+        monkeypatch.setattr(
+            "tools.registry.registry.get_schema",
+            lambda name: _MCP_THINKING_SCHEMA,
+        )
+        for provided in ({}, {"thought": "x"}, {"thoughtNumber": 2}):
+            err = validate_deferred_call_args(
+                "mcp__sequential_thinking__sequentialthinking", provided)
+            assert err is not None
+            assert "Expected parameters:" in err
+            assert "Provided:" in err
+
+    def test_complete_args_still_dispatch(self, monkeypatch):
+        from tools.tool_search import validate_deferred_call_args
+        monkeypatch.setattr(
+            "tools.registry.registry.get_schema",
+            lambda name: _MCP_THINKING_SCHEMA,
+        )
+        assert validate_deferred_call_args(
+            "mcp__sequential_thinking__sequentialthinking",
+            {"thought": "t", "nextThoughtNeeded": False,
+             "thoughtNumber": 1, "totalThoughts": 1},
+        ) is None
