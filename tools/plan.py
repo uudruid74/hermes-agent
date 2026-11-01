@@ -1242,23 +1242,6 @@ from tools.plan_binding_adapter import (
 _cmd_advance = _binding_cmd_advance
 
 
-def _load_summary_arg(summary: Optional[str], file: Optional[str]) -> str:
-    """Resolve the step summary: inline arg, or short-args path via file=.
-
-    Composed long-string arguments are the emission failure point under
-    context pressure (2026-11-01 wire capture: the provider stream carried
-    `advance` calls with the summary key stripped). Writing the summary with
-    write_file and passing file=<path> keeps every emitted argument short.
-    Raises OSError when file= is unreadable (caller reports it).
-    """
-    if summary:
-        return summary
-    if file:
-        with open(file, encoding="utf-8") as fh:
-            return fh.read()
-    return ""
-
-
 def plan(
     agent,
     command: str,
@@ -1328,12 +1311,8 @@ def plan(
         return _cmd_cron(agent, cron, root, title, goal, steps, temp, board)
 
     elif command == "advance":
-        try:
-            summary = _load_summary_arg(summary, file)
-        except OSError as exc:
-            return f"ERROR: cannot read summary file: {exc}"
         if not summary or not summary.strip():
-            return "ERROR: 'advance' requires summary (inline, or file=<path to summary text>)"
+            return "ERROR: 'advance' requires summary"
         return _binding_cmd_advance(
             agent,
             summary.strip(),
@@ -1361,12 +1340,8 @@ def plan(
         )
 
     elif command == "handoff":
-        try:
-            summary = _load_summary_arg(summary, file)
-        except OSError as exc:
-            return f"ERROR: cannot read summary file: {exc}"
         if not summary or not summary.strip():
-            return "ERROR: 'handoff' requires summary (inline, or file=<path to summary text>)"
+            return "ERROR: 'handoff' requires summary"
         return _cmd_handoff(agent, summary.strip())
 
     elif command == "continue":
@@ -1452,7 +1427,7 @@ PLAN_SCHEMA = {
             },
             "summary": {
                 "type": "string",
-                "description": "Required for 'advance' and 'handoff'. For 'advance', summarize what was done in this step, including any files changed. This single summary is submitted to the dispatcher or user for review. For 'handoff', summarize what has been done and what remains to complete the current step. Limited to 1024 characters — the limit lives in the limits manifest (plan_limits.PLAN_SUMMARY_MAX_CHARS) and the tool call is REFUSED over it; summaries are never truncated. If long arguments get dropped in your emission, write the summary to a file and pass file=<path> instead — the file content is used as the summary.",
+                "description": "Required for 'advance' and 'handoff'. For 'advance', summarize what was done in this step, including any files changed. This single summary is submitted to the dispatcher or user for review. For 'handoff', summarize what has been done and what remains to complete the current step. Limited to 1024 characters — the limit lives in the limits manifest (plan_limits.PLAN_SUMMARY_MAX_CHARS) and the tool call is REFUSED over it; summaries are never truncated.",
             },
             "decision": {
                 "type": "string",
@@ -1489,7 +1464,7 @@ PLAN_SCHEMA = {
             },
             "file": {
                 "type": "string",
-                "description": "Path to a flat markdown plan spec for 'import' (# Title, global description, ## step title + expansion body per step). For 'export': output path — optional; without it the markdown is returned in the response. For 'advance'/'handoff': a text file whose content is used as the summary (short-args path when long arguments get dropped).",
+                "description": "Path to a flat markdown plan spec for 'import' (# Title, global description, ## step title + expansion body per step). For 'export': output path — optional; without it the markdown is returned in the response.",
             },
             "board": {
                 "type": "string",
