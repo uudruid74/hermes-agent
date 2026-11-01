@@ -1717,7 +1717,10 @@ SKILL_MANAGE_SCHEMA = {
         "Pinned skills are protected from deletion only — skill_manage(action='delete') "
         "will refuse with a message pointing the user to `hermes curator unpin <name>`. "
         "Patches and edits go through on pinned skills so you can still improve them as "
-        "pitfalls come up; pin only guards against irrecoverable loss."
+        "pitfalls come up; pin only guards against irrecoverable loss.\n\n"
+        "EMISSION CONTRACT: action='patch' requires action, name, old_string, new_string "
+        "in ONE call — omitting any one fails the call. Never pad optional fields "
+        "(file_path, absorbed_into, category...) with empty strings; omit unused keys."
     ),
     "parameters": {
         "type": "object",
@@ -1798,6 +1801,28 @@ SKILL_MANAGE_SCHEMA = {
             },
         },
         "required": ["action", "name"],
+        "allOf": [
+            {
+                "if": {"properties": {"action": {"const": "patch"}}, "required": ["action"]},
+                "then": {"required": ["old_string", "new_string"]},
+            },
+            {
+                "if": {"properties": {"action": {"const": "write_file"}}, "required": ["action"]},
+                "then": {"required": ["file_path", "file_content"]},
+            },
+            {
+                "if": {"properties": {"action": {"const": "remove_file"}}, "required": ["action"]},
+                "then": {"required": ["file_path"]},
+            },
+            {
+                "if": {"properties": {"action": {"const": "edit"}}, "required": ["action"]},
+                "then": {"required": ["content"]},
+            },
+            {
+                "if": {"properties": {"action": {"const": "create"}}, "required": ["action"]},
+                "then": {"required": ["content"]},
+            },
+        ],
     },
 }
 
