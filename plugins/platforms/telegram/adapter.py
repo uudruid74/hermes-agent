@@ -1570,6 +1570,21 @@ class TelegramAdapter(BasePlatformAdapter):
             return {"link_preview_options": LinkPreviewOptions(is_disabled=True)}
         return {"disable_web_page_preview": True}
 
+    def _approval_link_preview_kwargs(self) -> Dict[str, Any]:
+        """Always disable link previews on approval prompts.
+
+        Approval messages embed the raw command, which routinely contains
+        URLs (localhost, docker-internal hostnames, etc.). Telegram clients
+        fetch link previews for URLs in incoming messages and hang before
+        rendering when the host is unroutable — the approval must never
+        trigger a preview fetch. Unlike :meth:`_link_preview_kwargs` this
+        ignores the ``disable_link_previews`` opt-in: approval text is code,
+        and a preview can never be useful, only harmful.
+        """
+        if LinkPreviewOptions is not None:
+            return {"link_preview_options": LinkPreviewOptions(is_disabled=True)}
+        return {"disable_web_page_preview": True}
+
     # ------------------------------------------------------------------
     # Bot API 10.1 Rich Messages (sendRichMessage)
     #
@@ -5491,7 +5506,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 "text": text,
                 "parse_mode": ParseMode.HTML,
                 "reply_markup": keyboard,
-                **self._link_preview_kwargs(),
+                # Approval prompts embed raw command text, which routinely
+                # contains URLs (localhost, docker-internal hostnames, etc.).
+                # Telegram clients fetch link previews for those URLs and hang
+                # before rendering the message when the host is unroutable.
+                # Approval text is code, never a link — always disable previews.
+                **self._approval_link_preview_kwargs(),
             }
             reply_to_id = self._reply_to_message_id_for_send(None, metadata, reply_to_mode=self._reply_to_mode)
             kwargs["reply_to_message_id"] = reply_to_id
