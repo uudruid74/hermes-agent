@@ -2209,12 +2209,9 @@ PATCH_SCHEMA = {
         "Uses fuzzy matching (9 strategies) so minor whitespace/indentation differences won't break it. "
         "Returns a unified diff. Auto-runs syntax checks after editing.\n\n"
         "REPLACE MODE (mode='replace', default): find a unique string and replace it. "
-        "REQUIRED PARAMETERS: mode, path, old_string, new_string — ALL FOUR in the same "
-        "call; omitting any one fails the call.\n"
+        "REQUIRED PARAMETERS: mode, path, old_string, new_string.\n"
         "PATCH MODE (mode='patch'): apply V4A multi-file patches for bulk changes. "
-        "REQUIRED PARAMETERS: mode, patch.\n"
-        "EMISSION CONTRACT: send every required key with a REAL value in one call. "
-        "Never pad unneeded fields with empty strings — omit keys you don't use."
+        "REQUIRED PARAMETERS: mode, patch."
     ),
     "parameters": {
         "type": "object",
@@ -2227,15 +2224,15 @@ PATCH_SCHEMA = {
             },
             "path": {
                 "type": "string",
-                "description": "REQUIRED when mode='replace' — OMITTING IT FAILS THE CALL. File path to edit.",
+                "description": "REQUIRED when mode='replace'. File path to edit.",
             },
             "old_string": {
                 "type": "string",
-                "description": "REQUIRED when mode='replace' — OMITTING IT FAILS THE CALL. Exact text to find and replace. Must be unique in the file unless replace_all=true. Include surrounding context lines to ensure uniqueness.",
+                "description": "REQUIRED when mode='replace'. Exact text to find and replace. Must be unique in the file unless replace_all=true. Include surrounding context lines to ensure uniqueness.",
             },
             "new_string": {
                 "type": "string",
-                "description": "REQUIRED when mode='replace' — OMITTING IT FAILS THE CALL. Replacement text. Pass empty string '' to delete the matched text.",
+                "description": "REQUIRED when mode='replace'. Replacement text. Pass empty string '' to delete the matched text.",
             },
             "replace_all": {
                 "type": "boolean",
@@ -2253,16 +2250,6 @@ PATCH_SCHEMA = {
             },
         },
         "required": ["mode"],
-        "allOf": [
-            {
-                "if": {"properties": {"mode": {"const": "replace"}}, "required": ["mode"]},
-                "then": {"required": ["path", "old_string", "new_string"]},
-            },
-            {
-                "if": {"properties": {"mode": {"const": "patch"}}, "required": ["mode"]},
-                "then": {"required": ["patch"]},
-            },
-        ],
     },
 }
 
