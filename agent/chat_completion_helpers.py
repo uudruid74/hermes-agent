@@ -3403,6 +3403,31 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         mock_tool_calls = None
         has_truncated_tool_args = False
         if tool_calls_acc:
+            # Raw response-side capture (HERMES_DUMP_REQUESTS=1): persist the
+            # PRE-repair tool_calls exactly as accumulated from the wire, so
+            # argument-loss forensics can distinguish provider-side emission
+            # from pipeline-side drops (2026-11-01 plan-advance summary drop).
+            if os.environ.get("HERMES_DUMP_REQUESTS"):
+                try:
+                    import json as _json
+                    from datetime import datetime as _dt
+
+                    _safe = _ra()._safe_session_filename_component(
+                        getattr(agent, "session_id", "unknown"))
+                    _ts = _dt.now().strftime("%Y%m%d_%H%M%S_%f")
+                    _path = (
+                        agent.logs_dir / f"response_dump_{_safe}_{_ts}.json"
+                    )
+                    _path.write_text(_json.dumps({
+                        "timestamp": _dt.now().isoformat(),
+                        "session_id": getattr(agent, "session_id", None),
+                        "finish_reason": finish_reason,
+                        "tool_calls_raw": [
+                            tool_calls_acc[i] for i in sorted(tool_calls_acc)
+                        ],
+                    }, ensure_ascii=False, indent=1))
+                except (OSError, TypeError, ValueError) as exc:
+                    logger.warning("response dump failed: %s", exc)
             mock_tool_calls = []
             for idx in sorted(tool_calls_acc):
                 tc = tool_calls_acc[idx]
