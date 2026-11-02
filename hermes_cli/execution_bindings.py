@@ -1588,8 +1588,9 @@ def sweep_stalled_plan_workers(
             f"[plan stop-guard] Task {task_id} step {step_no} has been idle "
             f"for {idle_min} minutes after a text-only turn end. If the step "
             f"is done, call `plan advance` with your summary; if it cannot be "
-            f"done, call `plan fail`; if you are blocked, call "
-            f"`plan block(reason=...)`. Do not narrate intent — act now."
+            f"done, call `plan fail`; if you are blocked, call `plan "
+            f"block` (a manual plan task cannot be blocked — it only "
+            f"notifies the user and stops). Do not narrate intent — act now."
         )
         emit = emit_fn if emit_fn is not None else _emit_plan_stop_nudge
         emit(conn, task_id, profile, text)

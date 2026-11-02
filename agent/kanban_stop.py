@@ -156,8 +156,9 @@ def build_kanban_stop_nudge(
             "1. Finish the step's deliverable (write the required file(s) "
             "now).\n"
             "2. Call `plan advance` with your step summary if the step is "
-            "done, OR `plan fail` if it cannot be done, OR "
-            "`plan block(reason=...)` if you are blocked.\n\n"
+            "done, OR `plan fail` if it cannot be done, OR `plan block` "
+            "if you are blocked (a manual plan task cannot be blocked — "
+            "it only notifies the user and stops).\n\n"
             "Never end a turn with only a promise of future action.]"
         )
     if session_called_kanban_terminal(messages):
