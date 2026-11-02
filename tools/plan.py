@@ -712,6 +712,15 @@ def _cmd_dispatch(agent, title: str, goal: str, project: str, assignee: str,
             "origin routing not stored for %s: %s", task_id, exc
         )
 
+    # Event-time dispatch kick (Evan's agreed design, 2026-10-19): every
+    # mutating verb/tool fires kick_dispatch() -> one dispatch_once tick at
+    # the moment of the event, serialized under the per-board tick lock.
+    # Without this the task waits for a tick that never comes (no polling
+    # loops by design) — t_084728ad sat in ready 1.4h (2026-11-02).
+    from hermes_cli.kanban import kick_dispatch
+
+    kick_dispatch(board=_resolve_board(project))
+
     project_display = "**Random**" if project.lower() == "default" else project
     return f"Task {task_id} dispatched to {assignee} on {project_display}: {title}"
 
@@ -1161,23 +1170,39 @@ def _enumerate_kanban_dbs():
 
 
 def _cmd_block(task_id: str) -> str:
-    """Block a task by ID. Searches all boards. Clears session task_id."""
+    """Block a task by ID. Searches all boards. Clears session task_id.
+
+    A task in the 'manual' state is a live plan with a bound worker session:
+    setting it to 'blocked' exposes the task to dispatcher promotion on
+    unblock and spawns a second worker on the same binding (t_f022fa1b,
+    2026-11-01). Per Evan 2026-11-01: block on a manual task only notifies
+    the user and stops — no state change, nothing more to do.
+    """
     if not task_id:
         return "ERROR: 'block' requires task_id"
     found_board = None
+    manual = False
     for db_path in _enumerate_kanban_dbs():
         try:
             conn = sqlite3.connect(db_path)
             with conn:
-                cur = conn.execute(
-                    "UPDATE tasks SET status='blocked' WHERE id=? AND status NOT IN ('done','archived','blocked')",
-                    (task_id,)
-                )
-                if cur.rowcount > 0:
-                    found_board = db_path
+                row = conn.execute(
+                    "SELECT status FROM tasks WHERE id=?", (task_id,)
+                ).fetchone()
+                if row is not None and row[0] == "manual":
+                    manual = True
+                else:
+                    cur = conn.execute(
+                        "UPDATE tasks SET status='blocked' WHERE id=? AND status NOT IN ('done','archived','blocked')",
+                        (task_id,)
+                    )
+                    if cur.rowcount > 0:
+                        found_board = db_path
             conn.close()
         except Exception:
             pass
+    if manual:
+        return _manual_block_notice(task_id)
     if not found_board:
         return f"ERROR: Task {task_id} not found on any board (or already blocked/done/archived)"
     try:
@@ -1191,6 +1216,52 @@ def _cmd_block(task_id: str) -> str:
     except Exception:
         pass
     return f"BLOCKED: {task_id} on {os.path.basename(os.path.dirname(found_board))}"
+
+
+def _manual_block_notice(task_id: str) -> str:
+    """Notify the user that block-on-manual is a no-op (Evan 2026-11-01).
+
+    A manual plan task is never set to 'blocked': that state exposes the
+    live-bound task to dispatcher promotion on unblock, spawning a second
+    worker (t_f022fa1b, 2026-11-01). The notice targets the task's origin
+    party (the human reviewer for a manual plan) and the caller receives
+    it in the return value. Nothing on the task is changed.
+    """
+    from tools.plan_binding_adapter import _dispatcher_for_task, _send_user
+
+    conn = _get_kanban_db()
+    message = (
+        f"NOTIFY: {task_id} is a manual plan task - `plan block` is a no-op "
+        "by design (Evan 2026-11-01). The task was NOT blocked; nothing more "
+        "to do. A manual plan has a live bound worker session; blocking it "
+        "would expose the task to dispatcher promotion and spawn a second "
+        "worker."
+    )
+    error = None
+    try:
+        recipient = _dispatcher_for_task(conn, task_id)
+        if not recipient:
+            row = conn.execute(
+                "SELECT assignee FROM tasks WHERE id=?", (task_id,)
+            ).fetchone()
+            recipient = (
+                str(row["assignee"]).strip()
+                if row and str(row["assignee"] or "").strip()
+                else None
+            )
+        if recipient:
+            error = _send_user(recipient, message, conn=conn, task_id=task_id)
+    except Exception as exc:
+        error = str(exc)
+    if error:
+        return (
+            f"NOTIFY: {task_id} is a manual plan task - not blocked. "
+            f"User notification failed: {error}"
+        )
+    return (
+        f"NOTIFY: {task_id} is a manual plan task - not blocked. "
+        "User notified; nothing more to do."
+    )
 
 
 def _cmd_archive(task_id: str) -> str:
