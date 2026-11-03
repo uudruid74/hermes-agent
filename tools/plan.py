@@ -1313,6 +1313,22 @@ from tools.plan_binding_adapter import (
 _cmd_advance = _binding_cmd_advance
 
 
+def _kick_after(result: str) -> str:
+    """Fire one event-time dispatch tick after a state-changing command.
+
+    Evan's agreed design (2026-10-19): every state change and every
+    mutating verb fires kick_dispatch() -> one dispatch_once tick at the
+    moment of the event (the kanban.py _DISPATCH_KICK_ACTIONS pattern).
+    ERROR results changed nothing, so they don't kick.
+    """
+    if str(result).startswith("ERROR"):
+        return result
+    from hermes_cli.kanban import kick_dispatch
+
+    kick_dispatch()
+    return result
+
+
 def plan(
     agent,
     command: str,
@@ -1384,10 +1400,12 @@ def plan(
     elif command == "advance":
         if not summary or not summary.strip():
             return "ERROR: 'advance' requires summary"
-        return _binding_cmd_advance(
-            agent,
-            summary.strip(),
-            step=step if isinstance(step, int) else None,
+        return _kick_after(
+            _binding_cmd_advance(
+                agent,
+                summary.strip(),
+                step=step if isinstance(step, int) else None,
+            )
         )
 
     elif command == "review":
@@ -1398,16 +1416,20 @@ def plan(
         # into a decision); response answers a pending worker ask only.
         if not decision:
             return "ERROR: 'review' requires decision"
-        return _cmd_review(agent, task_id, decision, reason=reason, response=response)
+        return _kick_after(
+            _cmd_review(agent, task_id, decision, reason=reason, response=response)
+        )
 
     elif command == "repeat":
-        return _cmd_repeat(
-            agent,
-            reason or "",
-            step if isinstance(step, int) else None,
-            title,
-            goal,
-            steps,
+        return _kick_after(
+            _cmd_repeat(
+                agent,
+                reason or "",
+                step if isinstance(step, int) else None,
+                title,
+                goal,
+                steps,
+            )
         )
 
     elif command == "handoff":
@@ -1429,23 +1451,23 @@ def plan(
         return _cmd_remind(agent, task_id)
 
     elif command == "fail":
-        return _cmd_fail(agent, reason or "")
+        return _kick_after(_cmd_fail(agent, reason or ""))
 
     elif command == "test-complete":
-        return _cmd_test_complete(agent)
+        return _kick_after(_cmd_test_complete(agent))
 
     elif command == "approve":
         if not task_id:
             return "ERROR: 'approve' requires task_id"
-        return _cmd_approve(agent, task_id)
+        return _kick_after(_cmd_approve(agent, task_id))
 
     elif command == "block":
         if not task_id:
             return "ERROR: 'block' requires task_id"
-        return _cmd_block(task_id)
+        return _kick_after(_cmd_block(task_id))
 
     elif command == "archive":
-        return _cmd_archive_adapter(agent, task_id)
+        return _kick_after(_cmd_archive_adapter(agent, task_id))
 
     else:
         return f"ERROR: Unknown plan command '{command}'. Valid: new, import, export, advance, review, repeat, handoff, continue, dispatch, remind, fail, test-complete, approve, block, archive, cron"
