@@ -297,12 +297,12 @@ def _detect_environment(env: str) -> bool:
 
     result = True
     if env == "kanban":
-        # Kanban is "active" either as a dispatcher-spawned worker (the
+        # The kanban *tool* surface is enabled for everyone (Evan's ruling #2,
+        # see tools/kanban_tools.py), but kanban skill *offering* stays scoped
+        # to kanban working context: a dispatcher-spawned worker (the
         # dispatcher sets ``HERMES_KANBAN_TASK`` / ``HERMES_KANBAN_BOARD`` in the
-        # worker env) or as an orchestrator profile that has opted into the
-        # kanban toolset. Mirror the same signals the kanban tools themselves
-        # gate on (``tools/kanban_tools.py``) so the offer filter agrees with
-        # tool availability.
+        # worker env) or an orchestrator profile that has opted into the
+        # kanban toolset.
         if os.getenv("HERMES_KANBAN_TASK") or os.getenv("HERMES_KANBAN_BOARD"):
             result = True
         else:

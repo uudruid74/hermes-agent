@@ -1,10 +1,11 @@
 """Kanban tools — structured tool-call surface for worker + orchestrator agents.
 
-These tools are registered into the model's schema when the agent is
-running under the dispatcher (env var ``HERMES_KANBAN_TASK`` set) or when
-the active profile explicitly enables the ``kanban`` toolset for
-orchestrator work. A normal ``hermes chat`` session still sees **zero**
-kanban tools in its schema unless configured.
+These tools are registered into the model's schema for every session —
+Evan's ruling #2: "Enable the kanban toolset for EVERYONE" — so a ``-t``-
+woken gateway worker (no ``HERMES_KANBAN_TASK`` env, no profile toolset
+flag) has the same lifecycle surface as a dispatcher-spawned one. Worker
+identity is enforced at call time by the ownership gate (env OR session
+binding), not by hiding the tools.
 
 Why tools instead of just shelling out to ``hermes kanban``?
 
@@ -90,38 +91,37 @@ def _reject_delegated_child_mutation(tool_name: str) -> Optional[str]:
 
 
 def _check_kanban_mode() -> bool:
-    """Task-lifecycle tools are available when:
+    """Task-lifecycle tools are available to everyone (Evan's ruling #2:
+    "Enable the kanban toolset for EVERYONE").
 
-    1. ``HERMES_KANBAN_TASK`` is set (dispatcher-spawned worker), OR
-    2. The current profile has ``kanban`` in its toolsets config
-       (orchestrator profiles like techlead that route work via Kanban).
+    No env var, no profile opt-in: a ``-t``-woken gateway worker (no
+    ``HERMES_KANBAN_TASK``) and a plain ``hermes chat`` session both get the
+    surface. Workers stay narrowly owned — ``_enforce_worker_task_ownership``
+    scopes calls to their one task via env (CLI spawn) or the session
+    binding (``-t`` wake).
 
-    Humans running ``hermes chat`` without the kanban toolset see zero
-    kanban tools. Workers spawned by the kanban dispatcher (gateway-
-    embedded by default) and orchestrator profiles with the kanban
-    toolset enabled see the Kanban lifecycle tool surface.
+    The one carve-out: delegate_task children, whose inherited env is not
+    proof of dispatcher ownership (see ``_reject_delegated_child_mutation``).
     """
-    if _is_delegated_child_context():
-        return False
-    if os.environ.get("HERMES_KANBAN_TASK"):
-        return True
-    return _profile_has_kanban_toolset()
+    return not _is_delegated_child_context()
 
 
 def _check_kanban_orchestrator_mode() -> bool:
     """Board-routing tools (kanban_list, kanban_unblock) are intentionally
     hidden from task workers.
 
-    Dispatcher-spawned workers should close their own task via the
-    lifecycle tools (complete/block/heartbeat), not enumerate or unblock
-    board state. Profiles that explicitly opt into the kanban toolset
-    and are NOT scoped to a single task are the orchestrator surface.
+    A task worker owns exactly one task — identified by
+    ``HERMES_KANBAN_TASK`` (CLI spawn) or the ``sessions.task_id`` binding
+    (``-t`` wake), the same identity ``_worker_task_scope`` uses — and should
+    close its own task through the lifecycle tools, not enumerate or unblock
+    board state. Everything else (orchestrators, plain sessions) gets the
+    board-routing surface per ruling #2.
     """
     if _is_delegated_child_context():
         return False
-    if os.environ.get("HERMES_KANBAN_TASK"):
+    if _worker_task_scope():
         return False
-    return _profile_has_kanban_toolset()
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -490,11 +490,12 @@ def _require_orchestrator_tool(tool_name: str) -> Optional[str]:
     out of the worker schema entirely, but in case a stale registration
     or test harness routes a worker to one of them anyway, return a
     structured tool_error so the model gets a clear refusal instead of
-    silently mutating board state from a worker context.
+    silently mutating board state from a worker context. Worker identity
+    covers both spawn paths (env OR session binding — ``_worker_task_scope``).
     """
-    if os.environ.get("HERMES_KANBAN_TASK"):
+    if _worker_task_scope():
         return tool_error(
-            f"{tool_name} is orchestrator-only; dispatcher-spawned workers "
+            f"{tool_name} is orchestrator-only; kanban task workers "
             "must use kanban_complete, kanban_block, kanban_heartbeat, or "
             "kanban_comment for their assigned task."
         )

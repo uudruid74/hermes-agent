@@ -1,8 +1,9 @@
 """Tests for the Kanban tool surface (tools/kanban_tools.py).
 
 Verifies:
-  - Tools are gated on HERMES_KANBAN_TASK: a normal chat session sees
-    zero kanban tools in its schema; a worker session sees the kanban set.
+  - The kanban toolset is enabled for everyone (Evan's ruling #2): a normal
+    chat session sees the lifecycle tools; board-routing tools are hidden
+    from task workers only (see tests/tools/test_kanban_toolset_gate.py).
   - Each handler's happy path.
   - Error paths (missing required args, bad metadata type, etc).
 """
@@ -19,10 +20,13 @@ import pytest
 # Gating
 # ---------------------------------------------------------------------------
 
-def test_kanban_tools_hidden_without_env_var(monkeypatch, tmp_path):
-    """Normal `hermes chat` sessions (no HERMES_KANBAN_TASK) must have
-    zero kanban_* tools in their schema."""
+def test_kanban_tools_visible_without_env_var(monkeypatch, tmp_path):
+    """Evan's ruling #2 ("Enable the kanban toolset for EVERYONE"): a normal
+    `hermes chat` session (no HERMES_KANBAN_TASK, no session binding) sees
+    the lifecycle tools — same for a `-t`-woken gateway worker, which never
+    carries the env var."""
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -34,9 +38,9 @@ def test_kanban_tools_hidden_without_env_var(monkeypatch, tmp_path):
     invalidate_check_fn_cache()
     schema = registry.get_definitions(set(resolve_toolset("hermes-cli")), quiet=True)
     names = {s["function"].get("name") for s in schema if "function" in s}
-    kanban = {n for n in names if n and n.startswith("kanban_")}
-    assert kanban == set(), (
-        f"kanban tools leaked into normal chat schema: {kanban}"
+    lifecycle = {"kanban_show", "kanban_complete", "kanban_heartbeat"}
+    assert lifecycle <= names, (
+        f"kanban lifecycle tools missing from schema: {lifecycle - names}"
     )
 
 

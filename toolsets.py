@@ -76,10 +76,10 @@ _HERMES_CORE_TOOLS = [
     "cronjob",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
-    # Kanban multi-agent coordination — only in schema when the agent is
-    # spawned as a kanban worker (HERMES_KANBAN_TASK env set) or the current
-    # profile explicitly enables the kanban toolset. Gated via check_fn in
-    # tools/kanban_tools.py.
+    # Kanban multi-agent coordination — enabled for every session (Evan's
+    # ruling #2: "Enable the kanban toolset for EVERYONE"), gated via check_fn
+    # in tools/kanban_tools.py only against delegate_task children. Workers
+    # are scoped to their one task at call time by the ownership gate.
     "kanban_show", "kanban_list",
     "kanban_complete", "kanban_block", "kanban_heartbeat",
     "kanban_comment", "kanban_create", "kanban_link",
@@ -297,13 +297,13 @@ TOOLSETS = {
 
     "kanban": {
         "description": (
-            "Kanban multi-agent coordination — only active when the agent "
-            "is spawned by the kanban dispatcher (HERMES_KANBAN_TASK env "
-            "set). The dispatcher runs inside the gateway by default; see "
-            "`kanban.dispatch_in_gateway` in config.yaml. Lets workers mark "
-            "tasks done with structured handoffs, block for human input, "
-            "heartbeat during long ops, comment on threads, attach files, and "
-            "(for orchestrators) list, unblock, and fan out tasks."
+            "Kanban multi-agent coordination — available to every session "
+            "(Evan's ruling #2: enable the kanban toolset for EVERYONE). "
+            "Lets workers mark tasks done with structured handoffs, block "
+            "for human input, heartbeat during long ops, comment on threads, "
+            "attach files, and (for orchestrators) list, unblock, and fan "
+            "out tasks. Workers are scoped to their one task by the "
+            "ownership gate (task_id arg / env / session binding)."
         ),
         "tools": [
             "kanban_show", "kanban_list", "kanban_complete", "kanban_block",

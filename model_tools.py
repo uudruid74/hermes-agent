@@ -54,6 +54,17 @@ def _is_delegated_child_context() -> bool:
         return False
 
 
+def _is_kanban_worker_identity() -> bool:
+    """True for a kanban task worker on either spawn path: ``HERMES_KANBAN_TASK``
+    (CLI spawn) or the ``sessions.task_id`` binding (``-t`` wake). Delegated
+    children are not workers — inherited env is not proof of ownership."""
+    if _is_delegated_child_context():
+        return False
+    from tools.kanban_tools import _worker_task_scope
+
+    return bool(_worker_task_scope())
+
+
 # =============================================================================
 # Async Bridging  (single source of truth -- used by registry.dispatch too)
 # =============================================================================
@@ -339,7 +350,7 @@ def get_tool_definitions(
                 frozenset(disabled_toolsets) if disabled_toolsets else None,
                 registry._generation,
                 cfg_fp,
-                bool(os.environ.get("HERMES_KANBAN_TASK")),
+                _is_kanban_worker_identity(),
                 bool(skip_tool_search_assembly),
                 _is_delegated_child_context(),
                 profile_scope,
@@ -389,15 +400,15 @@ def _compute_tool_definitions(
     if enabled_toolsets is not None:
         effective_enabled_toolsets = list(enabled_toolsets)
         if (
-            os.environ.get("HERMES_KANBAN_TASK")
-            and not _is_delegated_child_context()
+            _is_kanban_worker_identity()
             and "kanban" not in effective_enabled_toolsets
         ):
-            # Dispatcher-spawned workers are scoped by HERMES_KANBAN_TASK and
+            # Kanban task workers (env spawn OR ``-t`` wake session binding)
             # must always receive the lifecycle handoff tools. Assignee
             # profiles may intentionally restrict their normal chat toolsets
             # (for token/cost reasons), but that should not strip the kanban
-            # worker's completion/block/heartbeat surface.
+            # worker's completion/block/heartbeat surface. Non-worker
+            # restricted toolsets (e.g. webhook-safe) stay restricted.
             effective_enabled_toolsets.append("kanban")
         for toolset_name in effective_enabled_toolsets:
             if validate_toolset(toolset_name):
