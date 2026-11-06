@@ -4549,6 +4549,30 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             row = cursor.fetchone()
         return row["id"] if row else None
 
+    def get_session_task_id(self, session_id: str) -> Optional[str]:
+        """Return the task_id currently bound to ``session_id``, or None.
+
+        The mirror of :meth:`find_task_session_id` (session → task). A ``-t``
+        wake carries the worker's task_id and binds it here
+        (:meth:`set_session_task_id`); the kanban ownership gate reads it back
+        so a woken gateway worker — which has no ``HERMES_KANBAN_TASK`` env — is
+        scoped to that one task instead of being treated as an unrestricted
+        orchestrator. ``None`` means no binding (orchestrator / unbound CLI).
+        """
+        if not session_id:
+            return None
+        with self._lock:
+            if self._conn is None:
+                return None
+            cursor = self._conn.execute(
+                "SELECT task_id FROM sessions WHERE id = ?", (session_id,)
+            )
+            row = cursor.fetchone()
+        if row is None:
+            return None
+        value = row["task_id"] if isinstance(row, sqlite3.Row) else row[0]
+        return str(value) if value else None
+
     def _merge_model_config(self, session_id: str, updates: Dict[str, Any]) -> None:
         """Merge keys into the session's model_config JSON."""
         def _do(conn):

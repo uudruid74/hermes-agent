@@ -667,6 +667,114 @@ def clear_discovered_repos(
 
 
 # ---------------------------------------------------------------------------
+# Board -> Telegram topic wake routing (kanban/cron dispatch, t_20c014fc)
+# ---------------------------------------------------------------------------
+# Maps a kanban board name to ONE wake target for `hermes send -t` dispatch.
+# Stored in the project database's ``project_meta`` KV as ``board_topic:<board>``.
+#
+# Routing is opt-in and additive (Evan's design 2026-11-06, ruling #4: "NO
+# fallback chains — each board maps to ONE topic; Default -> null; null/empty ->
+# agent's DM. That is the ONLY fallback rule"):
+#
+#   * No ``board_topic:<board>`` entry  -> NOT opted in -> legacy subprocess
+#     spawn (today's behaviour; nothing rewires until a board opts in).
+#   * Entry with EMPTY topic            -> opted in, wake to the agent's DM
+#     (the single safe default; used by the Default board and journals).
+#   * Entry with a topic                -> opted in, wake to that one topic.
+#
+# The old ``_default_spawn`` subprocess path stays as the automatic fallback for
+# any board that has not opted in and for CLI-created tasks (ruling #7), so the
+# fleet keeps working while wake routing ships board by board.
+_BOARD_TOPIC_PREFIX = "board_topic:"
+
+
+@dataclass(frozen=True)
+class WakeRoute:
+    """Wake-routing decision for a board.
+
+    ``mode`` is ``"wake"`` when the board has opted into wake routing, else
+    ``"spawn"`` (legacy subprocess fallback). When ``mode == "wake"``, ``topic``
+    is the one mapped topic string, or ``None`` for the agent's DM (the empty-
+    topic safe default).
+    """
+
+    mode: str
+    topic: Optional[str] = None
+
+    @property
+    def is_wake(self) -> bool:
+        return self.mode == "wake"
+
+
+def _board_topic_key(board: str) -> str:
+    return _BOARD_TOPIC_PREFIX + (board or "").strip()
+
+
+def set_board_topic(
+    conn: sqlite3.Connection, board: str, topic: Optional[str]
+) -> None:
+    """Opt a board into wake routing, mapping it to ONE topic.
+
+    ``topic`` is the wake target (e.g. ``telegram:<chat_id>:<thread_id>``). An
+    empty/None ``topic`` opts the board in with the DM fallback. Use
+    :func:`clear_board_topic` to opt back out to the legacy spawn path.
+    """
+    board = (board or "").strip()
+    if not board:
+        raise ValueError("board name is required")
+    value = (topic or "").strip()
+    with write_txn(conn):
+        conn.execute(
+            "INSERT INTO project_meta (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (_board_topic_key(board), value),
+        )
+
+
+def clear_board_topic(conn: sqlite3.Connection, board: str) -> None:
+    """Opt a board out of wake routing (back to the legacy spawn path)."""
+    board = (board or "").strip()
+    if not board:
+        raise ValueError("board name is required")
+    with write_txn(conn):
+        conn.execute(
+            "DELETE FROM project_meta WHERE key = ?", (_board_topic_key(board),)
+        )
+
+
+def get_board_topic(conn: sqlite3.Connection, board: str) -> Optional[str]:
+    """Return the raw topic value for a board.
+
+    ``None`` means no mapping entry exists (not opted in). An empty string means
+    the board is opted in with the DM fallback. Any other value is the mapped
+    topic. Use :func:`resolve_board_wake_route` for the composed decision.
+    """
+    row = conn.execute(
+        "SELECT value FROM project_meta WHERE key = ?", (_board_topic_key(board),)
+    ).fetchone()
+    if row is None:
+        return None
+    return str(row["value"] or "") if isinstance(row, sqlite3.Row) else str(row[0] or "")
+
+
+def resolve_board_wake_route(conn: sqlite3.Connection, board: str) -> WakeRoute:
+    """Compose a board's wake-routing decision.
+
+    Distinguishes the three cases without any fallback chain: not opted in
+    (spawn), opted in with an empty topic (wake -> DM), opted in with a topic
+    (wake -> that topic).
+    """
+    topic = get_board_topic(conn, board)
+    if topic is None:
+        # No mapping entry: the board never opted in -> unchanged legacy spawn.
+        return WakeRoute(mode="spawn", topic=None)
+    if topic == "":
+        # Opted in, empty topic -> the single safe default: the agent's DM.
+        return WakeRoute(mode="wake", topic=None)
+    return WakeRoute(mode="wake", topic=topic)
+
+
+# ---------------------------------------------------------------------------
 # Discovered repos (filesystem scan cache)
 # ---------------------------------------------------------------------------
 

@@ -128,14 +128,55 @@ def _check_kanban_orchestrator_mode() -> bool:
 # Shared helpers
 # ---------------------------------------------------------------------------
 
+def _session_bound_task_id() -> Optional[str]:
+    """Return the task_id bound to the current session (the ``-t`` wake path).
+
+    A ``-t`` wake carries the worker's task_id and binds it to the session
+    (``sessions.task_id`` via ``set_session_task_id``). A gateway-woken worker    has **no** ``HERMES_KANBAN_TASK`` env — the env var only exists on the
+    CLI ``chat -q`` spawn path — so the session binding is its source of truth
+    for which one task it owns. ``None`` means no binding (orchestrator, or a
+    plain unbound CLI context).
+    """
+    session_id = (os.environ.get("HERMES_SESSION_ID") or "").strip()
+    if not session_id:
+        return None
+    import sqlite3
+
+    try:
+        from hermes_state import SessionDB
+
+        return SessionDB().get_session_task_id(session_id)
+    except (ImportError, OSError, sqlite3.Error):
+        # Best-effort scoping: if the session DB is unreachable we can't
+        # prove the binding, so fall back to "no binding" (orchestrator
+        # semantics — today's behaviour) rather than crash the tool.
+        return None
+
+
+def _worker_task_scope() -> Optional[str]:
+    """Return the one task_id this process is scoped to, or None (orchestrator).
+
+    The dispatcher-spawned CLI worker carries its task in
+    ``HERMES_KANBAN_TASK`` (kept for the CLI spawn path); a ``-t``-woken
+    gateway worker carries it in the session binding instead. Either way the
+    worker owns exactly one task and must not mutate siblings/cross-tenant
+    runs. ``None`` means no worker identity — orchestrators route and may    legitimately close out child tasks.
+    """
+    env_tid = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    return env_tid or _session_bound_task_id()
+
+
 def _default_task_id(arg: Optional[str]) -> Optional[str]:
-    """Resolve ``task_id`` arg or fall back to the env var the dispatcher set."""
+    """Resolve ``task_id`` arg or fall back to the worker's own task.
+
+    Order: explicit arg → env (CLI spawn) → session binding (``-t`` wake).
+    The explicit arg always wins so a woken worker can name the task it was    told to work without relying on either fallback.
+    """
     if arg:
         return arg
     if _is_delegated_child_context():
         return None
-    env_tid = os.environ.get("HERMES_KANBAN_TASK")
-    return env_tid or None
+    return _worker_task_scope()
 
 
 def _worker_run_id(task_id: str) -> Optional[int]:
@@ -181,14 +222,16 @@ def _notify_kanban_event(tid: str, status: str, summary: Optional[str], task) ->
 def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
     """Reject worker-driven destructive calls on foreign task IDs.
 
-    A process spawned by the dispatcher has ``HERMES_KANBAN_TASK`` set
-    to its own task id. Tools like ``kanban_complete`` / ``kanban_block``
+    A dispatcher-spawned worker has ``HERMES_KANBAN_TASK`` set to its own
+    task id (CLI spawn path); a ``-t``-woken gateway worker instead has the
+    task id bound to its session. Either way a worker owns exactly one task.
+    Tools like ``kanban_complete`` / ``kanban_block``
     / ``kanban_heartbeat`` mutate run-lifecycle state, so a buggy or
     prompt-injected worker that passed an explicit ``task_id`` for some
     other task could corrupt sibling or cross-tenant runs (see #19534).
 
-    Orchestrator profiles (kanban toolset enabled but **no**
-    ``HERMES_KANBAN_TASK`` in env) aren't subject to this check — their
+    Orchestrator profiles (kanban toolset enabled but **no** worker identity
+    — no env task, no session binding) aren't subject to this check — their
     job is routing, and they sometimes legitimately close out child
     tasks or reopen blocked ones. Workers are narrowly scoped to their
     one task.
@@ -197,13 +240,13 @@ def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
     when it must be rejected. Callers should ``return`` the error
     verbatim.
     """
-    env_tid = os.environ.get("HERMES_KANBAN_TASK")
-    if not env_tid:
-        # Orchestrator or CLI context — no task-scope restriction.
+    scope = _worker_task_scope()
+    if not scope:
+        # Orchestrator or unbound CLI context — no task-scope restriction.
         return None
-    if tid != env_tid:
+    if tid != scope:
         return tool_error(
-            f"worker is scoped to task {env_tid}; refusing to mutate "
+            f"worker is scoped to task {scope}; refusing to mutate "
             f"{tid}. Use kanban_comment to hand off information to other "
             f"tasks, or kanban_create to spawn follow-up work."
         )
