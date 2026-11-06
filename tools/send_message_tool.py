@@ -534,6 +534,11 @@ def _handle_send(args, mirror_role=""):
             "platform_user_id": platform_user_id,
             "sender_name": sender_name,
         }
+        # Wake carry (t_a8031c32 gap 1): the carried kanban task id rides the
+        # context to the delivery site, which binds it to the target session.
+        wake_task_id = str(args.get("task_id") or "").strip()
+        if wake_task_id:
+            user_context["task_id"] = wake_task_id
 
         # Try to get the live gateway adapter and deliver through handle_message.
         runner = None
@@ -555,6 +560,26 @@ def _handle_send(args, mirror_role=""):
                 user_name=sender_name,
                 thread_id=thread_id,
             )
+            # Wake intake (t_a8031c32 gap 1/4): bind the carried task id to
+            # the exact session this wake lands in (the store's single-flight
+            # resolution) BEFORE the turn runs; a duplicate — the session is
+            # already engaged on live work — is suppressed here, never a
+            # second work pass (Gopher's edge, 2026-11-06).
+            if wake_task_id and runner is not None:
+                from hermes_cli.kanban_db import wake_task_intake
+
+                if (
+                    wake_task_intake(runner.session_store, source, wake_task_id)
+                    == "duplicate"
+                ):
+                    return json.dumps({
+                        "success": True,
+                        "suppressed": True,
+                        "note": (
+                            f"duplicate wake for {wake_task_id} suppressed — "
+                            "session already engaged on it"
+                        ),
+                    })
             synth_event = MessageEvent(
                 text=cleaned_message,
                 message_type=MessageType.TEXT,

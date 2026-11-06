@@ -303,6 +303,28 @@ async def _handle_inject(runner, cmd: dict, writer: asyncio.StreamWriter) -> Non
             session_source.user_id = user_context.get("user_id")
             session_source.user_name = user_context.get("sender_name")
             event_metadata["platform_user_id"] = user_context.get("platform_user_id")
+        # Wake intake (t_a8031c32 gap 1/4): bind the carried task id to the
+        # exact session this wake lands in before the turn runs; a duplicate
+        # (the session is already engaged on live work) is suppressed — never
+        # a second work pass. Cron wakes carry no task id and never enter
+        # this path (Gopher's coordination 2026-11-06).
+        wake_task_id = str((user_context or {}).get("task_id") or "").strip()
+        if wake_task_id:
+            from hermes_cli.kanban_db import wake_task_intake
+
+            if (
+                wake_task_intake(runner.session_store, session_source, wake_task_id)
+                == "duplicate"
+            ):
+                _respond(writer, {
+                    "ok": True,
+                    "suppressed": True,
+                    "note": (
+                        f"duplicate wake for {wake_task_id} suppressed — "
+                        "session already engaged on it"
+                    ),
+                })
+                return
         notify_event = MessageEvent(
             text=text,
             source=session_source,

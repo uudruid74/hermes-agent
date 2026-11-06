@@ -581,6 +581,12 @@ def cmd_send(args: argparse.Namespace) -> None:
     if subject:
         message = f"{subject}\n\n{message.lstrip()}"
 
+    # Wake carry (t_a8031c32 gap 1): a `-t` wake may name the kanban task it
+    # dispatches work for. The delivery binds it to the target session
+    # (sessions.task_id) so the ownership gate scopes the woken worker to its
+    # one task. `-u` delivery ignores it — it never injects.
+    task_id = (getattr(args, "task_id", None) or "").strip() or None
+
     # One-call rule (Evan spec 2026-10-18): a `-t` wake ALWAYS also sends the
     # visible copy down the `-u` path — callers make ONE call and get both the
     # wake and the human-readable post. The copy is spawned FIRST so an
@@ -621,6 +627,13 @@ def cmd_send(args: argparse.Namespace) -> None:
         session_db = SessionDB(db_path=get_hermes_home() / "state.db")
         try:
             queued = session_db.enqueue_session_notice(session_id, message)
+            if queued and task_id:
+                # Bind the carried task id to this exact session (gap 1).
+                # The enqueue above validated the session exists; the bind
+                # is what turns this queue wake into a scoped worker wake.
+                from hermes_cli.kanban_db import bind_wake_task
+
+                bind_wake_task(session_id, task_id)
             # Signal half of the wake (t_8140688e): look up the live CLI
             # process for this session and SIGUSR1 it so the queued message is
             # injected as a real user turn instead of sitting in the queue.
@@ -689,6 +702,8 @@ def cmd_send(args: argparse.Namespace) -> None:
     if user_flag:
         tool_args["target"] = user_flag
         tool_args["internal"] = True
+        if task_id:
+            tool_args["task_id"] = task_id
     else:
         tool_args["target"] = target
 
@@ -800,6 +815,18 @@ def register_send_subparser(subparsers) -> argparse.ArgumentParser:
         ),
     )
 
+    parser.add_argument(
+        "--task-id",
+        dest="task_id",
+        metavar="TASK_ID",
+        default=None,
+        help=(
+            "Wake carry (t_a8031c32): name the kanban task a `-t` wake "
+            "dispatches work for. The delivery binds it to the target "
+            "session (sessions.task_id) so the kanban ownership gate scopes "
+            "the woken worker to its one task. Ignored for `-u` delivery."
+        ),
+    )
     parser.add_argument(
         "-s",
         "--subject",

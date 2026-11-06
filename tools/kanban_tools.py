@@ -327,19 +327,25 @@ def heartbeat_current_worker_from_env() -> bool:
     not branch on it.
 
     Identity comes from:
-      * ``HERMES_KANBAN_TASK`` — task id (required; absence means no-op)
+      * ``HERMES_KANBAN_TASK`` — task id (CLI spawn path)
+      * the session binding (``sessions.task_id``) — a ``-t`` wake worker
+        carries its task there instead of env (t_a8031c32 gap 3); the
+        fallback keeps the dispatcher's wake-claim liveness seeing this
+        session as alive during long turns
       * ``HERMES_KANBAN_RUN_ID`` — pins the run row so we don't heartbeat
         a stale run that may have already been reclaimed
       * ``HERMES_KANBAN_CLAIM_LOCK`` — claim lock for ``heartbeat_claim``;
         falls back to the default ``_claimer_id()`` for locally-driven
-        workers that never went through the dispatcher path
+        workers that never went through the dispatcher path (a wake claim
+        is extended dispatcher-side from this heartbeat, so the mismatched
+        ``heartbeat_claim`` is a harmless no-op there)
 
     Rate-limited via the module-level ``_auto_heartbeat_last_attempt``
     timestamp (monotonic clock); not thread-safe in the strict sense, but
     the worst case is one extra DB write per race, which is harmless.
     """
     global _auto_heartbeat_last_attempt
-    tid = os.environ.get("HERMES_KANBAN_TASK")
+    tid = os.environ.get("HERMES_KANBAN_TASK") or _session_bound_task_id()
     if not tid:
         return False
     import time as _time

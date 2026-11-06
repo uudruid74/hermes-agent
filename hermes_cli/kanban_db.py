@@ -5441,7 +5441,8 @@ def release_stale_claims(
     reclaimed = 0
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     stale = conn.execute(
-        "SELECT id, claim_lock, worker_pid, claim_expires, last_heartbeat_at "
+        "SELECT id, claim_lock, worker_pid, claim_expires, last_heartbeat_at, "
+        "       current_run_id "
         "FROM tasks "
         "WHERE status = 'running' AND claim_expires IS NOT NULL "
         "  AND claim_expires < ?",
@@ -5459,6 +5460,57 @@ def release_stale_claims(
             hb is not None
             and (now - int(hb)) > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
         )
+        # Wake claims (t_a8031c32 gap 3/4): a `hermes send -t` wake has no
+        # PID to poll — its liveness is the woken worker's heartbeat, and a
+        # wake still in flight (queued behind a busy agent) is a claim held,
+        # not a dead worker: reclaiming it re-fires the wake next tick
+        # (double-wake) while the session still owns the work. Extend while
+        # the worker heartbeats, or while the wake is inside its pickup
+        # window; otherwise fall through to reclaim so a genuinely lost
+        # wake re-dispatches (reclaim-on-death preserved).
+        if row["worker_pid"] is None:
+            run_id = row["current_run_id"]
+            wake_at = _wake_fired_at(conn, row["id"], run_id)
+            if wake_at is not None:
+                in_flight = (hb is not None and not heartbeat_stale) or (
+                    hb is None
+                    and (now - wake_at) <= WAKE_PICKUP_MAX_AGE_SECONDS
+                )
+                if in_flight:
+                    new_expires = now + _resolve_claim_ttl_seconds()
+                    with write_txn(conn):
+                        cur = conn.execute(
+                            "UPDATE tasks SET claim_expires = ? "
+                            "WHERE id = ? AND status = 'running' "
+                            "  AND claim_lock IS ? "
+                            "  AND claim_expires IS NOT NULL "
+                            "  AND claim_expires < ?",
+                            (new_expires, row["id"], row["claim_lock"], now),
+                        )
+                        if cur.rowcount != 1:
+                            continue
+                        if run_id is not None:
+                            conn.execute(
+                                "UPDATE task_runs SET claim_expires = ? "
+                                "WHERE id = ?",
+                                (new_expires, int(run_id)),
+                            )
+                        _append_event(
+                            conn, row["id"], "claim_extended",
+                            {
+                                "reason": (
+                                    "wake_heartbeat" if hb is not None
+                                    else "wake_pending"
+                                ),
+                                "claim_expires_was": int(row["claim_expires"]),
+                                "claim_expires_now": new_expires,
+                                "last_heartbeat_at": (
+                                    int(hb) if hb is not None else None
+                                ),
+                            },
+                            run_id=int(run_id) if run_id is not None else None,
+                        )
+                    continue
         if (
             host_local
             and row["worker_pid"]
@@ -6219,6 +6271,7 @@ def complete_task(
         )
     except Exception:
         _log.exception("kanban completion notification failed for task=%s", task_id)
+    _release_wake_task_binding(task_id, _done_task.assignee if _done_task else None)
     return True
 
 
@@ -6905,6 +6958,9 @@ def block_task(
                 _log.exception(
                     "kanban dependency notification failed for task=%s", task_id
                 )
+            _release_wake_task_binding(
+                task_id, _blocked_task.assignee if _blocked_task else None
+            )
             return True
 
         # Truly-blocked kinds. Increment the unblock-loop counter when this is a
@@ -7028,6 +7084,7 @@ def block_task(
         )
     except Exception:
         _log.exception("kanban blocked notification failed for task=%s", task_id)
+    _release_wake_task_binding(task_id, _blocked_task.assignee if _blocked_task else None)
     return True
 
 
@@ -8780,6 +8837,7 @@ def detect_stale_running(
 
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, t.last_heartbeat_at, t.claim_lock, "
+        "       t.current_run_id, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
@@ -8799,6 +8857,24 @@ def detect_stale_running(
         hb_age = (now - int(last_hb)) if last_hb is not None else None
         if hb_age is not None and hb_age < _STALE_HEARTBEAT_GAP_SECONDS:
             continue  # recent heartbeat → still alive
+        # Wake claims (t_a8031c32 gap 3/4): the same liveness model as
+        # release_stale_claims — a heartbeat inside the max-stale bound (a
+        # long turn may outlast the stale gap) OR a wake still in its pickup
+        # window (queued behind a busy agent) means the woken worker owns
+        # this task. Resetting it here would double-fire the wake next tick.
+        if row["worker_pid"] is None:
+            wake_at = _wake_fired_at(conn, row["id"], row["current_run_id"])
+            if wake_at is not None and (
+                (
+                    hb_age is not None
+                    and hb_age <= WAKE_HEARTBEAT_MAX_STALE_SECONDS
+                )
+                or (
+                    hb_age is None
+                    and (now - wake_at) <= WAKE_PICKUP_MAX_AGE_SECONDS
+                )
+            ):
+                continue
 
         pid = row["worker_pid"]
         tid = row["id"]
@@ -9899,6 +9975,22 @@ def _dispatch_once_locked(
             _log.warning("plan stop-guard sweep failed", exc_info=True)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
+    # Dispatch transport for this tick (t_a8031c32): on a wake-routed board
+    # (projects.db board_topic:<board>) tasks dispatch via `hermes send -t`
+    # wakes into the assignee's live gateway session instead of
+    # `_default_spawn` subprocesses. Opt-in and per-board: no mapping entry
+    # keeps the legacy spawn path unchanged. Tests pass `spawn_fn`, which
+    # always wins.
+    if spawn_fn is not None:
+        _resolved_spawn = spawn_fn
+    else:
+        _wake_route = _resolve_wake_route(board)
+        _resolved_spawn = (
+            _make_wake_dispatch(conn, _wake_route)
+            if _wake_route.is_wake
+            else _default_spawn
+        )
+
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full
     # rationale; the short version is that a 60-second tick interval with a
@@ -10107,7 +10199,7 @@ def _dispatch_once_locked(
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
-        _spawn = spawn_fn if spawn_fn is not None else _default_spawn
+        _spawn = _resolved_spawn
         try:
             # Back-compat: older spawn_fn signatures accept only
             # (task, workspace). Test stubs in the suite rely on that.
@@ -10205,7 +10297,7 @@ def _dispatch_once_locked(
         # prompt via KANBAN_GUIDANCE, so this is the only extra skill the
         # review agent needs.
         claimed.skills = ["sdlc-review"]
-        _spawn = spawn_fn if spawn_fn is not None else _default_spawn
+        _spawn = _resolved_spawn
         try:
             import inspect
             try:
@@ -10516,6 +10608,196 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
         _retagged_workspace_roots.add(workspaces_root_path)
     except Exception as exc:
         _log.debug("kanban worker: legacy session retag skipped (%s)", exc)
+
+
+# ---------------------------------------------------------------------------
+# Wake dispatch — `hermes send -t` routing for opted-in boards (t_a8031c32)
+# ---------------------------------------------------------------------------
+# On a wake-routed board the dispatcher claims as usual but fires
+# `hermes send -t <target> --task-id <id> "work kanban task <id>"` into the
+# assignee's LIVE gateway session instead of spawning a short-lived CLI
+# worker (Evan's design 2026-11-06 — gateway sessions survive turn-end, so
+# replies/tells land on a live session).
+#
+# Wake-claim liveness (gap 3/4) — two SEPARABLE timers (Gopher's review
+# 2026-11-06). A wake has no PID to poll, so the claim lives on the woken
+# worker's heartbeat; a wake still in flight (queued behind a busy agent) is
+# a claim held, not a dead worker. Reclaiming either case re-fires the wake
+# on the next tick (double-wake) while the session still owns the work.
+WAKE_HEARTBEAT_MAX_STALE_SECONDS = DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
+# Pickup latency: how long an unconsumed wake may sit in the target session
+# (agent busy on other turns) before the claim gives up and re-dispatches.
+WAKE_PICKUP_MAX_AGE_SECONDS = DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
+
+
+def _wake_fired_at(
+    conn: sqlite3.Connection, task_id: str, run_id: Optional[int]
+) -> Optional[int]:
+    """Return the ``wake_fired`` event time for the task's current run.
+
+    ``None`` means this claim is not a ``hermes send -t`` wake (spawned PID
+    workers and manually-claimed tasks carry no wake event), so callers keep
+    the PID-based reclaim semantics for them — the wake guard never broadens.
+    """
+    if run_id is None:
+        return None
+    row = conn.execute(
+        "SELECT created_at FROM task_events "
+        "WHERE task_id = ? AND run_id = ? AND kind = 'wake_fired' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, int(run_id)),
+    ).fetchone()
+    return int(row[0]) if row else None
+
+
+def _resolve_wake_route(board: Optional[str]):
+    """Compose this tick's board wake route (``projects.db``, ruling #6).
+
+    The board→topic map lives in the project database — a different sqlite
+    file from the kanban board this dispatcher ticks, hence the separate
+    connection. No mapping entry means the board never opted in and keeps
+    the legacy spawn path.
+    """
+    from hermes_cli import projects_db as pdb
+
+    slug = _normalize_board_slug(board) or get_current_board()
+    with pdb.connect_closing() as pconn:
+        return pdb.resolve_board_wake_route(pconn, slug)
+
+
+def _make_wake_dispatch(conn: sqlite3.Connection, route):
+    """Build the spawn_fn replacement for a wake-routed board.
+
+    Per task (ruling #7): a CLI-created task (no origin chat) falls back to
+    ``_default_spawn`` as the failsafe. Everything else fires one wake to
+    the board's ONE topic (assignee-qualified) or, when the topic is empty,
+    to the assignee's DM (ruling #4 — the only fallback). The wake carries
+    its task id (``--task-id``) so the intake can bind it to the target
+    session (gap 1). Returns ``None`` — there is no worker PID; wake-claim
+    liveness tracks the heartbeat instead (see ``_wake_fired_at``).
+    """
+    def _wake_dispatch(
+        task: Task, workspace: str, *, board: Optional[str] = None
+    ) -> Optional[int]:
+        origin = get_origin_routing(conn, task.id) or {}
+        if not str(origin.get("chat_id") or "").strip():
+            return _default_spawn(task, workspace, board=board)
+        if route.topic:
+            target = f"{task.assignee}:{route.topic}"
+        else:
+            target = str(task.assignee)
+        prompt = f"work kanban task {task.id}"
+        from hermes_cli._subprocess_compat import spawn_detached
+
+        proc = spawn_detached(
+            [
+                *_resolve_hermes_argv(),
+                "send", "--task-id", task.id,
+                "-t", target, prompt,
+            ]
+        )
+        if proc is None:
+            raise RuntimeError(
+                f"hermes send failed to launch wake for task {task.id}"
+            )
+        _append_event(
+            conn, task.id, "wake_fired",
+            {"target": target},
+            run_id=_current_run_id(conn, task.id),
+        )
+        return None
+
+    return _wake_dispatch
+
+
+def wake_task_intake(session_store, source, task_id: str) -> str:
+    """Resolve the wake's target session and run the gap-1 intake.
+
+    Thin glue over :func:`bind_wake_task`: the store's single-flight
+    ``get_or_create_session`` resolves the very session the handler will
+    deliver into, so the binding (or the duplicate suppression) lands on the
+    exact target with no resolution race. Returns ``"bound"`` /
+    ``"duplicate"`` as :func:`bind_wake_task` does.
+    """
+    entry = session_store.get_or_create_session(source)
+    return bind_wake_task(entry.session_id, task_id)
+
+
+def bind_wake_task(session_id: str, task_id: str, *, board: Optional[str] = None) -> str:
+    """Bind a dispatched wake's task to the session it lands in (gap 1).
+
+    The wake carries its task id (``hermes send --task-id``); the intake binds
+    it to the target session (``sessions.task_id``) BEFORE the wake text
+    reaches the agent, so the landed ownership gate
+    (``_enforce_worker_task_ownership``) scopes the woken gateway worker to
+    its one task exactly like ``HERMES_KANBAN_TASK`` scopes a spawned one.
+
+    Returns ``"bound"`` (deliver the wake) or ``"duplicate"`` — the session is
+    already engaged on this task and the claim is live, so this wake is a
+    re-fire that reached the session that still owns the work (the
+    busy-queue double-fire edge, Gopher's coordination 2026-11-06): intake
+    must NO-OP it — never run a second work pass. The binding is cleared when
+    the task completes/blocks (:func:`_release_wake_task_binding`), so a
+    genuinely re-opened task rebinds fresh and delivers.
+
+    The binding lives in the ASSIGNEE's profile state.db — the one database
+    both this write and the complete/block clear agree on, regardless of
+    which process touches the task. The wake only fires for claimed,
+    assigned tasks, so a task id that names no such row is an error.
+    """
+    if not session_id or not task_id:
+        raise ValueError("session_id and task_id are required")
+    from hermes_cli.profiles import get_profile_dir
+    from hermes_state import SessionDB
+
+    conn = connect(board=board)
+    try:
+        row = conn.execute(
+            "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None or not row["assignee"]:
+        raise ValueError(f"not a dispatchable task: {task_id}")
+    state = SessionDB(db_path=get_profile_dir(row["assignee"]) / "state.db")
+    try:
+        if state.get_session_task_id(session_id) == task_id:
+            if row["status"] == "running" and row["claim_lock"]:
+                return "duplicate"
+        state.set_session_task_id(session_id, task_id)
+    finally:
+        state.close()
+    return "bound"
+
+
+def _release_wake_task_binding(task_id: str, assignee: Optional[str]) -> None:
+    """Clear the wake binding when the task leaves the worker's hands.
+
+    ``bind_wake_task`` suppresses re-wakes while the binding matches a live
+    claim; clearing it on complete/block means a genuinely re-opened task
+    rebinds fresh and delivers instead of being mistaken for a duplicate.
+    The binding lives in the ASSIGNEE's profile state.db (that is where the
+    wake intake writes), so the clear reads that same database regardless of
+    which process completes the task. Best-effort: a session DB hiccup must
+    not fail the task transition that triggered it — logged, never swallowed
+    silently.
+    """
+    if not assignee:
+        return
+    try:
+        from hermes_cli.profiles import get_profile_dir
+        from hermes_state import SessionDB
+
+        state = SessionDB(db_path=get_profile_dir(assignee) / "state.db")
+        try:
+            sid = state.find_task_session_id(task_id)
+            if sid:
+                state.clear_session_task_id(sid)
+        finally:
+            state.close()
+    except (sqlite3.Error, OSError, ValueError) as exc:
+        _log.warning("wake binding clear failed for task=%s: %s", task_id, exc)
 
 
 def _default_spawn(
