@@ -33,6 +33,7 @@ except ImportError:
         msvcrt = None
 from pathlib import Path
 from typing import Any, List, Optional
+from dataclasses import dataclass
 
 # Add parent directory to path for imports BEFORE repo-level imports.
 # Without this, standalone invocations (e.g. after `hermes update` reloads
@@ -2761,6 +2762,180 @@ def _guard_job_credential_exfil(job: dict) -> None:
         raise RuntimeError(f"Cron job '{job_id}' blocked for safety: {err}")
 
 
+# ---------------------------------------------------------------------------
+# Cron wake dispatch (gap 5 / t_f961f13b) — fire `hermes send -t` into the
+# target agent's LIVE gateway session instead of spawning a short-lived cron
+# session that hard-closes at turn-end (the end_session(id, "cron_complete")
+# tear-down). The motivating bug: a journal cron spawned a session that died the
+# moment the turn ended, so a later `tell` / pente reply routed to a dead
+# session (Wintermute's journal -> the pente accept never landed). A wake lands
+# in the live DM gateway session, which survives turn-end — later replies land
+# live (the pente case).
+#
+# Evan's rulings (2026-11-06, bugs/resolved/2026-11-06-kanban-cron-wake-routing):
+#   * Ruling #8 — journal crons wake to the agent's DM session (attribution
+#     shifts from the cron session to the DM session; intended).
+#   * Ruling #4 — empty topic -> DM is the ONLY fallback (no fallback chains).
+# Framing (gap 5): the wake is the single delivery channel; the job's framed
+#   delivery is suppressed (deliver='local' semantics) to avoid a double post.
+#   The toggle axis is SEPARATE from `deliver` — routing is never derived from
+#   `deliver` / origin (Gopher, gap 5).
+# Exclusive invariant (Gopher, gap 5): a job fires the wake XOR the legacy
+#   spawn, never both. The wake path returns before run_job so the spawned
+#   session can never also run; the resolver asserts the single dispatch mode.
+#
+# Only journal crons wake today (the documented motivating case). Non-journal
+# jobs stay on the unchanged spawn path until their opt-in is designed — no
+# invented trigger, no silent scope drop.
+# ---------------------------------------------------------------------------
+
+WAKE_FIRED_STATUS = "wake fired"
+JOURNAL_SKILL_SUFFIX = "-journal"
+
+
+def _cron_skill_names(job: dict) -> List[str]:
+    """Normalized skill names for a cron job (``skills`` array or legacy ``skill``)."""
+    skills = job.get("skills")
+    if isinstance(skills, str):
+        skills = [skills]
+    if not skills:
+        legacy = job.get("skill")
+        skills = [legacy] if legacy else []
+    return [str(s).strip() for s in skills if str(s).strip()]
+
+
+def is_journal_cron(job: dict) -> bool:
+    """True for a journal cron — a structured ``skills`` entry ending ``-journal``.
+
+    The fleet's cross-agent naming convention is ``<agent>-journal``
+    (gopher-journal, neo-journal, wintermute-journal). This is a STRUCTURED
+    signal (the ``skills`` array), not prompt free-text and not a script name
+    (Gopher, gap 5): precise (``journal-article`` does not match the ``-journal``
+    suffix), cross-agent, and not tied to one agent's scripts.
+    """
+    return any(name.endswith(JOURNAL_SKILL_SUFFIX) for name in _cron_skill_names(job))
+
+
+@dataclass(frozen=True)
+class CronWakeRoute:
+    """Wake-routing decision for one cron job — EXCLUSIVE: wake XOR spawn.
+
+    ``mode`` is ``"wake"`` (fire `hermes send -t` into a live gateway session)
+    or ``"spawn"`` (unchanged legacy subprocess/AIAgent path). When waking,
+    ``target`` is the `hermes send -t` target (the agent's DM for journals).
+    ``reason`` records why the route chose wake (audit / tests).
+    """
+
+    mode: str
+    target: Optional[str] = None
+    reason: Optional[str] = None
+
+    @property
+    def is_wake(self) -> bool:
+        return self.mode == "wake"
+
+
+def _agent_dm_wake_target() -> str:
+    """The current profile's bare agent name.
+
+    ``hermes send -t <agent>`` expands to the agent's REAL DM session (ruling
+    #8 journals; ruling #4 empty->DM is the only fallback). Empty means no
+    resolvable target — the caller refuses to fire rather than wake the void.
+    """
+    name = ""
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+
+        name = (get_active_profile_name() or "").strip()
+    except Exception:  # noqa: BLE001 — resolution is best-effort; env is the fallback
+        name = ""
+    return (
+        name
+        or os.environ.get("HERMES_PROFILE", "").strip()
+        or os.environ.get("USERNAME", "").strip()
+    )
+
+
+def resolve_cron_wake_route(job: dict) -> CronWakeRoute:
+    """Decide wake vs legacy spawn for one cron job — EXCLUSIVE (wake XOR spawn).
+
+    Only journal crons wake today (the documented motivating case / ruling #8);
+    every other job stays on the unchanged legacy spawn path until its opt-in is
+    designed. Routing is NOT derived from ``deliver`` / origin (no fallback
+    chain) — Gopher, gap 5.
+    """
+    if is_journal_cron(job):
+        route = CronWakeRoute(mode="wake", target=_agent_dm_wake_target(), reason="journal")
+    else:
+        route = CronWakeRoute(mode="spawn", target=None, reason=None)
+
+    # EXCLUSIVE invariant (Gopher, gap 5): exactly one dispatch mode, and a wake
+    # always hides a resolvable target (ruling #4: empty->DM) while a spawn never
+    # carries one. Guards a misconfigured job from double-firing.
+    assert route.mode in ("wake", "spawn"), f"unknown cron dispatch mode: {route.mode!r}"
+    if route.is_wake:
+        assert route.target, "wake route must resolve a delivery target (ruling #4: empty->DM)"
+    else:
+        assert route.target is None, "spawn route must not carry a wake target"
+    return route
+
+
+def fire_cron_wake(target: Optional[str], prompt: str) -> bool:
+    """Fire ONE `hermes send -t` wake carrying the job prompt into the target's
+    live gateway session. Returns True when the wake was dispatched.
+
+    Mirrors ``tools/tell_tool.py``'s one-call wake (the canonical primitive):
+    `hermes send -t` injects the prompt as a user turn so the target agent wakes
+    in its live session (user+assistant pair — role alternation preserved) and
+    posts the visible copy internally. Fire-and-forget: we only observe the
+    spawn (a missing `hermes` binary is the one synchronous failure).
+    """
+    from hermes_cli._subprocess_compat import spawn_detached
+
+    if not (target or "").strip():
+        logger.error("cron wake: no wake target resolved — refusing to fire into the void")
+        return False
+    proc = spawn_detached(["hermes", "send", "-t", target, prompt])
+    if proc is None:
+        logger.error("cron wake: failed to launch 'hermes send -t' for %s", target)
+        return False
+    logger.info("cron wake: fired 'hermes send -t %s' (job dispatched to live session)", target)
+    return True
+
+
+def _dispatch_cron_wake(job: dict, route: CronWakeRoute, execution_id: str) -> None:
+    """Build the job's content, fire the wake, and record 'wake fired'.
+
+    Skips the spawned-session / framed-delivery path entirely (gap 5 framing:
+    the wake is the single delivery channel). On a wake that cannot fire, record
+    an honest failure — NO silent fall back to spawn (exclusive invariant + the
+    no-fallbacks rule).
+    """
+    job_id = job["id"]
+    try:
+        prompt = _build_job_prompt(job)
+    except CronPromptInjectionBlocked as exc:
+        logger.error("Job '%s': wake blocked — %s", job_id, exc)
+        mark_job_run(job_id, False, str(exc))
+        finish_execution(execution_id, success=False, error=str(exc))
+        return
+
+    if prompt is None:
+        # Script produced no output — nothing to report, so no wake is fired.
+        logger.info("Job '%s': script produced no output, skipping wake.", job_id)
+        mark_job_run(job_id, True, None)
+        finish_execution(execution_id, success=True, delivery_outcome="suppressed")
+        return
+
+    if fire_cron_wake(route.target, prompt):
+        mark_job_run(job_id, True, None, status=WAKE_FIRED_STATUS)
+        finish_execution(execution_id, success=True, delivery_outcome="suppressed")
+    else:
+        err = f"cron wake failed to fire for target {route.target!r}"
+        mark_job_run(job_id, False, err)
+        finish_execution(execution_id, success=False, error=err)
+
+
 def run_job(
     job: dict, *, defer_agent_teardown: Optional[list] = None
 ) -> tuple[bool, str, str, Optional[str]]:
@@ -3930,6 +4105,20 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         # The attempt is claimed durably before executor/provider dispatch and
         # becomes running only immediately before the actual run.
         mark_execution_running(execution_id)
+
+        # Cron wake dispatch (gap 5 / t_f961f13b): a journal cron fires a
+        # `hermes send -t` wake into the target agent's live gateway DM session
+        # instead of spawning a short-lived cron session that hard-closes at
+        # turn-end (the motivating bug — a later tell / pente reply landed on a
+        # dead session). The wake is the single delivery channel: framed
+        # delivery is suppressed (deliver='local' semantics) and we return
+        # before the spawn/deploy path at all. Exclusive (Gopher, gap 5): this
+        # early return guarantees the legacy spawn never also runs for a waking
+        # job — wake XOR spawn, never both.
+        _wake_route = resolve_cron_wake_route(job)
+        if _wake_route.is_wake:
+            _dispatch_cron_wake(job, _wake_route, execution_id)
+            return True
 
         # Run the job under the profile's secret scope. get_secret() fails
         # closed outside a scope once profile isolation is in play (multiple
