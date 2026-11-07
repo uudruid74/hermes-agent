@@ -194,10 +194,15 @@ def test_worker_clarify_queues_row_and_wakes_dispatcher(kb_env):
 
     # The wake carried the question and the /review answer instruction
     # (Evan 2026-10-20: the answer channel is /review — NOT a new command).
+    # t_ad4b4a96 (2026-11-06 05:52 repro): the ask must ALSO name the tool
+    # form the agent-dispatcher actually runs — the wake command's payload
+    # routes through `plan review`'s `response`, and the agent answering the
+    # named channel hit "has none pending" before this fix.
     assert kb_env.wakes, "the dispatcher was never woken"
     wake_text = " ".join(kb_env.wakes[0])
     assert "which three tools" in wake_text
     assert f"/review t_e4812748 <your answer>" in wake_text
+    assert "plan review task_id=t_e4812748 response=" in wake_text
     assert "hermes kanban answer" not in wake_text
 
     # The dispatcher answers through the review command (/review flow).

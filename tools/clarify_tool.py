@@ -189,8 +189,11 @@ def _route_clarify_to_dispatcher(
         ask = (
             f"{tid} → your worker ({agent_name}) is asking for clarification.\n\n"
             f"Question: {question}\n\n"
-            f"Answer it with the review command:\n  /review {tid} <your answer>\n"
-            "(or the dashboard). The worker is parked until the answer arrives."
+            f"Answer it with the review command:\n"
+            f"  plan review task_id={tid} response=<your answer>\n"
+            f"  (or /review {tid} <your answer> from an interactive session, "
+            "or the dashboard).\n"
+            "The worker is parked until the answer arrives."
         )
         ok, detail = send_dispatcher_message(
             conn,

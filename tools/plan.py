@@ -1414,8 +1414,14 @@ def plan(
         # so when nothing is bound. Explicit task_id behaves as always.
         # decision + reason are the review fields (reason is never parsed
         # into a decision); response answers a pending worker ask only.
-        if not decision:
-            return "ERROR: 'review' requires decision"
+        # Decision-less answer form (t_ad4b4a96, 2026-11-06 05:52 repro):
+        # answering a worker's ask needs no step-review decision — the ask
+        # is the thing being resolved.
+        if not decision and not response:
+            return (
+                "ERROR: 'review' requires decision (approved/denied/yolo) "
+                "to review a step, or response to answer a worker's pending ask"
+            )
         return _kick_after(
             _cmd_review(agent, task_id, decision, reason=reason, response=response)
         )

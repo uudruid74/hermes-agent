@@ -755,14 +755,18 @@ def block_active_plan_at_iteration_limit(agent, *, used: int, maximum: int) -> b
         f"Step {step_no} ended at the tool-call limit "
         f"({used}/{maximum}) with no submission"
     )
-    parked = kanban_db.park_plan_task(conn, binding.task_id, detail=detail)
-    if not parked:
-        return False
-    # F2 dual-mode: write the durable tool_limit_hit flag BEFORE the wake-ping
-    # so the dispatcher's 'plan review' command answers as a guide, not a step
-    # review. Annotation-only write; parking has already succeeded.
+    # B (t_ad4b4a96, 2026-11-06 06:58 repro): the durable ask flag is written
+    # BEFORE the park. A park without its flag is a stuck shape no plan
+    # command can leave — `advance` refuses `attention`, `review` reports
+    # "none pending" (no flag to answer), and the dispatcher is told never to
+    # unblock plan tasks. So a flag write that fails must abort the park:
+    # the worker's next `continue`/dispatcher touch can still reach a
+    # `manual` plan, while a flagless park cannot be reached at all. The
+    # previous order (park first, flag after, warning on failure) is exactly
+    # the shape that stranded t_6ad885ef.
     from hermes_cli.execution_bindings import (
         ExecutionBindingError as _ebb_error,
+        clear_clarify_flag as _clear_clarify_flag,
         set_clarify_flag as _set_clarify_flag,
     )
 
@@ -776,6 +780,14 @@ def block_active_plan_at_iteration_limit(agent, *, used: int, maximum: int) -> b
         )
     except _ebb_error as exc:
         logger.warning("tool-limit flag for task %s failed: %s", binding.task_id, exc)
+        return False
+    parked = kanban_db.park_plan_task(conn, binding.task_id, detail=detail)
+    if not parked:
+        # The park was refused (state moved under us) — withdraw the ask so
+        # it cannot dangle as an unanswered question on a plan that never
+        # parked.
+        _clear_clarify_flag(conn, binding.task_id)
+        return False
     # The parked-state prompt goes to the plan's dispatcher (an agent), not
     # through the generic kanban notification — this is the "separate prompt"
     # Evan specified. Best-effort: parking itself has already succeeded.
@@ -1319,7 +1331,7 @@ def cmd_advance(agent, summary: str, step: Optional[int] = None) -> str:
 def cmd_review(
     agent,
     task_id: Optional[str],
-    decision: str,
+    decision: Optional[str],
     reason: Optional[str] = None,
     response: Optional[str] = None,
 ) -> str:
@@ -1340,8 +1352,16 @@ def cmd_review(
     from hermes_cli import execution_bindings as bindings
 
     decision = (decision or "").strip().lower()
-    if decision not in {"approved", "denied", "yolo"}:
+    if decision and decision not in {"approved", "denied", "yolo"}:
         return "ERROR: 'review' decision must be 'approved', 'denied', or 'yolo'"
+    # Decision-less answer form (t_ad4b4a96): a worker's ask is answered by
+    # `response` alone — the ask IS the thing being resolved, so there is no
+    # step to decide. A review of a step still requires its decision.
+    if not decision and not response:
+        return (
+            "ERROR: 'review' requires decision (approved/denied/yolo) to "
+            "review a step, or response to answer a worker's pending ask"
+        )
     reason = (reason or "").strip() or None
     if reason is not None and len(reason) > 1024:
         return "ERROR: review reason must be at most 1024 characters"
@@ -1393,6 +1413,14 @@ def cmd_review(
                 "ask from the worker — a response is required to answer it"
             )
         bindings.clear_clarify_flag(conn, task_id)
+        # C (t_ad4b4a96, 16:35 repro): the answer must restore the park it
+        # was parked FOR. Without this the dispatcher sees "delivered to
+        # worker" while the plan stays `attention` — dead-ended, because
+        # `advance` requires `manual` and the dispatcher is told not to
+        # unblock. Idempotent CAS; the worker resumes on its binding.
+        released = bindings.release_parked_plan(
+            conn, task_id, actor=reviewer, via="review-response"
+        )
         kind = str(flag.get("kind") or "needs_clarify")
         step_no = flag.get("step")
         if kind == "tool_limit_hit":
@@ -1421,7 +1449,47 @@ def cmd_review(
         return (
             f"Clarify response delivered to worker for {task_id} "
             f"(Step {step_no}, {kind})."
+            + (
+                " Park released — the worker resumes on its existing binding."
+                if released
+                else ""
+            )
         )
+
+    # A (t_ad4b4a96, 2026-11-06 05:52 repro): `response` also answers a
+    # pending `clarify_queue` ask — the channel `clarify_tool` writes when
+    # the worker is a bound plan worker. Before this, the woken dispatcher
+    # answering the exact wake command (`/review <task_id> <answer>`, whose
+    # payload routes through this field) got "requires decision" or "none
+    # pending": the ask was only reachable via the human slash command.
+    if response is not None:
+        from hermes_cli.plan_slash_helpers import (
+            _pending_clarify_ask,
+            answer_clarify_ask,
+        )
+
+        ask = _pending_clarify_ask(conn, task_id)
+        if ask is not None:
+            if reason is not None:
+                return (
+                    f"ERROR: Plan {task_id} has a pending ask from the worker — "
+                    "answer it with 'response'; 'reason' is the review denial "
+                    "message and is never an ask answer"
+                )
+            answer_clarify_ask(conn, str(ask["id"]), response)
+            released = bindings.release_parked_plan(
+                conn, task_id, actor=reviewer, via="review-response"
+            )
+            return (
+                f"Clarify answer delivered to worker for {task_id} "
+                f"(ask {ask['id']})."
+                + (
+                    " Park released — the worker resumes on its existing "
+                    "binding."
+                    if released
+                    else ""
+                )
+            )
 
     if response is not None:
         # An answer is never a reason: 'response' is the F2 ask-answer field
@@ -2084,6 +2152,18 @@ def cmd_continue(agent, task_id: str) -> str:
         # same steer here instead of a confusing re-bind.
         current = bindings.get_binding(conn, key)
         if current is not None and current.task_id == task_id:
+            # D (t_ad4b4a96, 16:35 repro): a still-bound worker reaching a
+            # parked plan via `continue` must NOT dead-end. The park
+            # (attention) blocks `advance` and the dispatcher is told never
+            # to unblock plan tasks — so the worker's own `continue` is the
+            # documented restore channel. Clear the stale ask with it: the
+            # worker resuming on its own binding IS the answer to "how do I
+            # proceed" — a leftover flag would hijack the next step review.
+            bindings.release_parked_plan(
+                conn, task_id, actor=_legacy()._get_agent_name(agent),
+                via="continue",
+            )
+            bindings.clear_clarify_flag(conn, task_id)
             task = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
             return (
                 f"Plan {task_id} is ALREADY ACTIVE in this session. "

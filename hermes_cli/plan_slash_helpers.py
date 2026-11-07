@@ -113,6 +113,25 @@ def _pending_clarify_ask(conn, task_id: str):
     ).fetchone()
 
 
+def answer_clarify_ask(conn, ask_id: str, answer: str) -> None:
+    """Record a dispatcher's answer to a ``clarify_queue`` ask (F2 channel).
+
+    The worker is parked inside ``clarify_tool`` polling this row, so this
+    write IS the delivery — the answer reaches the worker verbatim through
+    the parked tool call. One writer for both responder surfaces (the
+    ``/review`` command and ``cmd_review``'s ``response`` field) so the two
+    can never disagree on what "answered" means (t_ad4b4a96).
+    """
+    from hermes_cli.kanban_db import write_txn
+
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE clarify_queue SET status='answered', answer=?, "
+            "answered_at=? WHERE id=?",
+            (answer, int(time.time()), ask_id),
+        )
+
+
 def plan_review_command(args: str) -> Tuple[bool, str]:
     """``/review <task_id> [answer]`` — the review command (F2 dual-mode).
 
@@ -157,14 +176,7 @@ def plan_review_command(args: str) -> Tuple[bool, str]:
                     "(or the dashboard). The worker is parked until the "
                     "answer arrives."
                 )
-            from hermes_cli.kanban_db import write_txn
-
-            with write_txn(conn):
-                conn.execute(
-                    "UPDATE clarify_queue SET status='answered', answer=?, "
-                    "answered_at=? WHERE id=?",
-                    (response, int(time.time()), ask["id"]),
-                )
+            answer_clarify_ask(conn, ask["id"], response)
             return True, (
                 f"Clarify answer delivered to worker for {task_id} "
                 f"(ask {ask['id']})."

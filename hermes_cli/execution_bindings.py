@@ -922,6 +922,38 @@ def clear_clarify_flag(conn: sqlite3.Connection, task_id: str) -> None:
         )
 
 
+def release_parked_plan(
+    conn: sqlite3.Connection, task_id: str, *, actor: str, via: str
+) -> bool:
+    """Restore a parked (``attention``) Plan to ``manual`` — the un-park half.
+
+    Every documented restore channel must land the same transition the park
+    made, in reverse: ``attention -> manual`` plus one auditable event. The
+    2026-11-06 repro (t_ad4b4a96): the clarify answer reported "delivered to
+    worker" while the task stayed ``attention`` for 8h — an answer that does
+    not release the park leaves the plan dead-ended (``advance`` requires
+    ``manual``, and the dispatcher is told not to unblock). Called from the
+    answer channels (``plan review``/``/review``) and from ``continue``'s
+    already-bound path so a still-bound worker can self-recover.
+
+    Idempotent CAS: returns True only when this call made the transition.
+    """
+    with write_txn(conn):
+        changed = conn.execute(
+            "UPDATE tasks SET status='manual' WHERE id=? AND status='attention'",
+            (task_id,),
+        ).rowcount
+        if changed != 1:
+            return False
+        _append_event(
+            conn,
+            task_id,
+            "plan-unparked",
+            payload={"actor": actor, "via": via},
+        )
+    return True
+
+
 def _repeat_target(conn: sqlite3.Connection, task_id: str) -> Optional[tuple[str, int]]:
     """Return ``(parent_task_id, step_no)`` when this Plan is a `repeat` child.
 
@@ -1366,6 +1398,13 @@ def continue_plan(
             )
         from_status: str = task["status"]
         _steps_for_task(task)
+        # D (t_ad4b4a96): continuing a parked plan is itself the restore
+        # channel — the worker is proceeding on its own binding, so any ask
+        # written at the park is moot. Clear it or a stale flag hijacks the
+        # next step review (cmd_review would demand a response for a dead
+        # ask). Covers both the re-bind flow below and the already-bound
+        # early return.
+        clear_clarify_flag(conn, plan_id)
         # Already bound to this exact session? No-op. Do NOT re-file the
         # binding — re-computing revision = max(...) + 1 bumps the counter and
         # races the step-review gate (`_assert_expected_binding` compares the
@@ -1374,6 +1413,9 @@ def continue_plan(
         # revision; the caller steers it to `advance` instead.
         already = _get_binding_row(conn, key)
         if already is not None and already["task_id"] == plan_id:
+            # Still parked? Release it here too — the early return would
+            # otherwise leave the task in `attention` with `advance` blocked.
+            release_parked_plan(conn, plan_id, actor=actor, via="continue")
             return _binding_from_row(already)
         prior = conn.execute(
             "SELECT revision FROM execution_bindings "
