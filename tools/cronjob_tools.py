@@ -686,10 +686,11 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
 
         # The manual `hermes cron run` path runs inside the caller's
         # process. t_94b593b6: the verified CLI wake is the official/primary
-        # delivery path; when this process happens to host a live gateway
-        # the in-process adapter injection is an optional optimization that
-        # must prove itself and defer on failure (see fire_cron_wake).
-        # No detached spawn, no false green.
+        # delivery path and it is attempted first, always — the in-process
+        # adapter injection is only a last-resort optimization, consulted
+        # solely when the official path cannot confirm delivery and a live
+        # adapter + loop are verifiable (see fire_cron_wake). No detached
+        # spawn, no false green.
         try:
             from cron.scheduler import (
                 WAKE_FIRED_STATUS,

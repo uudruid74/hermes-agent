@@ -1,9 +1,12 @@
 """Cron wake dispatch: journal -> `hermes send -t` into a live gateway session (t_f961f13b).
 
-t_94b593b6 hardening (this file): the verified CLI wake is the primary
-mechanism; the in-process adapter injection is an optimization that must
-prove itself and defer on any failure. The CLI wake runs to completion and
-its JSON result is checked — spawn success alone is never delivery.
+t_94b593b6 hardening (this file): the verified CLI wake is the official and
+primary mechanism and is attempted first, always — the fragile in-process
+adapter injection is a last-resort optimization that runs only when the
+official path cannot confirm delivery and must prove itself; a wake never
+reports a failed first attempt and then a rescued fallback. The CLI wake
+runs to completion and its JSON result is checked — spawn success alone is
+never delivery.
 """
 from __future__ import annotations
 
@@ -186,9 +189,11 @@ def _live_loop():
     return loop
 
 
-def test_in_process_optimization_lands_when_available(monkeypatch):
-    """When a live adapter AND loop are present, in-process is tried first
-    and, if it lands, short-circuits the CLI wake."""
+def test_in_process_optimization_is_last_resort(monkeypatch):
+    """The in-process injection is an optimization only — it is NOT
+    attempted before the official CLI wake.  It applies only when the
+    official path cannot confirm delivery, and only when a live adapter
+    AND loop are verifiable; then it must prove itself or the wake fails."""
     accepted = []
 
     class FakeAdapter:
@@ -211,19 +216,21 @@ def test_in_process_optimization_lands_when_available(monkeypatch):
 
     loop = _live_loop()
     try:
-        from cron.scheduler import _in_process_candidate_present, fire_cron_wake
-
-        assert _in_process_candidate_present("neo", loop=loop) is True
         cli_calls = []
         monkeypatch.setattr(
             "cron.scheduler._bridge_cli_wake",
-            lambda target, body, **kw: cli_calls.append((target, body)) or True,
+            lambda target, body, **kw: cli_calls.append((target, body)) or False,
         )
+        from cron.scheduler import _in_process_candidate_present, fire_cron_wake
+
+        # Even with adapters+loop present, the official path is tried first
+        # and is the path that defines success.
+        assert _in_process_candidate_present("neo", loop=loop) is True
         ok = fire_cron_wake("neo", "the journal prompt", loop=loop)
 
         assert ok is True
-        assert len(accepted) == 1  # in-process injection happened
-        assert cli_calls == []  # and the CLI wake was short-circuited
+        assert cli_calls == [("neo", "the journal prompt")]
+        assert len(accepted) == 1  # last-resort injection landed
         event = accepted[0]
         assert event.text.startswith("Incoming user wake (cron):")
         assert "the journal prompt" in event.text
@@ -233,10 +240,81 @@ def test_in_process_optimization_lands_when_available(monkeypatch):
         loop.call_soon_threadsafe(loop.stop)
 
 
-def test_in_process_failure_defers_to_cli(monkeypatch):
-    """An adapter that rejects means the optimization did NOT prove itself —
-    fall through to the official CLI wake instead of a hard failure."""
-    import asyncio
+def test_cli_win_is_used_without_failed_attempt(monkeypatch):
+    """When the official CLI wake confirms delivery, the optimization is
+    never attempted at all — no failed first attempt, no rescue path,
+    no fallback chain.  (The pattern Evan flagged: 'reported failed, then
+    hit the fallback and succeeded' must not exist.)"""
+    import subprocess
+
+    calls = []
+
+    def fake_run(argv, **kw):
+        calls.append(argv)
+        return subprocess.CompletedProcess(
+            argv, 0, stdout='{"success": true}', stderr=""
+        )
+
+    optimization_calls = []
+    monkeypatch.setattr("cron.scheduler.subprocess.run", fake_run)
+    monkeypatch.setattr(
+        "cron.scheduler._in_process_wake",
+        lambda *a, **k: optimization_calls.append(a) or False,
+    )
+    from cron.scheduler import fire_cron_wake
+
+    assert fire_cron_wake("gopher", "short prompt") is True
+
+    # Exactly one delivery attempt: the official CLI wake.  The fragile
+    # in-process path was never consulted.
+    assert calls == [["hermes", "send", "-t", "gopher", "short prompt"]]
+    assert optimization_calls == []
+
+
+def test_cli_fail_and_no_candidate_is_honest_failure(monkeypatch):
+    """If the official path cannot confirm AND no optimization is
+    verifiable, the wake fails honestly — never a false green."""
+    import subprocess
+
+    monkeypatch.setattr(
+        "cron.scheduler.subprocess.run",
+        lambda argv, **kw: subprocess.CompletedProcess(argv, 1, stdout="", stderr="boom"),
+    )
+    from cron.scheduler import fire_cron_wake
+
+    # No adapters, no loop: the optimization is not a candidate.
+    assert fire_cron_wake("neo", "prompt", adapters=None, loop=None) is False
+
+
+def test_in_process_rejection_is_not_false_green(monkeypatch):
+    """If the official path fails AND the last-resort optimization rejects,
+    never report success."""
+    import subprocess
+
+    class RejectingAdapter:
+        async def handle_message(self, event):
+            raise RuntimeError("live session is wedged")
+
+    loop = _live_loop()
+    try:
+        monkeypatch.setattr(
+            "cron.scheduler.subprocess.run",
+            lambda argv, **kw: subprocess.CompletedProcess(
+                argv, 1, stdout="", stderr="boom"
+            ),
+        )
+        from cron.scheduler import fire_cron_wake
+
+        assert fire_cron_wake("neo", "prompt", adapters={"telegram": RejectingAdapter()}, loop=loop) is False
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+
+
+def test_optimization_never_precedes_official_wake(monkeypatch):
+    """The exact pattern Evan flagged must not exist: the in-process
+    optimization must never be attempted, fail, and then be rescued by the
+    CLI wake.  When adapters+loop are present the CLI wake still runs
+    first and still succeeds on its own — the optimization is untouched."""
     import subprocess
 
     class RejectingAdapter:
@@ -247,6 +325,7 @@ def test_in_process_failure_defers_to_cli(monkeypatch):
 
     adapters = {"telegram": RejectingAdapter()}
     cli_calls = []
+    optimization_calls = []
 
     def fake_run(argv, **kw):
         cli_calls.append(argv)
@@ -257,34 +336,18 @@ def test_in_process_failure_defers_to_cli(monkeypatch):
     loop = _live_loop()
     try:
         monkeypatch.setattr("cron.scheduler.subprocess.run", fake_run)
-        from cron.scheduler import _in_process_candidate_present, fire_cron_wake
+        monkeypatch.setattr(
+            "cron.scheduler._in_process_wake",
+            lambda *a, **k: optimization_calls.append(a) or False,
+        )
+        from cron.scheduler import fire_cron_wake
 
-        assert _in_process_candidate_present("neo", adapters=adapters, loop=loop) is True
         ok = fire_cron_wake("neo", "prompt", adapters=adapters, loop=loop)
         assert ok is True
         assert cli_calls == [["hermes", "send", "-t", "neo", "prompt"]]
-    finally:
-        loop.call_soon_threadsafe(loop.stop)
-
-
-def test_in_process_rejection_is_not_false_green(monkeypatch):
-    """If BOTH paths fail, never report success — no false green from the
-    optimization or the official path."""
-    import asyncio
-    import subprocess
-
-    class RejectingAdapter:
-        async def handle_message(self, event):
-            raise RuntimeError("live session is wedged")
-
-    loop = _live_loop()
-    try:
-        monkeypatch.setattr("cron.scheduler.subprocess.run", lambda argv, **kw: subprocess.CompletedProcess(
-            argv, 1, stdout="", stderr="boom"
-        ))
-        from cron.scheduler import fire_cron_wake
-
-        assert fire_cron_wake("neo", "prompt", adapters={"telegram": RejectingAdapter()}, loop=loop) is False
+        # The fragile path was never consulted — no failed first attempt,
+        # no fallback chain.
+        assert optimization_calls == []
     finally:
         loop.call_soon_threadsafe(loop.stop)
 
@@ -452,8 +515,9 @@ def test_wake_payload_truncates_overdraft_prompts():
 
 
 def test_dispatch_threads_adapters_to_wake(monkeypatch):
-    """t_94b593b6: adapters/loop reach the wake site so in-process injection is
-    used instead of a detached subprocess."""
+    """t_94b593b6: adapters/loop reach the wake site so the last-resort
+    in-process injection is available when the official CLI wake cannot
+    confirm."""
     rec = _install_dispatch_mocks(monkeypatch)
     from cron.scheduler import CronWakeRoute, _dispatch_cron_wake
 

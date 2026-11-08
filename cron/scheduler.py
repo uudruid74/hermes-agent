@@ -3093,19 +3093,20 @@ def _in_process_wake(
 ) -> bool:
     """Inject the wake into the target's live gateway session *in-process*.
 
-    The controlled bug (t_94b593b6): the cron scheduler spawned a detached
-    ``hermes send -t`` subprocess for a wake.  A detached CLI has no live
-    gateway adapter (``_gateway_runner_ref()`` only resolves inside the
-    running gateway), so ``send_message_tool`` fell through to the bridge
-    socket, the oversized payload killed the connection (``LimitOverrunError``
-    past the 64 KiB reader limit), and the injection never happened while
-    ``last_status`` recorded false green ("wake fired") — spawn success
-    mistaken for delivery.
+    Last-resort optimization (t_94b593b6): the official path is the verified
+    ``hermes send -t`` CLI wake; this injection is only consulted when that
+    path cannot confirm delivery and a live adapter plus live loop are
+    verifiable for the target.  It must prove itself — the adapter must
+    accept the turn — or the wake fails honestly.
 
-    The scheduler runs *inside* the gateway, so inject through the target's
-    live adapter directly — the same primitive ``handle_message`` uses for
-    real inbound messages — and report failure loudly if no adapter could
-    accept the turn.
+    Historical background (the controlled bug this area replaces): the cron
+    scheduler spawned a detached ``hermes send -t`` subprocess for a wake.  A
+    detached CLI has no live gateway adapter (``_gateway_runner_ref()`` only
+    resolves inside the running gateway), so ``send_message_tool`` fell
+    through to the bridge socket, the oversized payload killed the connection
+    (``LimitOverrunError`` past the 64 KiB reader limit), and the injection
+    never happened while ``last_status`` recorded false green ("wake fired")
+    — spawn success mistaken for delivery.
 
     Returns True iff the adapter accepted the wake turn.
     """
@@ -3292,20 +3293,28 @@ def fire_cron_wake(
 ) -> bool:
     """Fire ONE wake carrying the job prompt into the target's live session.
 
-    Priority (t_94b593b6, flipped per Evan — the CLI wake is the official
-    mechanism, the optimized path must prove itself):
+    Priority (t_94b593b6, corrected per Evan — the failed-then-fallback
+    pattern must not exist; the official path runs first):
 
-    1. **CLI subprocess — OFFICIAL**: run ``hermes send -t`` to completion
-       and require a zero exit + a delivery-confirmed payload.  This is
-       the spec'd wake path: it lands the turn in the target's live session
-       as a real user turn, and it is exactly what works in gateway-less
-       contexts (the detached spawn was the bug, not the mechanism).
-    2. **In-process — OPTIMIZATION ONLY**: when this gateway owns the tick,
-       inject through the target's live adapter.  This is an optional
-       shortcut that must prove itself — attempt it only when a live
-       adapter AND a live event loop are verifiably present, and on ANY
-       failure fall through to the CLI path immediately.  It is never a
-       hard failure and never a false green.
+    1. **CLI subprocess — OFFICIAL, PRIMARY, TRIED FIRST**: run
+       ``hermes send -t`` to completion and require a zero exit plus a
+       delivery-confirmed payload.  This is the spec'd wake path; it lands
+       the turn in the target's live session as a real user turn.  It is
+       never preceded by a doomed attempt — the CLI path is the first
+       thing that runs, in every context (the detached spawn was the bug,
+       not the mechanism).
+    2. **In-process — OPTIMIZATION ONLY, LAST RESORT**: only if the official
+       CLI wake itself cannot run or cannot confirm delivery, and a live
+       adapter plus live event loop are verifiably present, inject through
+       the target's live adapter as an optimization.  It must prove itself
+       (adapter accepts the turn) or the wake fails honestly.  It is never
+       a hard failure and never a false green.
+
+    The in-process optimization is deliberately NOT attempted before the
+    official CLI wake: a wake must never show a failed first attempt and
+    then limp along on a rescue path.  The official path either delivers
+    (verified) or the optimization — when one is even verifiable — is the
+    last resort.
 
     Both sites use the same "CLI User" identity derivation.
 
@@ -3316,15 +3325,20 @@ def fire_cron_wake(
     if body is None:
         body = prompt
 
-    # Optional optimization first: prove it before relying on it.  If a
-    # live adapter and a live gateway loop are both present, try the
-    # in-process injection; anything short of that must defer to the
-    # official CLI wake.  The attempt is best-effort by design — a failure
-    # here is not an error, it is a reason to use the path that works.
+    # Official/primary path first — always, no preconditions, no failed
+    # attempt before it.  Verified by exit code plus the CLI's own
+    # delivery-confirmed JSON payload.
+    if _bridge_cli_wake(target, body, env=env):
+        return True
+
+    # The official path could not confirm delivery.  Only then may the
+    # optimization apply — and only when a live adapter and a live gateway
+    # loop are actually verifiable.  If the optimization does not prove
+    # itself, the wake fails honestly: no false green, no silent rescue.
     if _in_process_candidate_present(target, adapters, loop):
         logger.debug(
-            "cron wake: live adapter + loop available for %r — trying "
-            "in-process injection before the CLI wake",
+            "cron wake: official CLI wake could not confirm for %r — "
+            "last-resort in-process injection",
             target,
         )
         try:
@@ -3332,18 +3346,16 @@ def fire_cron_wake(
                 return True
         except Exception as exc:  # pragma: no cover - defensive only
             logger.warning(
-                "cron wake: in-process injection raised for %r: %s — "
-                "deferring to the CLI wake",
+                "cron wake: in-process last-resort injection raised for %r: %s",
                 target,
                 exc,
             )
         logger.debug(
-            "cron wake: in-process injection did not land for %r — "
-            "deferring to the official CLI wake",
+            "cron wake: in-process last-resort injection did not land for %r",
             target,
         )
 
-    return _bridge_cli_wake(target, body, env=env)
+    return False
 
 
 def _dispatch_cron_wake(
@@ -3360,9 +3372,9 @@ def _dispatch_cron_wake(
     Skips the spawned-session / framed-delivery path entirely (gap 5 framing:
     the wake is the single delivery channel).  ``wake fired`` is recorded ONLY
     after the wake was verified (the official CLI wake returned a
-    delivery-confirmed payload, or the in-process optimization's adapter
-    accepted the turn).  A wake that cannot fire records a loud failure — no
-    false green, no silent fall back to spawn.
+    delivery-confirmed payload, or the last-resort in-process adapter accepted
+    the turn).  A wake that cannot fire records a loud failure — no false
+    green, no silent fall back to spawn.
     """
     job_id = job["id"]
     body = _build_wake_payload(job)
