@@ -685,10 +685,11 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
             _heartbeat_thread.start()
 
         # The manual `hermes cron run` path runs inside the caller's
-        # process. When the gateway is live in this process (runner
-        # reference resolves) the same in-process wake as the ticker uses
-        # applies; otherwise the verified CLI-wake fallback runs — no
-        # detached spawn, no false green (t_94b593b6).
+        # process. t_94b593b6: the verified CLI wake is the official/primary
+        # delivery path; when this process happens to host a live gateway
+        # the in-process adapter injection is an optional optimization that
+        # must prove itself and defer on failure (see fire_cron_wake).
+        # No detached spawn, no false green.
         try:
             from cron.scheduler import (
                 WAKE_FIRED_STATUS,

@@ -3022,6 +3022,67 @@ def _wake_render_injection(wake_profile: str, body: str, chat_type: str) -> Opti
     return f"Incoming user wake (cron):\n{text}\n\nThis is a cron-scheduled wake event for {wake_profile}; the agent should run its journal/brief work and reply in this session."
 
 
+def _in_process_candidate_present(target: Optional[str], adapters=None, loop=None) -> bool:
+    """Cheap pre-check: only attempt in-process injection when it can work.
+
+    The in-process wake is an optimization, never the only path (t_94b593b6,
+    flipped priority per Evan).  It needs three things to have any chance:
+
+    * a resolvable wake target,
+    * a live adapter for the target's platform — either from the caller's
+      adapter map or from the live gateway runner (``_gateway_runner_ref``,
+      which only resolves inside a running gateway), and
+    * a live asyncio event loop to schedule the injection on.
+
+    When anything is missing the caller must defer straight to the official
+    CLI wake; this check must never raise and must never be the sole
+    decision point that records a failure.
+    """
+    if not (target or "").strip():
+        return False
+    if loop is None:
+        return False
+
+    from gateway.config import Platform
+
+    platform_name, _chat_id = _resolve_wake_platform_and_chat(target)
+    if platform_name is None:
+        return False
+    try:
+        platform = Platform(platform_name)
+    except (ValueError, KeyError):
+        return False
+
+    adapter = None
+    try:
+        if adapters:
+            adapter = adapters.get(platform) or adapters.get(platform_name)
+    except Exception:
+        adapter = None
+    if adapter is None:
+        try:
+            from gateway.run import _gateway_runner_ref
+
+            runner = _gateway_runner_ref()
+        except Exception:
+            runner = None
+        if runner is None:
+            return False
+        woke_profile = str(target or "").split(":", 1)[0].strip()
+        try:
+            if woke_profile:
+                profile_maps = getattr(runner, "_profile_adapters", None) or {}
+                profile_map = profile_maps.get(woke_profile)
+                if profile_map:
+                    adapter = profile_map.get(platform) or profile_map.get(platform_name)
+            if adapter is None:
+                rmap = getattr(runner, "adapters", None) or {}
+                adapter = rmap.get(platform) or rmap.get(platform_name)
+        except Exception:
+            adapter = None
+    return adapter is not None
+
+
 def _in_process_wake(
     target: Optional[str],
     body: str,
@@ -3170,14 +3231,16 @@ def _bridge_cli_wake(
     env: Optional[dict] = None,
     timeout: float = 90.0,
 ) -> bool:
-    """Fallback wake for contexts with no live gateway: run ``hermes send -t``.
+    """Official/primary wake: run ``hermes send -t`` and verify delivery.
 
-    Unlike the old detached spawn this RUNS the CLI to completion and
-    inspects the result — exit code plus the parsed JSON payload — so
-    "wake fired" is only ever recorded when the CLI confirmed the delivery
-    (spawn success alone is the false-green bug).  The payload is the short
-    wake body and the visible copy is capped (both t_94b593b6 defects), so
-    this path cannot re-create the 29-message spam.
+    This is the spec'd wake mechanism: the CLI runs to completion and the
+    turn lands in the target's live session as a real user turn.  Unlike
+    the old detached spawn this RUNS the CLI to completion and inspects
+    the result — exit code plus the parsed JSON payload — so "wake fired"
+    is only ever recorded when the CLI confirmed the delivery (spawn
+    success alone was the false-green bug).  The payload is the short wake
+    body and the visible copy is capped (both t_94b593b6 defects), so this
+    path cannot re-create the 29-message spam.
     """
     if not (target or "").strip():
         logger.error("cron wake: no wake target resolved — refusing to fire into the void")
@@ -3229,32 +3292,57 @@ def fire_cron_wake(
 ) -> bool:
     """Fire ONE wake carrying the job prompt into the target's live session.
 
-    Two delivery sites, both now *verified*:
+    Priority (t_94b593b6, flipped per Evan — the CLI wake is the official
+    mechanism, the optimized path must prove itself):
 
-    1. **In-process** (the scheduler runs inside the gateway): inject the
-       short wake payload through the target's live adapter — the fix for
-       t_94b593b6, where a detached subprocess had no adapter to inject
-       through and the oversized payload killed the bridge connection.
-    2. **CLI subprocess** (standalone contexts such as ``hermes cron run``): run
-       ``hermes send -t`` synchronously and require a zero exit + a
-       success payload — spawn success alone never counts as delivered.
+    1. **CLI subprocess — OFFICIAL**: run ``hermes send -t`` to completion
+       and require a zero exit + a delivery-confirmed payload.  This is
+       the spec'd wake path: it lands the turn in the target's live session
+       as a real user turn, and it is exactly what works in gateway-less
+       contexts (the detached spawn was the bug, not the mechanism).
+    2. **In-process — OPTIMIZATION ONLY**: when this gateway owns the tick,
+       inject through the target's live adapter.  This is an optional
+       shortcut that must prove itself — attempt it only when a live
+       adapter AND a live event loop are verifiably present, and on ANY
+       failure fall through to the CLI path immediately.  It is never a
+       hard failure and never a false green.
+
+    Both sites use the same "CLI User" identity derivation.
 
     ``prompt`` remains the backward-compatible argument (the assembled
     brief); ``body`` is the preferred short wake payload when the caller
-    built one.  Returns True only when an adapter accepted the turn.
+    built one.  Returns True only when a delivery was confirmed.
     """
     if body is None:
         body = prompt
 
-    # In-process first — it is the only site where the wake lands with real
-    # user identity, and it is available whenever a gateway owns this tick.
-    if _in_process_wake(target, body, adapters=adapters, loop=loop):
-        return True
-    logger.debug(
-        "cron wake: in-process injection unavailable for %r — "
-        "falling back to a verified CLI wake",
-        target,
-    )
+    # Optional optimization first: prove it before relying on it.  If a
+    # live adapter and a live gateway loop are both present, try the
+    # in-process injection; anything short of that must defer to the
+    # official CLI wake.  The attempt is best-effort by design — a failure
+    # here is not an error, it is a reason to use the path that works.
+    if _in_process_candidate_present(target, adapters, loop):
+        logger.debug(
+            "cron wake: live adapter + loop available for %r — trying "
+            "in-process injection before the CLI wake",
+            target,
+        )
+        try:
+            if _in_process_wake(target, body, adapters=adapters, loop=loop):
+                return True
+        except Exception as exc:  # pragma: no cover - defensive only
+            logger.warning(
+                "cron wake: in-process injection raised for %r: %s — "
+                "deferring to the CLI wake",
+                target,
+                exc,
+            )
+        logger.debug(
+            "cron wake: in-process injection did not land for %r — "
+            "deferring to the official CLI wake",
+            target,
+        )
+
     return _bridge_cli_wake(target, body, env=env)
 
 
@@ -3271,9 +3359,10 @@ def _dispatch_cron_wake(
 
     Skips the spawned-session / framed-delivery path entirely (gap 5 framing:
     the wake is the single delivery channel).  ``wake fired`` is recorded ONLY
-    after the wake was verified (an adapter accepted the injected turn, or the
-    CLI wake returned a delivery-confirmed payload).  A wake that cannot fire
-    records a loud failure — no false green, no silent fall back to spawn.
+    after the wake was verified (the official CLI wake returned a
+    delivery-confirmed payload, or the in-process optimization's adapter
+    accepted the turn).  A wake that cannot fire records a loud failure — no
+    false green, no silent fall back to spawn.
     """
     job_id = job["id"]
     body = _build_wake_payload(job)

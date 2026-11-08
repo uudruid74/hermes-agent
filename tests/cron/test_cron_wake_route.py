@@ -1,17 +1,35 @@
 """Cron wake dispatch: journal -> `hermes send -t` into a live gateway session (t_f961f13b).
 
-Gap 5 — a journal cron fires a `hermes send -t` wake into the target agent's
-live gateway DM session instead of spawning a short-lived cron session that
-hard-closes at turn-end (the motivating bug: a later tell / pente reply landed
-on a dead session). The wake is the single delivery channel — framed delivery
-is suppressed (deliver='local' semantics). Routing is EXCLUSIVE (wake XOR spawn)
-and only journals wake today (Evan ruling #8 -> DM; ruling #4 -> empty topic -> DM
-is the only fallback). Journal marker is the structured ``skills`` entry ending
-``-journal`` (Gopher, gap 5) — not prompt free-text, not a script name.
+t_94b593b6 hardening (this file): the verified CLI wake is the primary
+mechanism; the in-process adapter injection is an optimization that must
+prove itself and defer on any failure. The CLI wake runs to completion and
+its JSON result is checked — spawn success alone is never delivery.
 """
 from __future__ import annotations
 
+import subprocess as _real_subprocess
+
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def _no_live_wake(monkeypatch):
+    """Module guard (t_94b593b6): no test here may reach a real `hermes send`.
+
+    The wake paths shell out to the `hermes` binary; a test that forgets to
+    fake `cron.scheduler.subprocess.run` could deliver a real wake to a live
+    agent (that happened once during debugging: the 03:16 Gopher row). Any
+    wake test must fake the subprocess call itself; this fixture holds the
+    real one hostage and turns a miss into a loud, non-destructive failure.
+    """
+
+    def blocked(*_a, **_kw):
+        raise AssertionError(
+            "wake test tried to run a real subprocess — fake "
+            "cron.scheduler.subprocess.run before invoking a wake path"
+        )
+
+    monkeypatch.setattr(_real_subprocess, "run", blocked)
 
 
 # ---------------------------------------------------------------------------
@@ -111,153 +129,184 @@ def test_wake_route_requires_a_target(monkeypatch):
 # Transport — `hermes send -t <target> <prompt>` (mirrors tools/tell_tool.py)
 # ---------------------------------------------------------------------------
 
-def test_fire_cron_wake_injects_in_process(monkeypatch):
-    """t_94b593b6: the scheduler runs inside the gateway — the wake is injected
-    through the target's live adapter, never through a detached subprocess."""
-    from cron import scheduler as S
+# ---------------------------------------------------------------------------
+# Transport — `hermes send -t <target> <prompt>` (mirrors tools/tell_tool.py)
+# ---------------------------------------------------------------------------
+#
+# t_94b593b6 priority (flipped per Evan): the verified CLI wake is the
+# official/primary delivery path; the in-process adapter injection is an
+# optimization that must prove itself and defer on any failure.  The two
+# sites share the "CLI User" identity derivation.
 
+def test_cli_wake_is_primary_when_no_candidate(monkeypatch):
+    """With no live adapter/loop, the verified CLI wake runs and confirms."""
+    import subprocess
+
+    calls = []
+
+    def fake_run(argv, **kw):
+        calls.append((argv, kw.get("timeout")))
+        return subprocess.CompletedProcess(
+            argv, 0, stdout='{"success": true}', stderr=""
+        )
+
+    # No adapters, no loop: gate must say "no candidate" and the CLI wake
+    # must be the path that runs.
+    monkeypatch.setattr("cron.scheduler.subprocess.run", fake_run)
+    from cron.scheduler import _in_process_candidate_present, fire_cron_wake
+
+    assert _in_process_candidate_present("neo", adapters=None, loop=None) is False
+    ok = fire_cron_wake("gopher", "short prompt")
+
+    assert ok is True
+    assert calls == [
+        (
+            ["hermes", "send", "-t", "gopher", "short prompt"],
+            90.0,
+        )
+    ]
+    assert calls[0][0] == ["hermes", "send", "-t", "gopher", "short prompt"]
+    # The CLI was RUN synchronously (blocking, bounded) — never detached.
+    assert calls[0][1] is not None
+
+
+def _live_loop():
+    """A running event loop in a background thread (tests only)."""
+    import asyncio
+    import threading
+
+    loop = asyncio.new_event_loop()
+
+    def run():
+        asyncio.set_event_loop(loop)
+        loop.run_forever()
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return loop
+
+
+def test_in_process_optimization_lands_when_available(monkeypatch):
+    """When a live adapter AND loop are present, in-process is tried first
+    and, if it lands, short-circuits the CLI wake."""
     accepted = []
 
     class FakeAdapter:
-        name = "FakeTelegram"
+        name = "FakeAdapter"
 
         async def handle_message(self, event):
             accepted.append(event)
 
     fake_adapter = FakeAdapter()
-    fake_runner = type("FakeRunner", (), {
-        "adapters": {"telegram": fake_adapter},
-        "_profile_adapters": {"neo": {"telegram": fake_adapter}},
-        "_gateway_loop": None,
-    })()
-
-    # Route the module's `_gateway_runner_ref` import to the fake runner and
-    # make scheduling run the coroutine to completion on a throwaway loop
-    # (the real caller is the gateway's own loop; here we just need the
-    # adapter to be invoked and accepted).
+    fake_runner = type(
+        "FakeRunner",
+        (),
+        {
+            "adapters": {"telegram": fake_adapter},
+            "_profile_adapters": {"neo": {"telegram": fake_adapter}},
+            "_gateway_loop": None,
+        },
+    )()
     monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: fake_runner)
 
+    loop = _live_loop()
+    try:
+        from cron.scheduler import _in_process_candidate_present, fire_cron_wake
+
+        assert _in_process_candidate_present("neo", loop=loop) is True
+        cli_calls = []
+        monkeypatch.setattr(
+            "cron.scheduler._bridge_cli_wake",
+            lambda target, body, **kw: cli_calls.append((target, body)) or True,
+        )
+        ok = fire_cron_wake("neo", "the journal prompt", loop=loop)
+
+        assert ok is True
+        assert len(accepted) == 1  # in-process injection happened
+        assert cli_calls == []  # and the CLI wake was short-circuited
+        event = accepted[0]
+        assert event.text.startswith("Incoming user wake (cron):")
+        assert "the journal prompt" in event.text
+        assert event.internal is False  # a real inbound user identity
+        assert event.source.chat_id == "8900123006"
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+
+
+def test_in_process_failure_defers_to_cli(monkeypatch):
+    """An adapter that rejects means the optimization did NOT prove itself —
+    fall through to the official CLI wake instead of a hard failure."""
     import asyncio
-    import concurrent.futures
-    import threading
+    import subprocess
 
-    def fake_schedule(coro, loop, **kw):
-        fut = concurrent.futures.Future()
+    class RejectingAdapter:
+        name = "RejectingAdapter"
 
-        def go():
-            try:
-                loop_obj = asyncio.new_event_loop()
-                try:
-                    result = loop_obj.run_until_complete(coro)
-                finally:
-                    loop_obj.close()
-                fut.set_result(result)
-            except Exception as exc:
-                fut.set_exception(exc)
+        async def handle_message(self, event):
+            raise RuntimeError("no live session for this target")
 
-        threading.Thread(target=go, daemon=True).start()
-        return fut
+    adapters = {"telegram": RejectingAdapter()}
+    cli_calls = []
 
-    # `_in_process_wake` imports the scheduler lazily; patch the source and
-    # hand it a loop (the real caller is the gateway's own running loop).
-    monkeypatch.setattr("agent.async_utils.safe_schedule_threadsafe", fake_schedule)
-    from cron.scheduler import _in_process_wake
+    def fake_run(argv, **kw):
+        cli_calls.append(argv)
+        return subprocess.CompletedProcess(
+            argv, 0, stdout='{"success": true}', stderr=""
+        )
 
-    ok = _in_process_wake("neo", "the journal prompt", loop=asyncio.new_event_loop())
-    assert ok is True
-    assert len(accepted) == 1
-    event = accepted[0]
-    assert event.text.startswith("Incoming user wake (cron):")
-    assert "the journal prompt" in event.text
-    assert event.internal is False  # a real inbound user identity, not internal
-    assert event.source.chat_id == "8900123006"  # bare profile -> DM wake target
-    assert event.source.platform.value == "telegram"
+    loop = _live_loop()
+    try:
+        monkeypatch.setattr("cron.scheduler.subprocess.run", fake_run)
+        from cron.scheduler import _in_process_candidate_present, fire_cron_wake
+
+        assert _in_process_candidate_present("neo", adapters=adapters, loop=loop) is True
+        ok = fire_cron_wake("neo", "prompt", adapters=adapters, loop=loop)
+        assert ok is True
+        assert cli_calls == [["hermes", "send", "-t", "neo", "prompt"]]
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+
+
+def test_in_process_rejection_is_not_false_green(monkeypatch):
+    """If BOTH paths fail, never report success — no false green from the
+    optimization or the official path."""
+    import asyncio
+    import subprocess
+
+    class RejectingAdapter:
+        async def handle_message(self, event):
+            raise RuntimeError("live session is wedged")
+
+    loop = _live_loop()
+    try:
+        monkeypatch.setattr("cron.scheduler.subprocess.run", lambda argv, **kw: subprocess.CompletedProcess(
+            argv, 1, stdout="", stderr="boom"
+        ))
+        from cron.scheduler import fire_cron_wake
+
+        assert fire_cron_wake("neo", "prompt", adapters={"telegram": RejectingAdapter()}, loop=loop) is False
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
 
 
 def test_fire_cron_wake_refuses_empty_target(monkeypatch):
-    """Never fire into the void — an empty target is an error, not a send."""
-    # In-process injection must be refused and no fallback may be called
-    # with an empty target.
+    """Never fire into the void — an empty target is a hard error before any
+    delivery site, so no path can send to nothing."""
     delivered = {"to": None}
 
     def spy(target, body, **kw):
         delivered["to"] = target
         return False
 
-    monkeypatch.setattr("cron.scheduler._in_process_wake", lambda target, body, **kw: False)
     monkeypatch.setattr("cron.scheduler._bridge_cli_wake", spy)
+    monkeypatch.setattr(
+        "cron.scheduler._in_process_wake", lambda target, body, **kw: False
+    )
     from cron.scheduler import fire_cron_wake
 
     assert fire_cron_wake("", "prompt") is False
     assert fire_cron_wake(None, "prompt") is False
     assert delivered["to"] is None
-
-
-def test_fire_cron_wake_falls_back_to_verified_cli(monkeypatch):
-    """A detached/gateway-less context runs the CLI synchronously and requires
-    a delivery-confirmed result — spawn success alone is the false-green bug."""
-    from cron import scheduler as S
-
-    # In-process unavailable in this test context, and the CLI path is
-    # honest about failures.
-    for argv, code in (
-        ([], 1),
-    ):
-        pass
-
-    calls = []
-
-    def fake_run(argv, **kw):
-        calls.append((argv, kw.get("timeout")))
-        import subprocess
-
-        return subprocess.CompletedProcess(
-            argv, 0, stdout='{"success": true}', stderr=""
-        )
-
-    monkeypatch.setattr("cron.scheduler._in_process_wake", lambda target, body, **kw: False)
-    monkeypatch.setattr("cron.scheduler.subprocess.run", fake_run)
-    from cron.scheduler import fire_cron_wake
-
-    ok = fire_cron_wake("telegram:8900123006", "short prompt")
-    assert ok is True
-    assert calls and calls[0][0] == [
-        "hermes", "send", "-t", "telegram:8900123006", "short prompt",
-    ]
-    # The CLI was RUN synchronously (blocking, bounded) — not detached.
-    assert calls[0][1] is not None
-
-
-def test_fire_cron_wake_reports_cli_failure(monkeypatch):
-    """A CLI wake that exits non-zero is a failure — never false green."""
-    import subprocess
-
-    monkeypatch.setattr("cron.scheduler._in_process_wake", lambda target, body, **kw: False)
-
-    def fake_run(argv, **kw):
-        return subprocess.CompletedProcess(argv, 1, stdout="", stderr="boom")
-
-    monkeypatch.setattr("cron.scheduler.subprocess.run", fake_run)
-    from cron.scheduler import fire_cron_wake
-
-    assert fire_cron_wake("telegram:8900123006", "prompt") is False
-
-
-def test_fire_cron_wake_reports_cli_error_payload(monkeypatch):
-    """A zero-exit CLI that reports an error payload is still a failure."""
-    import subprocess
-
-    monkeypatch.setattr("cron.scheduler._in_process_wake", lambda target, body, **kw: False)
-
-    def fake_run(argv, **kw):
-        return subprocess.CompletedProcess(
-            argv, 0, stdout='{"error": "bridge socket not found"}', stderr=""
-        )
-
-    monkeypatch.setattr("cron.scheduler.subprocess.run", fake_run)
-    from cron.scheduler import fire_cron_wake
-
-    assert fire_cron_wake("telegram:8900123006", "prompt") is False
 
 
 def test_wake_target_shapes_resolve():

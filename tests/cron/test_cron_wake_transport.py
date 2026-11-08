@@ -8,11 +8,29 @@ Three controlled defects and their guards, all covered here:
 2. Cron wakes carried the assembled brief with the full skill inlined.
 3. The ``-t`` wake's mandatory visible copy posted that same payload as 29
    chunked messages.  It must stay a short notice.
+
+Module guard (t_94b593b6): no test here may reach a real `hermes send` — the
+subprocess is held hostage so a forgotten fake fails loud instead of
+waking a live agent.
 """
 from __future__ import annotations
 
 import asyncio
 import json
+import subprocess as _real_subprocess
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _no_live_wake(monkeypatch):
+    def blocked(*_a, **_kw):
+        raise AssertionError(
+            "wake test tried to run a real subprocess — fake "
+            "cron.scheduler.subprocess.run before invoking a wake path"
+        )
+
+    monkeypatch.setattr(_real_subprocess, "run", blocked)
 
 
 # ---------------------------------------------------------------------------
