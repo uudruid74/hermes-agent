@@ -684,6 +684,36 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
             )
             _heartbeat_thread.start()
 
+        # The manual `hermes cron run` path runs inside the caller's
+        # process. When the gateway is live in this process (runner
+        # reference resolves) the same in-process wake as the ticker uses
+        # applies; otherwise the verified CLI-wake fallback runs — no
+        # detached spawn, no false green (t_94b593b6).
+        try:
+            from cron.scheduler import (
+                WAKE_FIRED_STATUS,
+                _dispatch_cron_wake,
+                resolve_cron_wake_route,
+            )
+            from cron.executions import create_execution
+        except Exception:
+            _dispatch_cron_wake = None  # type: ignore[assignment]
+            resolve_cron_wake_route = None  # type: ignore[assignment]
+            WAKE_FIRED_STATUS = None  # type: ignore[assignment]
+
+        if resolve_cron_wake_route is not None:
+            wake_route = resolve_cron_wake_route(job)
+            if wake_route.is_wake and _dispatch_cron_wake is not None:
+                execution_id = job.get("execution_id")
+                if not execution_id:
+                    execution_id = create_execution(job_id, source="manual")["id"]
+                _dispatch_cron_wake(job, wake_route, execution_id)
+                refreshed = get_job(job_id) or {}
+                return {
+                    "claimed": True,
+                    "success": refreshed.get("last_status") == WAKE_FIRED_STATUS,
+                    "error": refreshed.get("last_error"),
+                }
         try:
             processed = run_one_job(job)
         finally:

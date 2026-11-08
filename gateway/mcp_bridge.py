@@ -17,10 +17,15 @@ Protocol (newline-delimited JSON):
   -> {"action": "send", "platform": "telegram", "chat_id": "...", "text": "..."}
   <- {"ok": true, "queued": true}
 
-For write actions, the bridge sends the command to the persistent peer
-and waits for a response with a matching msg_id.  Commands on the
-session socket are tagged with msg_id; responses from the plugin carry
-the same msg_id back.  The bridge matches and returns the response.
+Payload framing: the bridge reads one newline-delimited JSON command per
+connection with an EXPLICIT byte cap (:data:`BRIDGE_MAX_PAYLOAD_BYTES`),
+never relying on the ``asyncio.StreamReader`` default line limit.  The
+default 64 KiB reader limit used to raise ``LimitOverrunError`` on a large
+wake payload (the 106K-char cron journal brief, t_94b593b6) and the
+exception propagated out of ``_handle`` as "Unhandled exception in
+client_connected_cb" — killing the connection before it answered, so the
+injection silently never happened.  The cap is generous (256 KiB) and
+still bounded, so a rogue peer cannot balloon gateway memory.
 """
 
 import asyncio
@@ -29,6 +34,12 @@ import logging
 import os
 import socket as _socket
 from collections import OrderedDict
+
+# Largest single JSON command the bridge accepts (bytes, incl. newline).
+# 256 KiB is far above any real wake/brief and still bounded.  Must match
+# the reader loop in ``_read_command_line``.
+BRIDGE_MAX_PAYLOAD_BYTES = 256 * 1024
+BRIDGE_READ_CHUNK = 64 * 1024
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +101,41 @@ def _kanban_delivery_state(task_id: str) -> dict:
     return state
 
 
+async def _read_command_line(
+    reader: asyncio.StreamReader,
+    *,
+    timeout: float = 30.0,
+    max_bytes: int = BRIDGE_MAX_PAYLOAD_BYTES,
+) -> bytes | None:
+    """Read one newline-delimited JSON command, bounded by ``max_bytes``.
+
+    The stdlib ``StreamReader.readuntil`` honours the reader's *line limit*
+    (64 KiB by default) and raises ``LimitOverrunError`` past it — the
+    failure that used to kill large wake payloads mid-connection
+    (t_94b593b6).  Read fixed-size chunks instead and assemble the line
+    ourselves, so arbitrarily long (but bounded) payloads survive while a
+    non-conforming peer cannot exhaust gateway memory.
+
+    Returns the raw line (newline included) or ``None`` on timeout/oversize/
+    EOF.
+    """
+    data = bytearray()
+    try:
+        while True:
+            if len(data) > max_bytes:
+                return None
+            chunk = await asyncio.wait_for(reader.read(BRIDGE_READ_CHUNK), timeout=timeout)
+            if not chunk:
+                return None  # EOF before a newline
+            data.extend(chunk)
+            if b"\n" in chunk or b"\n" in data:
+                return bytes(data)
+    except (asyncio.TimeoutError, asyncio.IncompleteReadError):
+        return None
+    except Exception:
+        return None
+
+
 async def start_bridge_server(runner) -> asyncio.AbstractServer:
     """Start the MCP bridge Unix socket server."""
     try:
@@ -100,16 +146,18 @@ async def start_bridge_server(runner) -> asyncio.AbstractServer:
 
     async def _handle(reader: asyncio.StreamReader,
                       writer: asyncio.StreamWriter) -> None:
-        try:
-            data = await asyncio.wait_for(reader.readuntil(b"\n"), timeout=10.0)
-        except (asyncio.TimeoutError, asyncio.IncompleteReadError):
+        data = await _read_command_line(reader)
+        if data is None:
             writer.close()
-            await writer.wait_closed()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
             return
 
         try:
             cmd = json.loads(data.decode("utf-8"))
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, UnicodeDecodeError):
             _respond(writer, {"error": "Invalid JSON"})
             return
 

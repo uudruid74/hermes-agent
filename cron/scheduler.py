@@ -2792,6 +2792,31 @@ def _guard_job_credential_exfil(job: dict) -> None:
 WAKE_FIRED_STATUS = "wake fired"
 JOURNAL_SKILL_SUFFIX = "-journal"
 
+# Toolsets a journal wake is expected to run with (t_94b593b6).  The wake
+# itself is short by design (skills are named, never inlined), but the woken
+# run still needs a deterministic, sufficient toolset so it does NOT depend
+# on the days' global ``platform_toolsets.cron`` config.  The fleet journals
+# already pin this list per job; ``_journal_wake_toolsets`` is the single
+# typed accession point for t_94b593b6-related toolset work so ops edits
+# audit in one place.
+_JOURNAL_WAKE_TOOLSETS = [
+    "skills",       # skill_view / skill loading (the journal skill itself)
+    "terminal",     # git, workspace commands, shell work
+    "file",         # write_file / patch — the journal INDEX.md
+    "web",          # web_search (references, links)
+    "browser",      # deterministic browser inspection
+    "session",      # session_search / session context
+    "session_search",  # session_search tool
+    "behavior",     # behavior/strategy tools the journals use
+    "delegate_cli", # delegation for cross-agent work (skill allowed-toolsets)
+    "fabric",       # fabric memory read/write
+]
+
+
+def journal_wake_toolsets() -> list[str]:
+    """Returns a copy of the journal-wake toolset list (t_94b593b6)."""
+    return list(_JOURNAL_WAKE_TOOLSETS)
+
 
 def _cron_skill_names(job: dict) -> List[str]:
     """Normalized skill names for a cron job (``skills`` array or legacy ``skill``)."""
@@ -2880,58 +2905,394 @@ def resolve_cron_wake_route(job: dict) -> CronWakeRoute:
     return route
 
 
-def fire_cron_wake(target: Optional[str], prompt: str) -> bool:
-    """Fire ONE `hermes send -t` wake carrying the job prompt into the target's
-    live gateway session. Returns True when the wake was dispatched.
+def _wake_max_chars() -> int:
+    """Hard ceiling for wake payloads (characters).
 
-    Mirrors ``tools/tell_tool.py``'s one-call wake (the canonical primitive):
-    `hermes send -t` injects the prompt as a user turn so the target agent wakes
-    in its live session (user+assistant pair — role alternation preserved) and
-    posts the visible copy internally. Fire-and-forget: we only observe the
-    spawn (a missing `hermes` binary is the one synchronous failure).
+    Wakes must be short: the agent loads its own skills at run time.  A
+    payload over this ceiling is truncated with a visible tail marker rather
+    than posted in full (the visible-copy spam of t_94b593b6 was a
+    106K-char skill embed; the wake itself should be the scheduled
+    instruction only).
     """
-    from hermes_cli._subprocess_compat import spawn_detached
+    return 8192
 
+
+def _build_wake_payload(job: dict) -> str:
+    """The wake's message body — short, self-loading, never the full brief.
+
+    The controlled bug (t_94b593b6): the wake carried
+    ``_build_job_prompt``'s assembled prompt, which embeds the ENTIRE skill
+    content of every listed skill (~106K chars for gopher-journal).  That
+    (a) spams the visible copy as 29 chunked outbound messages, and (b) is
+    pure waste — the woken agent loads its own skills inside its run.
+
+    This builder keeps only what a wake needs: the job's own schedule
+    metadata plus the operator's short prompt.  Skills are named but never
+    inlined.  Bounded by :func:`_wake_max_chars` so a future over-long
+    prompt cannot re-create the spam.
+    """
+    job_id = job.get("id") or "?"
+    name = job.get("name") or job_id
+    prompt = str(job.get("prompt") or "").strip()
+    skills = _cron_skill_names(job)
+
+    parts = [
+        f"[cron-wake] {name}\n"
+        f"job_id: {job_id}\n"
+    ]
+    if skills:
+        parts.append("[cron skills — load them yourself: " + ", ".join(skills) + "]\n")
+    if prompt:
+        parts.append(prompt)
+
+    body = "\n".join(parts)
+    limit = _wake_max_chars()
+    if len(body) > limit:
+        tail = body[: limit - 120].rstrip() + (
+            "\n...[wake payload truncated from %d chars; full brief on file]"
+            % len(body)
+        )
+        return tail
+    return body
+
+
+def _resolve_wake_platform_and_chat(target: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    """Split a wake target into ``(platform, chat_id)`` for in-process injection.
+
+    Wake targets come in the shapes ``hermes send -t`` / ``_resolve_agent_wake_target``
+    produce:
+
+    * bare profile name (``gopher``) → the agent's DM wake target
+      (``telegram:<DM chat id>``);
+    * ``<platform>:<chat>[:thread]`` (``telegram:8900123006``);
+    * ``<profile>:<platform>:<chat>[:thread]`` (``gopher:telegram:8900123006``).
+
+    Returns ``(None, None)`` when nothing resolvable exists.
+    """
+    from gateway.config import Platform
+
+    clean = str(target or "").strip()
+    if not clean:
+        return None, None
+    if ":" not in clean:
+        # Bare profile name -> DM wake target of that profile.  The wake
+        # protocol is stable: a bare target is always the agent's telegram
+        # DM (mirrors send_cmd._resolve_agent_wake_target and
+        # resolve_cron_wake_route's bare-profile target).  No profile-disk
+        # lookup here — the scheduler may run with a HERMES_HOME that is
+        # one profile down, and a lookup could misresolve.
+        from hermes_cli.send_cmd import _AGENT_DM_CHAT_ID
+
+        return "telegram", str(_AGENT_DM_CHAT_ID)
+
+    segments = [seg.strip() for seg in clean.split(":")]
+    if len(segments) < 2:
+        return None, None
+
+    def _platform(seg: str):
+        try:
+            return Platform(seg)
+        except (ValueError, KeyError):
+            return None
+
+    # Plain shape: <platform>:<chat>[:thread]
+    if _platform(segments[0]) is not None:
+        platform_name, chat = segments[0], segments[1]
+    # Profile-qualified shape: <profile>:<platform>:<chat>[:thread]
+    elif len(segments) >= 3 and _platform(segments[1]) is not None:
+        platform_name, chat = segments[1], segments[2]
+    else:
+        return None, None
+    if not platform_name or not str(chat or "").strip():
+        return None, None
+    return platform_name.lower(), str(chat).strip()
+
+
+def _wake_render_injection(wake_profile: str, body: str, chat_type: str) -> Optional[str]:
+    """Render the event the adapter receives as the injected user turn.
+
+    Keeps the shape ``send_message_tool``'s wake path uses: a short
+    ``[cron-wake]`` banner plus the short wake payload.  The payload is
+    truncated by the caller (:func:`_build_wake_payload`).
+    """
+    limit = _wake_max_chars() - 256  # leave room for the banner
+    text = body if len(body) <= limit else body[: limit - 120] + (
+        "\n...[wake truncated from %d chars]" % len(body)
+    )
+    return f"Incoming user wake (cron):\n{text}\n\nThis is a cron-scheduled wake event for {wake_profile}; the agent should run its journal/brief work and reply in this session."
+
+
+def _in_process_wake(
+    target: Optional[str],
+    body: str,
+    *,
+    adapters=None,
+    loop=None,
+    timeout: Optional[float] = 30.0,
+) -> bool:
+    """Inject the wake into the target's live gateway session *in-process*.
+
+    The controlled bug (t_94b593b6): the cron scheduler spawned a detached
+    ``hermes send -t`` subprocess for a wake.  A detached CLI has no live
+    gateway adapter (``_gateway_runner_ref()`` only resolves inside the
+    running gateway), so ``send_message_tool`` fell through to the bridge
+    socket, the oversized payload killed the connection (``LimitOverrunError``
+    past the 64 KiB reader limit), and the injection never happened while
+    ``last_status`` recorded false green ("wake fired") — spawn success
+    mistaken for delivery.
+
+    The scheduler runs *inside* the gateway, so inject through the target's
+    live adapter directly — the same primitive ``handle_message`` uses for
+    real inbound messages — and report failure loudly if no adapter could
+    accept the turn.
+
+    Returns True iff the adapter accepted the wake turn.
+    """
     if not (target or "").strip():
         logger.error("cron wake: no wake target resolved — refusing to fire into the void")
         return False
-    proc = spawn_detached(["hermes", "send", "-t", target, prompt])
-    if proc is None:
-        logger.error("cron wake: failed to launch 'hermes send -t' for %s", target)
+
+    from gateway.platforms.base import MessageEvent, MessageType
+    from gateway.session import SessionSource
+
+    platform_name, chat_id = _resolve_wake_platform_and_chat(target)
+    if platform_name is None:
+        logger.error("cron wake: unresolvable wake target %r", target)
         return False
-    logger.info("cron wake: fired 'hermes send -t %s' (job dispatched to live session)", target)
+
+    platform = None
+    try:
+        from gateway.config import Platform
+
+        platform = Platform(platform_name)
+    except (ValueError, KeyError):
+        logger.error("cron wake: unknown wake platform %r", platform_name)
+        return False
+
+    # Resolve the right adapter: the caller's map, else the runner's
+    # (the cron ticker runs inside the gateway process, so its runner is
+    # always live).  In multiplex mode prefer the target profile's map.
+    # Adapter maps are keyed by the Platform enum member.
+    from gateway.run import _gateway_runner_ref
+
+    runner = None
+    try:
+        runner = _gateway_runner_ref()
+    except Exception:
+        runner = None
+
+    adapter = None
+    if adapters:
+        adapter = adapters.get(platform) or adapters.get(platform_name)
+    if adapter is None and runner is not None:
+        woke_profile = (target.split(":", 1)[0] if ":" in target else "").strip()
+        if woke_profile:
+            profile_maps = getattr(runner, "_profile_adapters", None) or {}
+            profile_map = profile_maps.get(woke_profile)
+            if profile_map:
+                adapter = profile_map.get(platform) or profile_map.get(platform_name)
+        if adapter is None:
+            rmap = getattr(runner, "adapters", None) or {}
+            adapter = rmap.get(platform) or rmap.get(platform_name)
+    if adapter is None:
+        logger.error(
+            "cron wake: no live %s adapter for target %r — injection impossible",
+            platform_name,
+            target,
+        )
+        return False
+
+    # Identity of the wake source (same shape as send_cmd's -t visible copy).
+    telegram_id = (
+        os.environ.get("HERMES_SESSION_TELEGRAM_ID", "").strip()
+        or os.environ.get("TELEGRAM_ALLOWED_USERS", "").split(",")[0].strip()
+    )
+    user_id = os.environ.get("HERMES_SESSION_USER_ID", "").strip() or telegram_id or "cli"
+    sender_name = os.environ.get("HERMES_SESSION_USER_NAME", "").strip() or "CLI User"
+
+    source = SessionSource(
+        platform=platform,
+        chat_id=str(chat_id or ""),
+        chat_type="dm",
+        user_id=user_id,
+        user_name=sender_name,
+    )
+    text = _wake_render_injection(str(target), body, "dm")
+    event = MessageEvent(
+        text=text,
+        message_type=MessageType.TEXT,
+        source=source,
+        internal=False,
+    )
+
+    # Schedule on the runner's loop (we are on the cron tick thread) and wait
+    # a bounded amount for the adapter to accept the turn — an adapter that
+    # raises means the wake did NOT land; report that loudly instead of
+    # recording false green.
+    wake_loop = None
+    if runner is not None:
+        wake_loop = getattr(runner, "_gateway_loop", None)
+    if wake_loop is None:
+        wake_loop = loop
+    if wake_loop is None:
+        logger.error("cron wake: no gateway event loop available — cannot inject")
+        return False
+
+    try:
+        from agent.async_utils import safe_schedule_threadsafe
+
+        future = safe_schedule_threadsafe(adapter.handle_message(event), wake_loop)
+        if future is None:
+            logger.error("cron wake: could not schedule wake onto the gateway loop")
+            return False
+        try:
+            future.result(timeout=timeout or 30.0)
+        except Exception as exc:
+            logger.error("cron wake: adapter rejected the wake for %r: %s", target, exc)
+            return False
+    except Exception as exc:
+        logger.error("cron wake: injection failed for %r: %s", target, exc)
+        return False
+
+    logger.info(
+        "cron wake: injected user turn into %s:%s (target profile %r)",
+        platform_name,
+        chat_id or "<home>",
+        target,
+    )
     return True
 
 
-def _dispatch_cron_wake(job: dict, route: CronWakeRoute, execution_id: str) -> None:
-    """Build the job's content, fire the wake, and record 'wake fired'.
+def _bridge_cli_wake(
+    target: Optional[str],
+    body: str,
+    *,
+    env: Optional[dict] = None,
+    timeout: float = 90.0,
+) -> bool:
+    """Fallback wake for contexts with no live gateway: run ``hermes send -t``.
+
+    Unlike the old detached spawn this RUNS the CLI to completion and
+    inspects the result — exit code plus the parsed JSON payload — so
+    "wake fired" is only ever recorded when the CLI confirmed the delivery
+    (spawn success alone is the false-green bug).  The payload is the short
+    wake body and the visible copy is capped (both t_94b593b6 defects), so
+    this path cannot re-create the 29-message spam.
+    """
+    if not (target or "").strip():
+        logger.error("cron wake: no wake target resolved — refusing to fire into the void")
+        return False
+
+    try:
+        proc = subprocess.run(
+            ["hermes", "send", "-t", target, body],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.error("cron wake: 'hermes send -t' failed to run for %r: %s", target, exc)
+        return False
+    if proc.returncode != 0:
+        logger.error(
+            "cron wake: 'hermes send -t %s' exited %s: %s",
+            target,
+            proc.returncode,
+            (proc.stderr or "").strip()[:400],
+        )
+        return False
+    try:
+        payload = json.loads(proc.stdout or "{}")
+    except json.JSONDecodeError:
+        payload = {}
+    if payload.get("error"):
+        logger.error("cron wake: delivery reported error: %s", payload["error"])
+        return False
+    if payload.get("suppressed"):
+        logger.info("cron wake: duplicate wake for %r suppressed (already engaged)", target)
+        return True
+    logger.info("cron wake: 'hermes send -t %s' confirmed delivery", target)
+    return True
+
+
+def fire_cron_wake(
+    target: Optional[str],
+    prompt: str,
+    *,
+    body: Optional[str] = None,
+    env: Optional[dict] = None,
+    adapters=None,
+    loop=None,
+) -> bool:
+    """Fire ONE wake carrying the job prompt into the target's live session.
+
+    Two delivery sites, both now *verified*:
+
+    1. **In-process** (the scheduler runs inside the gateway): inject the
+       short wake payload through the target's live adapter — the fix for
+       t_94b593b6, where a detached subprocess had no adapter to inject
+       through and the oversized payload killed the bridge connection.
+    2. **CLI subprocess** (standalone contexts such as ``hermes cron run``): run
+       ``hermes send -t`` synchronously and require a zero exit + a
+       success payload — spawn success alone never counts as delivered.
+
+    ``prompt`` remains the backward-compatible argument (the assembled
+    brief); ``body`` is the preferred short wake payload when the caller
+    built one.  Returns True only when an adapter accepted the turn.
+    """
+    if body is None:
+        body = prompt
+
+    # In-process first — it is the only site where the wake lands with real
+    # user identity, and it is available whenever a gateway owns this tick.
+    if _in_process_wake(target, body, adapters=adapters, loop=loop):
+        return True
+    logger.debug(
+        "cron wake: in-process injection unavailable for %r — "
+        "falling back to a verified CLI wake",
+        target,
+    )
+    return _bridge_cli_wake(target, body, env=env)
+
+
+def _dispatch_cron_wake(
+    job: dict,
+    route: CronWakeRoute,
+    execution_id: str,
+    *,
+    adapters=None,
+    loop=None,
+    wake_env: Optional[dict] = None,
+) -> None:
+    """Build the wake payload, fire it, and record an honest outcome.
 
     Skips the spawned-session / framed-delivery path entirely (gap 5 framing:
-    the wake is the single delivery channel). On a wake that cannot fire, record
-    an honest failure — NO silent fall back to spawn (exclusive invariant + the
-    no-fallbacks rule).
+    the wake is the single delivery channel).  ``wake fired`` is recorded ONLY
+    after the wake was verified (an adapter accepted the injected turn, or the
+    CLI wake returned a delivery-confirmed payload).  A wake that cannot fire
+    records a loud failure — no false green, no silent fall back to spawn.
     """
     job_id = job["id"]
-    try:
-        prompt = _build_job_prompt(job)
-    except CronPromptInjectionBlocked as exc:
-        logger.error("Job '%s': wake blocked — %s", job_id, exc)
-        mark_job_run(job_id, False, str(exc))
-        finish_execution(execution_id, success=False, error=str(exc))
-        return
-
-    if prompt is None:
-        # Script produced no output — nothing to report, so no wake is fired.
-        logger.info("Job '%s': script produced no output, skipping wake.", job_id)
-        mark_job_run(job_id, True, None)
-        finish_execution(execution_id, success=True, delivery_outcome="suppressed")
-        return
-
-    if fire_cron_wake(route.target, prompt):
+    body = _build_wake_payload(job)
+    if fire_cron_wake(
+        route.target,
+        body,
+        body=body,
+        env=wake_env,
+        adapters=adapters,
+        loop=loop,
+    ):
         mark_job_run(job_id, True, None, status=WAKE_FIRED_STATUS)
         finish_execution(execution_id, success=True, delivery_outcome="suppressed")
     else:
-        err = f"cron wake failed to fire for target {route.target!r}"
+        err = (
+            f"cron wake failed to fire for target {route.target!r} — "
+            "the injected user turn never landed"
+        )
+        logger.error("Job '%s': %s", job_id, err)
         mark_job_run(job_id, False, err)
         finish_execution(execution_id, success=False, error=err)
 
@@ -4106,18 +4467,29 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         # becomes running only immediately before the actual run.
         mark_execution_running(execution_id)
 
-        # Cron wake dispatch (gap 5 / t_f961f13b): a journal cron fires a
-        # `hermes send -t` wake into the target agent's live gateway DM session
-        # instead of spawning a short-lived cron session that hard-closes at
-        # turn-end (the motivating bug — a later tell / pente reply landed on a
-        # dead session). The wake is the single delivery channel: framed
-        # delivery is suppressed (deliver='local' semantics) and we return
-        # before the spawn/deploy path at all. Exclusive (Gopher, gap 5): this
-        # early return guarantees the legacy spawn never also runs for a waking
-        # job — wake XOR spawn, never both.
+        # Cron wake dispatch (gap 5 / t_f961f13b, hardening t_94b593b6): a
+        # journal cron fires a verified wake into the target agent's live
+        # session instead of spawning a detached cron session that
+        # hard-closes at turn-end (the motivating bug — a later tell / pente
+        # reply landed on a dead session). The wake is the single delivery
+        # channel: framed delivery is suppressed (deliver='local' semantics)
+        # and we return before the spawn/deploy path at all. Exclusive
+        # (Gopher, gap 5): this early return guarantees the legacy spawn
+        # never also runs for a waking job — wake XOR spawn, never both.
+        #
+        # t_94b593b6: the wake itself is now injected in-process (adapters +
+        # loop are threaded through) so it actually lands, carries a short
+        # payload instead of the full skill embed, and "wake fired" is only
+        # recorded after the injection was verified.
         _wake_route = resolve_cron_wake_route(job)
         if _wake_route.is_wake:
-            _dispatch_cron_wake(job, _wake_route, execution_id)
+            _dispatch_cron_wake(
+                job,
+                _wake_route,
+                execution_id,
+                adapters=adapters,
+                loop=loop,
+            )
             return True
 
         # Run the job under the profile's secret scope. get_secret() fails

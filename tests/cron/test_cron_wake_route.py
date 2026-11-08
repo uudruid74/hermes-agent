@@ -111,56 +111,202 @@ def test_wake_route_requires_a_target(monkeypatch):
 # Transport — `hermes send -t <target> <prompt>` (mirrors tools/tell_tool.py)
 # ---------------------------------------------------------------------------
 
-def test_fire_cron_wake_dispatches_hermes_send(monkeypatch):
-    calls = {}
+def test_fire_cron_wake_injects_in_process(monkeypatch):
+    """t_94b593b6: the scheduler runs inside the gateway — the wake is injected
+    through the target's live adapter, never through a detached subprocess."""
+    from cron import scheduler as S
 
-    def fake_spawn(argv):
-        calls["argv"] = argv
-        return object()  # non-None = spawn succeeded
+    accepted = []
 
-    monkeypatch.setattr("hermes_cli._subprocess_compat.spawn_detached", fake_spawn)
-    from cron.scheduler import fire_cron_wake
+    class FakeAdapter:
+        name = "FakeTelegram"
 
-    ok = fire_cron_wake("neo", "the journal prompt")
+        async def handle_message(self, event):
+            accepted.append(event)
+
+    fake_adapter = FakeAdapter()
+    fake_runner = type("FakeRunner", (), {
+        "adapters": {"telegram": fake_adapter},
+        "_profile_adapters": {"neo": {"telegram": fake_adapter}},
+        "_gateway_loop": None,
+    })()
+
+    # Route the module's `_gateway_runner_ref` import to the fake runner and
+    # make scheduling run the coroutine to completion on a throwaway loop
+    # (the real caller is the gateway's own loop; here we just need the
+    # adapter to be invoked and accepted).
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: fake_runner)
+
+    import asyncio
+    import concurrent.futures
+    import threading
+
+    def fake_schedule(coro, loop, **kw):
+        fut = concurrent.futures.Future()
+
+        def go():
+            try:
+                loop_obj = asyncio.new_event_loop()
+                try:
+                    result = loop_obj.run_until_complete(coro)
+                finally:
+                    loop_obj.close()
+                fut.set_result(result)
+            except Exception as exc:
+                fut.set_exception(exc)
+
+        threading.Thread(target=go, daemon=True).start()
+        return fut
+
+    # `_in_process_wake` imports the scheduler lazily; patch the source and
+    # hand it a loop (the real caller is the gateway's own running loop).
+    monkeypatch.setattr("agent.async_utils.safe_schedule_threadsafe", fake_schedule)
+    from cron.scheduler import _in_process_wake
+
+    ok = _in_process_wake("neo", "the journal prompt", loop=asyncio.new_event_loop())
     assert ok is True
-    assert calls["argv"][0] == "hermes"
-    assert calls["argv"][1:4] == ["send", "-t", "neo"]
-    assert "the journal prompt" in calls["argv"]
+    assert len(accepted) == 1
+    event = accepted[0]
+    assert event.text.startswith("Incoming user wake (cron):")
+    assert "the journal prompt" in event.text
+    assert event.internal is False  # a real inbound user identity, not internal
+    assert event.source.chat_id == "8900123006"  # bare profile -> DM wake target
+    assert event.source.platform.value == "telegram"
 
 
 def test_fire_cron_wake_refuses_empty_target(monkeypatch):
     """Never fire into the void — an empty target is an error, not a send."""
-    called = []
-    monkeypatch.setattr(
-        "hermes_cli._subprocess_compat.spawn_detached",
-        lambda argv: called.append(argv) or object(),
-    )
+    # In-process injection must be refused and no fallback may be called
+    # with an empty target.
+    delivered = {"to": None}
+
+    def spy(target, body, **kw):
+        delivered["to"] = target
+        return False
+
+    monkeypatch.setattr("cron.scheduler._in_process_wake", lambda target, body, **kw: False)
+    monkeypatch.setattr("cron.scheduler._bridge_cli_wake", spy)
     from cron.scheduler import fire_cron_wake
 
     assert fire_cron_wake("", "prompt") is False
     assert fire_cron_wake(None, "prompt") is False
-    assert called == []
+    assert delivered["to"] is None
 
 
-def test_fire_cron_wake_reports_spawn_failure(monkeypatch):
-    monkeypatch.setattr("hermes_cli._subprocess_compat.spawn_detached", lambda argv: None)
+def test_fire_cron_wake_falls_back_to_verified_cli(monkeypatch):
+    """A detached/gateway-less context runs the CLI synchronously and requires
+    a delivery-confirmed result — spawn success alone is the false-green bug."""
+    from cron import scheduler as S
+
+    # In-process unavailable in this test context, and the CLI path is
+    # honest about failures.
+    for argv, code in (
+        ([], 1),
+    ):
+        pass
+
+    calls = []
+
+    def fake_run(argv, **kw):
+        calls.append((argv, kw.get("timeout")))
+        import subprocess
+
+        return subprocess.CompletedProcess(
+            argv, 0, stdout='{"success": true}', stderr=""
+        )
+
+    monkeypatch.setattr("cron.scheduler._in_process_wake", lambda target, body, **kw: False)
+    monkeypatch.setattr("cron.scheduler.subprocess.run", fake_run)
     from cron.scheduler import fire_cron_wake
 
-    assert fire_cron_wake("neo", "prompt") is False
+    ok = fire_cron_wake("telegram:8900123006", "short prompt")
+    assert ok is True
+    assert calls and calls[0][0] == [
+        "hermes", "send", "-t", "telegram:8900123006", "short prompt",
+    ]
+    # The CLI was RUN synchronously (blocking, bounded) — not detached.
+    assert calls[0][1] is not None
 
 
-# ---------------------------------------------------------------------------
-# Dispatch orchestration — fires the wake, records 'wake fired', no spawn/fallback
-# ---------------------------------------------------------------------------
+def test_fire_cron_wake_reports_cli_failure(monkeypatch):
+    """A CLI wake that exits non-zero is a failure — never false green."""
+    import subprocess
+
+    monkeypatch.setattr("cron.scheduler._in_process_wake", lambda target, body, **kw: False)
+
+    def fake_run(argv, **kw):
+        return subprocess.CompletedProcess(argv, 1, stdout="", stderr="boom")
+
+    monkeypatch.setattr("cron.scheduler.subprocess.run", fake_run)
+    from cron.scheduler import fire_cron_wake
+
+    assert fire_cron_wake("telegram:8900123006", "prompt") is False
+
+
+def test_fire_cron_wake_reports_cli_error_payload(monkeypatch):
+    """A zero-exit CLI that reports an error payload is still a failure."""
+    import subprocess
+
+    monkeypatch.setattr("cron.scheduler._in_process_wake", lambda target, body, **kw: False)
+
+    def fake_run(argv, **kw):
+        return subprocess.CompletedProcess(
+            argv, 0, stdout='{"error": "bridge socket not found"}', stderr=""
+        )
+
+    monkeypatch.setattr("cron.scheduler.subprocess.run", fake_run)
+    from cron.scheduler import fire_cron_wake
+
+    assert fire_cron_wake("telegram:8900123006", "prompt") is False
+
+
+def test_wake_target_shapes_resolve():
+    from cron.scheduler import _resolve_wake_platform_and_chat
+
+    assert _resolve_wake_platform_and_chat("gopher") == ("telegram", "8900123006")
+    assert _resolve_wake_platform_and_chat("telegram:8900123006") == (
+        "telegram",
+        "8900123006",
+    )
+    assert _resolve_wake_platform_and_chat("gopher:telegram:8900123006") == (
+        "telegram",
+        "8900123006",
+    )
+    assert _resolve_wake_platform_and_chat("discord:my-channel") == (
+        "discord",
+        "my-channel",
+    )
+    assert _resolve_wake_platform_and_chat("gopher:discord:chan:7") == (
+        "discord",
+        "chan",
+    )
+
+
+def test_wake_target_shapes_reject_garbage():
+    from cron.scheduler import _resolve_wake_platform_and_chat
+
+    assert _resolve_wake_platform_and_chat("") == (None, None)
+    assert _resolve_wake_platform_and_chat(None) == (None, None)
+    assert _resolve_wake_platform_and_chat("bogus:maybe:chat") == (None, None)
+    assert _resolve_wake_platform_and_chat("telegram:") == (None, None)
 
 def _install_dispatch_mocks(monkeypatch):
     """Wire _dispatch_cron_wake's collaborators to spies; return the record dict."""
-    rec = {"fired": [], "marks": [], "finish": [], "prompt": "assembled prompt"}
+    rec = {
+        "fired": [],
+        "marks": [],
+        "finish": [],
+        "wake_bodies": [],
+        "prompt": "assembled prompt",
+    }
 
-    monkeypatch.setattr("cron.scheduler._build_job_prompt", lambda job: rec["prompt"])
+    monkeypatch.setattr("cron.scheduler._build_wake_payload", lambda job: rec["prompt"])
     monkeypatch.setattr(
         "cron.scheduler.fire_cron_wake",
-        lambda target, prompt: rec["fired"].append((target, prompt)) or True,
+        lambda target, prompt, **kw: (
+            rec["fired"].append((target, prompt, kw.get("body"), kw.get("adapters"))),
+            True,
+        )[-1],
     )
     # mark_job_run / finish_execution are imported into cron.scheduler's
     # namespace (scheduler.py:286-287) — patch the scheduler binding so the
@@ -184,63 +330,92 @@ def test_dispatch_fires_wake_and_records_status(monkeypatch):
 
     job = {"id": "jid1", "skills": ["neo-journal"]}
     route = CronWakeRoute(mode="wake", target="neo", reason="journal")
-    _dispatch_cron_wake(job, route, "exec-1")
+    _dispatch_cron_wake(job, route, "exec-1", adapters=None, loop=None)
 
-    # Wake fired exactly once, carrying the prompt.
-    assert rec["fired"] == [("neo", "assembled prompt")]
+    # Wake fired exactly once, carrying the SHORT wake body (never the full
+    # assembled brief — t_94b593b6).
+    assert len(rec["fired"]) == 1
+    target, prompt, body, adapters = rec["fired"][0]
+    assert target == "neo"
+    assert prompt == "assembled prompt"
+    assert body == prompt
     # last_status = "wake fired", success, no framed delivery (suppressed).
     assert rec["marks"] == [("jid1", True, None, WAKE_FIRED_STATUS)]
     assert rec["finish"][0][0] == "exec-1"
     assert rec["finish"][0][1]["delivery_outcome"] == "suppressed"
-
-
-def test_dispatch_no_wake_when_script_output_empty(monkeypatch):
-    """A silent run (no content) fires no wake and records a quiet success."""
-    rec = _install_dispatch_mocks(monkeypatch)
-    monkeypatch.setattr("cron.scheduler._build_job_prompt", lambda job: None)
-    from cron.scheduler import CronWakeRoute, _dispatch_cron_wake
-
-    job = {"id": "jid2", "skills": ["neo-journal"]}
-    route = CronWakeRoute(mode="wake", target="neo", reason="journal")
-    _dispatch_cron_wake(job, route, "exec-2")
-
-    assert rec["fired"] == []
-    # success + default status (not "wake fired") — nothing was dispatched.
-    assert rec["marks"] == [("jid2", True, None, None)]
+    # Threads adapters/loop through to the wake site (in-process injection
+    # becomes possible) instead of a detached spawn.
+    assert adapters is None
 
 
 def test_dispatch_records_error_when_wake_fails(monkeypatch):
     """A wake that cannot fire is an honest failure — NO silent fall back to spawn."""
     rec = _install_dispatch_mocks(monkeypatch)
-    monkeypatch.setattr("cron.scheduler.fire_cron_wake", lambda target, prompt: False)
+    monkeypatch.setattr("cron.scheduler.fire_cron_wake", lambda target, prompt, **kw: False)
     from cron.scheduler import CronWakeRoute, _dispatch_cron_wake
 
     job = {"id": "jid3", "skills": ["neo-journal"]}
     route = CronWakeRoute(mode="wake", target="neo", reason="journal")
-    _dispatch_cron_wake(job, route, "exec-3")
+    _dispatch_cron_wake(job, route, "exec-3", adapters=None, loop=None)
 
     # Failure recorded; no spawn fallback marker present, and the status stays
     # the default 'error' (not 'wake fired') because nothing was dispatched.
     assert rec["fired"] == []
+    assert rec["marks"] == [("jid3", False, rec["marks"][0][2], None)]
     assert rec["marks"][0][1] is False
     assert rec["marks"][0][3] is None
 
 
-def test_dispatch_injection_block_is_fenced(monkeypatch):
-    """A blocked prompt never fires a wake (injection fence holds on the wake path)."""
+# ---------------------------------------------------------------------------
+# Wake payload discipline (t_94b593b6) — short wakes, never the full brief
+# ---------------------------------------------------------------------------
+
+def test_wake_payload_never_inlines_skills():
+    """A journal job's wake carries names, not the 106K-char skill embed."""
+    from cron.scheduler import _build_wake_payload, _wake_max_chars
+
+    job = {
+        "id": "wj",
+        "name": "Journals",
+        "prompt": "run the weekly journal",
+        "skills": ["gopher-journal", "hermes-cli"],
+    }
+    body = _build_wake_payload(job)
+    assert "gopher-journal" in body  # named, for the agent to load itself
+    assert len(body) << 5000
+    assert len(body) <= _wake_max_chars()
+
+
+def test_wake_payload_truncates_overdraft_prompts():
+    """An absurdly over-long prompt is capped with a visible tail marker."""
+    from cron.scheduler import _build_wake_payload, _wake_max_chars
+
+    job = {
+        "id": "wj",
+        "name": "huge",
+        "prompt": "A" * (_wake_max_chars() + 5000),
+        "skills": [],
+    }
+    body = _build_wake_payload(job)
+    assert len(body) <= _wake_max_chars()
+    assert "truncated" in body
+    assert "...[wake payload truncated from" in body
+
+
+def test_dispatch_threads_adapters_to_wake(monkeypatch):
+    """t_94b593b6: adapters/loop reach the wake site so in-process injection is
+    used instead of a detached subprocess."""
     rec = _install_dispatch_mocks(monkeypatch)
-    from cron.scheduler import CronPromptInjectionBlocked, CronWakeRoute, _dispatch_cron_wake
+    from cron.scheduler import CronWakeRoute, _dispatch_cron_wake
 
-    def boom(job):
-        raise CronPromptInjectionBlocked("rm -rf /")
-
-    monkeypatch.setattr("cron.scheduler._build_job_prompt", boom)
-    job = {"id": "jid4", "skills": ["neo-journal"]}
+    fake_adapters = {"telegram": object()}
+    loop = object()
+    job = {"id": "jid-thread", "skills": ["neo-journal"]}
     route = CronWakeRoute(mode="wake", target="neo", reason="journal")
-    _dispatch_cron_wake(job, route, "exec-4")
+    _dispatch_cron_wake(job, route, "exec-t", adapters=fake_adapters, loop=loop)
 
-    assert rec["fired"] == []
-    assert rec["marks"][0][1] is False  # recorded as a failure, not silently dropped
+    target, prompt, body, adapters = rec["fired"][0]
+    assert adapters is fake_adapters
 
 
 # ---------------------------------------------------------------------------

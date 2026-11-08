@@ -10,7 +10,12 @@ from unittest.mock import AsyncMock, patch
 
 import gateway.mcp_bridge as mcp_bridge
 from gateway.config import Platform
-from gateway.mcp_bridge import _handle_inject, _handle_send
+from gateway.mcp_bridge import (
+    BRIDGE_MAX_PAYLOAD_BYTES,
+    _handle_inject,
+    _handle_send,
+    _read_command_line,
+)
 from tools.send_message_tool import (
     _send_delivery_via_bridge,
     _send_via_bridge,
@@ -470,3 +475,28 @@ def test_inject_with_user_context_creates_real_inbound_user_event():
     assert event.source.user_name == "Evan"
     assert event.source.chat_type == "forum"
     assert event.metadata["platform_user_id"] == "8900123006"
+
+# ---------------------------------------------------------------------------
+# Framing limit — t_94b593b6 (large wake payloads must survive the bridge)
+# ---------------------------------------------------------------------------
+
+def test_bridge_reader_reads_over_64k_payloads():
+    """A 106K-char wake brief (the gopher journal defect) frames cleanly."""
+    payload = json.dumps({"action": "send", "text": "B" * (106 * 1024)}).encode() + b"\n"
+    reader = asyncio.StreamReader()
+    reader.feed_data(payload)
+    reader.feed_eof()
+    assert asyncio.run(_read_command_line(reader, timeout=5.0)) == payload
+
+
+def test_bridge_reader_is_bounded_by_max_bytes():
+    payload = json.dumps({"action": "x", "text": "Y" * 300_000}).encode() + b"\n"
+    reader = asyncio.StreamReader()
+    reader.feed_data(payload)
+    reader.feed_eof()
+    assert asyncio.run(_read_command_line(reader, timeout=5.0, max_bytes=100)) is None
+
+
+def test_bridge_default_cap_is_above_the_64k_line_limit():
+    assert BRIDGE_MAX_PAYLOAD_BYTES > 64 * 1024
+    assert BRIDGE_MAX_PAYLOAD_BYTES <= 1024 * 1024

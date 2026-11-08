@@ -544,3 +544,38 @@ def test_wake_copy_target_routes_each_shape(monkeypatch):
     assert send_cmd._wake_copy_target("cli:sess-1") is None
 
 
+def test_t_copy_payload_is_capped_to_short_notice(fake_tool, monkeypatch):
+    """t_94b593b6: a huge wake payload posts a SHORT copy, not 29 messages.
+
+    The visible copy exists so a human sees the wake happened; the copy
+    must never be the raw brief (that chunked into 29 outbound messages).
+    """
+    import hermes_cli.profiles
+
+    from hermes_cli import _subprocess_compat
+
+    monkeypatch.setattr(send_cmd, "_load_hermes_env", lambda: None)
+    monkeypatch.setattr(hermes_cli.profiles, "profile_exists", lambda name: False)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    copies = []
+    monkeypatch.setattr(
+        _subprocess_compat,
+        "spawn_detached",
+        lambda argv, **_kw: copies.append(list(argv)) or object(),
+    )
+
+    huge = "[cron-wake] Journals\njob_id: jw\n" + ("brief text " * 20000)
+    args = _parse(["-t", "zephyr:telegram:123", huge])
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(args)
+
+    assert exc.value.code == 0
+    assert len(copies) == 1
+    _, _, _, copy_target, copy_message = copies[0]
+    assert copy_target == "zephyr:telegram:123"
+    # One short notice — nowhere near the raw payload length.
+    assert len(copy_message) < 400
+    assert copy_message != huge
+    assert "wake payload" in copy_message
+
+

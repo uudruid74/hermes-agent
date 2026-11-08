@@ -340,6 +340,40 @@ def _emit_result(
     return _FAILURE_EXIT
 
 
+def _wake_visible_copy_message(target: str, message: str) -> str:
+    """Cap the mandatory ``-u`` copy of a ``-t`` wake to a short notice.
+
+    The one-call rule (Evan spec 2026-10-18) requires every ``-t`` wake to
+    also carry a human-visible copy down the ``-u`` path.  But the copy must
+    never be the raw payload: when the wake carries a large brief (a cron
+    journal embeds its full skill, ~106K chars, t_94b593b6) the copy chunked
+    into 29 outbound bot messages — the spam Evan saw.
+
+    The woken agent's own run is the real signal; the copy exists so a human
+    can see that a wake happened at all.  So: collapse the message to a
+    single short line naming who was woken and where the work continues.
+    Never raise — the copy is doctrine, not a failure of the wake.
+    """
+    try:
+        stripped = message.strip()
+    except Exception:
+        return f"wake fired: {target} (payload unavailable)"
+
+    if not stripped:
+        return f"wake fired: {target} (empty payload)"
+
+    first_line = stripped.splitlines()[0]
+    if len(stripped) <= 200:
+        # Short wakes (kanban dispatches, tells) keep their full text.
+        return stripped
+    if len(first_line) <= 280:
+        return f"{first_line} (wake payload: {len(stripped)} chars; run continues in the agent's session)"
+    return (
+        f"cron wake fired: {first_line[:250]}… "
+        f"(wake payload {len(stripped)} chars; run continues in the agent's session)"
+    )
+
+
 def _list_targets(platform_filter: Optional[str], *, json_mode: bool) -> int:
     """Print channel targets plus profile-qualified active agent sessions."""
     try:
@@ -591,6 +625,10 @@ def cmd_send(args: argparse.Namespace) -> None:
     # visible copy down the `-u` path — callers make ONE call and get both the
     # wake and the human-readable post. The copy is spawned FIRST so an
     # interrupted process can never leave a wake with no visible trace.
+    #
+    # The copy is capped to a short notice (t_94b593b6): the wake must never
+    # post its raw payload to the human channel — that was 29 chunked messages
+    # of a journal skill embed.
     copy_error = None
     if wake_raw:
         try:
@@ -604,7 +642,7 @@ def cmd_send(args: argparse.Namespace) -> None:
             from hermes_cli._subprocess_compat import spawn_detached
 
             copy_proc = spawn_detached(
-                ["hermes", "send", "-u", copy_target, message]
+                ["hermes", "send", "-u", copy_target, _wake_visible_copy_message(wake_raw, message)]
             )
             if copy_proc is None:
                 copy_error = (
