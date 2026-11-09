@@ -469,7 +469,7 @@ def build_turn_context(
     *,
     persist_user_display_kind: Optional[str] = None,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
-    register_conversation_loop,
+    register_conversation_loop=None,
     restore_or_build_system_prompt,
     install_safe_stdio,
     sanitize_surrogates,
@@ -644,6 +644,11 @@ def build_turn_context(
     # The claim is released in AIAgent.run_conversation's finally; the
     # registry is thread-death aware anyway, so a leaked claim can never
     # wedge a session permanently — release is hygiene, not the safety net.
+    if register_conversation_loop is None:
+        # Safe-by-default: callers that don't inject the seam still get the
+        # guard. Tests may pass a stub instead.
+        from agent.agent_runtime_helpers import register_conversation_loop as _reg
+        register_conversation_loop = _reg
     register_conversation_loop(agent.session_id)
     # Empty-turn spiral companion: drop no-payload assistant rows ONCE at the
     # live-replay boundary. The cached-agent live transcript bypasses every
