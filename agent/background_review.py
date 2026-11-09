@@ -22,6 +22,7 @@ import copy
 import json
 import logging
 import os
+import threading
 import time
 from typing import Any, Dict, List, Optional
 
@@ -605,29 +606,107 @@ def extract_curator_mutations(review_messages: Optional[List[Dict]]) -> List[str
     return lines
 
 
-def surface_curator_mutations(agent: Any, lines: List[str]) -> None:
-    """Shape (a) — surface the fork's durable writes to the parent's context.
+def queue_curator_note(agent: Any, content: str) -> None:
+    """Buffer a curator note for the parent to surface at its next turn.
 
-    The fork keeps its write isolation; the parent gets a synthetic note row
+    Thread-safe: called from the background-review thread, drained by the
+    parent's own turn prologue (:func:`drain_pending_curator_notes`).
+
+    The review fork must NEVER append directly to the parent's live message
+    list (the old ``surface_curator_mutations`` behavior). The parent's
+    tool round persists its assistant tool_call row to state.db *before*
+    executing the tool and appends the matching tool result afterwards, so a
+    user row landing in the middle of that window splits a call from its
+    result: the next repair pass drops the result as an orphan and the
+    pre-call sanitizer stubs the call on every subsequent API call (15+
+    "added 1 stub tool result(s)" logged in zephyr session
+    20261109_064259_98663b60). Queuing keeps the interleaving structurally
+    impossible — notes are appended only between turns, never mid-round.
+    """
+    if not content:
+        return
+    notes = getattr(agent, "_pending_curator_notes", None)
+    if notes is None:
+        notes = agent._pending_curator_notes = []
+    lock = getattr(agent, "_pending_curator_notes_lock", None)
+    if lock is None:
+        lock = threading.Lock()
+        try:
+            agent._pending_curator_notes_lock = lock
+        except Exception:
+            pass
+    try:
+        with lock:
+            notes.append(content)
+    except Exception:
+        # Last-resort single-threaded append; the GIL makes list.append
+        # atomic enough that this path cannot lose the note.
+        notes.append(content)
+
+
+def drain_pending_curator_notes(agent: Any, messages: List[Dict]) -> List[Dict]:
+    """Drain queued curator notes into ``messages`` at a turn boundary.
+
+    Called from ``agent/turn_context.build_turn_context`` (the loop
+    prologue, before the new user message is appended) — a point where no
+    tool round is in flight, so appending whole user rows cannot split an
+    assistant tool_call from its result. The note rows are appended as
+    informational user turns, exactly like the previous surface path, and
+    they ride the parent's normal next flush.
+    """
+    notes = getattr(agent, "_pending_curator_notes", None)
+    if not notes:
+        return messages
+    lock = getattr(agent, "_pending_curator_notes_lock", None)
+    if lock is not None:
+        try:
+            with lock:
+                notes_to_drain = list(notes)
+                notes.clear()
+        except Exception:
+            notes_to_drain = list(notes)
+    else:
+        notes_to_drain = list(notes)
+        notes.clear()
+    if not notes_to_drain:
+        return messages
+    for content in notes_to_drain:
+        if isinstance(messages, list):
+            messages.append(
+                {
+                    "role": "user",
+                    "content": content,
+                    "timestamp": time.time(),
+                }
+            )
+    return messages
+
+
+def surface_curator_mutations(agent: Any, lines: List[str]) -> None:
+    """Shape (a) evidence layer (Zephyr 2026-10-20) — updated 2026-11-09.
+
+    The fork keeps its write isolation; the parent gets a synthetic note
     listing the mutations so its context reflects reality at the next turn.
-    Appended to the parent's live message list — the parent's normal flush
-    persists it. Informational framing deliberately (the 2026-08 curator
-    takeover came from an INSTRUCTIVE row being re-read as a standing task).
+    Previously this appended the note row straight into the parent's live
+    message list from the review thread — that mid-round mutation is what
+    wedged role-alternation repair and stubbed in-flight tool results
+    (concurrent-loop session race, 2026-11-09). It now queues the note
+    (``queue_curator_note``) for the parent to drain between turns.
     """
     if not lines:
         return
-    row = {
-        "role": "user",
-        "content": (
-            "[BACKGROUND CURATOR — persistent file changes made after your "
-            "last turn. For your context only — NOT a task request.]\n"
-            + "\n".join(f"- {line}" for line in lines)
-        ),
-        "timestamp": time.time(),
-    }
-    msgs = getattr(agent, "_session_messages", None)
-    if isinstance(msgs, list):
-        msgs.append(row)
+    content = (
+        "[BACKGROUND CURATOR — persistent file changes made after your "
+        "last turn. For your context only — NOT a task request.]\n"
+        + "\n".join(f"- {line}" for line in lines)
+    )
+    try:
+        queue_curator_note(agent, content)
+    except Exception:
+        # A failed surface must never take down the review fork — the
+        # mutations still landed on disk; worst case the parent stays
+        # unaware of them until the next review.
+        pass
 
 
 def summarize_background_review_actions(
@@ -1017,6 +1096,20 @@ def _run_review_in_thread(
                 api_key=_rt.get("api_key") or None,
                 credential_pool=_rt.get("credential_pool"),
                 request_overrides=_rt.get("request_overrides") or {},
+                # ISOLATED SESSION ID (the concurrent-loop session-race fix,
+                # 2026-11-09): the fork must not run a conversation loop on the
+                # parent's live session at all. Sharing the id meant (a) its
+                # synthetic curator-note row could interleave with the parent's
+                # in-flight tool round and wedge the transcript (the 15+
+                # sanitizer-stub window in zephyr session
+                # 20261109_064259_98663b60), and (b) the parent's relay scope
+                # stack got a second turn pushed on top of it. The fork runs
+                # on its own child session id now; prompt-cache parity with
+                # the parent is preserved by pinning the cached system prompt
+                # and session_start below, and by the shared runtime/toolset
+                # bytes — the wire bytes of the fork's requests don't depend
+                # on its session id.
+                session_id=f"{agent.session_id}:bg-review",
                 parent_session_id=agent.session_id,
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
@@ -1096,24 +1189,31 @@ def _run_review_in_thread(
                 # rebuild path, but these pins guarantee parity even
                 # if a future code path bypasses the cache.
                 review_agent.session_start = agent.session_start
-            review_agent.session_id = agent.session_id
-            # The fork shares the parent's live session_id (pinned above for
-            # prefix-cache parity). It is single-lifecycle and calls close()
-            # right after this run_conversation(); without opting out, close()
-            # would finalize the parent's still-active session row mid
-            # conversation (the review fires every ~10 turns). Leave session
-            # finalization to the real owner (CLI close / gateway reset / cron).
+            # The fork's session id was set at construction above to its
+            # isolated child id ("{parent}:bg-review"). Keep it there — never
+            # re-point it at the parent's live session (the previous behavior
+            # is what caused the concurrent-loop session race). If someone
+            # later re-enables shared-id cache parity here, fail loudly.
+            if review_agent.session_id == agent.session_id:
+                raise RuntimeError(
+                    "background-review fork must not share the parent's "
+                    "live session_id (concurrent-loop session race, "
+                    "2026-11-09)"
+                )
+            # The fork is single-lifecycle and calls close() right after this
+            # run_conversation(); without opting out, close() would finalize
+            # a session row mid flight. Leave finalization to the real owner
+            # (CLI close / gateway reset / cron).
             review_agent._end_session_on_close = False
-            # Never let the review fork compress. It shares the parent's
-            # session_id, so if it won a compression race it would rotate the
-            # parent into a NEW child that the gateway never adopts (the fork
-            # is single-lifecycle and dies right after this run_conversation).
-            # The foreground turn would then start from the stale parent and
-            # compress it again, leaving the same parent with two sibling
-            # children (issue #38727). Review also needs full context to
-            # produce a good memory/skill summary — compressing would strip
-            # detail. Both compression triggers in conversation_loop.py gate on
-            # agent.compression_enabled, so this short-circuits both paths.
+            # Never let the review fork compress. It runs on an isolated
+            # session, so nothing in the parent's lineage is reachable from
+            # it, but compression would still create orphan state on the
+            # fork's own row that nobody adopts — the fork is single-lifecycle
+            # and dies right after this run_conversation. Review also needs
+            # full context to produce a good memory/skill summary — compressing
+            # would strip detail. Both compression triggers in
+            # conversation_loop.py gate on agent.compression_enabled, so this
+            # short-circuits both paths.
             review_agent.compression_enabled = False
 
             from model_tools import get_tool_definitions

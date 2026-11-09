@@ -513,6 +513,20 @@ def _try_refresh_nous_paid_entitlement_credentials(agent) -> bool:
         return False
 
 
+def _register_conversation_loop(session_id):
+    """Claim in-process ownership of the session id for this loop.
+
+    Thin wrapper so ``build_turn_context`` stays free of module-level
+    imports that would reintroduce the import cycle the explicit-callable
+    signature exists to avoid. Implements the concurrent-loop session-race
+    guard: a second LIVE conversation loop on the same session id raises
+    instead of interleaving (see agent/agent_runtime_helpers.py).
+    """
+    from agent.agent_runtime_helpers import register_conversation_loop
+
+    register_conversation_loop(session_id)
+
+
 def _restore_or_build_system_prompt(agent, system_message, conversation_history):
     """Restore the cached system prompt from the session DB or build it fresh.
 
@@ -1395,6 +1409,7 @@ def run_conversation(
         persist_user_timestamp,
         persist_user_display_kind=persist_user_display_kind,
         persist_user_display_metadata=persist_user_display_metadata,
+        register_conversation_loop=_register_conversation_loop,
         restore_or_build_system_prompt=_restore_or_build_system_prompt,
         install_safe_stdio=_install_safe_stdio,
         sanitize_surrogates=_sanitize_surrogates,

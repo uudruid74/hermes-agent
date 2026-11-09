@@ -469,6 +469,7 @@ def build_turn_context(
     *,
     persist_user_display_kind: Optional[str] = None,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
+    register_conversation_loop,
     restore_or_build_system_prompt,
     install_safe_stdio,
     sanitize_surrogates,
@@ -634,6 +635,16 @@ def build_turn_context(
 
     # Initialize conversation (copy to avoid mutating the caller's list).
     messages = list(conversation_history) if conversation_history else []
+    # ── Conversation-loop session ownership ─────────────────────────────
+    # Claim exclusive in-process ownership of this loop's session id. A
+    # second live loop on the same session id is refused outright: two loops
+    # on one session interleave their transcript writes and corrupt the
+    # record (2026-11-09 concurrent-loop session-race report; see
+    # agent/agent_runtime_helpers.register_conversation_loop for the guard).
+    # The claim is released in AIAgent.run_conversation's finally; the
+    # registry is thread-death aware anyway, so a leaked claim can never
+    # wedge a session permanently — release is hygiene, not the safety net.
+    register_conversation_loop(agent.session_id)
     # Empty-turn spiral companion: drop no-payload assistant rows ONCE at the
     # live-replay boundary. The cached-agent live transcript bypasses every
     # load-time filter (gateway/run.py _select_cached_agent_history prefers the
@@ -642,6 +653,17 @@ def build_turn_context(
     # Model-fed list only; the stored transcript is never rewritten here.
     from agent.agent_runtime_helpers import drop_no_payload_non_final as _drop_poison_rows
     messages = _drop_poison_rows(messages)
+
+    # Drain curator notes queued by the background review thread (shape (a)
+    # evidence layer). The review fork must never mutate the parent's
+    # live message list itself — injecting a synthetic user row mid-tool-
+    # round splits an assistant tool_call from its not-yet-appended
+    # result, wedging role-alternation repair and making the pre-call
+    # sanitizer stub the call on every later API call. Draining here —
+    # at the turn boundary, before the new user message is appended —
+    # keeps the interleaving impossible. The drain runs between turns.
+    from agent.background_review import drain_pending_curator_notes
+    messages = drain_pending_curator_notes(agent, messages)
 
     # The CLI may already have staged this input outside the history passed to
     # ``run_conversation``. Reuse it only when its clean transcript text matches

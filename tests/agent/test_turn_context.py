@@ -186,6 +186,7 @@ def _build(agent, **overrides):
         stream_callback=None,
         persist_user_message=None,
         restore_or_build_system_prompt=lambda *a, **k: None,
+        register_conversation_loop=lambda _sid: None,
         install_safe_stdio=lambda: None,
         sanitize_surrogates=lambda s: s,
         summarize_user_message_for_log=lambda s: s,

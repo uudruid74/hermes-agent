@@ -451,6 +451,84 @@ def sanitize_tool_call_arguments(
 _INFLIGHT_TURNS_BY_SESSION: Dict[str, Tuple[str, float]] = {}
 _INFLIGHT_TURNS_LOCK = threading.Lock()
 
+# ── Conversation-loop session ownership (the concurrent-loop session race
+# ── fix, 2026-11-09 report).
+#
+# A conversation loop now claims exclusive in-process ownership of its
+# session id while it runs. Two loops running on the SAME session id in one
+# process interleave their transcript writes; the observed defect chain was:
+# the background-review thread appends a synthetic curator note to the
+# parent's live message list mid-tool-round (surface_curator_mutations),
+# which splits an assistant tool_call from its not-yet-appended result,
+# which repair_message_sequence then drops as an orphan, which makes the
+# pre-call sanitizer stub the call on EVERY subsequent API call
+# (15+ "added 1 stub tool result(s)" in zephyr session
+# 20261109_064259_98663b60). The ownership registry refuses the second
+# live loop outright; the review fork additionally runs under an isolated
+# child session id (see agent/background_review.py). The registry is
+# thread-death aware: a claim whose owner thread has exited is taken over,
+# so a leaked claim cannot wedge a session permanently.
+_ACTIVE_SESSION_LOOPS: Dict[str, Dict[str, Any]] = {}
+_ACTIVE_SESSION_LOOPS_LOCK = threading.Lock()
+
+
+def _session_loop_owner_is_live(owner: Dict[str, Any]) -> bool:
+    thread = owner.get("thread")
+    if thread is None:
+        return True  # conservative: unknown ownership blocks newcomers
+    return thread.is_alive()
+
+
+def register_conversation_loop(session_id: Optional[str]) -> None:
+    """Claim exclusive in-process ownership of ``session_id`` for this loop.
+
+    Raises ``RuntimeError`` when another LIVE loop already owns the session
+    — concurrent loops on one session are the defect class, not a mode to
+    support. A claim owned by an already-exited thread is taken over.
+    """
+    if not session_id:
+        return
+    me = threading.current_thread()
+    ident = threading.get_ident()
+    with _ACTIVE_SESSION_LOOPS_LOCK:
+        owner = _ACTIVE_SESSION_LOOPS.get(session_id)
+        if (
+            owner is not None
+            and owner.get("ident") != ident
+            and _session_loop_owner_is_live(owner)
+        ):
+            _owner_thread = owner.get("thread")
+            _owner_name = getattr(_owner_thread, "name", "?") if _owner_thread else "<unknown>"
+            raise RuntimeError(
+                "a conversation loop is already active on session "
+                f"{session_id} (thread {_owner_name}); "
+                "refusing to run a second concurrent loop on the same session — "
+                "use an isolated session id for the second loop"
+            )
+        _ACTIVE_SESSION_LOOPS[session_id] = {
+            "ident": ident,
+            "thread": me,
+        }
+
+
+def release_conversation_loop(session_id: Optional[str], expected_ident: Optional[int] = None) -> None:
+    """Release a session claim taken by :func:`register_conversation_loop`."""
+    if not session_id:
+        return
+    with _ACTIVE_SESSION_LOOPS_LOCK:
+        owner = _ACTIVE_SESSION_LOOPS.get(session_id)
+        if owner is None:
+            return
+        if expected_ident is not None and owner.get("ident") != expected_ident:
+            return
+        _ACTIVE_SESSION_LOOPS.pop(session_id, None)
+
+
+def clear_active_session_loops() -> None:
+    """Test/teardown helper: drop every ownership claim in this process."""
+    with _ACTIVE_SESSION_LOOPS_LOCK:
+        _ACTIVE_SESSION_LOOPS.clear()
+
 
 def note_turn_start(agent, turn_id: str):
     """Tripwire: detect a turn starting while a previous turn of the same

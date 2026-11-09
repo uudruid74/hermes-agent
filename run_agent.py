@@ -7764,6 +7764,18 @@ class AIAgent:
                         reset_accounting_context(acct_token)
                     if token is not None:
                         reset_conversation_context(token)
+                # Release this loop's session-ownership claim (concurrent-loop
+                # session-race guard, 2026-11-09). The registry is thread-death
+                # aware, so this is hygiene: a leaked claim would be taken over
+                # by a later live loop rather than wedge the session.
+                try:
+                    from agent.agent_runtime_helpers import release_conversation_loop
+
+                    release_conversation_loop(
+                        str(session_id or ""), threading.get_ident()
+                    )
+                except Exception:
+                    pass
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """

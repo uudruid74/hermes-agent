@@ -99,10 +99,24 @@ class TestExtractCuratorMutations:
 
 class TestSurfaceToParent:
     def test_one_note_row_reaches_the_parent_context(self):
+        """The note reaches the parent's context via the turn-boundary drain.
+
+        Surface must NOT mutate the live message list (that interleaving was
+        the concurrent-loop session race of 2026-11-09 — it split an
+        assistant tool_call from its result and stubbed the call on every
+        later API call); it queues the note and the parent drains it between
+        turns (see tests/agent/test_concurrent_loop_session_race.py).
+        """
         parent = SimpleNamespace(_session_messages=[{"role": "user", "content": "hi"}])
         lines = extract_curator_mutations(REAL_WINDOW_MESSAGES)
         surface_curator_mutations(parent, lines)
-        rows = parent._session_messages
+        # Live list untouched — note queued.
+        assert parent._session_messages == [{"role": "user", "content": "hi"}]
+        assert getattr(parent, "_pending_curator_notes", []) != []
+
+        from agent.background_review import drain_pending_curator_notes
+
+        rows = drain_pending_curator_notes(parent, parent._session_messages)
         assert len(rows) == 2
         note = rows[-1]
         assert note["role"] == "user"
@@ -114,6 +128,7 @@ class TestSurfaceToParent:
         parent = SimpleNamespace(_session_messages=[])
         surface_curator_mutations(parent, [])
         assert parent._session_messages == []
+        assert getattr(parent, "_pending_curator_notes", []) == []
 
     def test_missing_message_list_is_harmless(self):
         surface_curator_mutations(SimpleNamespace(), ["x"])  # must not raise

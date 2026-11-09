@@ -1146,16 +1146,21 @@ def test_review_fork_disables_compression_to_prevent_stale_parent_fork(tmp_path:
         "_run_review_in_thread never reached run_conversation — the spawn path "
         "changed; update this test to capture the review AIAgent."
     )
-    assert captured["session_id"] == parent_sid, (
-        "Review fork should inherit the parent's session_id (shared id is the "
-        "whole reason compression must be disabled)."
+    # The fork runs on an ISOLATED child session id (the concurrent-loop
+    # session-race fix, 2026-11-09): no two conversation loops may run on the
+    # same session in one process. The previous contract (share the parent's
+    # id for cache parity) is exactly what allowed the fork to interleave with
+    # the parent's in-flight tool round; cache parity is now achieved by the
+    # pinned cached system prompt + pinned session_start instead.
+    assert captured["session_id"] == f"{parent_sid}:bg-review", (
+        "FIX REGRESSION: background-review fork must NOT share the parent's "
+        "live session_id. Two loops on one session corrupt the transcript."
     )
+    assert captured["session_id"] != parent_sid
     assert captured["compression_enabled"] is False, (
         "FIX REGRESSION: background-review fork did NOT disable compression. "
-        "It shares the parent's session_id, so an enabled fork can rotate the "
-        "parent into an orphan child (issue #38727). The trigger gates in "
-        "conversation_loop.py only short-circuit when compression_enabled is "
-        "False — this flag MUST be cleared on the review fork."
+        "It runs on an isolated session now, but the flag must stay cleared "
+        "so it cannot create orphan state on its own row (issue #38727)."
     )
     db.close()
 
