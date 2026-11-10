@@ -190,8 +190,6 @@ Six stores, each with a different access cost. The system prompt (`Memory OS`) r
 ## The Technology Stack
 
 - **Fork base:** Hermes Agent by Nous Research (upstream `main`, thousands of commits ahead at fork time)
-- **Models:** DeepSeek V4-Flash (primary), GLM5.2 (Wintermute — compliance enforcement)
-- **Provider:** Custom DeepSeek endpoint, LM Studio for local/Ornith workloads
 - **[Beans](https://github.com/uudruid74/beans):** self-configuring local inference router (llama.cpp) — serves Ornith (chat + vision via mmproj), nomic-embed (embeddings), title-generator (titles) at `127.0.0.1:11434/v1`
 - **Orchestration:** Kanban board + CLI (profile-aware routing, no group chat needed)
 - **Real-time:** Unix domain sockets → MCP tools → continuation feed injection
