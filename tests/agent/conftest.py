@@ -51,6 +51,21 @@ def _module_table_guard():
         if name == "run_agent" or name.startswith(("agent.", "tools.", "hermes_"))
     }
     yield
+    fresh = [
+        name
+        for name in list(sys.modules)
+        if (name == "run_agent" or name.startswith(("agent.", "tools.", "hermes_")))
+        and name not in saved
+    ]
+    for name in fresh:
+        del sys.modules[name]
+        parent_name, _, child = name.rpartition(".")
+        parent = sys.modules.get(parent_name)
+        if parent is not None and getattr(parent, child, None) is not saved.get(name):
+            try:
+                delattr(parent, child)
+            except AttributeError:
+                pass
     for name in list(sys.modules):
         if name == "run_agent" or name.startswith(("agent.", "tools.", "hermes_")):
             del sys.modules[name]
