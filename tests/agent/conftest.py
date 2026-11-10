@@ -28,6 +28,25 @@ def _reset_current_agent():
 
 
 @pytest.fixture(autouse=True)
+def _reset_session_context():
+    """Each test starts with unbound session ContextVars.
+
+    Tests that exercise handler paths call set/clear_session_vars, which
+    latch non-_UNSET values in the ContextVars for the rest of the process.
+    get_session_env then stops falling back to os.environ (by design), so a
+    later test's monkeypatch.setenv("HERMES_SESSION_PLATFORM", ...) is
+    silently shadowed — e.g. test_verify_on_stop_default_path_through_load_
+    config flips red depending on which handler tests ran before it.
+    reset_session_vars() restores the "never bound" sentinel before each test.
+    """
+    from gateway import session_context
+
+    session_context.reset_session_vars()
+    yield
+    session_context.reset_session_vars()
+
+
+@pytest.fixture(autouse=True)
 def _module_table_guard():
     """Snapshot/restore runtime module identity around every test.
 
