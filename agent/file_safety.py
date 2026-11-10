@@ -289,9 +289,10 @@ def _classify_write_denial(path: str) -> Optional[str]:
         except Exception:
             pass
 
-    if _is_temp_path(resolved):
-        return None
-
+    # An explicit HERMES_WRITE_SAFE_ROOT sandbox is a user-imposed
+    # restriction and must be consulted BEFORE the generic temp-path
+    # allowance: /tmp scratch is only exempt while no safe root is
+    # configured (test_write_text_file_respects_safe_root pins this).
     safe_roots = get_safe_write_roots()
     task_root = _task_root()
     if task_root:
@@ -305,6 +306,9 @@ def _classify_write_denial(path: str) -> Optional[str]:
                 break
         if not allowed:
             return "safe_root"
+
+    if _is_temp_path(resolved):
+        return None
 
     return None
 

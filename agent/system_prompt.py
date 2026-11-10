@@ -605,8 +605,12 @@ def build_system_prompt(agent: Any, system_message: Optional[str] = None) -> str
 
     # Surface context-file truncation warnings through the normal agent status
     # channel so gateway/CLI users see them in chat instead of only in logs.
+    # getattr guard: test doubles built via SimpleNamespace/object.__new__
+    # lack the method (the gateway test-double pitfall) — absence is a no-op.
+    _emit_status = getattr(agent, "_emit_status", None)
     for warning in drain_truncation_warnings():
-        agent._emit_status(warning)
+        if callable(_emit_status):
+            _emit_status(warning)
 
     return joined
 

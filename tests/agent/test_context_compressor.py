@@ -170,11 +170,15 @@ class TestCompress:
         the floored threshold used to equal the whole window, so
         auto-compression could never fire. It now triggers at 85% of the
         window — high enough not to waste the small budget, below 100% so it
-        actually fires."""
+        actually fires. The minimum itself moved 64K -> 32K in c8aff74632
+        ("compression floor, budget overhaul"); the contract is 85% OF
+        WHATEVER THE MINIMUM IS, so the assertion tracks the constant."""
         from agent.context_compressor import MINIMUM_CONTEXT_LENGTH
         t = ContextCompressor._compute_threshold_tokens(MINIMUM_CONTEXT_LENGTH, 0.50)
         assert t < MINIMUM_CONTEXT_LENGTH
-        assert t == 54400  # 85% of 64000
+        assert t == int(
+            MINIMUM_CONTEXT_LENGTH * ContextCompressor._MIN_CTX_TRIGGER_RATIO
+        )
 
     def test_threshold_above_minimum_uses_configured_window_ratio(self):
         """A window just above 64K must not inherit the old absolute floor."""

@@ -51,7 +51,12 @@ def _contents(rows):
 
 
 def test_rotation_flush_without_history_boundary_duplicates(tmp_path: Path) -> None:
-    """Control: bare flush of unstamped cold-resume rows double-writes (#68454)."""
+    """Was the #68454 control: a bare flush of unstamped cold-resume rows
+    double-wrote ("persisted question" twice). The double-write is gone —
+    the unconditional trail dedupe / _replace_messages path (injection
+    contract, 2026-10-20) now keeps the bare flush safe too. Flipped 2026-
+    11-10 to pin the new invariant: without conversation_history=, rows are
+    still written exactly once."""
     db = SessionDB(db_path=tmp_path / "state.db")
     sid = "COLD_ROTATE_DUP"
     db.create_session(sid, source="cli")
@@ -63,7 +68,8 @@ def test_rotation_flush_without_history_boundary_duplicates(tmp_path: Path) -> N
     agent._flush_messages_to_session_db(loaded)  # missing conversation_history=
 
     rows = db.get_messages_as_conversation(sid, include_inactive=True)
-    assert _contents(rows).count("persisted question") == 2
+    assert _contents(rows).count("persisted question") == 1
+    assert _contents(rows) == ["persisted question", "persisted answer"]
 
 
 def test_rotation_flush_with_history_boundary_is_noop(tmp_path: Path) -> None:

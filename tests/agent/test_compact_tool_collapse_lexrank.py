@@ -397,7 +397,14 @@ def test_every_unit_carries_a_handle_role_tag_and_stamp():
     summary = build_internal_fallback(
         messages, protect_head_count=2, protect_last_n=1, target_tokens=4_000
     ).summary
-    unit_starts = [line for line in summary.splitlines() if line.startswith("[#")]
+    # Unit rows carry a numeric handle ([#123] [ROLE]: ...); the legend
+    # line ([#N] = session row id ...) is not a unit and is excluded (it is
+    # pinned by the emit-marker self-description contract instead).
+    unit_starts = [
+        line
+        for line in summary.splitlines()
+        if re.match(r"^\[#\d+\]", line)
+    ]
     assert unit_starts
     for line in unit_starts:
         assert re.match(r"^\[#\d+\] \[[A-Z]+\]: ", line), line
