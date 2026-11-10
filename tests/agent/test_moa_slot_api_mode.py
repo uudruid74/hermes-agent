@@ -13,6 +13,18 @@ from unittest.mock import patch
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _clear_slot_runtime_cache():
+    """The per-(provider, model) slot-runtime cache (#66793) is a process
+    singleton — without this, one test's resolved runtime (and its mock)
+    leaks into the next test's expectations."""
+    from agent import moa_loop
+
+    moa_loop._runtime_cache.clear()
+    yield
+    moa_loop._runtime_cache.clear()
+
+
 def _response(content="ok"):
     message = SimpleNamespace(content=content, tool_calls=[])
     choice = SimpleNamespace(message=message, finish_reason="stop")

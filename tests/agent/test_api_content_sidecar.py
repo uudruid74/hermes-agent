@@ -251,6 +251,23 @@ def _stub_runtime_main():
         yield
 
 
+@pytest.fixture(autouse=True)
+def _no_ephemeral_neighbor_injections():
+    """Isolate the two environment-dependent per-turn injections from the
+    sidecar mechanics under test: the ego/mood ratings block (DB-state:
+    ``get_agent_rating``) and the active-plan-state block (binding DB).
+    Both ride the same composition deliberately and are pinned by their own
+    tests (``test_ego_ratings_block_rides_the_sidecar``,
+    ``test_plan_state_block_rides_the_sidecar``). Stubbing them here keeps
+    these tests deterministic (they used to leak the live rating and a real
+    PlanStateUnavailable into pinned literals)."""
+    with (
+        patch("agent.turn_context._build_ratings_injection", lambda agent: ""),
+        patch("agent.turn_context.active_plan_api_context", lambda agent: ""),
+    ):
+        yield
+
+
 class TestPrologueStamping:
     def test_stamps_api_content_from_plugin_context(self):
         agent = _FakeAgent()
@@ -274,6 +291,45 @@ class TestPrologueStamping:
             ctx = _build(agent)
         assert "api_content" not in ctx.messages[ctx.current_turn_user_idx]
         assert agent.api_content_at_persist is None
+
+    def test_ego_ratings_block_rides_the_sidecar(self):
+        """The ego/mood ratings block is injected per-turn into the API copy
+        (never the stored content) and the sidecar stamps the exact sent
+        bytes — so the ratings ride the stamp too (persist-what-you-send)."""
+        agent = _FakeAgent()
+        with (
+            patch(
+                "agent.turn_context._build_ratings_injection",
+                lambda _a: "RATINGS-BLOCK",
+            ),
+            patch(
+                "hermes_cli.plugins.invoke_hook",
+                return_value=[{"context": "PLUGIN-CTX"}],
+            ),
+        ):
+            ctx = _build(agent)
+        msg = ctx.messages[ctx.current_turn_user_idx]
+        assert msg["content"] == "hello"  # stored content stays clean
+        assert msg["api_content"] == "hello\n\nRATINGS-BLOCK\n\nPLUGIN-CTX"
+
+    def test_plan_state_block_rides_the_sidecar(self):
+        """The active-plan-state block (deliberate: the model is told when
+        the plan binding state is unavailable — 'plan state becomes
+        self-sufficient') rides the same composition and the stamp."""
+        agent = _FakeAgent()
+        with (
+            patch(
+                "agent.turn_context.active_plan_api_context",
+                lambda _a: "[ACTIVE PLAN STATE UNAVAILABLE: test]",
+            ),
+            patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+        ):
+            ctx = _build(agent)
+        msg = ctx.messages[ctx.current_turn_user_idx]
+        assert msg["content"] == "hello"
+        assert msg["api_content"] == (
+            "hello\n\n[ACTIVE PLAN STATE UNAVAILABLE: test]"
+        )
 
     def test_no_stamp_for_codex_app_server(self):
         """codex_app_server turns bypass the api_messages build, so the

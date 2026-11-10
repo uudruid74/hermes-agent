@@ -176,6 +176,21 @@ def _stub_runtime_main():
         yield
 
 
+@pytest.fixture(autouse=True)
+def _no_ephemeral_neighbor_injections():
+    """Isolate the DB-state-dependent per-turn injections (ego ratings
+    block, active-plan-state block) from the turn-context assembly under
+    test — both ride the same composition deliberately and are pinned in
+    test_api_content_sidecar; leaking them here made these tests depend on
+    the live rating and binding DB state (the pre-existing api_content
+    'footer contamination' reds)."""
+    with (
+        patch("agent.turn_context._build_ratings_injection", lambda agent: ""),
+        patch("agent.turn_context.active_plan_api_context", lambda agent: ""),
+    ):
+        yield
+
+
 def _build(agent, **overrides):
     kwargs = dict(
         agent=agent,
