@@ -19,6 +19,25 @@ from unittest.mock import MagicMock
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _module_isolation():
+    """Save/restore the runtime modules _fresh_run_agent purges.
+
+    Without this, the reloaded copies leak into sys.modules after each
+    test, splitting module identity (and module-level singletons) for
+    every later test in the process (same class as issue #61597).
+    """
+    saved = {
+        name: mod for name, mod in sys.modules.items()
+        if name == "run_agent" or name.startswith(("agent.", "tools.", "hermes_"))
+    }
+    yield
+    for name in list(sys.modules):
+        if name == "run_agent" or name.startswith(("agent.", "tools.", "hermes_")):
+            del sys.modules[name]
+    sys.modules.update(saved)
+
+
 def _fresh_run_agent(hermes_home):
     for mod in list(sys.modules):
         if mod == "run_agent" or mod.startswith("agent.") or mod.startswith("tools.") or mod.startswith("hermes_"):

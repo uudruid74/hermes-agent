@@ -141,6 +141,32 @@ class TestLookupModelsDevContext:
 
 
 
+@pytest.fixture(autouse=True)
+def _isolate_models_dev_requests_reference():
+    """Route agent.models_dev's ``requests`` reference through a private shim.
+
+    The ``@patch("agent.models_dev.requests.get")`` decorators in this file
+    resolve onto the SHARED ``requests`` package, so they also capture every
+    stray background thread's HTTP during the test (env-probe/monitor/refresh
+    workers spawned by earlier tests in the process). That turns thread timing
+    into order-dependent failures ("Expected 'get' to not have been called").
+    Patching the shim intercepts only this module's calls — worker-thread
+    calls included, since they resolve ``requests`` through the same module
+    global.
+    """
+    import types
+
+    import requests as _real_requests
+
+    import agent.models_dev as md
+
+    shim = types.SimpleNamespace(get=_real_requests.get)
+    prev = md.requests
+    md.requests = shim
+    yield
+    md.requests = prev
+
+
 class TestFetchModelsDev:
     @pytest.fixture(autouse=True)
     def _reset_fetch_state(self):

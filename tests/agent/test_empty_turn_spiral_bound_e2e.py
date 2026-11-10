@@ -65,9 +65,16 @@ def spiral_agent():
     prev_home = os.environ.get("HERMES_HOME")
     os.environ["HERMES_HOME"] = os.path.join(test_home, ".hermes")
 
-    for mod in list(sys.modules):
-        if mod == "run_agent" or mod.startswith("agent.") or mod.startswith("tools.") or mod.startswith("hermes_"):
-            del sys.modules[mod]
+    # Snapshot the purged modules and restore them at teardown — leaving the
+    # fresh copies in sys.modules splits module identity (and every
+    # module-level singleton) for every later test in the process (same class
+    # as issue #61597).
+    saved_modules = {
+        name: mod for name, mod in sys.modules.items()
+        if name == "run_agent" or name.startswith(("agent.", "tools.", "hermes_"))
+    }
+    for mod in saved_modules:
+        del sys.modules[mod]
     from run_agent import AIAgent
 
     agent = AIAgent(
@@ -88,6 +95,10 @@ def spiral_agent():
             os.environ.pop("HERMES_HOME", None)
         else:
             os.environ["HERMES_HOME"] = prev_home
+        for name in list(sys.modules):
+            if name == "run_agent" or name.startswith(("agent.", "tools.", "hermes_")):
+                del sys.modules[name]
+        sys.modules.update(saved_modules)
 
 
 def _chat_calls(handler):

@@ -73,7 +73,27 @@ class _TinyImageHandler(http.server.BaseHTTPRequestHandler):
         return
 
 
-@pytest.fixture
+@pytest.fixture(autouse=True)
+def _module_isolation():
+    """Save/restore the modules the http_server fixture purges.
+
+    Without this, the reloaded copies leak into sys.modules after the
+    test, splitting module identity (and module-level singletons) for
+    every later test in the process (same class as issue #61597).
+    """
+    import sys
+    saved = {
+        name: mod for name, mod in sys.modules.items()
+        if name.startswith("hermes_constants") or name.startswith("agent.image_gen_provider")
+    }
+    yield
+    for name in list(sys.modules):
+        if name.startswith("hermes_constants") or name.startswith("agent.image_gen_provider"):
+            del sys.modules[name]
+    sys.modules.update(saved)
+
+
+@pytest.fixture()
 def http_server(tmp_path, monkeypatch):
     """Spin up a localhost HTTP server and isolate HERMES_HOME under tmp_path."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
