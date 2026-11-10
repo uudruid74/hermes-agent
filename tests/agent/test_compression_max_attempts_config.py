@@ -75,6 +75,31 @@ class TestCompressionMaxAttemptsConfig:
         agent = _make_agent(monkeypatch, tmp_path, max_attempts=6)
         assert agent.max_compression_attempts == 6
 
+    def test_zero_turns_off_the_limit(self, monkeypatch, tmp_path):
+        """Evan 2026-11-10: ``compression.max_attempts: 0`` means UNLIMITED —
+        "a value of 0 turns off the limit. The if < 1 you found should be a
+        bypass not an error." The resolved value is +inf so every
+        ``attempts < max`` gate stays open and every ``attempts > max``
+        terminal stays closed with no per-site branching."""
+        agent = _make_agent(monkeypatch, tmp_path, max_attempts=0)
+        assert agent.max_compression_attempts == float("inf")
+
+    def test_negative_also_bypasses_the_limit(self, monkeypatch, tmp_path):
+        """The whole < 1 half-line is the bypass — not just literal 0."""
+        agent = _make_agent(monkeypatch, tmp_path, max_attempts=-3)
+        assert agent.max_compression_attempts == float("inf")
+
+    def test_ceiling_still_caps_finite_values(self, monkeypatch, tmp_path):
+        """The 10-cap must not fight the bypass: finite values still cap."""
+        agent = _make_agent(monkeypatch, tmp_path, max_attempts=25)
+        assert agent.max_compression_attempts == 10
+
+    def test_zero_float_and_numeric_string_bypass_too(self, monkeypatch, tmp_path):
+        agent = _make_agent(monkeypatch, tmp_path, max_attempts=0.0)
+        assert agent.max_compression_attempts == float("inf")
+        agent = _make_agent(monkeypatch, tmp_path, max_attempts="0")
+        assert agent.max_compression_attempts == float("inf")
+
 
 
 

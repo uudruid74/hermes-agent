@@ -254,6 +254,19 @@ class TestPostToolCompressionAttemptCap:
             f"got {len(compress_calls)} compactions"
         )
 
+    def test_unlimited_attempts_never_stops_post_tool_compression(self, agent):
+        """0-configured unlimited (+inf) turns the limit OFF (Evan 2026-11-10:
+        "a value of 0 turns off the limit"): 7 tool iterations under constant
+        pressure → 7 compactions, never the old cap of 3."""
+        agent.max_compression_attempts = float("inf")
+        result, compress_calls = _run_tool_loop(agent, n_tool_iterations=7)
+
+        assert result["completed"] is True
+        assert len(compress_calls) == 7, (
+            "unlimited compression attempts must compact on every pressured "
+            f"tool iteration, got {len(compress_calls)} compactions"
+        )
+
 
     def test_post_tool_compression_shares_counter_with_pre_api_gate(self, agent):
         """Pre-API compactions consume the same per-turn budget.

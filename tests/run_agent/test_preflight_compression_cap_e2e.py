@@ -147,3 +147,53 @@ def test_preflight_runs_fourth_compaction_pass_at_cap_six(monkeypatch, tmp_path)
     assert len(compress_calls) == 6
 
 
+def test_preflight_unlimited_passes_when_configured_zero(monkeypatch, tmp_path):
+    """``compression.max_attempts: 0`` = UNLIMITED (Evan 2026-11-10) — the
+    preflight pass loop must keep passing well beyond any cap while every
+    pass makes real progress over threshold, and still self-terminate (the
+    turn completes) via its own no-progress/under-threshold break."""
+    agent = _make_agent(monkeypatch, tmp_path, max_attempts=0)
+    assert agent.max_compression_attempts == float("inf")
+
+    compressor = agent.context_compressor
+    compressor.threshold_tokens = 50_000
+
+    estimate_state = {"tokens": 1_000_000.0, "calls": 0}
+
+    def _shrinking_estimate(*_args, **_kwargs):
+        if estimate_state["calls"]:
+            estimate_state["tokens"] *= 0.9
+        estimate_state["calls"] += 1
+        return int(estimate_state["tokens"])
+
+    compress_calls = []
+
+    def _fake_compress(messages, system_message, **_kwargs):
+        compress_calls.append(len(messages))
+        return messages, "compressed prompt"
+
+    history = [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"}
+        for i in range(60)
+    ]
+    agent.client.chat.completions.create.return_value = _stop_response()
+
+    with (
+        patch(
+            "agent.turn_context.estimate_request_tokens_rough",
+            side_effect=_shrinking_estimate,
+        ),
+        patch.object(agent, "_compress_context", side_effect=_fake_compress),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("hello", conversation_history=history)
+
+    assert result["completed"] is True
+    assert len(compress_calls) > 6, (
+        "0 = unlimited: preflight passes must not stop at any fixed cap, "
+        f"got {len(compress_calls)} passes"
+    )
+
+

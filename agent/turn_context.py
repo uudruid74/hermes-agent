@@ -24,6 +24,7 @@ move-and-name refactor with no semantic change.
 
 from __future__ import annotations
 
+import itertools
 import logging
 import threading
 import time
@@ -1038,11 +1039,17 @@ def build_turn_context(
                 agent._emit_status(_preflight_status)
             # Preflight passes honor the same configured per-turn cap
             # (compression.max_attempts) as the loop's compression sites;
-            # default 3 preserves the prior hardcoded behavior.
-            _max_preflight_passes = max(
-                1, int(getattr(agent, "max_compression_attempts", 3) or 3)
-            )
-            for _pass in range(_max_preflight_passes):
+            # default 3 preserves the prior hardcoded behavior. A configured
+            # 0 = unlimited resolves to +inf (agent_init) — an unbounded
+            # iterator; the loop still self-terminates on its own break
+            # conditions (lock defer / no progress / under threshold /
+            # insufficient warrant).
+            _raw_preflight_cap = getattr(agent, "max_compression_attempts", 3)
+            if _raw_preflight_cap == float("inf"):
+                _preflight_passes = itertools.count()
+            else:
+                _preflight_passes = range(max(1, int(_raw_preflight_cap or 3)))
+            for _pass in _preflight_passes:
                 _orig_len = len(messages)
                 _orig_tokens = _preflight_tokens
                 _preflight_input = messages

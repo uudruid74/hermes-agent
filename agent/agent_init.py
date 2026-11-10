@@ -1949,7 +1949,9 @@ def init_agent(
     # estimate above the threshold even though the messages compress fine
     # (the #62605 failure class).  Default 3 preserves current behavior, so
     # an unset key is behavior-neutral; validated >= 1, hard-capped at 10,
-    # and any non-int-like value falls back to 3.  Booleans are rejected
+    # and any non-int-like value falls back to 3.  A configured 0 (or any
+    # value < 1) is the UNLIMITED bypass — the limit is turned off, not
+    # error-coerced.  Booleans are rejected
     # (bool subclasses int, so int(True) would silently become 1) and
     # fractional floats are rejected rather than truncated — "4.7 attempts"
     # is a config mistake, not a request for 4.
@@ -1968,8 +1970,15 @@ def init_agent(
         except (TypeError, ValueError):
             compression_max_attempts = 3
     if compression_max_attempts < 1:
-        compression_max_attempts = 3
-    compression_max_attempts = min(compression_max_attempts, 10)
+        # Bypass, not an error (Evan 2026-11-10: "a value of 0 turns off
+        # the limit. The if < 1 you found should be a bypass not an
+        # error"): 0 — or anything below 1 — means UNLIMITED attempts.
+        # +inf is the representation: every `attempts < max` gate stays
+        # open and every `attempts > max` terminal stays closed with no
+        # per-site branching.
+        compression_max_attempts = float("inf")
+    else:
+        compression_max_attempts = min(compression_max_attempts, 10)
 
     def _parse_prune_int(raw, default):
         # Same parser semantics as compression.max_attempts above: reject
