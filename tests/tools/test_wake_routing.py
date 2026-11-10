@@ -15,9 +15,13 @@ session 20261014_023141_da82753a, not 20260906_194042_f0b3c774".
 
 from __future__ import annotations
 
+import json
 import sqlite3
+import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -28,6 +32,18 @@ DEAD_SESSION = "20260906_194042_f0b3c774"  # names no row at all (compression ro
 OLD_SESSION = "20261001_000000_deadbeef"  # real row, ended
 LIVE_SESSION = "20261014_023141_da82753a"  # real row, current live
 DM_KEY = "agent:main:telegram:dm:8900123006"
+
+
+@pytest.fixture(autouse=True)
+def _no_real_wake(monkeypatch):
+    """Hostage guard (agent-wake-routing): fails loud on a real wake send."""
+
+    def _guard(*_args, **_kwargs):
+        raise AssertionError(
+            "real 'hermes send' attempted — fake subprocess.run in the test"
+        )
+
+    monkeypatch.setattr("subprocess.run", _guard)
 
 
 def _profiles(tmp_path, monkeypatch):
@@ -137,7 +153,12 @@ def test_session_origin_wakes_live_session_not_home(tmp_path, monkeypatch):
         overwrite=True,
     )
     target = kb.wake_target_for(conn, tid, "gopher")
-    assert target == f"gopher:cli:{LIVE_SESSION}"
+    # t_de2a9b4a contract: a chat-backed session rolls up to its CHAT —
+    # the :cli: shape does NOT inject into the named session (the copy
+    # posts to the profile's home session), so it cannot satisfy "lands
+    # in the live session". See test_wake_target_shape.py.
+    assert target == "gopher:telegram:8900123006"
+    assert ":cli:" not in target
 
 
 def test_stale_origin_rolls_forward_instead_of_waking_dead_session(
@@ -156,7 +177,8 @@ def test_stale_origin_rolls_forward_instead_of_waking_dead_session(
         overwrite=True,
     )
     target = kb.wake_target_for(conn, tid, "gopher")
-    assert target == f"gopher:cli:{LIVE_SESSION}"
+    # t_de2a9b4a contract: rolls forward to the live session's CHAT shape.
+    assert target == "gopher:telegram:8900123006"
     assert OLD_SESSION not in target
 
 
@@ -241,11 +263,17 @@ def test_send_user_passes_live_session_target_to_send_t(tmp_path, monkeypatch):
 
     sent: list[list[str]] = []
 
-    def fake_spawn(argv, **_kw):
-        sent.append(list(argv))
-        return object()
+    class _SendProc:
+        returncode = 0
+        stdout = json.dumps({"delivered": True})
+        stderr = ""
 
-    monkeypatch.setattr("hermes_cli._subprocess_compat.spawn_detached", fake_spawn)
+    def fake_run(argv, **_kw):
+        sent.append(list(argv))
+        return _SendProc()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
     error = plan_binding_adapter._send_user("gopher", "ping", conn=conn, task_id=tid)
     assert error is None
-    assert sent == [["hermes", "send", "-t", f"gopher:cli:{LIVE_SESSION}", "ping"]]
+    # t_de2a9b4a contract: the resolved target is the CHAT shape.
+    assert sent == [["hermes", "send", "-t", "gopher:telegram:8900123006", "ping"]]

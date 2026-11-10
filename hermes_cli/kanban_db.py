@@ -3840,6 +3840,40 @@ def _is_acting_session(session_id: str) -> bool:
     return bool(actor) and actor == session_id
 
 
+def _binding_live_session_id(conn: sqlite3.Connection, profile: str, task_id: str) -> Optional[str]:
+    """The plan worker's bound session from ``execution_bindings`` (t_1098032b).
+
+    A plan worker's durable wiring is its execution binding
+    (``profile + task_id -> root_session_id``). ``sessions.task_id`` is
+    stamped only on ``HERMES_KANBAN_TASK`` boots, so a plan-continue worker
+    is invisible to :func:`resolve_worker_live_session_id` and worker wakes
+    fell through to the home channel (Gopher's review response never reached
+    Ornith's worker session, 2026-11-10). Newest binding first; the first
+    root that rolls forward to a live session wins, else the newest root.
+    Tolerates legacy/hand-rolled schemas without the table (t_853aa789).
+    """
+    try:
+        rows = conn.execute(
+            "SELECT root_session_id FROM execution_bindings "
+            "WHERE profile = ? AND task_id = ? "
+            "ORDER BY updated_at DESC LIMIT 5",
+            (str(profile or "").casefold(), str(task_id or "")),
+        ).fetchall()
+    except sqlite3.Error:
+        return None
+    newest = None
+    for row in rows:
+        root = str(row[0] or "").strip()
+        if not root:
+            continue
+        if newest is None:
+            newest = root
+        live = resolve_live_session_id(profile, root)
+        if live:
+            return live
+    return newest
+
+
 def wake_target_for(conn: sqlite3.Connection, task_id: str, recipient: str) -> str:
     """Use-time wake target for a plan/kanban message to *recipient*.
 
@@ -3879,8 +3913,21 @@ def wake_target_for(conn: sqlite3.Connection, task_id: str, recipient: str) -> s
             return target
     else:
         live = resolve_worker_live_session_id(recipient, task_id)
+        if not live:
+            # t_1098032b: plan workers are wired via execution_bindings, not
+            # sessions.task_id — see _binding_live_session_id.
+            live = _binding_live_session_id(conn, recipient, task_id)
         if live and not _is_acting_session(live):
-            return f"{recipient}:cli:{live}"
+            # Worker direction rolls up to the CHAT target exactly like the
+            # origin direction (t_de2a9b4a row 505784): the bare ``:cli:``
+            # shape does NOT inject into the named session — the wake copy
+            # posts to the profile's HOME session and the worker never sees
+            # it. ``session_wake_target`` already keeps ``:cli:`` for
+            # genuinely chatless live sessions; when it resolves to None the
+            # id is unresolvable and rule 2 says fall back to the bare
+            # profile (the DM) — never ``:cli:<dead-id>``.
+            target = session_wake_target(recipient, live)
+            return target or recipient
     return recipient
 
 

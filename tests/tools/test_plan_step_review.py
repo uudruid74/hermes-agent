@@ -6,8 +6,23 @@ import json
 import sqlite3
 from types import SimpleNamespace
 
+import pytest
+
 from hermes_cli.kanban_db import SCHEMA_SQL
 from tools import plan
+
+
+@pytest.fixture(autouse=True)
+def _no_real_wake(monkeypatch):
+    """Hostage guard (agent-wake-routing): a test that forgets to fake the
+    wake transport fails loud instead of firing a real 'hermes send'."""
+
+    def _guard(*_args, **_kwargs):
+        raise AssertionError(
+            "real 'hermes send' attempted — fake subprocess.run in the test"
+        )
+
+    monkeypatch.setattr("subprocess.run", _guard)
 
 
 class _SessionDB:
@@ -51,6 +66,8 @@ def _db() -> sqlite3.Connection:
 
 
 def _install(monkeypatch):
+    import subprocess
+
     from hermes_cli import _subprocess_compat
 
     conn = _db()
@@ -61,8 +78,20 @@ def _install(monkeypatch):
         # Truthy handle = "spawned successfully"; None = spawn failure.
         return SimpleNamespace()
 
+    class _SendProc:
+        returncode = 0
+        stdout = json.dumps({"delivered": True})
+        stderr = ""
+
+    def run(argv, **_kwargs):
+        # The verified wake transport (_bridge_cli_wake runs 'hermes send'
+        # to completion and checks its JSON result): capture argv, confirm.
+        sent.append(list(argv))
+        return _SendProc()
+
     monkeypatch.setattr(plan, "_get_kanban_db", lambda board=None: conn)
     monkeypatch.setattr(_subprocess_compat, "spawn_detached", spawn)
+    monkeypatch.setattr(subprocess, "run", run)
     monkeypatch.setenv("USERNAME", "neo")
     return conn, sent
 

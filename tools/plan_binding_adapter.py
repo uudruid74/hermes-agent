@@ -893,25 +893,31 @@ def _send_user(
     conn=None,
     task_id: Optional[str] = None,
 ) -> Optional[str]:
-    """Wake *profile* with *message* via ``hermes send -t`` (user-turn inject).
+    """Wake *profile* with *message* via a VERIFIED ``hermes send -t``.
 
     When ``conn``/``task_id`` are given, the wake target is resolved at use
     time (``hermes_cli.kanban_db.wake_target_for``) — the task's origin
     session/chat or the worker's live bound session — instead of the
     profile home channel.
-    """
-    from hermes_cli._subprocess_compat import spawn_detached
 
+    Delivery is verified (t_1098032b): the send runs to completion and its
+    JSON result must confirm the turn landed, the canonical
+    ``_bridge_cli_wake`` pattern. The old detached spawn returned success on
+    process launch alone, so callers claimed "delivered" for wakes that
+    never arrived (Gopher's review response never reached Ornith's worker
+    session, 2026-11-10 — Evan: "the review didn't land"). Returns None
+    only on confirmed delivery.
+    """
     target = profile
     if conn is not None and task_id:
         from hermes_cli import kanban_db as kb
 
         target = kb.wake_target_for(conn, task_id, profile)
-    proc = spawn_detached(["hermes", "send", "-t", target, message])
-    if proc is None:
-        # Spawn failure (binary missing, permission) — surfaced, not buried.
-        return f"failed to launch 'hermes send' for {target}"
-    return None
+    from cron.scheduler import _bridge_cli_wake
+
+    if _bridge_cli_wake(target, message):
+        return None
+    return f"'hermes send -t {target}' did not confirm delivery"
 
 
 def _review_request_text(task, pending, *, auto_approved: bool = False) -> str:

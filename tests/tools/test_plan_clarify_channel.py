@@ -26,6 +26,20 @@ from tests.tools.test_plan_step_review import (  # noqa: E402
 from tools import plan  # noqa: E402
 from tools import plan_binding_adapter  # noqa: E402
 
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _no_real_wake(monkeypatch):
+    """Hostage guard (agent-wake-routing): fails loud on a real wake send."""
+
+    def _guard(*_args, **_kwargs):
+        raise AssertionError(
+            "real 'hermes send' attempted — fake subprocess.run in the test"
+        )
+
+    monkeypatch.setattr("subprocess.run", _guard)
+
 
 def test_plan_clarify_command_is_gone(monkeypatch):
     """One clarify tool only: `plan clarify` must not exist anywhere."""

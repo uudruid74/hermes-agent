@@ -21,6 +21,8 @@ import json
 import sqlite3
 from types import SimpleNamespace
 
+import pytest
+
 from hermes_cli import plan_authorizations as pa
 from hermes_cli.kanban_db import SCHEMA_SQL
 from tools import plan
@@ -29,6 +31,45 @@ from tools import plan_binding_adapter
 REVIEWER_SESSION = "20260906_194042_f0b3c774"
 WORKER_SESSION = "20261021_202440_b3b8141b"
 REVIEWER_LINE = f"Reviewer: zephyr (session_id={REVIEWER_SESSION})"
+
+
+def _fake_wake(monkeypatch, sink=None):
+    """Fake BOTH wake transports into *sink*: the fire-and-forget dispatch
+    spawn and the verified send run (_bridge_cli_wake checks the JSON
+    result). The autouse hostage guard below holds the real transport."""
+    import subprocess
+
+    from hermes_cli import _subprocess_compat
+
+    def _capture(argv, **_kw):
+        if sink is not None:
+            sink.append(list(argv))
+        return SimpleNamespace(pid=1)
+
+    class _SendProc:
+        returncode = 0
+        stdout = json.dumps({"delivered": True})
+        stderr = ""
+
+    def _run(argv, **_kw):
+        if sink is not None:
+            sink.append(list(argv))
+        return _SendProc()
+
+    monkeypatch.setattr(_subprocess_compat, "spawn_detached", _capture)
+    monkeypatch.setattr(subprocess, "run", _run)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_wake(monkeypatch):
+    """Hostage guard (agent-wake-routing): fails loud on a real wake send."""
+
+    def _guard(*_args, **_kwargs):
+        raise AssertionError(
+            "real 'hermes send' attempted — fake the wake transport in the test"
+        )
+
+    monkeypatch.setattr("subprocess.run", _guard)
 
 
 class _SessionDB:
@@ -174,17 +215,11 @@ def test_delegate_wake_drops_tell_guidance_and_names_reviewer(monkeypatch):
     conn = _db()
     sent: list[list[str]] = []
 
-    def spawn(argv, **_kwargs):
-        sent.append(list(argv))
-        return SimpleNamespace()
-
     monkeypatch.setattr(plan, "_get_kanban_db", lambda board=None: conn)
     monkeypatch.setattr(
         plan, "clarify_tool", lambda *_args, **_kwargs: '{"user_response":"Approve"}'
     )
-    from hermes_cli import _subprocess_compat
-
-    monkeypatch.setattr(_subprocess_compat, "spawn_detached", spawn)
+    _fake_wake(monkeypatch, sent)
 
     creator = _Agent("zephyr", REVIEWER_SESSION)
     worker = _Agent("ornith", WORKER_SESSION)
@@ -257,10 +292,7 @@ def test_plan_approval_routes_to_dispatcher_and_continue_gates_on_it(monkeypatch
     monkeypatch.setattr(plan, "_get_kanban_db", lambda board=None: conn)
     monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda name: True)
     wakes = []
-    monkeypatch.setattr(
-        "hermes_cli._subprocess_compat.spawn_detached",
-        lambda argv, **kw: wakes.append(list(argv)) or SimpleNamespace(pid=1),
-    )
+    _fake_wake(monkeypatch, wakes)
     calls = []
 
     def interactive_stub(question, choices=None, **kwargs):
@@ -335,10 +367,7 @@ def test_self_created_top_level_plan_keeps_interactive_buttons(monkeypatch):
 
     monkeypatch.setattr(plan, "clarify_tool", stub)
     wakes = []
-    monkeypatch.setattr(
-        "hermes_cli._subprocess_compat.spawn_detached",
-        lambda argv, **kw: wakes.append(list(argv)) or SimpleNamespace(pid=1),
-    )
+    _fake_wake(monkeypatch, wakes)
     worker = _Agent("ornith", WORKER_SESSION)
     out = plan.plan(worker, "new", title="My own plan", goal="g", steps=["one"])
     assert out.startswith("TASK APPROVED"), out
@@ -353,10 +382,7 @@ def test_child_plan_inherits_parent_board(monkeypatch):
     _seed_dispatch_parent(conn, board="pente")
     monkeypatch.setattr(plan, "_get_kanban_db", lambda board=None: conn)
     monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda name: True)
-    monkeypatch.setattr(
-        "hermes_cli._subprocess_compat.spawn_detached",
-        lambda argv, **kw: SimpleNamespace(pid=1),
-    )
+    _fake_wake(monkeypatch)
     worker = _Agent("ornith", WORKER_SESSION)
     out = plan.plan(worker, "new", title="child plan", goal="g", steps=["one"])
     task_id = out.split("(", 1)[1].split(")", 1)[0]
@@ -412,10 +438,7 @@ def test_denial_with_approval_shaped_reason_records_verbatim(monkeypatch):
     conn = _db()
     task_id = _seed_plan(conn)
     monkeypatch.setattr(plan, "_get_kanban_db", lambda board=None: conn)
-    monkeypatch.setattr(
-        "hermes_cli._subprocess_compat.spawn_detached",
-        lambda argv, **kw: SimpleNamespace(pid=1),
-    )
+    _fake_wake(monkeypatch)
     worker = _Agent("ornith", WORKER_SESSION)
     submitted = plan_binding_adapter.cmd_advance(worker, summary="step one done")
     assert "Pause and wait" in submitted, submitted
@@ -451,10 +474,7 @@ def test_approved_review_with_reason_is_refused(monkeypatch):
     conn = _db()
     task_id = _seed_plan(conn)
     monkeypatch.setattr(plan, "_get_kanban_db", lambda board=None: conn)
-    monkeypatch.setattr(
-        "hermes_cli._subprocess_compat.spawn_detached",
-        lambda argv, **kw: SimpleNamespace(pid=1),
-    )
+    _fake_wake(monkeypatch)
     worker = _Agent("ornith", WORKER_SESSION)
     submitted = plan_binding_adapter.cmd_advance(worker, summary="step one done")
     assert "Pause and wait" in submitted, submitted
@@ -550,10 +570,7 @@ def test_child_close_restores_parked_parent_and_parent_advances(monkeypatch):
     conn.commit()
     monkeypatch.setattr(plan, "_get_kanban_db", lambda board=None: conn)
     monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda name: True)
-    monkeypatch.setattr(
-        "hermes_cli._subprocess_compat.spawn_detached",
-        lambda argv, **kw: SimpleNamespace(pid=1),
-    )
+    _fake_wake(monkeypatch)
     worker = _Agent("ornith", WORKER_SESSION)
     submitted = plan_binding_adapter.cmd_advance(worker, summary="step three done")
     assert "Pause and wait" in submitted, submitted
