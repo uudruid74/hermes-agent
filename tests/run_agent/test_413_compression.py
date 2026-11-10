@@ -108,6 +108,20 @@ def agent():
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _no_ephemeral_neighbor_injections():
+    """Isolate the DB-state-dependent per-turn injections (ego ratings
+    block, active-plan-state block) from the persistence/wire mechanics
+    under test — both ride the api_content composition deliberately and
+    are pinned in tests/agent/test_api_content_sidecar; leaking them here
+    made these tests depend on the live rating and binding DB state."""
+    with (
+        patch("agent.turn_context._build_ratings_injection", lambda agent: ""),
+        patch("agent.turn_context.active_plan_api_context", lambda agent: ""),
+    ):
+        yield
+
+
 def test_current_user_turn_is_persisted_before_provider_call(agent):
     """The inbound user turn is flushed before provider/tool work can crash."""
     observed = []

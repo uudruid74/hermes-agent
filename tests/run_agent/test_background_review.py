@@ -47,6 +47,7 @@ def test_background_review_shuts_down_memory_provider_before_close(monkeypatch):
         def __init__(self, **kwargs):
             events.append(("init", kwargs))
             self._session_messages = []
+            self.session_id = kwargs.get("session_id", "")
 
         def run_conversation(self, **kwargs):
             events.append(("run_conversation", kwargs))
@@ -77,16 +78,18 @@ def test_background_review_shuts_down_memory_provider_before_close(monkeypatch):
 
 
 def test_background_review_fork_opts_out_of_session_finalization(monkeypatch):
-    """The review fork shares the parent's live session_id, so it must set
+    """The review fork is single-lifecycle, so it must set
     ``_end_session_on_close = False``. Otherwise close() (now finalizing owned
-    session rows) would end the still-active parent session mid-conversation
-    every time the review fires (~every 10 turns). Regression for #12029.
+    session rows) would end the fork's own isolated ``{parent}:bg-review``
+    row mid-flight every time the review fires (~every 10 turns).
+    Regression for #12029.
     """
     seen = {}
 
     class FakeReviewAgent:
         def __init__(self, **kwargs):
             self._session_messages = []
+            self.session_id = kwargs.get("session_id", "")
             # Default matches AIAgent.__init__ (agent_init.py): owns its row.
             self._end_session_on_close = True
 

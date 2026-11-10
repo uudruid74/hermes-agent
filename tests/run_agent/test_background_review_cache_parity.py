@@ -239,10 +239,12 @@ def test_review_fork_inherits_prefill_and_provider_routing():
 def test_review_fork_pins_session_start_and_session_id():
     """Defensive complement to cached-system-prompt inheritance.
 
-    Even though ``_cached_system_prompt`` inheritance short-circuits the
-    normal rebuild path, pinning ``session_start`` and ``session_id`` to
-    the parent's guarantees byte-identical output from any code path that
-    re-renders parts of the system prompt (compression, plugin hooks).
+    The fork runs on its own isolated child session id (``{parent}:bg-review``,
+    the concurrent-loop session-race fix of 2026-11-09) and must never share
+    the parent's live id. System-prompt rebuild parity is carried by the
+    ``_cached_system_prompt`` inheritance plus the ``session_start`` pin —
+    ``pass_session_id`` defaults to False so rendered prompt bytes don't
+    embed the session id at all.
     """
     import run_agent
 
@@ -265,9 +267,13 @@ def test_review_fork_pins_session_start_and_session_id():
         "Review fork did not inherit parent's session_start — "
         "system-prompt rebuild paths would diverge."
     )
-    assert captured.get("session_id") == agent.session_id, (
-        "Review fork did not inherit parent's session_id — "
-        "system-prompt rebuild paths would diverge."
+    init_kwargs = captured.get("init_kwargs") or {}
+    assert init_kwargs.get("session_id") == f"{agent.session_id}:bg-review", (
+        "Review fork must be constructed on its isolated child session id."
+    )
+    assert init_kwargs.get("session_id") != agent.session_id, (
+        "Review fork must not share the parent's live session_id "
+        "(concurrent-loop session race, 2026-11-09)."
     )
 
 

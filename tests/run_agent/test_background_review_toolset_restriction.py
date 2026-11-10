@@ -109,6 +109,7 @@ def test_background_review_installs_thread_local_whitelist():
     def _no_init(self, *args, **kwargs):
         # Don't crash AIAgent.__init__; let execution flow reach
         # set_thread_tool_whitelist.
+        self.session_id = kwargs.get("session_id", "")
         return None
 
     with patch.object(run_agent.AIAgent, "__init__", _no_init), \

@@ -1181,12 +1181,13 @@ def _run_review_in_thread(
             # and would miss anyway, so let the routed fork build its own.
             if not _routed:
                 review_agent._cached_system_prompt = agent._cached_system_prompt
-                # Defensive: pin session_start + session_id to the
-                # parent's so any code path that re-renders parts of
-                # the system prompt (compression, plugin hooks) still
-                # produces byte-identical output. The cached-prompt
+                # Defensive: pin session_start to the parent's so any code
+                # path that re-renders parts of the system prompt
+                # (compression, plugin hooks) still produces byte-identical
+                # output (the rendered bytes don't embed the fork's session
+                # id — pass_session_id defaults to False). The cached-prompt
                 # assignment above already short-circuits the normal
-                # rebuild path, but these pins guarantee parity even
+                # rebuild path, but this pin guarantees parity even
                 # if a future code path bypasses the cache.
                 review_agent.session_start = agent.session_start
             # The fork's session id was set at construction above to its

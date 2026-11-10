@@ -4263,6 +4263,8 @@ class TestRunConversation:
             patch.object(agent, "_cleanup_task_resources"),
             patch.object(agent.context_compressor, "update_model"),
             patch.object(agent, "_compress_context", mock_compress),
+            patch("agent.turn_context._build_ratings_injection", lambda agent: ""),
+            patch("agent.turn_context.active_plan_api_context", lambda agent: ""),
         ):
             result = agent.run_conversation("hello")
 
