@@ -35,7 +35,9 @@ from agent.context_engine import ContextEngine, sanitize_memory_context
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.internal_compression_fallback import (
     INTERNAL_FALLBACK_PREFIX,
+    _tool_call_rows_by_id,
     build_internal_fallback,
+    collapse_tail_tool_pairs,
 )
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
@@ -6643,6 +6645,20 @@ This compaction should PRIORITISE preserving all information related to the focu
             stripped = self._strip_context_summary_handoff_message(msg)
             if stripped is not None:
                 tail_messages.append(stripped)
+
+        # Bounded tail tool-pair collapse (Evan-approved, 2026-11-10) — the
+        # Phase-4 assembly of BOTH summary paths (LLM and internal fallback)
+        # goes through here, so the in-window pair collapse is applied once,
+        # deterministically, to the assembled tail: the N most recent tool
+        # pairs verbatim with full results (N = protect_last_n, the config's
+        # double meaning), OLDER pairs in the window → one-line tool-trail
+        # digests in place. (build_internal_fallback applies the same pure
+        # function earlier so its measurement and rungs see the light tail.)
+        tail_messages, _collapsed_tail_pairs = collapse_tail_tool_pairs(
+            tail_messages,
+            self.protect_last_n,
+            call_rows=_tool_call_rows_by_id(messages),
+        )
 
         _merge_summary_into_tail = False
         # last_head_role reads the assembled (post-strip) head; first_tail_role

@@ -779,6 +779,17 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
                         known_tool_ids.add(tc_id)
             filtered.append(msg)
         elif role == "tool":
+            # In-stream tool-trail digests (bounded tail tool-pair collapse,
+            # 2026-11-10) are ledger provenance lines, not tool results: no
+            # tool_call_id to match, and dropping them as strays would
+            # silently erase the collapsed pair's action at the API belt.
+            # Lazy import: keep the belt's import surface at module load
+            # unchanged (same pattern as hermes_state's restore repair).
+            from agent.internal_compression_fallback import is_trail_digest_message
+
+            if is_trail_digest_message(msg):
+                filtered.append(msg)
+                continue
             tc_id = msg.get("tool_call_id")
             if tc_id and tc_id in known_tool_ids:
                 filtered.append(msg)

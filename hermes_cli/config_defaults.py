@@ -596,7 +596,12 @@ DEFAULT_CONFIG = {
         "target_ratio": 0.20,         # fraction of threshold to preserve as recent tail
         "internal_only": False,       # opt-in: skip all LLM summary providers and use
                                       # only the deterministic local CPU fallback
-        "protect_last_n": 20,         # minimum recent messages to keep uncompressed
+        "protect_last_n": 20,         # DOUBLE MEANING (2026-11-10): N visible
+                                      # turns bound the tail region; within it,
+                                      # the N most recent tool-call pairs stay
+                                      # verbatim with full results and OLDER
+                                      # tool pairs in the window collapse to
+                                      # one-line tool-trail digests.
         "min_tail_user_messages": 1,  # REAL (actionable) user messages guaranteed to
                                       # survive in the uncompressed tail. 1 = existing
                                       # single last-user anchor (default, behavior-
@@ -607,7 +612,9 @@ DEFAULT_CONFIG = {
                                       # with "max compression attempts reached". Raise
                                       # (e.g. 6) for tool-schema-heavy sessions where 3
                                       # rounds cannot clear the request estimate.
-                                      # Validated >= 1, hard-capped at 10.
+                                      # 0 (or any value < 1) = UNLIMITED attempts
+                                      # (the limit is turned off). Positive values are
+                                      # hard-capped at 10.
         "proactive_prune_tokens": 0,  # opt-in trigger (tokens) for the deterministic,
                                       # no-LLM tool-result prune, run independently of
                                       # `threshold` above. On large-window models

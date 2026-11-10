@@ -1169,6 +1169,178 @@ def _strip_tail_tool_rows(
     return out, dropped
 
 
+# ------------------------------------------- bounded tail tool-pair collapse
+# Evan-approved design (2026-11-10, relayed by Gopher): ``protect_last_n``
+# keeps its public meaning — N visible turns bound the tail region — but
+# within that window the N most recent tool-call PAIRS stay verbatim with
+# FULL results while every OLDER pair collapses to one one-line tool-trail
+# digest (the Phase-2 t_490b92fc line format) in place. Measured need
+# (Ornith's wedged session): 8 visible turns swallowed 323 rows / 159 tool
+# rows — tool output was 78% of the protected tail and off-limits.
+
+_TRAIL_DIGEST_PREFIX = "[TOOL]: "
+
+
+def is_trail_digest_message(message: dict[str, Any]) -> bool:
+    """True for an in-stream tool-trail digest row (bounded tail collapse).
+
+    Digest rows carry the ledger's ``[TOOL]: `` line as content and NO
+    ``tool_call_id`` — they are provenance lines, not tool results — so the
+    pre-API pairing belt (``repair_message_sequence`` Pass 1) must exempt
+    them instead of dropping them as strays.
+    """
+    if message.get("role") != "tool" or message.get("tool_call_id"):
+        return False
+    content = message.get("content")
+    return isinstance(content, str) and content.startswith(_TRAIL_DIGEST_PREFIX)
+
+
+def _tool_call_rows_by_id(
+    rows: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """cid -> assistant tool_calls row, for orphan-result digest rendering."""
+    by_id: dict[str, dict[str, Any]] = {}
+    for message in rows:
+        if message.get("role") != "assistant" or not message.get("tool_calls"):
+            continue
+        for call in message.get("tool_calls") or []:
+            if not isinstance(call, dict):
+                continue
+            cid = str(call.get("id") or call.get("call_id") or "")
+            if cid and cid not in by_id:
+                by_id[cid] = message
+    return by_id
+
+
+def collapse_tail_tool_pairs(
+    tail_rows: list[dict[str, Any]],
+    keep_pairs: int,
+    *,
+    call_rows: dict[str, dict[str, Any]] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Bounded tool-pair collapse inside the protected tail.
+
+    Within ``tail_rows`` the ``keep_pairs`` most recent tool-call pairs
+    (assistant ``tool_calls`` entry + its matching tool result rows) stay
+    verbatim with FULL results; every OLDER pair collapses to one one-line
+    tool-trail digest placed where the pair's rows were. Visible rows are
+    never touched. Row-atomic rule (Oct-27 ruling: kept rows are never
+    mutated): an assistant row holding any kept call is kept whole with all
+    its results, so kept-pair counts exceed ``keep_pairs`` at those
+    straddles. Fewer than ``keep_pairs`` pairs → byte-identical output
+    (light-session invariant).
+
+    ``call_rows`` maps cid -> the assistant row for pairs whose call entry
+    lives outside the tail (orphan results) — needed only to render their
+    digest line.
+
+    Returns ``(new_rows, collapsed_rows)`` — ``collapsed_rows`` are the
+    removed originals (telemetry/provenance). They are already digested in
+    place: one channel per row, they must NOT additionally feed the trail
+    ledger. The input list is never mutated.
+    """
+    if keep_pairs < 0:
+        keep_pairs = 0
+    if not tail_rows:
+        return tail_rows, []
+    call_rows = call_rows or {}
+
+    # Units: one per tool_call id. Ordered by first row in the tail.
+    unit_rows: dict[str, list[dict[str, Any]]] = {}
+    unit_order: dict[str, int] = {}
+    row_units: dict[int, set[str]] = {}
+    for offset, message in enumerate(tail_rows):
+        role = message.get("role")
+        if role == "assistant" and message.get("tool_calls"):
+            for call in message.get("tool_calls") or []:
+                if not isinstance(call, dict):
+                    continue
+                cid = str(call.get("id") or call.get("call_id") or "")
+                if not cid:
+                    continue
+                unit_rows.setdefault(cid, []).append(message)
+                unit_order.setdefault(cid, offset)
+                row_units.setdefault(offset, set()).add(cid)
+        elif role == "tool":
+            cid = str(message.get("tool_call_id") or "")
+            if not cid or is_trail_digest_message(message):
+                continue
+            unit_rows.setdefault(cid, []).append(message)
+            unit_order.setdefault(cid, offset)
+            row_units.setdefault(offset, set()).add(cid)
+
+    if not unit_rows:
+        return tail_rows, []
+    ordered = sorted(unit_rows, key=lambda cid: unit_order[cid])
+
+    # Keep set: the newest N units, expanded to full rows — any unit sharing
+    # a row with a kept unit is kept too (row-atomic straddle rule).
+    keep: set[str] = set(ordered[-keep_pairs:]) if keep_pairs else set()
+    changed = True
+    while changed:
+        changed = False
+        for cid in list(keep):
+            for unit in unit_rows[cid]:
+                offset = tail_rows.index(unit) if unit in tail_rows else None
+                if offset is None:
+                    continue
+                for peer in row_units.get(offset, ()):
+                    if peer not in keep:
+                        keep.add(peer)
+                        changed = True
+
+    # Render one digest line per collapsed pair (the t_490b92fc format,
+    # 1:1 — the fusion pass over a single occurrence is one line).
+    digest_for: dict[str, str] = {}
+    for cid in ordered:
+        if cid in keep:
+            continue
+        render_rows = unit_rows[cid]
+        if render_rows and not (
+            render_rows[0].get("role") == "assistant" and render_rows[0].get("tool_calls")
+        ):
+            call_row = call_rows.get(cid)
+            if call_row is not None:
+                render_rows = [call_row] + render_rows
+        occurrences = _tool_trail_scan(render_rows, start_index=0)
+        lines = _tool_trail_lines(occurrences)
+        digest_for[cid] = (
+            lines[0].text
+            if lines
+            else f"{_TRAIL_DIGEST_PREFIX}tool_call_id {cid} — collapsed"
+        )
+
+    # Assemble: visible rows and kept units pass through byte-identical;
+    # each collapsed pair's rows collapse to one digest at its first row.
+    first_row_cid: dict[int, str] = {}
+    for cid in ordered:
+        offset = unit_order[cid]
+        first_row_cid.setdefault(offset, cid)
+
+    dropped_ids: set[int] = set()
+    for cid in ordered:
+        if cid in keep:
+            continue
+        for unit in unit_rows[cid]:
+            for offset, row in enumerate(tail_rows):
+                if row is unit:
+                    dropped_ids.add(offset)
+
+    out: list[dict[str, Any]] = []
+    collapsed: list[dict[str, Any]] = []
+    emitted: set[str] = set()
+    for offset, message in enumerate(tail_rows):
+        if offset in dropped_ids:
+            collapsed.append(message)
+            cid = first_row_cid.get(offset)
+            if cid is not None and cid not in emitted and cid in digest_for:
+                out.append({"role": "tool", "content": digest_for[cid]})
+                emitted.add(cid)
+            continue
+        out.append(message)
+    return out, collapsed
+
+
 def _is_observation(message: dict[str, Any]) -> bool:
     """True for environment observations (tool results).
 
@@ -3582,6 +3754,19 @@ def build_internal_fallback(
     # occupies one reserved slot; globally ranked units fill the rest.
     head_count = system_head if plan_active and not null_mode else raw_head_count
     tail_start = _verbatim_tail_start(messages, head_count, protect_last_n)
+    # Bounded tail tool-pair collapse (Evan-approved, 2026-11-10): within
+    # the protected tail keep only the N most recent tool pairs verbatim
+    # (protect_last_n = the pair keep count — the config's double meaning);
+    # OLDER tool pairs in the window collapse to one-line tool-trail
+    # digests in place. Runs BEFORE tail measurement so the mask/strip
+    # rungs and _fits see the light tail (Ornith shape: 78% of the
+    # protected tail was tool output inside the window).
+    _tail_region, _collapsed_tail_pairs = collapse_tail_tool_pairs(
+        messages[tail_start:],
+        protect_last_n,
+        call_rows=_tool_call_rows_by_id(messages[:tail_start]),
+    )
+    messages = messages[:tail_start] + _tail_region
     selection_telemetry = _blank_selection_telemetry()
 
     memory = protected_memory or ProtectedMemory()
@@ -3682,8 +3867,12 @@ def build_internal_fallback(
     # step-change (completed steps stay out of the ranking per Evan
     # 2026-09-16, but their provenance is not noise) and the rows the tail
     # rungs destroyed.  One channel per row: nothing dropped, and no
-    # duplication across regions — rows the verbatim tail keeps raw are
-    # deliberately NOT digested anywhere.
+    # duplication across regions — rows the verbatim tail keeps raw (the
+    # newest N tool pairs and the visible rows) are deliberately NOT
+    # digested anywhere, and the OLDER tail pairs that
+    # ``collapse_tail_tool_pairs`` digested in place above are likewise NOT
+    # re-digested here (one channel per row: the digest rows ARE their
+    # ledger line).
     rank_start = _plan_step_change_index(messages, head_count, tail_start)
     tool_units = _collapsed_tool_units(
         messages[rank_start:tail_start], start_index=rank_start
