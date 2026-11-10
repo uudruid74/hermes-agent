@@ -595,7 +595,10 @@ DEFAULT_CONFIG = {
                                       # the model's context length at apply-time.
         "target_ratio": 0.20,         # fraction of threshold to preserve as recent tail
         "internal_only": False,       # opt-in: skip all LLM summary providers and use
-                                      # only the deterministic local CPU fallback
+                                      # only the deterministic local CPU fallback.
+                                      # When true, max_attempts is FORCED to 1
+                                      # (retries are pointless without an LLM) —
+                                      # any configured max_attempts is ignored.
         "protect_last_n": 20,         # DOUBLE MEANING (2026-11-10): N visible
                                       # turns bound the tail region; within it,
                                       # the N most recent tool-call pairs stay

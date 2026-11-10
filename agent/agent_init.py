@@ -2041,6 +2041,15 @@ def init_agent(
         compression_internal_only: bool | None = None
     else:
         compression_internal_only = is_truthy_value(_raw_internal_only, default=False)
+    # Deterministic compressor → forced single attempt (Evan 2026-11-10):
+    # "retrying a deterministic compressor is pointless — same input, same
+    # output; the retry budget only makes sense for LLM summarizers where a
+    # retry can produce a different (smaller) result." When internal_only is
+    # true the LLM is skipped entirely, so compression.max_attempts is
+    # forced to 1 — overriding ANY configured value, including the 0 =
+    # unlimited bypass (a deterministic single pass is all there is).
+    if compression_internal_only is True:
+        compression_max_attempts = 1
     # Per-model threshold overrides: keys are substring-matched against the
     # model name (longest match wins). Empty dict = use the global threshold
     # for all models (backward compatible).
