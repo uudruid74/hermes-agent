@@ -30,7 +30,7 @@ The script hits 'eject.' We're the parachute.
 | 🦊 **Zephyr**<br>`#FF6B35` | Gopher's assistant, built by Gopher, to do routine tasks. Now a dispatcher in his own right. |
 | 🐦 **Ornith**<br>`#5D63BB` | The canary — runs background reviews and audits so bad code dies before the miners do. If it breaks Ornith first, we fixed it here instead of in production. |
 
-Five profiles, one gateway, one bot token. *(There's also a sixth profile on the box — Daxicaruspoc — but it's a lab rat for the Eddon/Dax proving ground, not a teammate. When Dax grows up, the profile dies.)* No group chat. No bot-sees-bot limitations. Just kanban-based routing: somebody gets an event, decides who acts, creates the task, the worker picks it up live.
+Five profiles, one gateway, one bot token. No group chat. No bot-sees-bot limitations. Just kanban-based routing: somebody gets an event, decides who acts, creates the task, the worker picks it up live.
 
 ## What Makes It Alive
 
