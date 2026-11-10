@@ -519,9 +519,12 @@ class TestSendTimeEmptyAssistantPad:
     -stream-stub row written by an older build (content:'' ,
     finish_reason:'length') is rebuilt to content:'' on every reload —
     ``_rows_to_conversation`` strips whitespace, so a DB-side pad cannot
-    survive.  The class owner ``repair_empty_non_final_messages`` (inside
-    ``sanitize_api_messages``, the pre-send chokepoint) must repair the
-    empty textless assistant turn at the serialization boundary, so a
+    survive.  Resumed poisoned rows are healed at the live-replay boundary
+    by ``drop_no_payload_non_final`` (build_turn_context; the 9912330e27
+    empty-turn-spiral fix chose ingest-DROP over re-healing on every
+    request).  In-session empties still pad via the class owner
+    ``repair_empty_non_final_messages`` ("[response interrupted]" — pinned
+    in test_repair_owner_skips_list_content_directly).  Either way a
     RESUMED poisoned session replays cleanly against strict providers
     (Moonshot/Kimi HTTP 400 "message ... with role 'assistant' must not
     be empty" / Anthropic "all messages must have non-empty content")."""
@@ -567,7 +570,19 @@ class TestSendTimeEmptyAssistantPad:
              and not m.get("tool_calls")),
             None,
         )
-        assert stub is not None and stub["content"] == "[response interrupted]"
+        assert stub is None, (
+            "A resumed poisoned no-payload assistant row must be dropped at "
+            f"the live-replay boundary, not replayed: {stub!r}"
+        )
+        merged = [
+            m for m in sent
+            if m.get("role") == "user"
+            and "make me a webpage" in str(m.get("content"))
+        ]
+        assert merged and "please proceed" in str(merged[0].get("content")), (
+            "Dropping the dead row must merge its neighboring user turns: "
+            f"{sent!r}"
+        )
 
     def test_tool_call_turn_not_padded_on_send(self, loop_agent):
         history = [

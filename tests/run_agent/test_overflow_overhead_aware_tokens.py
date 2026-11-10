@@ -155,7 +155,7 @@ class TestHTTP413OverheadAwareTokens:
 
         estimate_calls = []
 
-        def _capture_estimate(messages, tools=None):
+        def _capture_estimate(messages, tools=None, system_prompt=None):
             estimate_calls.append({"messages": messages, "tools": tools})
             return _SENTINEL_TOKENS
 
@@ -249,7 +249,7 @@ class TestContextOverflowOverheadAwareTokens:
 
         estimate_calls = []
 
-        def _capture_estimate(messages, tools=None):
+        def _capture_estimate(messages, tools=None, system_prompt=None):
             estimate_calls.append({"messages": messages, "tools": tools})
             return _SENTINEL_TOKENS
 
@@ -376,7 +376,7 @@ class TestLongContextTierOverheadAwareTokens:
 
         estimate_calls = []
 
-        def _capture_estimate(messages, tools=None):
+        def _capture_estimate(messages, tools=None, system_prompt=None):
             estimate_calls.append({"messages": messages, "tools": tools})
             return _SENTINEL_TOKENS
 

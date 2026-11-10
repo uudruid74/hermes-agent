@@ -1486,6 +1486,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
 
         middleware_trace: list[dict[str, Any]] = []
         _execution_blocked = False
+        _invoke_tool_routed = False
 
         tool_start_time = time.time()
 
@@ -1823,12 +1824,15 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             _spinner_result = None
             try:
                 def _execute(next_args: dict) -> Any:
+                    nonlocal _invoke_tool_routed
+                    _invoke_tool_routed = True
                     return agent._invoke_tool(
                         function_name,
                         next_args,
                         effective_task_id,
                         tool_call_id=tool_call.id,
                         messages=messages,
+                        pre_tool_block_checked=True,
                         skip_tool_request_middleware=True,
                         skip_tool_execution_middleware=True,
                         tool_request_middleware_trace=list(middleware_trace),
@@ -1890,12 +1894,15 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         else:
             try:
                 def _execute(next_args: dict) -> Any:
+                    nonlocal _invoke_tool_routed
+                    _invoke_tool_routed = True
                     return agent._invoke_tool(
                         function_name,
                         next_args,
                         effective_task_id,
                         tool_call_id=tool_call.id,
                         messages=messages,
+                        pre_tool_block_checked=True,
                         skip_tool_request_middleware=True,
                         skip_tool_execution_middleware=True,
                         tool_request_middleware_trace=list(middleware_trace),
@@ -1964,10 +1971,14 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # dispatched inline — they never reach handle_function_call, so the
         # executor is the one that has to fire post_tool_call. For
         # registry-dispatched tools the else-branch above invoked
-        # handle_function_call, which already fires the hook.
+        # handle_function_call, which already fires the hook. Tools routed
+        # through agent._invoke_tool (e.g. tell, set_session) emit their own
+        # hook inside the agent-runtime path (_finish_agent_tool), so the
+        # executor must NOT fire a second one for those.
         from agent.agent_runtime_helpers import agent_runtime_owns_post_tool_hook
         _executor_must_emit_post_hook = (
             not _execution_blocked
+            and not _invoke_tool_routed
             and agent_runtime_owns_post_tool_hook(agent, function_name)
         )
         if _executor_must_emit_post_hook:

@@ -3444,7 +3444,26 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         # and kill the session.  _repair_tool_call_arguments
                         # returns "{}" for unrepairable args, which is far
                         # better than a crashed session.
-                        repaired = _repair_tool_call_arguments(arguments, tool_name)
+                        #
+                        # SAFETY GATE (2026-11-10, restores the #42314 /
+                        # #32086 contracts): salvage applies ONLY to streams
+                        # the provider actually completed.  On an incomplete
+                        # stream — no finish_reason (mid-tool-call drop) or
+                        # finish_reason="length" (genuine output cap) — the
+                        # args are known-untrustworthy regardless of
+                        # syntactic repairability; closing a genuinely
+                        # truncated payload would silently execute partial
+                        # arguments.  Leave them raw so the truncation /
+                        # stream-drop handlers below see the true signal.
+                        _salvageable = (
+                            finish_reason is not None
+                            and finish_reason != FINISH_REASON_LENGTH
+                        )
+                        repaired = (
+                            _repair_tool_call_arguments(arguments, tool_name)
+                            if _salvageable
+                            else "{}"
+                        )
                         if repaired != "{}":
                             # Successfully repaired — use the fixed args
                             arguments = repaired

@@ -2204,6 +2204,8 @@ class TestAgentRuntimePostHookOwnershipSync:
         ("clarify", {"question": "Continue?"}),
         ("read_terminal", {}),
         ("delegate_task", {"goal": "Check the child path"}),
+        ("set_session", {"note": "contract case"}),
+        ("tell", {"agent": "zephyr", "message": "contract case"}),
     )
 
     @pytest.mark.parametrize(("tool_name", "tool_args"), _CASES)
@@ -2241,6 +2243,20 @@ class TestAgentRuntimePostHookOwnershipSync:
         monkeypatch.setattr(
             "tools.read_terminal_tool.read_terminal_tool",
             lambda **kwargs: '{"ok":true}',
+        )
+        monkeypatch.setattr(
+            "tools.set_session_tool.set_session_tool",
+            lambda **kwargs: '{"ok":true}',
+        )
+        monkeypatch.setattr(
+            "tools.tell_tool.tell_tool",
+            lambda **kwargs: '{"ok":true}',
+        )
+        monkeypatch.setattr(
+            agent,
+            "tell_echo_callback",
+            lambda *args, **kwargs: None,
+            raising=False,
         )
         monkeypatch.setattr(agent, "_get_session_db_for_recall", lambda: None)
         monkeypatch.setattr(
@@ -2908,6 +2924,8 @@ class TestRunConversation:
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
+            patch("agent.turn_context._build_ratings_injection", lambda agent: ""),
+            patch("agent.turn_context.active_plan_api_context", lambda agent: ""),
         ):
             result = agent.run_conversation("search something")
 
