@@ -341,18 +341,22 @@ def _emit_result(
 
 
 def _wake_visible_copy_message(target: str, message: str) -> str:
-    """Cap the mandatory ``-u`` copy of a ``-t`` wake to a short notice.
+    """Return the FULL payload for the mandatory ``-u`` copy of a ``-t`` wake.
 
-    The one-call rule (Evan spec 2026-10-18) requires every ``-t`` wake to
-    also carry a human-visible copy down the ``-u`` path.  But the copy must
-    never be the raw payload: when the wake carries a large brief (a cron
-    journal embeds its full skill, ~106K chars, t_94b593b6) the copy chunked
-    into 29 outbound bot messages — the spam Evan saw.
+    Evan's rule (2026-11-11): *"At NO TIME EVER should [I] be denied from
+    seeing the messages that are traveling through my system. A tell command
+    MUST show me the full payload, always."*
 
-    The woken agent's own run is the real signal; the copy exists so a human
-    can see that a wake happened at all.  So: collapse the message to a
-    single short line naming who was woken and where the work continues.
-    Never raise — the copy is doctrine, not a failure of the wake.
+    This previously collapsed any wake over 200 chars down to its first line
+    plus a ``(wake payload: N chars; run continues in the agent's session)``
+    note, to stop a 106K cron-journal payload chunking into 29 outbound
+    messages. That cap made every agent-to-agent tell unreadable: a pente
+    board whose first line is a code fence arrived as a bare "```" plus the
+    note, and the real content was never shown to the human.
+
+    The cap is REMOVED. The visible copy IS the payload. A long payload chunks
+    into several messages — accepted cost of never hiding what travels
+    through the system.
     """
     try:
         stripped = message.strip()
@@ -362,16 +366,7 @@ def _wake_visible_copy_message(target: str, message: str) -> str:
     if not stripped:
         return f"wake fired: {target} (empty payload)"
 
-    first_line = stripped.splitlines()[0]
-    if len(stripped) <= 200:
-        # Short wakes (kanban dispatches, tells) keep their full text.
-        return stripped
-    if len(first_line) <= 280:
-        return f"{first_line} (wake payload: {len(stripped)} chars; run continues in the agent's session)"
-    return (
-        f"cron wake fired: {first_line[:250]}… "
-        f"(wake payload {len(stripped)} chars; run continues in the agent's session)"
-    )
+    return stripped
 
 
 def _list_targets(platform_filter: Optional[str], *, json_mode: bool) -> int:
@@ -737,6 +732,8 @@ def cmd_send(args: argparse.Namespace) -> None:
         "action": "send",
         "message": message,
     }
+    if getattr(args, "raw", False):
+        tool_args["raw"] = True
     if user_flag:
         tool_args["target"] = user_flag
         tool_args["internal"] = True
@@ -895,6 +892,21 @@ def register_send_subparser(subparsers) -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help="Emit raw JSON result instead of human-readable output.",
+    )
+
+    parser.add_argument(
+        "--raw",
+        action="store_true",
+        default=False,
+        help=(
+            "Send the message body EXACTLY as given — skip all markdown "
+            "REWRITING (no MarkdownV2 escaping, no code-fence handling, no "
+            "table->bullet conversion, no plain-text fallback). The body is "
+            "passed to Telegram verbatim; only the parse_mode is detected from "
+            "it (<pre>...</pre> -> HTML, ``` -> MarkdownV2, else plain). Use "
+            "for fixed-width text (boards, tables, ASCII art) where byte-exact "
+            "content matters more than styling."
+        ),
     )
 
     parser.set_defaults(func=cmd_send)
