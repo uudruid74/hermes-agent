@@ -380,6 +380,9 @@ def _handle_send(args, mirror_role=""):
     """Send a message to a platform target."""
     target = args.get("target", "")
     message = args.get("message", "")
+    # --raw: skip all markdown REWRITING; the body goes to the platform
+    # verbatim and only the parse_mode is detected from its content.
+    raw_mode = bool(args.get("raw"))
     if not target or not message:
         return tool_error("Both 'target' and 'message' are required when action='send'")
 
@@ -623,6 +626,7 @@ def _handle_send(args, mirror_role=""):
                 thread_id=thread_id,
                 media_files=media_files,
                 force_document=force_document_attachments,
+                raw=raw_mode,
             )
         )
         if used_home_channel and isinstance(result, dict) and result.get("success"):
@@ -1024,7 +1028,7 @@ async def _send_bridge_command(payload, *, bridge_path=None, operation: str):
     }
 
 
-async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False):
+async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False, raw=False):
     """Route a message to the appropriate platform sender.
 
     Long messages are automatically chunked to fit within platform limits
@@ -1104,6 +1108,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             thread_id=thread_id,
             disable_link_previews=disable_link_previews,
             force_document=force_document,
+            raw=raw,
         )
 
     # --- Discord: chunked delivery via the registry's standalone_sender_fn.
@@ -1417,7 +1422,7 @@ def _is_telegram_thread_not_found(error: Exception) -> bool:
     return "thread not found" in str(error).lower()
 
 
-async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False):
+async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False, raw=False):
     """Send via Telegram Bot API (one-shot, no polling needed).
 
     Applies markdown→MarkdownV2 formatting (same as the gateway adapter)
@@ -1433,7 +1438,21 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         # Inspired by github.com/ashaney — PR #1568.
         _has_html = bool(re.search(r'<[a-zA-Z/][^>]*>', message))
 
-        if _has_html:
+        if raw:
+            # --raw: never rewrite the body. Pick a parse_mode from what the
+            # caller already supplied, so fixed-width text (fenced blocks,
+            # <pre> boards, pipe tables) reaches Telegram byte-exact.
+            #   <pre>/<code> present  -> HTML   (monospace, no escaping needed)
+            #   ``` fence present     -> MarkdownV2 (caller owns escaping)
+            #   otherwise             -> plain (no entities to trip over)
+            formatted = message
+            if _has_html:
+                send_parse_mode = ParseMode.HTML
+            elif "```" in message:
+                send_parse_mode = ParseMode.MARKDOWN_V2
+            else:
+                send_parse_mode = None
+        elif _has_html:
             formatted = message
             send_parse_mode = ParseMode.HTML
         else:
