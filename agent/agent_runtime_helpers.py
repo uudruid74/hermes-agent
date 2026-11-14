@@ -634,6 +634,15 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
     host code) can feed in already-broken histories.
 
     Repairs applied:
+      pre. Tool-trail digest rows (``role=tool`` carrying the ``[TOOL]: ``
+         ledger line and no ``tool_call_id``, from the bounded tail
+         tool-pair collapse) — normalized in place to ``role=assistant``
+         narration. ``role=tool`` without a matching ``tool_call_id`` is
+         invalid OpenAI wire shape; strict providers (cheaperinference /
+         mercury-3) reject the whole request with HTTP 400 "Tool message
+         must have tool_call_id" (live failure, 2026-11-13). Runs before
+         Pass 0 so the normalized rows fold into adjacent assistant turns,
+         and heals rows persisted before the fix on every restore/request.
       0. Consecutive ``assistant`` messages with no intervening
          ``tool``/``user`` turn — merged into a single assistant turn
          (union of ``tool_calls``, concatenated ``content``). Strict
@@ -664,6 +673,20 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
         return 0
 
     repairs = 0
+
+    # Pre-pass: normalize in-stream tool-trail digest rows to the wire role
+    # (see the docstring). Rewritten IN PLACE — object identity is
+    # load-bearing for the flush-cursor bookkeeping in
+    # repair_message_sequence_with_cursor and the no-inserted-rows
+    # invariant. Lazy import: keep the belt's import surface at module
+    # load unchanged (same pattern as hermes_state's restore repair).
+    from agent.internal_compression_fallback import is_trail_digest_message
+
+    for msg in messages:
+        if isinstance(msg, dict) and is_trail_digest_message(msg):
+            msg["role"] = "assistant"
+            drop_stale_api_content(msg)
+            repairs += 1
 
     # Pass 0: merge consecutive assistant messages. Runs BEFORE Pass 1 so
     # the merged turn's union of tool_call ids is known when Pass 1
@@ -779,17 +802,11 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
                         known_tool_ids.add(tc_id)
             filtered.append(msg)
         elif role == "tool":
-            # In-stream tool-trail digests (bounded tail tool-pair collapse,
-            # 2026-11-10) are ledger provenance lines, not tool results: no
-            # tool_call_id to match, and dropping them as strays would
-            # silently erase the collapsed pair's action at the API belt.
-            # Lazy import: keep the belt's import surface at module load
-            # unchanged (same pattern as hermes_state's restore repair).
-            from agent.internal_compression_fallback import is_trail_digest_message
-
-            if is_trail_digest_message(msg):
-                filtered.append(msg)
-                continue
+            # Tool-trail digest rows never reach this pass — the
+            # normalization pass above already rewrote them to assistant
+            # narration. Any remaining tool row without a matching id is a
+            # genuine stray and must not reach the provider (the wire
+            # contract: every role=tool message carries its tool_call_id).
             tc_id = msg.get("tool_call_id")
             if tc_id and tc_id in known_tool_ids:
                 filtered.append(msg)

@@ -11,7 +11,10 @@ Phase-2 t_490b92fc line format) placed where the pair's rows were.
 
 Acceptance (spec items 1-5) plus belt survival: digest rows must survive
 ``repair_message_sequence`` (the pre-API alternation/pairing belt) instead of
-being dropped as stray tool results.
+being dropped as stray tool results. The belt normalizes their wire role to
+``role=assistant`` narration (``role=tool`` without a ``tool_call_id`` is
+invalid OpenAI shape and strict providers reject the request with HTTP 400),
+and Pass 0 folds runs of them into adjacent assistant turns.
 """
 
 from __future__ import annotations
@@ -127,28 +130,41 @@ class TestBoundedCollapse:
 
 
 # ---------------------------------------------------------------------------
-# Acceptance 2 — assembled payload passes the chat-template alternation
-# rules (tool rows are alternation-exempt) and digests survive the belt
+# Acceptance 2 — digests survive the belt as normalized assistant
+# narration and the belt output carries NO orphan role=tool rows (wire
+# contract: every role=tool message needs its tool_call_id)
 # ---------------------------------------------------------------------------
 
 
 class TestAlternationAndBelt:
-    def test_assembled_sequence_needs_zero_repairs_and_digests_survive(self):
+    def test_digests_survive_belt_and_no_orphan_tool_rows(self):
         rows = _ornith_shape()
         new_rows, _ = collapse_tail_tool_pairs(rows, keep_pairs=8)
-        repaired = repair_message_sequence(None, list(new_rows))
-        assert repaired == 0, (
-            f"collapsed tail must be alternation-valid as assembled, "
-            f"repair made {repaired} fixes"
+        digest_lines = [r["content"] for r in new_rows if is_trail_digest_message(r)]
+        assert len(digest_lines) == 142
+        msgs = [dict(r) for r in new_rows]
+        repair_message_sequence(None, msgs)
+        # Regression for the cheaperinference HTTP 400 ("Tool message must
+        # have tool_call_id"): the belt output must contain no role=tool
+        # message without a tool_call_id.
+        assert all(
+            m.get("tool_call_id") for m in msgs if m.get("role") == "tool"
+        ), "belt output must not carry orphan role=tool messages"
+        kept_tool_rows = [
+            m for m in msgs if m.get("role") == "tool" and m.get("tool_call_id")
+        ]
+        assert len(kept_tool_rows) == 8, "the 8 newest pairs ride verbatim"
+        # Digest provenance survives as assistant narration (Pass 0 folds
+        # runs of digest rows into adjacent assistant turns).
+        joined = "\n".join(
+            m["content"] for m in msgs if isinstance(m.get("content"), str)
         )
-        surviving = [r for r in new_rows if is_trail_digest_message(r)]
-        assert len(surviving) == 142, (
-            "digest rows must survive the pre-API belt, not be dropped as "
-            f"stray tool results (got {len(surviving)})"
-        )
+        lost = [d for d in digest_lines if d not in joined]
+        assert not lost, f"{len(lost)} digest lines were lost at the belt"
 
     def test_belt_drops_unmarked_strays_but_keeps_digests(self):
-        # The exemption is narrow: a bare orphan tool row is still dropped.
+        # The normalization is narrow: a bare stray tool row is still
+        # dropped; a digest row survives as normalized assistant narration.
         stray = {"role": "tool", "tool_call_id": "call_gone", "content": "orphan"}
         digest = {"role": "tool", "content": "[TOOL]: terminal run — ok"}
         msgs = [
@@ -160,7 +176,13 @@ class TestAlternationAndBelt:
         repaired = repair_message_sequence(None, msgs)
         assert stray not in msgs
         assert digest in msgs
-        assert repaired == 1
+        assert digest["role"] == "assistant", (
+            "digest rows must leave the belt as assistant narration — "
+            "role=tool without tool_call_id is rejected by strict providers"
+        )
+        # 3 repairs: 1 digest role normalization + 1 assistant merge (the
+        # digest folds into the trailing assistant turn) + 1 stray drop.
+        assert repaired == 3
 
 
 # ---------------------------------------------------------------------------

@@ -1185,9 +1185,14 @@ def is_trail_digest_message(message: dict[str, Any]) -> bool:
     """True for an in-stream tool-trail digest row (bounded tail collapse).
 
     Digest rows carry the ledger's ``[TOOL]: `` line as content and NO
-    ``tool_call_id`` — they are provenance lines, not tool results — so the
-    pre-API pairing belt (``repair_message_sequence`` Pass 1) must exempt
-    them instead of dropping them as strays.
+    ``tool_call_id`` — they are provenance lines, not tool results, and
+    must not be dropped as strays. As ``role=tool`` they violate the
+    OpenAI tool-message contract (every ``role=tool`` message carries its
+    ``tool_call_id``), so the pre-API pairing belt
+    (``repair_message_sequence`` normalization pass) rewrites them to
+    ``role=assistant`` narration before the request is built — strict
+    providers reject the wire shape with HTTP 400 "Tool message must have
+    tool_call_id" (cheaperinference/mercury-3, 2026-11-13).
     """
     if message.get("role") != "tool" or message.get("tool_call_id"):
         return False
