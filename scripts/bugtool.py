@@ -226,7 +226,12 @@ def all_bug_files(project: Optional[str] = None) -> list[Path]:
         for status in ("pending", "resolved"):
             directory = root / "bugs" / status
             if directory.exists():
-                files.extend(sorted(directory.glob("*.md")))
+                for p in sorted(directory.glob("*.md")):
+                    # Navigation/boilerplate pages are not bug files (2026-11-16):
+                    # lint/repair must never inject approval sections into them.
+                    if p.name in ("Home.md", "INDEX.md"):
+                        continue
+                    files.append(p)
     return sorted(files)
 
 
@@ -360,18 +365,42 @@ CHECKED_BOX = "- [x] approved by Evan"
 
 
 def frontmatter_raw(text: str) -> dict[str, str]:
-    """Parse frontmatter keeping raw key names (frontmatter() also strips values)."""
+    """Parse frontmatter keeping raw key names (frontmatter() also strips values).
+
+    Handles block-form values (`tags:\n  - x`) — a key with no inline value
+    followed by indented list items is non-empty (2026-10-05 fix-tags
+    block-form bug class; lint must not false-positive "empty tags" on it).
+    """
     if not text.startswith("---"):
         return {}
     try:
         end = text.index("\n---", 3)
     except ValueError:
         return {}
-    fm = {}
-    for line in text[4:end].splitlines():
-        if ":" in line and not line.startswith((" ", "-")):
+    fm: dict[str, str] = {}
+    lines = text[4:end].splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if ":" in line and not line.startswith((" ", "-", "\t")):
             k, _, v = line.partition(":")
-            fm[k.strip()] = v.strip().strip('"')
+            key = k.strip()
+            val = v.strip().strip('"')
+            i += 1
+            # Consume block-form continuation lines (indented list items).
+            if not val:
+                block: list[str] = []
+                while i < len(lines) and (
+                    lines[i].startswith((" ", "\t"))
+                ):
+                    block.append(lines[i].strip())
+                    i += 1
+                if block:
+                    fm[key] = " ".join(block)
+                    continue
+            fm[key] = val
+        else:
+            i += 1
     return fm
 
 
@@ -430,6 +459,10 @@ def _lint_apply_fixes(
     author: Optional[str],
     date_str: Optional[str],
     assignee: Optional[str],
+    session: Optional[str] = None,
+    title: Optional[str] = None,
+    severity: Optional[str] = None,
+    bug_type: Optional[str] = None,
 ) -> tuple[str, list[str]]:
     """Apply the auto-fixable set (and flag-supplied backfills) to one file's text."""
     applied: list[str] = []
@@ -453,6 +486,18 @@ def _lint_apply_fixes(
     if date_str and not canonical.get("date", "").strip():
         text = _insert_frontmatter_key(text, "date", date_str)
         applied.append(f"backfilled `date: \"{date_str}\"`")
+    if session and not canonical.get("session", "").strip():
+        text = _insert_frontmatter_key(text, "session", session)
+        applied.append(f"backfilled `session: \"{session}\"`")
+    if title and not canonical.get("title", "").strip():
+        text = _insert_frontmatter_key(text, "title", title)
+        applied.append(f"backfilled `title: \"{title}\"`")
+    if severity and not canonical.get("severity", "").strip():
+        text = _insert_frontmatter_key(text, "severity", severity)
+        applied.append(f"backfilled `severity: \"{severity}\"`")
+    if bug_type and not canonical.get("type", "").strip():
+        text = _insert_frontmatter_key(text, "type", bug_type)
+        applied.append(f"backfilled `type: \"{bug_type}\"`")
     # 3. Fill empty tags/summary keys with benign defaults.
     raw = frontmatter_raw(text)
     if "tags" in raw and not raw["tags"].strip():
@@ -518,6 +563,11 @@ def cmd_lint(args: argparse.Namespace) -> None:
     files = all_bug_files(args.project)
     if args.file:
         files = [bug_path(args.file)]
+    # Backfill flags imply --repair (the flags exist to repair).
+    if any((args.author, args.date, args.assignee,
+            getattr(args, "session", None), getattr(args, "title", None),
+            getattr(args, "severity", None), getattr(args, "bug_type", None))):
+        args.repair = True
     for path in files:
         try:
             text = path.read_text(encoding="utf-8")
@@ -540,7 +590,11 @@ def cmd_lint(args: argparse.Namespace) -> None:
             with locked_root():
                 current = path.read_text(encoding="utf-8")
                 fixed, applied = _lint_apply_fixes(
-                    current, path, args.author, args.date, args.assignee
+                    current, path, args.author, args.date, args.assignee,
+                    session=getattr(args, "session", None),
+                    title=getattr(args, "title", None),
+                    severity=getattr(args, "severity", None),
+                    bug_type=getattr(args, "bug_type", None),
                 )
                 if fixed != current:
                     atomic_write_text(path, fixed)
@@ -1448,6 +1502,10 @@ def parser() -> argparse.ArgumentParser:
     lint.add_argument("--author", default=None, help="backfill filed_by when missing (implies --repair)")
     lint.add_argument("--date", default=None, help="backfill date when missing (implies --repair)")
     lint.add_argument("--assignee", default=None, help="backfill assignee when missing (implies --repair)")
+    lint.add_argument("--session", default=None, help="backfill session when missing (implies --repair)")
+    lint.add_argument("--title", default=None, help="backfill title when missing (implies --repair)")
+    lint.add_argument("--severity", default=None, help="backfill severity when missing (implies --repair); normal|high")
+    lint.add_argument("--bug-type", default=None, help="backfill type when missing (implies --repair)")
     lint.set_defaults(func=cmd_lint)
     set_cmd = commands.add_parser("set")
     set_cmd.add_argument("file")
