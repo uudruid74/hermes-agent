@@ -1,11 +1,9 @@
 """Tests for `_pin_kanban_board_env` helper invoked by `cmd_chat`.
 
-Regression coverage for #20074: a chat session must export the active kanban
-board into `HERMES_KANBAN_BOARD` at boot so subprocess shell-outs (e.g.
-`hermes kanban …`) inherit the same board the in-process kanban tools resolve.
-Without this, a concurrent `hermes kanban boards switch` from another session
-can flip the global current-board file mid-turn and silently divert the
-shell calls to a different DB.
+The ambient "current board" was ripped out (2026-11-16): pinning must be a
+no-op unless the caller explicitly set `HERMES_KANBAN_BOARD`. There is no
+resolved-value pinning anymore — nothing reads an ambient pointer, so
+there is nothing to mirror into the env.
 """
 import importlib
 import os
@@ -17,10 +15,10 @@ import pytest
 def _isolate_kanban_board_env():
     """Snapshot `HERMES_KANBAN_BOARD` and restore it after the test.
 
-    `_pin_kanban_board_env()` writes to ``os.environ`` directly, bypassing
+    `_pin_kanban_board_env()` inspects ``os.environ`` directly, bypassing
     any ``monkeypatch.setenv`` tracking. Without this fixture the mutation
     leaks into subsequent tests and breaks anything that resolves a kanban
-    path from the env (e.g. ``TestSharedBoardPaths`` in test_kanban_db.py).
+    path from the env.
     """
     prev = os.environ.get("HERMES_KANBAN_BOARD")
     os.environ.pop("HERMES_KANBAN_BOARD", None)
@@ -33,30 +31,19 @@ def _isolate_kanban_board_env():
             os.environ["HERMES_KANBAN_BOARD"] = prev
 
 
-def test_pin_writes_resolved_board_when_env_unset(monkeypatch):
+def test_pin_is_noop_when_env_unset(monkeypatch):
+    """No ambient pointer exists: nothing is written when env is unset."""
     main_mod = importlib.import_module("hermes_cli.main")
-
-    import hermes_cli.kanban_db as kdb
-    monkeypatch.setattr(kdb, "get_current_board", lambda: "space")
 
     main_mod._pin_kanban_board_env()
 
-    assert main_mod.os.environ.get("HERMES_KANBAN_BOARD") == "space"
+    assert "HERMES_KANBAN_BOARD" not in main_mod.os.environ
 
 
 def test_pin_does_not_overwrite_existing_env(monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_BOARD", "preset")
     main_mod = importlib.import_module("hermes_cli.main")
 
-    import hermes_cli.kanban_db as kdb
-
-    def _explode():
-        raise AssertionError("get_current_board must not be called when env is set")
-
-    monkeypatch.setattr(kdb, "get_current_board", _explode)
-
     main_mod._pin_kanban_board_env()
 
     assert main_mod.os.environ.get("HERMES_KANBAN_BOARD") == "preset"
-
-

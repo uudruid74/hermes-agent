@@ -2360,10 +2360,8 @@ def list_kanban_projects():
 def list_boards(include_archived: bool = Query(False)):
     """Return every board on disk with task counts and the active slug."""
     boards = kanban_db.list_boards(include_archived=include_archived)
-    current = kanban_db.get_current_board()
     proj_map = _projects_by_id()
     for b in boards:
-        b["is_current"] = (b["slug"] == current)
         b["counts"] = _board_counts(b["slug"])
         # Live cards only — archived tasks are hidden from every default
         # board view, so advertising them in the switcher badge makes the
@@ -2376,7 +2374,9 @@ def list_boards(include_archived: bool = Query(False)):
         b["project_id"] = pid
         proj = proj_map.get(pid) if pid else None
         b["project_name"] = proj.name if proj else None
-    return {"boards": boards, "current": current}
+    # No "current" anymore — the ambient pointer was ripped out
+    # (2026-11-16). The frontend picks boards client-side.
+    return {"boards": boards}
 
 
 def _validate_workdir(raw: str) -> str:
@@ -2422,14 +2422,11 @@ def create_board_endpoint(payload: CreateBoardBody):
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    if payload.switch:
-        try:
-            kanban_db.set_current_board(meta["slug"])
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
+    # payload.switch is a no-op: no ambient "current board" exists anymore
+    # (ripped out 2026-11-16). The frontend tracks its own selection.
     meta["default_workspace_kind"] = _default_workspace_kind(meta)
     _, meta["project_name"], _ = _resolve_project(meta.get("project_id"))
-    return {"board": meta, "current": kanban_db.get_current_board()}
+    return {"board": meta}
 
 
 @router.patch("/boards/{slug}")
@@ -2479,25 +2476,27 @@ def delete_board(slug: str, delete: bool = Query(False, description="Hard-delete
         res = kanban_db.remove_board(slug, archive=not delete)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    return {"result": res, "current": kanban_db.get_current_board()}
+    return {"result": res}
 
 
 @router.post("/boards/{slug}/switch")
 def switch_board(slug: str):
-    """Persist ``slug`` as the active board for subsequent CLI / slash calls.
+    """/boards switch parity — REMOVED.
 
-    Dashboard users pick boards via a client-side ``localStorage`` — this
-    endpoint is for ``/kanban boards switch`` parity so gateway slash
-    commands and the CLI share the same current-board pointer.
+    The ambient "current board" was ripped out (2026-11-16): it silently
+    rerouted kanban wakes, workspaces, and task creation to whatever board
+    was last "switched" to. Dashboard users pick boards client-side
+    (localStorage); CLI callers pass --board. Keep the endpoint responding
+    410 so stale frontends fail loudly instead of silently no-oping.
     """
-    try:
-        normed = kanban_db._normalize_board_slug(slug)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    if not normed or not kanban_db.board_exists(normed):
-        raise HTTPException(status_code=404, detail=f"board {slug!r} does not exist")
-    kanban_db.set_current_board(normed)
-    return {"current": normed}
+    raise HTTPException(
+        status_code=410,
+        detail=(
+            "Board switching removed — there is no ambient 'current board'. "
+            "Select boards client-side; pass ?board=<slug> or --board <slug> "
+            "per call."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------

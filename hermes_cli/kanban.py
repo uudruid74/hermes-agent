@@ -241,18 +241,19 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     # --- global --board flag ---
     # Applies to every subcommand below. When set, scopes all reads and
-    # writes to that board's DB. When omitted, resolves via the
-    # HERMES_KANBAN_BOARD env var, then the persisted current-board
-    # file, then "default". See kanban_db.get_current_board().
+    # writes to that board. When omitted, commands that need a board
+    # default to the 'default' board — there is NO ambient "current
+    # board" pointer anymore (ripped out 2026-11-16: it silently routed
+    # wakes, workspaces, and task creation to whatever board someone
+    # last "switched" to). Name the board explicitly.
     kanban_parser.add_argument(
         "--board",
         default=None,
         metavar="<slug>",
         help=(
-            "Board slug to operate on. Defaults to the current board "
-            "(set via `hermes kanban boards switch <slug>` or the "
-            "HERMES_KANBAN_BOARD env var). Use `hermes kanban boards list` "
-            "to see all boards."
+            "Board slug to operate on. Defaults to the 'default' board "
+            "when omitted. Use `hermes kanban boards list` to see all "
+            "boards."
         ),
     )
     sub = kanban_parser.add_subparsers(dest="kanban_action")
@@ -312,14 +313,15 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
 
     b_switch = boards_sub.add_parser(
         "switch", aliases=["use"],
-        help="Set the active board for subsequent CLI calls",
+        help="REMOVED: there is no ambient 'current board'; pass --board instead",
     )
     b_switch.add_argument("slug")
 
-    boards_sub.add_parser(
-        "show", aliases=["current"],
-        help="Print the currently-active board slug",
+    b_show = boards_sub.add_parser(
+        "show", aliases=[],
+        help="Print one board's metadata (name, counts, paths)",
     )
+    b_show.add_argument("slug", nargs="?", default=None)
 
     b_rename = boards_sub.add_parser(
         "rename",
@@ -2210,22 +2212,21 @@ def _notify_via_env_telegram(message: str) -> None:
 def _cmd_boards_list(args: argparse.Namespace) -> int:
     include_archived = bool(getattr(args, "all", False))
     boards = kb.list_boards(include_archived=include_archived)
-    # Enrich each entry with task counts + whether it's the current board.
-    current = kb.get_current_board()
+    # Enrich each entry with task counts. There is no "current board"
+    # marker anymore — the ambient pointer was ripped out (2026-11-16);
+    # boards are named explicitly per command via --board.
     for b in boards:
-        b["is_current"] = (b["slug"] == current)
         b["counts"] = _board_task_counts(b["slug"])
         b["total"] = sum(b["counts"].values())
     if getattr(args, "json", False):
         print(json.dumps(boards, indent=2, ensure_ascii=False))
         return 0
-    # Human table: marker (•) for current, slug, display name, counts.
+    # Human table: slug, display name, counts.
     if not boards:
         print("(no boards — create one with `hermes kanban boards create <slug>`)")
         return 0
-    print(f"{'':2s}  {'SLUG':24s}  {'NAME':28s}  COUNTS")
+    print(f"  {'SLUG':24s}  {'NAME':28s}  COUNTS")
     for b in boards:
-        marker = "●" if b["is_current"] else " "
         counts = b["counts"] or {}
         counts_str = (
             ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
@@ -2234,11 +2235,9 @@ def _cmd_boards_list(args: argparse.Namespace) -> int:
         name = b.get("name") or ""
         if b.get("archived"):
             name += " [archived]"
-        print(f"{marker:2s}  {b['slug']:24s}  {name:28s}  {counts_str}")
+        print(f"  {b['slug']:24s}  {name:28s}  {counts_str}")
     print()
-    print(f"Current board: {current}")
-    if len(boards) > 1:
-        print("Switch boards with `hermes kanban boards switch <slug>`.")
+    print("Pass --board <slug> to any kanban command to operate on a board.")
     return 0
 
 
@@ -2265,10 +2264,12 @@ def _cmd_boards_create(args: argparse.Namespace) -> int:
     print(f"  Display name: {meta.get('name', '')}")
     print(f"  DB path:      {meta['db_path']}")
     if getattr(args, "switch", False):
-        kb.set_current_board(meta["slug"])
-        print(f"  Switched to {meta['slug']!r}.")
-    else:
-        print(f"  Use `hermes kanban boards switch {meta['slug']}` to make it current.")
+        print(
+            "  Note: --switch is a no-op — there is no ambient 'current "
+            "board' anymore. Pass --board <slug> to commands instead.",
+            file=sys.stderr,
+        )
+    print(f"  Use --board {meta['slug']} on kanban commands to operate on it.")
     return 0
 
 
@@ -2293,32 +2294,32 @@ def _cmd_boards_rm(args: argparse.Namespace) -> int:
 
 
 def _cmd_boards_switch(args: argparse.Namespace) -> int:
-    try:
-        normed = kb._normalize_board_slug(args.slug)
-    except ValueError as exc:
-        print(f"kanban boards switch: {exc}", file=sys.stderr)
-        return 2
-    if not normed:
-        print("kanban boards switch: slug is required", file=sys.stderr)
-        return 2
-    if not kb.board_exists(normed):
-        print(
-            f"kanban boards switch: board {normed!r} does not exist. "
-            f"Create it with `hermes kanban boards create {normed}`.",
-            file=sys.stderr,
-        )
-        return 1
-    kb.set_current_board(normed)
-    print(f"Active board is now {normed!r}.")
-    return 0
+    # The ambient "current board" was ripped out (2026-11-16, Evan's
+    # order): `boards switch` silently rerouted wakes, workspaces, and
+    # task creation to whatever board was last "switched" to. Keep the
+    # verb as an explicit deprecation so scripts fail loudly, not subtly.
+    print(
+        "kanban boards switch: removed — there is no 'current board' "
+        "anymore. Pass --board <slug> to each kanban command instead.",
+        file=sys.stderr,
+    )
+    return 2
 
 
 def _cmd_boards_show(args: argparse.Namespace) -> int:
-    current = kb.get_current_board()
-    meta = kb.read_board_metadata(current)
-    counts = _board_task_counts(current)
+    slug = getattr(args, "slug", None) or kb.DEFAULT_BOARD
+    try:
+        normed = kb._normalize_board_slug(slug)
+    except ValueError as exc:
+        print(f"kanban boards show: {exc}", file=sys.stderr)
+        return 2
+    if not normed or not kb.board_exists(normed):
+        print(f"kanban boards show: board {slug!r} does not exist", file=sys.stderr)
+        return 1
+    meta = kb.read_board_metadata(normed)
+    counts = _board_task_counts(normed)
     total = sum(counts.values())
-    print(f"Current board: {current}")
+    print(f"Board: {normed}")
     print(f"  Display name: {meta.get('name', '')}")
     if meta.get("description"):
         print(f"  Description:  {meta['description']}")
@@ -2918,11 +2919,11 @@ def _cmd_list(args: argparse.Namespace) -> int:
             status=args.status,
             tenant=args.tenant,
             session_id=args.session,
-            # --board resolves through the scoped pin (get_current_board
-            # returns the --board slug for this call); without --board it
-            # is the active board. Tasks live on one shared DB, so the
-            # board column is what scopes the list.
-            board=kb.get_current_board(),
+            # --board pins the context (scoped_current_board), so resolve
+            # through it; without --board the list shows the 'default'
+            # board's tasks. Tasks live on one shared DB, so the board
+            # column is what scopes the list.
+            board=kb.resolve_board_slug(None) or kb.DEFAULT_BOARD,
             include_archived=args.archived,
             order_by=getattr(args, "sort", None),
             workflow_template_id=args.workflow_template_id,
@@ -2932,17 +2933,17 @@ def _cmd_list(args: argparse.Namespace) -> int:
         print(json.dumps([_task_to_dict(t) for t in tasks], indent=2, ensure_ascii=False))
         return 0
     # Passive discoverability: when the user has multiple boards, surface
-    # which one they're looking at in the list header. Single-board users
+    # which board they're looking at in the list header. Single-board users
     # never see this — the feature stays invisible until you opt in.
     try:
         all_boards = kb.list_boards(include_archived=False)
     except Exception:
         all_boards = []
     if len(all_boards) > 1:
-        current = kb.get_current_board()
+        shown_board = kb.resolve_board_slug(None) or kb.DEFAULT_BOARD
         other_count = len(all_boards) - 1
         print(
-            f"Board: {current} "
+            f"Board: {shown_board} "
             f"({other_count} other board{'s' if other_count != 1 else ''} — "
             f"`hermes kanban boards list`)\n"
         )

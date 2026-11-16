@@ -6,13 +6,14 @@ field, registry in the ``boards`` table):
 * Slug validation and normalisation.
 * Single consolidated DB path — the ``board=`` argument never selects a
   per-board file (``HERMES_KANBAN_DB`` still pins the file).
-* Current-board persistence via the ``board_state`` table and the
-  ``HERMES_KANBAN_BOARD`` env var.
+* NO ambient "current board": the legacy ``<root>/kanban/current`` file
+  and the ``board_state.current_board`` row are inert (ripped out
+  2026-11-16). A task's board is its ``tasks.board`` column.
 * Board isolation through the ``tasks.board`` column — writes on one
   board don't leak into another.
 * ``create_board`` / ``list_boards`` / ``remove_board`` round trip on the
-  registry table (legacy board.json / current file are import-only).
-* CLI surface: ``hermes kanban boards list/create/switch/rm``.
+  registry table (legacy board.json is import-only).
+* CLI surface: ``hermes kanban boards list/create/rm`` and ``--board``.
 * ``_default_spawn`` injects ``HERMES_KANBAN_BOARD`` + the single DB path
   into worker env.
 """
@@ -109,54 +110,58 @@ class TestPathResolution:
 
 
 # ---------------------------------------------------------------------------
-# Current-board resolution
+# No ambient "current board" (ripped out 2026-11-16)
 # ---------------------------------------------------------------------------
 
-class TestCurrentBoard:
-    def test_current_board_persists_in_board_state(self, fresh_home):
-        """``set_current_board`` writes the ``board_state`` table, not a file."""
-        kb.create_board("my-proj")
-        kb.set_current_board("my-proj")
-        # No legacy current file involved.
-        assert not (fresh_home / "kanban" / "current").exists()
-        conn = kb.connect()
-        row = conn.execute(
-            "SELECT value FROM board_state WHERE key = 'current_board'"
-        ).fetchone()
-        assert row is not None and row["value"] == "my-proj"
-        assert kb.get_current_board() == "my-proj"
+class TestNoAmbientCurrentBoard:
+    def test_legacy_current_file_is_inert(self, fresh_home):
+        """A pre-existing <root>/kanban/current file changes NOTHING.
 
-
-    def test_stale_pointer_falls_back_to_default(self, fresh_home):
-        """A current_board value naming a removed/unknown slug → default."""
-        kb.set_current_board("ghost-board")
-        # Simulate the removal path: the row exists but the board doesn't.
-        conn = kb.connect()
-        conn.execute(
-            "UPDATE board_state SET value='ghost-board' WHERE key='current_board'"
-        )
-        assert not kb.board_exists("ghost-board")
-        assert kb.get_current_board() == "default"
-
-
-    def test_legacy_current_file_imported_once(self, fresh_home):
-        """Pre-existing <root>/kanban/current is imported into board_state."""
+        The wake-routing bug (eddon task → hermes-agent topic) came from
+        ambient pointers silently selecting boards. The file must be
+        ignored even on a fresh first-connect import pass.
+        """
         current = fresh_home / "kanban" / "current"
         current.parent.mkdir(parents=True, exist_ok=True)
-        # The board must exist before the file points at it (board_exists
-        # gate on import) and the file must predate the first connect
-        # (the import runs once on schema init).
-        kb.create_board("imported-board")
-        current.write_text("imported-board\n", encoding="utf-8")
-        # Force a fresh init pass so the import sees the file, the way a
-        # real first-boot-after-upgrade does.
+        kb.create_board("some-other-board")
+        current.write_text("some-other-board\n", encoding="utf-8")
+        # Force a fresh init pass so any import path would see the file.
         kb._INITIALIZED_PATHS.clear()
-        conn = kb.connect()
-        row = conn.execute(
-            "SELECT value FROM board_state WHERE key = 'current_board'"
-        ).fetchone()
-        assert row is not None and row["value"] == "imported-board"
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="implicit", assignee="x")
+            row = conn.execute(
+                "SELECT board FROM tasks WHERE id = ?", (tid,)
+            ).fetchone()
+        assert row["board"] == "default"
 
+    def test_board_state_current_board_row_is_inert(self, fresh_home):
+        """A stale board_state.current_board row changes NOTHING."""
+        kb.create_board("ghost-curr")
+        with kb.connect() as conn:
+            conn.execute(
+                "INSERT INTO board_state (key, value) "
+                "VALUES ('current_board', 'ghost-curr')"
+            )
+            tid = kb.create_task(conn, title="implicit", assignee="x")
+            row = conn.execute(
+                "SELECT board FROM tasks WHERE id = ?", (tid,)
+            ).fetchone()
+        assert row["board"] == "default"
+
+    def test_workspace_paths_anchor_on_task_board(self, fresh_home):
+        """Scratch workspaces anchor on the task's board, never ambient."""
+        kb.create_board("board-a")
+        with kb.connect() as conn:
+            tid = kb.create_task(
+                conn, title="on-a", assignee="x", board="board-a"
+            )
+            task = kb.get_task(conn, tid)
+        assert task is not None
+        # board=None on purpose: the task's own column must anchor it.
+        ws = kb.resolve_workspace(task, board=None)
+        assert ws == (
+            fresh_home / "kanban" / "boards" / "board-a" / "workspaces" / tid
+        )
 
     def test_legacy_board_json_imported(self, fresh_home):
         """Pre-existing boards/<slug>/board.json feeds the boards table."""
@@ -212,11 +217,10 @@ class TestBoardCRUD:
         assert "gone" not in slugs
 
 
-    def test_remove_current_board_reverts_to_default(self, fresh_home):
+    def test_remove_board_leaves_no_trace(self, fresh_home):
         kb.create_board("active")
-        kb.set_current_board("active")
         kb.remove_board("active", archive=False)
-        assert kb.get_current_board() == "default"
+        assert not kb.board_exists("active")
 
 
     def test_default_board_cannot_be_removed(self, fresh_home):
@@ -267,24 +271,20 @@ class TestConnectionIsolation:
         assert row["board"] == "pinned"
 
 
-    def test_create_without_board_uses_current(self, fresh_home):
+    def test_create_without_board_goes_to_default(self, fresh_home):
+        """No board param → 'default'. Never an ambient pointer."""
         kb.create_board("curr")
-        kb.set_current_board("curr")
         with kb.connect() as conn:
             tid = kb.create_task(conn, title="implicit", assignee="x")
             row = conn.execute(
                 "SELECT board FROM tasks WHERE id = ?", (tid,)
             ).fetchone()
-        assert row["board"] == "curr"
-        with kb.connect() as conn:
-            tasks = kb.list_tasks(conn, board="curr")
-        assert [t.title for t in tasks] == ["implicit"]
+        assert row["board"] == "default"
 
 
-    def test_env_var_overrides_current(self, fresh_home, monkeypatch):
+    def test_env_var_pins_board_on_create(self, fresh_home, monkeypatch):
         kb.create_board("persist")
         kb.create_board("envwin")
-        kb.set_current_board("persist")
         monkeypatch.setenv("HERMES_KANBAN_BOARD", "envwin")
         with kb.connect() as conn:
             tid = kb.create_task(conn, title="via-env", assignee="x")
@@ -292,6 +292,21 @@ class TestConnectionIsolation:
                 "SELECT board FROM tasks WHERE id = ?", (tid,)
             ).fetchone()
         assert row["board"] == "envwin"
+
+
+    def test_explicit_board_wins_over_env_var(self, fresh_home, monkeypatch):
+        """An explicitly-passed board outranks the env pin."""
+        kb.create_board("pinned")
+        kb.create_board("envwin")
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", "envwin")
+        with kb.connect() as conn:
+            tid = kb.create_task(
+                conn, title="explicit", assignee="x", board="pinned"
+            )
+            row = conn.execute(
+                "SELECT board FROM tasks WHERE id = ?", (tid,)
+            ).fetchone()
+        assert row["board"] == "pinned"
 
 
 # ---------------------------------------------------------------------------
@@ -375,7 +390,14 @@ class TestCLI:
         data = json.loads(res.stdout)
         slugs = [b["slug"] for b in data]
         assert slugs == ["default"]
-        assert data[0]["is_current"] is True
+
+
+    def test_boards_switch_removed(self, tmp_path):
+        """`boards switch` fails loudly — no ambient current board."""
+        env = {"HERMES_HOME": str(tmp_path)}
+        res = _cli(["boards", "switch", "default"], env_extra=env)
+        assert res.returncode == 2
+        assert "--board" in res.stderr
 
 
     def test_per_board_task_isolation_via_cli(self, tmp_path):

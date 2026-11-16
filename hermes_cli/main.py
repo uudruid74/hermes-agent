@@ -2473,24 +2473,17 @@ def _launch_tui(
 
 
 def _pin_kanban_board_env() -> None:
-    """Pin the active kanban board into ``HERMES_KANBAN_BOARD`` for the chat session.
+    """Pin the explicitly-configured kanban board into ``HERMES_KANBAN_BOARD``.
 
-    Without this, in-process tools (``kanban_*``) and shelled-out CLI calls
-    (``hermes kanban …``) resolve the board on different paths: the env-pin if
-    set, otherwise the global ``<root>/kanban/current`` file. A concurrent
-    ``hermes kanban boards switch`` from another session can flip the file
-    mid-turn, so the same chat sees its tool calls hit board A while its shell
-    calls hit board B (#20074). Pinning at chat boot mirrors what the
-    dispatcher already does for spawned workers.
+    There is NO ambient "current board" (ripped out 2026-11-16). The env
+    var is honoured when the caller (dispatcher spawn, dashboard scope,
+    operator shell) set it deliberately; otherwise nothing is pinned and
+    the in-process tools resolve to the default board, matching what a
+    shell-out does. Pinning a *resolved* value here would resurrect the
+    ambient pointer through the back door.
     """
     if os.environ.get("HERMES_KANBAN_BOARD"):
         return
-    try:
-        from hermes_cli.kanban_db import get_current_board
-
-        os.environ["HERMES_KANBAN_BOARD"] = get_current_board()
-    except Exception:
-        pass
 
 
 def _sync_bundled_skills_quietly() -> None:

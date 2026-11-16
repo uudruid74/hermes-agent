@@ -32,9 +32,13 @@ Board resolution order (highest precedence first, all optional):
 * ``HERMES_KANBAN_DB`` env var (pins the DB file path directly — legacy
   override still honoured; highest precedence when the file path itself
   is what the caller wants to force).
-* ``<root>/kanban/current`` — a one-line text file holding the slug of
-  the "currently selected" board. Written by ``hermes kanban boards
-  switch <slug>``. When absent, the active board is ``default``.
+
+There is NO ambient "current board": the ``<root>/kanban/current`` file
+and the persisted active-board pointer were removed (2026-11-16) after
+an eddon-board task's wake routed to the hermes-agent topic and eddon
+workspaces landed under ``boards/hermes-agent/``. A task's board is its
+own ``tasks.board`` column; a command's board is the one it was
+explicitly given, else ``default``.
 
 In standard installs ``<root>`` is ``~/.hermes``. In Docker / custom
 deployments where ``HERMES_HOME`` points outside ``~/.hermes`` (e.g.
@@ -414,7 +418,13 @@ _CURRENT_BOARD_OVERRIDE: ContextVar[str | None] = ContextVar(
 
 @contextlib.contextmanager
 def scoped_current_board(slug: str):
-    """Temporarily pin the active board for the current context only."""
+    """Temporarily pin the board for the current context only.
+
+    NOT an ambient "current board": this is an explicit, per-call pin used
+    by the CLI ``--board`` flag and dashboard endpoints that must scope a
+    module which connects with no board argument. It never persists
+    anywhere and dies with the calling context.
+    """
     token: Token[str | None] = _CURRENT_BOARD_OVERRIDE.set(slug)
     try:
         yield
@@ -478,30 +488,30 @@ def boards_root() -> Path:
     return kanban_home() / "kanban" / "boards"
 
 
-def current_board_path() -> Path:
-    """Return the path to ``<root>/kanban/current``.
+def resolve_board_slug(board: Optional[str]) -> Optional[str]:
+    """Resolve an optional explicit board slug. ``None`` means "unspecified".
 
-    One-line text file written by ``hermes kanban boards switch <slug>``
-    to persist the user's board selection across CLI invocations. Absent
-    by default (meaning: active board is ``default``).
-    """
-    return kanban_home() / "kanban" / "current"
+    There is NO ambient "current board" (Evan, 2026-11-16: the ``current``
+    file/symlink and the persisted active-board pointer were ordered ripped
+    out after an eddon-board task's wake routed to the hermes-agent topic
+    and eddon workspaces landed under boards/hermes-agent/). Callers that
+    genuinely have no board context resolve to ``DEFAULT_BOARD`` explicitly
+    at their call site — never via a hidden global pointer.
 
+    Resolution order for a caller-passed value:
 
-def get_current_board() -> str:
-    """Return the active board slug, honouring the resolution chain.
+    1. The CLI ``--board`` / per-call pin (context-local override set by
+       :func:`scoped_current_board`).
+    2. ``HERMES_KANBAN_BOARD`` env var — an *explicit* pin set by the
+       dispatcher on worker spawn, by the dashboard for scoped endpoints,
+       or manually for ad-hoc overrides. This is a scoped pin, not an
+       ambient pointer: it must be set by someone who knows the board.
+    3. ``None`` — the caller decides (most fall back to ``DEFAULT_BOARD``
+       or the task's own ``board`` column).
 
-    Order (highest precedence first):
-
-    1. ``HERMES_KANBAN_BOARD`` env var (set by the dispatcher on worker
-       spawn, or manually for ad-hoc overrides).
-    2. the ``board_state`` table (``current_board`` key) — set by
-       ``hermes kanban boards switch``.
-    3. ``DEFAULT_BOARD`` (``"default"``).
-
-    A malformed or stale slug at any step falls through to the next layer
-    with a best-effort warning — the dispatcher must never crash because a
-    user hand-edited a file or removed a board directory.
+    A malformed or unknown slug at any step falls through with a
+    best-effort warning — the dispatcher must never crash because a user
+    hand-edited an env var.
     """
     scoped = (_CURRENT_BOARD_OVERRIDE.get() or "").strip()
     if scoped:
@@ -520,48 +530,7 @@ def get_current_board() -> str:
                 return normed
         except ValueError:
             pass
-    try:
-        conn = connect()
-        row = conn.execute(
-            "SELECT value FROM board_state WHERE key = 'current_board'"
-        ).fetchone()
-        if row is not None:
-            val = (row["value"] or "").strip()
-            if val:
-                try:
-                    normed = _normalize_board_slug(val)
-                    if normed and board_exists(normed):
-                        return normed
-                except ValueError:
-                    pass
-    except sqlite3.Error:
-        pass
-    return DEFAULT_BOARD
-
-
-def set_current_board(slug: str) -> str:
-    """Persist ``slug`` as the active board. Returns the slug written.
-
-    Writes the ``board_state`` table (``current_board`` key). The caller
-    should validate the slug exists first (via :func:`board_exists`) —
-    this function does not — so that ``hermes kanban boards switch
-    <typo>`` returns an error instead of silently pointing at nothing.
-    """
-    normed = _normalize_board_slug(slug) or DEFAULT_BOARD
-    conn = connect()
-    conn.execute(
-        "INSERT INTO board_state (key, value) VALUES ('current_board', ?) "
-        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        (normed,),
-    )
-    return normed
-
-
-def clear_current_board() -> None:
-    """Remove the active-board setting so the board reverts to ``default``."""
-    _assert_not_delegated_child_mutation()
-    conn = connect()
-    conn.execute("DELETE FROM board_state WHERE key = 'current_board'")
+    return None
 
 
 def board_dir(board: Optional[str] = None) -> Path:
@@ -630,7 +599,7 @@ def workspaces_root(board: Optional[str] = None) -> Path:
         return Path(override).expanduser()
     slug = _normalize_board_slug(board)
     if slug is None:
-        slug = get_current_board()
+        slug = DEFAULT_BOARD
     if slug == DEFAULT_BOARD:
         return kanban_home() / "kanban" / "workspaces"
     return board_dir(slug) / "workspaces"
@@ -660,7 +629,7 @@ def attachments_root(board: Optional[str] = None) -> Path:
         return Path(override).expanduser()
     slug = _normalize_board_slug(board)
     if slug is None:
-        slug = get_current_board()
+        slug = DEFAULT_BOARD
     if slug == DEFAULT_BOARD:
         return kanban_home() / "kanban" / "attachments"
     return board_dir(slug) / "attachments"
@@ -681,7 +650,7 @@ def worker_logs_dir(board: Optional[str] = None) -> Path:
     """
     slug = _normalize_board_slug(board)
     if slug is None:
-        slug = get_current_board()
+        slug = DEFAULT_BOARD
     if slug == DEFAULT_BOARD:
         return kanban_home() / "kanban" / "logs"
     return board_dir(slug) / "logs"
@@ -941,10 +910,6 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
     if row is None:
         raise ValueError(f"board {normed!r} does not exist")
 
-    # If the user removed the currently-active board, revert to default.
-    if get_current_board() == normed:
-        clear_current_board()
-
     # Tasks are NOT deleted — they keep their historical board slug so old
     # rows remain attributable. list_tasks(--board <slug>) simply stops
     # returning active work once the board row is archived/removed.
@@ -1074,6 +1039,12 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # The board this task belongs to. THE authoritative board context for a
+    # task — wake routing, workspace paths, worker env pins, and lifecycle
+    # hooks all read this, never an ambient "current board" (ripped out
+    # 2026-11-16 by order: the ambient pointer routed an eddon task's wake to
+    # the hermes-agent topic and its workspace under boards/hermes-agent/).
+    board: str = "default"
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1167,6 +1138,9 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            board=(
+                row["board"] if "board" in keys and row["board"] else "default"
             ),
         )
 
@@ -1407,9 +1381,10 @@ CREATE TABLE IF NOT EXISTS boards (
 );
 
 -- Key/value state for kanban-level settings that have exactly one value.
--- Currently: 'current_board' — the active board slug. Replaces the legacy
--- <root>/kanban/current one-line file (a global singleton that two chat
--- sessions could race — the reason this table exists).
+-- Historical note: the ambient 'current_board' key lived here until the
+-- ambient "current board" concept was ripped out (2026-11-16). The table
+-- is kept for other future single-value settings and for compatibility
+-- with existing DB files; nothing reads or writes 'current_board' now.
 CREATE TABLE IF NOT EXISTS board_state (
     key   TEXT PRIMARY KEY,
     value TEXT
@@ -2384,7 +2359,8 @@ def connect(
     * ``board`` explicit → resolves to that board's DB.
     * Neither → :func:`kanban_db_path` resolves via
       ``HERMES_KANBAN_DB`` env → ``HERMES_KANBAN_BOARD`` env →
-      ``<root>/kanban/current`` → ``default``.
+      ``default``. There is no ambient "current board" (removed
+      2026-11-16).
     """
     if db_path is not None:
         path = db_path
@@ -2591,32 +2567,11 @@ def _import_legacy_board_files(conn: sqlite3.Connection) -> None:
             )
             imported += 1
 
-    # --- 2. legacy current-file -> board_state ----------------------------
-    cur_path = current_board_path()
-    if cur_path.exists():
-        try:
-            val = cur_path.read_text(encoding="utf-8").strip()
-        except OSError:
-            val = ""
-        if val:
-            try:
-                normed = _normalize_board_slug(val)
-            except ValueError:
-                normed = None
-            if normed:
-                # Check the registry on THIS connection — calling
-                # board_exists() here would re-enter connect() while
-                # _INIT_LOCK is held (non-reentrant) and deadlock first
-                # init. The board row was just imported in step 1.
-                row = conn.execute(
-                    "SELECT 1 FROM boards WHERE slug = ?", (normed,)
-                ).fetchone()
-                if row is not None:
-                    conn.execute(
-                        "INSERT OR IGNORE INTO board_state (key, value) "
-                        "VALUES ('current_board', ?)",
-                        (normed,),
-                    )
+    # --- 2. (removed) legacy current-file -> board_state ------------------
+    # The ambient "current board" pointer was ripped out (2026-11-16):
+    # neither the legacy <root>/kanban/current file nor the
+    # board_state.current_board row is read or written anymore. Stale
+    # artifacts on disk are inert.
 
     # --- 3. default board always registered -------------------------------
     conn.execute(
@@ -3362,7 +3317,7 @@ def create_task(
     # (deterministic worktree + branch) without each surface repeating it.
     if project_id is None:
         try:
-            _bmeta = read_board_metadata(board if board else get_current_board())
+            _bmeta = read_board_metadata(board if board else DEFAULT_BOARD)
             _board_project = (_bmeta.get("project_id") or "").strip()
             if _board_project:
                 project_id = _board_project
@@ -3536,7 +3491,7 @@ def create_task(
         and project_repo is None
         and workspace_kind in {"dir", "worktree"}
     ):
-        board_slug = board if board else get_current_board()
+        board_slug = board if board else DEFAULT_BOARD
         board_meta = read_board_metadata(board_slug)
         board_default = board_meta.get("default_workdir")
         if board_default:
@@ -3597,11 +3552,15 @@ def create_task(
                         except Exception:
                             branch_name = None
 
-                # Board resolution single source: the explicit param, else the
-                # active board. Written explicitly into the row (the column
-                # DEFAULT 'default' fired instead when this was omitted).
+                # Board resolution: the explicit param wins; else an
+                # explicitly-pinned env (dispatcher/dashboard sets it
+                # deliberately); else the default board. NEVER an ambient
+                # "current board" pointer (ripped out 2026-11-16). Tasks
+                # are created with their board named, or they are
+                # default-board tasks; there is no third,
+                # environment-dependent answer.
                 if not board:
-                    board = get_current_board()
+                    board = resolve_board_slug(None) or DEFAULT_BOARD
 
                 conn.execute(
                     """
@@ -5330,7 +5289,7 @@ def claim_task(
     _fire_kanban_lifecycle_hook(
         "kanban_task_claimed",
         task_id,
-        board=get_current_board(),
+        board=(claimed.board if claimed else DEFAULT_BOARD),
         assignee=claimed.assignee if claimed else None,
         run_id=run_id,
     )
@@ -6295,7 +6254,7 @@ def complete_task(
     _fire_kanban_lifecycle_hook(
         "kanban_task_completed",
         task_id,
-        board=get_current_board(),
+        board=(_done_task.board if _done_task else DEFAULT_BOARD),
         assignee=_done_task.assignee if _done_task else None,
         run_id=run_id,
         summary=(summary if summary is not None else result),
@@ -6987,7 +6946,7 @@ def block_task(
             _fire_kanban_lifecycle_hook(
                 "kanban_task_blocked",
                 task_id,
-                board=get_current_board(),
+                board=(_blocked_task.board if _blocked_task else DEFAULT_BOARD),
                 assignee=_blocked_task.assignee if _blocked_task else None,
                 run_id=run_id,
                 reason=reason,
@@ -7115,7 +7074,7 @@ def block_task(
     _fire_kanban_lifecycle_hook(
         "kanban_task_blocked",
         task_id,
-        board=get_current_board(),
+        board=(_blocked_task.board if _blocked_task else DEFAULT_BOARD),
         assignee=_blocked_task.assignee if _blocked_task else None,
         run_id=run_id,
         reason=reason,
@@ -7363,10 +7322,11 @@ def park_plan_task(
     # ``True`` means committed AND notified-attempted (never delivered —
     # that is best-effort). The entry guard above keeps the nested-txn
     # variant of this failure mode loud.
+    _parked_task = get_task(conn, task_id)
     _fire_kanban_lifecycle_hook(
         "kanban_task_parked",
         task_id,
-        board=get_current_board(),
+        board=(_parked_task.board if _parked_task else DEFAULT_BOARD),
         assignee=None,
         run_id=run_id,
         reason=detail,
@@ -8075,7 +8035,10 @@ def _resolve_worktree_workspace(
         # Anchor on the board's configured default_workdir, not Path.cwd().
         # The dispatcher's CWD is incidental (gateway launch dir) and using it
         # scatters worktrees under whatever repo the gateway started in.
-        board_slug = board if board else get_current_board()
+        # The task's own board column is authoritative — never an ambient
+        # "current board" (this exact fallback put eddon workspaces under
+        # boards/hermes-agent/, 2026-11-16).
+        board_slug = board if board else (task.board or DEFAULT_BOARD)
         board_default = (read_board_metadata(board_slug).get("default_workdir") or "").strip()
         if not board_default:
             raise ValueError(
@@ -8150,9 +8113,11 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
     """Resolve (and create if needed) the workspace for a task.
 
     - ``scratch``: a fresh dir under ``<board-root>/workspaces/<id>/``,
-      where ``<board-root>`` is the active board's root. The path is the
-      same for the dispatcher and every profile worker, so handoff is
-      path-stable.
+      where ``<board-root>`` is the task's board root (its own ``board``
+      column when the caller didn't pin one — never an ambient pointer,
+      which put eddon workspaces under boards/hermes-agent/ 2026-11-16).
+      The path is the same for the dispatcher and every profile worker,
+      so handoff is path-stable.
     - ``dir:<path>``: the path stored in ``workspace_path``.  Created
       if missing.  MUST be absolute — relative paths are rejected to
       prevent confused-deputy traversal where ``../../../tmp/attacker``
@@ -8185,7 +8150,9 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
                     f"{task.workspace_path!r}; workspace paths must be absolute"
                 )
         else:
-            p = workspaces_root(board=board) / task.id
+            # Task's own board column is the anchor — never an ambient
+            # "current board".
+            p = workspaces_root(board=board or task.board) / task.id
         p.mkdir(parents=True, exist_ok=True)
         return p
     if kind == "dir":
@@ -8203,7 +8170,7 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
         p.mkdir(parents=True, exist_ok=True)
         return p
     if kind == "worktree":
-        p, _branch_name = _resolve_worktree_workspace(task, board=board)
+        p, _branch_name = _resolve_worktree_workspace(task, board=board or task.board)
         return p
     raise ValueError(f"unknown workspace_kind: {kind}")
 
@@ -10022,20 +9989,20 @@ def _dispatch_once_locked(
             _log.warning("plan stop-guard sweep failed", exc_info=True)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
-    # Dispatch transport for this tick (t_a8031c32): on a wake-routed board
-    # (projects.db board_topic:<board>) tasks dispatch via `hermes send -t`
-    # wakes into the assignee's live gateway session instead of
-    # `_default_spawn` subprocesses. Opt-in and per-board: no mapping entry
-    # keeps the legacy spawn path unchanged. Tests pass `spawn_fn`, which
-    # always wins.
+    # Dispatch transport (t_a8031c32, revised 2026-11-16): on a wake-routed
+    # board (projects.db board_topic:<board>) tasks dispatch via
+    # ``hermes send -t`` wakes into the assignee's live gateway session
+    # instead of ``_default_spawn`` subprocesses. The wake route is resolved
+    # PER TASK from the task's own ``board`` column — never tick-level state
+    # and never an ambient "current board" (an eddon-board task woke into
+    # the hermes-agent topic via the old ambient fallback). Boards that
+    # never opted in keep the legacy spawn path, decided per task.
+    # Tests pass ``spawn_fn``, which always wins.
     if spawn_fn is not None:
         _resolved_spawn = spawn_fn
     else:
-        _wake_route = _resolve_wake_route(board)
-        _resolved_spawn = (
-            _make_wake_dispatch(conn, _wake_route)
-            if _wake_route.is_wake
-            else _default_spawn
+        _resolved_spawn = _make_wake_dispatch(
+            conn, _resolve_wake_route, fallback_spawn=_default_spawn,
         )
 
     # Count tasks already running so max_spawn enforces concurrency rather
@@ -10697,23 +10664,36 @@ def _wake_fired_at(
     return int(row[0]) if row else None
 
 
-def _resolve_wake_route(board: Optional[str]):
-    """Compose this tick's board wake route (``projects.db``, ruling #6).
+def _resolve_wake_route(conn: Optional[sqlite3.Connection], board: Optional[str]):
+    """Compose a board's wake route (``projects.db``, ruling #6).
 
     The board→topic map lives in the project database — a different sqlite
     file from the kanban board this dispatcher ticks, hence the separate
     connection. No mapping entry means the board never opted in and keeps
     the legacy spawn path.
+
+    The board is per-task: the task's own ``board`` column is the ONLY
+    source. When ``board`` is unspecified, the caller must pass the task's
+    board — never an ambient "current board" (the ambient pointer routed
+    an eddon task's wake into the hermes-agent topic, 2026-11-16; Evan's
+    order: "We need the wake to go to you when you dispatch it").
     """
     from hermes_cli import projects_db as pdb
 
-    slug = _normalize_board_slug(board) or get_current_board()
+    slug = _normalize_board_slug(board)
+    if slug is None:
+        return None
     with pdb.connect_closing() as pconn:
         return pdb.resolve_board_wake_route(pconn, slug)
 
 
-def _make_wake_dispatch(conn: sqlite3.Connection, route):
-    """Build the spawn_fn replacement for a wake-routed board.
+def _make_wake_dispatch(
+    conn: sqlite3.Connection,
+    resolve_route,
+    *,
+    fallback_spawn=None,
+):
+    """Build the spawn_fn replacement for wake-routed boards.
 
     Per task (ruling #7): a CLI-created task (no origin chat) falls back to
     ``_default_spawn`` as the failsafe. Everything else fires one wake to
@@ -10722,13 +10702,24 @@ def _make_wake_dispatch(conn: sqlite3.Connection, route):
     its task id (``--task-id``) so the intake can bind it to the target
     session (gap 1). Returns ``None`` — there is no worker PID; wake-claim
     liveness tracks the heartbeat instead (see ``_wake_fired_at``).
+
+    The wake route is resolved PER TASK from ``task.board`` — the task's
+    own board column, never tick-level state. Boards that never opted in
+    (or tasks with no board) fall back to the legacy spawn path.
     """
     def _wake_dispatch(
         task: Task, workspace: str, *, board: Optional[str] = None
     ) -> Optional[int]:
+        spawn = fallback_spawn or _default_spawn
         origin = get_origin_routing(conn, task.id) or {}
         if not str(origin.get("chat_id") or "").strip():
-            return _default_spawn(task, workspace, board=board)
+            return spawn(task, workspace, board=board)
+        # Per-task wake route: the task's OWN board column decides where
+        # the wake lands. Never the tick-level board, never an ambient
+        # pointer, never the dispatcher's cwd.
+        route = resolve_route(conn, task.board or DEFAULT_BOARD)
+        if route is None or not route.is_wake:
+            return spawn(task, workspace, board=board)
         if route.topic:
             target = f"{task.assignee}:{route.topic}"
         else:
@@ -10962,8 +10953,9 @@ def _default_spawn(
     _retag_legacy_worker_sessions(env["HERMES_KANBAN_WORKSPACES_ROOT"])
     # Board slug — the final defense-in-depth pin. If the worker ever
     # resolves kanban paths without the DB / workspaces env vars, the
-    # board slug still forces it to the right directory.
-    resolved_board = _normalize_board_slug(board) or get_current_board()
+    # board slug still forces it to the right directory. The task's own
+    # board column is the authoritative source (never ambient).
+    resolved_board = _normalize_board_slug(board) or (task.board or DEFAULT_BOARD)
     env["HERMES_KANBAN_BOARD"] = resolved_board
     # HERMES_PROFILE selects the worker profile. `hermes -p <assignee>` also
     # loads that profile's .env, whose USERNAME value owns attribution.

@@ -165,3 +165,140 @@ def test_unbound_context_is_unrestricted_orchestrator(monkeypatch, worker_env):
     assert kt._enforce_worker_task_ownership("t_any_child") is None
     # ...but a bare kanban_complete still needs an explicit id (no default).
     assert kt._default_task_id(None) is None
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — per-task wake routing (2026-11-16 ripout regression)
+# ---------------------------------------------------------------------------
+
+def _make_task(task_id: str, assignee: str, board: str):
+    """Build a minimal Task without touching a DB."""
+    from hermes_cli.kanban_db import Task
+
+    return Task(
+        id=task_id,
+        title="wake-route test",
+        body=None,
+        assignee=assignee,
+        status="ready",
+        priority=0,
+        created_by="test",
+        created_at=0,
+        started_at=None,
+        completed_at=None,
+        workspace_kind="scratch",
+        workspace_path="/tmp/wsx",
+        claim_lock=None,
+        claim_expires=None,
+        tenant=None,
+        board=board,
+    )
+
+
+class TestPerTaskWakeRouting:
+    """The wake target comes from the task's OWN board column.
+
+    Regression: an eddon-board task woke into the hermes-agent topic
+    because the dispatcher tick resolved the wake route from an ambient
+    "current board" pointer (2026-11-16, Evan: "We need the wake to go to
+    you when you dispatch it" + "Rip that out now!").
+    """
+
+    @pytest.fixture
+    def routed_env(self, monkeypatch, tmp_path):
+        """Isolated kanban DB + projects DB with two opted-in boards."""
+        from pathlib import Path
+
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        # No ambient pin — the whole point.
+        monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+
+        from hermes_cli import kanban_db as kb
+        from hermes_cli import projects_db as pdb
+
+        kb._INITIALIZED_PATHS.clear()
+        kb.init_db()
+        with kb.connect() as conn:
+            kb.create_board("eddon")
+            kb.create_board("hermes-agent")
+            kb.create_task(
+                conn, title="eddon-task", assignee="neo", board="eddon"
+            )
+        with pdb.connect_closing() as pconn:
+            pdb.set_board_topic(pconn, "eddon", "telegram:-100:4")
+            pdb.set_board_topic(pconn, "hermes-agent", "telegram:-100:6")
+        return kb
+
+    def _capture_wake(self, kb, monkeypatch):
+        """Return a (spawn_dispatch, wake_dispatch) capture pair."""
+        import types
+
+        calls = {"spawn": [], "wake": []}
+
+        def fake_spawn(task, workspace, *, board=None):
+            calls["spawn"].append((task.id, board))
+            return None
+
+        def fake_resolver(conn, board):
+            from hermes_cli import projects_db as pdb
+
+            with pdb.connect_closing() as pconn:
+                return pdb.resolve_board_wake_route(pconn, board)
+
+        # A real connection: the dispatch records a wake_fired event.
+        conn = kb.connect()
+        dispatch = kb._make_wake_dispatch(
+            conn, fake_resolver, fallback_spawn=fake_spawn,
+        )
+
+        def fake_origin(conn, task_id):
+            return {"chat_id": "-100"}
+
+        def fake_send(argv, **kwargs):
+            calls["wake"].append(argv)
+            proc = types.SimpleNamespace(pid=4242)
+            return proc
+
+        monkeypatch.setattr(kb, "get_origin_routing", fake_origin)
+        import hermes_cli._subprocess_compat as sc
+        monkeypatch.setattr(sc, "spawn_detached", fake_send)
+        return dispatch, calls
+
+    def test_task_board_decides_wake_topic(self, routed_env, monkeypatch):
+        """eddon task -> eddon topic, even with NO ambient board set."""
+        kb = routed_env
+        dispatch, calls = self._capture_wake(kb, monkeypatch)
+
+        task = _make_task("t_eddon", "neo", "eddon")
+        pid = dispatch(task, "/tmp/wsx")
+        assert pid is None
+        assert len(calls["wake"]) == 1
+        argv = calls["wake"][0]
+        # Topic /4 — NOT /6.
+        assert "neo:telegram:-100:4" in argv
+
+    def test_unmapped_board_falls_back_to_spawn(self, routed_env, monkeypatch):
+        """A board with no topic mapping uses the classic spawn path."""
+        kb = routed_env
+        dispatch, calls = self._capture_wake(kb, monkeypatch)
+
+        task = _make_task("t_plain", "neo", "default")
+        dispatch(task, "/tmp/wsx")
+        assert calls["wake"] == []
+        # board=None here: the per-task dispatch was called without a
+        # tick-level board, and the task's board never opted in — the
+        # spawn falls through exactly as the classic dispatcher would.
+        assert calls["spawn"] == [("t_plain", None)]
+
+    def test_two_boards_route_independently(self, routed_env, monkeypatch):
+        """Two tasks on different boards in one tick go to their own topics."""
+        kb = routed_env
+        dispatch, calls = self._capture_wake(kb, monkeypatch)
+
+        dispatch(_make_task("t_e", "neo", "eddon"), "/tmp/wsx1")
+        dispatch(_make_task("t_h", "neo", "hermes-agent"), "/tmp/wsx2")
+        targets = [a[a.index("-t") + 1] for a in calls["wake"]]
+        assert targets == ["neo:telegram:-100:4", "neo:telegram:-100:6"]
