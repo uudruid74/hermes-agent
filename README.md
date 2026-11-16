@@ -78,6 +78,7 @@ Measured against LLM-based compression on the same sessions, the deterministic e
 - **Zero token cost** — the compression itself is arithmetic, not inference.
 - **Deterministic** — the same session compresses the same way every time. No summarizer drift.
 - **Observation masking** — tool noise gets stripped before the digest is built, so the summary reflects what's happening, not what the tools happened to print.
+- **Boundary-aware triggers** — compaction doesn't sit and wait for the window to fill. When a plan step changes (`Complete Step n` / `>>> STEP n` / `Active Step n of m`) or a plan is continued into a session, a fresh digest fires automatically: the step that just finished is *completed history*, and re-sending it on every subsequent call — mostly as cache reads — is pure waste. The tail protections (`protect_last_n`, user-message floors, tool-chain protection) are untouched; only the *when* changes.
 
 #### Tuning: how model size changes the config
 
