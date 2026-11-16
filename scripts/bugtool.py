@@ -341,6 +341,224 @@ def fix_tags_line(path: Path, text: str) -> tuple[str, bool]:
     return text, False
 
 
+REQUIRED_FRONTMATTER_KEYS = ("title", "type", "status", "date", "severity", "filed_by", "assignee", "session", "tags", "summary")
+# Legacy/alias frontmatter keys seen in free-handed bug files; lint migrates
+# these to canonical names rather than just flagging them (Evan 2026-11-16:
+# "fix all the bugs missing a damn checkbox" — silent drift like
+# `created:`/`reporter:` instead of `date:`/`filed_by:` is exactly the damage).
+FRONTMATTER_ALIASES = {
+    "created": "date",
+    "reporter": "filed_by",
+    "author": "filed_by",
+    "author_profile": "filed_by",
+    "assigned": "assignee",
+    "sev": "severity",
+    "kind": "type",
+}
+APPROVED_CHECKBOX_LINE = "- [ ] approved by Evan (check this box ONLY after reviewing the fix spec)"
+CHECKED_BOX = "- [x] approved by Evan"
+
+
+def frontmatter_raw(text: str) -> dict[str, str]:
+    """Parse frontmatter keeping raw key names (frontmatter() also strips values)."""
+    if not text.startswith("---"):
+        return {}
+    try:
+        end = text.index("\n---", 3)
+    except ValueError:
+        return {}
+    fm = {}
+    for line in text[4:end].splitlines():
+        if ":" in line and not line.startswith((" ", "-")):
+            k, _, v = line.partition(":")
+            fm[k.strip()] = v.strip().strip('"')
+    return fm
+
+
+def replace_frontmatter_key(text: str, old: str, new: str) -> str:
+    """Rename a frontmatter key in place, preserving order."""
+    pattern = rf"(?m)^{re.escape(old)}:(.*)$"
+    return re.sub(pattern, rf"{new}:\1", text, count=1)
+
+
+def bug_lint_issues(text: str, path: Path) -> tuple[list[str], list[str]]:
+    """Return (auto_fixable, manual) issue lists for one bug file.
+
+    Auto-fixable: things bugtool can safely repair without inventing facts
+    (alias-key migration, missing approval SECTION with an UNCHECKED box —
+    agents may add an unchecked box; only Evan ever ticks a box).
+    Manual: things that need a human/forensics input (missing author, missing
+    date, no frontmatter at all) — repair mode backfills them only when the
+    value is supplied via CLI flags.
+    """
+    auto: list[str] = []
+    manual: list[str] = []
+    if not text.lstrip().startswith("---"):
+        manual.append("no frontmatter block")
+        # Still lint the body for the approval section even without frontmatter.
+        if not re.search(rf"(?m)^## {re.escape(APPROVED_SECTION)}\s*$", text):
+            manual.append(f"missing `## {APPROVED_SECTION}` section (no frontmatter; needs author info anyway)")
+        return auto, manual
+    raw = frontmatter_raw(text)
+    for legacy, canonical in FRONTMATTER_ALIASES.items():
+        if legacy in raw and canonical not in raw:
+            auto.append(f"non-canonical key `{legacy}:` -> `{canonical}:`")
+    canonical = {FRONTMATTER_ALIASES.get(k, k): v for k, v in raw.items()}
+    for key in REQUIRED_FRONTMATTER_KEYS:
+        value = canonical.get(key, "").strip()
+        if not value:
+            if key == "tags":
+                auto.append("empty `tags:` — repair will emit `tags: []`")
+            elif key == "summary":
+                auto.append("empty `summary:` — repair will leave empty (cosmetic)")
+            elif key == "title":
+                manual.append("missing `title:` (needs value from CLI flag or heading)")
+            else:
+                manual.append(f"missing/empty `{key}:` (needs value from CLI flag or forensics)")
+    if not re.search(rf"(?m)^## {re.escape(APPROVED_SECTION)}\s*$", text):
+        auto.append(f"missing `## {APPROVED_SECTION}` section — repair inserts UNCHECKED box (only Evan ever ticks a box)")
+    else:
+        section = section_value(text, APPROVED_SECTION)
+        if not re.search(r"- \[[ xX]\]", section):
+            auto.append(f"`## {APPROVED_SECTION}` section has no checkbox line — repair inserts UNCHECKED box")
+    return auto, manual
+
+
+def _lint_apply_fixes(
+    text: str,
+    path: Path,
+    author: Optional[str],
+    date_str: Optional[str],
+    assignee: Optional[str],
+) -> tuple[str, list[str]]:
+    """Apply the auto-fixable set (and flag-supplied backfills) to one file's text."""
+    applied: list[str] = []
+    if not text.lstrip().startswith("---"):
+        return text, ["no frontmatter block — cannot auto-fix; needs manual authorship"]
+    raw = frontmatter_raw(text)
+    # 1. Migrate alias keys to canonical names, preserving order.
+    for legacy, canonical in sorted(FRONTMATTER_ALIASES.items()):
+        if legacy in raw and canonical not in raw:
+            text = replace_frontmatter_key(text, legacy, canonical)
+            applied.append(f"`{legacy}:` -> `{canonical}:`")
+    raw = frontmatter_raw(text)
+    canonical = {FRONTMATTER_ALIASES.get(k, k): v for k, v in raw.items()}
+    # 2. Backfill missing/empty keys from CLI flags.
+    if author and not canonical.get("filed_by", "").strip():
+        text = _insert_frontmatter_key(text, "filed_by", author)
+        applied.append(f"backfilled `filed_by: \"{author}\"`")
+    if assignee and not canonical.get("assignee", "").strip():
+        text = _insert_frontmatter_key(text, "assignee", assignee)
+        applied.append(f"backfilled `assignee: \"{assignee}\"`")
+    if date_str and not canonical.get("date", "").strip():
+        text = _insert_frontmatter_key(text, "date", date_str)
+        applied.append(f"backfilled `date: \"{date_str}\"`")
+    # 3. Fill empty tags/summary keys with benign defaults.
+    raw = frontmatter_raw(text)
+    if "tags" in raw and not raw["tags"].strip():
+        text = re.sub(r"(?m)^tags:\s*$", "tags: []", text, count=1)
+        applied.append("emptied `tags:` -> `tags: []`")
+    if "summary" in raw and not raw["summary"].strip(" \""):
+        text = re.sub(r'(?m)^summary:\s*""?\s*$', 'summary: ""', text, count=1)
+        applied.append("normalized empty `summary:`")
+
+    # 4. Missing approval section -> insert UNCHECKED box before `## Kanban tasks`,
+    #    or append at end. NEVER touch an existing checkbox state.
+    if not re.search(rf"(?m)^## {re.escape(APPROVED_SECTION)}\s*$", text):
+        block = f"\n## {APPROVED_SECTION}\n\n{APPROVED_CHECKBOX_LINE}\n"
+        if re.search(rf"(?m)^## {re.escape('Kanban tasks')}\s*$", text):
+            text = re.sub(
+                rf"(?m)^(## Kanban tasks\s*)$",
+                rf"{block.strip()}\n\n\1",
+                text,
+                count=1,
+            )
+            applied.append("inserted `## Approved to run` with UNCHECKED box before Kanban tasks")
+        else:
+            text = text.rstrip() + "\n\n" + block.strip() + "\n"
+            applied.append("appended `## Approved to run` with UNCHECKED box at end")
+    else:
+        section = section_value(text, APPROVED_SECTION)
+        if not re.search(r"- \[[ xX]\]", section):
+            # Section exists but has no checkbox line inside — add unchecked box.
+            text = replace_section(
+                text, APPROVED_SECTION, APPROVED_CHECKBOX_LINE
+            )
+            applied.append("inserted UNCHECKED approval checkbox into existing section")
+    return text, applied
+
+
+def _insert_frontmatter_key(text: str, key: str, value: str) -> str:
+    """Insert `key: "value"` as the last line of the frontmatter block."""
+    try:
+        end = text.index("\n---", 3)
+    except ValueError:
+        return text
+    return text[:end] + f'\n{key}: "{value}"' + text[end:]
+
+
+def cmd_lint(args: argparse.Namespace) -> None:
+    """Lint bug files for structural integrity; optionally repair (2026-11-16).
+
+    Root cause this guards: agents free-handing bug files with write_file
+    instead of `bugtool new`, then hand-edits deleting frontmatter keys or
+    the approval section. `bugtool new` always writes the full canonical
+    frontmatter + UNCHECKED approval checkbox; drift comes from bypasses.
+
+    Rules enforced (honoring the human-authored checkbox contract):
+      - Preferred: canonical frontmatter keys present and non-empty:
+        title/type/status/date/severity/filed_by/assignee/session/tags/summary
+      - Alias keys (created/reporter/author/...) migrate to canonical names.
+      - Every bug file MUST have a `## Approved to run` section containing a
+        checkbox. Missing section / missing box -> repair inserts an UNCHECKED
+        box. lint NEVER ticks, unticks, or rewrites an existing checkbox —
+        that state belongs to Evan alone.
+    """
+    broken_count = 0
+    files = all_bug_files(args.project)
+    if args.file:
+        files = [bug_path(args.file)]
+    for path in files:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            die(f"bug file not found: {path}")
+        auto, manual = bug_lint_issues(text, path)
+        if not auto and not manual:
+            continue
+        broken_count += 1
+        rel = path.name if args.project or args.file else path
+        print(f"FAIL {rel}")
+        for issue in auto:
+            print(f"  fixable:   {issue}")
+        for issue in manual:
+            per_file_fix = issue.replace(
+                " (needs value from CLI flag or forensics)", ""
+            ).replace(" (needs value from CLI flag or heading)", "")
+            print(f"  needs-auth: {per_file_fix}")
+        if args.repair:
+            with locked_root():
+                current = path.read_text(encoding="utf-8")
+                fixed, applied = _lint_apply_fixes(
+                    current, path, args.author, args.date, args.assignee
+                )
+                if fixed != current:
+                    atomic_write_text(path, fixed)
+                    print(f"  repaired:  {len(applied)} change(s)")
+                    for line in applied:
+                        print(f"    - {line}")
+                else:
+                    print("  repaired:  nothing to apply")
+    if not broken_count:
+        print("all bug files pass lint")
+    else:
+        print(f"\n{broken_count} file(s) failed lint")
+        if not args.repair:
+            print("run with --repair to auto-fix safe issues (checkbox states are never touched)")
+    if getattr(args, "lint_exit_code", False):
+        sys.exit(1 if broken_count else 0)
+
+
 def cmd_fix_tags(args: argparse.Namespace) -> None:
     """Repair broken tags frontmatter in existing bug files (converter into the tool)."""
     for path in all_bug_files(args.project):
@@ -1220,6 +1438,17 @@ def parser() -> argparse.ArgumentParser:
     fix = commands.add_parser("fix-tags", help="repair broken tags frontmatter in existing bug files")
     fix.add_argument("project", nargs="?")
     fix.set_defaults(func=cmd_fix_tags)
+    lint = commands.add_parser(
+        "lint",
+        help="validate bug file frontmatter and approval checkboxes; optionally repair",
+    )
+    lint.add_argument("project", nargs="?", default=None)
+    lint.add_argument("--file", default=None, help="lint a single bug file instead of a project")
+    lint.add_argument("--repair", action="store_true", help="apply auto-fixable repairs in place")
+    lint.add_argument("--author", default=None, help="backfill filed_by when missing (implies --repair)")
+    lint.add_argument("--date", default=None, help="backfill date when missing (implies --repair)")
+    lint.add_argument("--assignee", default=None, help="backfill assignee when missing (implies --repair)")
+    lint.set_defaults(func=cmd_lint)
     set_cmd = commands.add_parser("set")
     set_cmd.add_argument("file")
     set_cmd.add_argument("section")
