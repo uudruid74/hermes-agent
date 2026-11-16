@@ -286,6 +286,58 @@ def test_approve_question_contains_full_plan(monkeypatch):
     assert "2. Load all steps" in seen["question"]
 
 
+def test_approve_is_idempotent_after_inline_delegated_approval(monkeypatch):
+    """Defect 2 (t_56369c1d, stage-12): `plan approve` must not re-prompt.
+
+    A delegated plan approved inline by the human keeps status
+    blocked/block_kind='approval' until the WORKER's `plan continue` flips
+    it. The old guard looked only at task status, so a follow-up
+    `plan approve` presented a SECOND approval prompt to the human and fired
+    a SECOND worker wake — Evan saw a doubled approval pair on stage 12
+    (t_e189638e, 2026-11-16). The durable plan_authorizations state is the
+    discriminator: an approved authorization short-circuits.
+    """
+    conn = _db()
+    monkeypatch.setattr(plan, "_get_kanban_db", lambda board=None: conn)
+    prompts = []
+
+    def fake_clarify(question, **_kwargs):
+        prompts.append(question)
+        return '{"user_response":"Approve"}'
+
+    monkeypatch.setattr(plan, "clarify_tool", fake_clarify)
+    sent = []
+    # spawn_detached is imported inside the functions from
+    # hermes_cli._subprocess_compat — patch it at the source module.
+    import hermes_cli._subprocess_compat as _subproc
+
+    monkeypatch.setattr(_subproc, "spawn_detached", lambda argv: sent.append(argv))
+    agent = _Agent()
+
+    delegated = plan.plan(
+        agent, "new", title="Worker plan", goal="theirs", steps=["one"],
+        assignee="ornith",
+    )
+    assert delegated.startswith("ornith has been notified"), delegated
+    child_id = conn.execute(
+        "SELECT id FROM tasks WHERE assignee='ornith' ORDER BY created_at DESC LIMIT 1"
+    ).fetchone()[0]
+    task = conn.execute(
+        "SELECT status, block_kind FROM tasks WHERE id=?", (child_id,)
+    ).fetchone()
+    # The delegated plan is deliberately still blocked/approval here.
+    assert tuple(task) == ("blocked", "approval")
+    assert len(prompts) == 1, "inline approval prompted the human once"
+    wakes_after_new = len(sent)
+
+    # The follow-up `plan approve` must NOT re-prompt or re-wake.
+    again = plan.plan(agent, "approve", task_id=child_id)
+
+    assert "already approved" in again, again
+    assert len(prompts) == 1, f"second approval prompt sent: {prompts}"
+    assert len(sent) == wakes_after_new, "assignee wake fired a second time"
+
+
 def test_new_nests_implicitly_under_the_active_plan(monkeypatch):
     """`new` while a Plan is active nests instead of refusing (Evan, 2026-09-15).
 

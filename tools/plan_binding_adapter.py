@@ -2189,6 +2189,20 @@ def cmd_continue(agent, task_id: str) -> str:
     # The Plan was transferred to this session — point the subject at its
     # active step.  See _sync_subject_from_binding.
     _sync_subject_from_binding(agent)
+    # Boundary compaction trigger (Evan, 2026-11-16): the pre-continue
+    # context window is noise — the plan is pinned at the head and the
+    # resumed step starts from a compacted window.  The explicit bump fires
+    # even when the marker text / subject string happen to be unchanged
+    # (resuming the same step), which the marker/subject detectors alone
+    # would miss.  Best-effort: a compressor without the method (test
+    # doubles / plugin engines) simply skips the bump.
+    _cc = getattr(agent, "context_compressor", None)
+    _boundary_request = getattr(_cc, "request_boundary_compaction", None) if _cc else None
+    if callable(_boundary_request):
+        try:
+            _boundary_request("plan_continue")
+        except Exception as exc:
+            logger.debug("boundary compaction bump failed: %s", exc)
     task = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
     return _format_plan(conn, task, include_summaries=True)
 
@@ -2203,6 +2217,24 @@ def cmd_approve(agent, task_id: str) -> str:
         return f"ERROR: Task {task_id} not found"
     if task["status"] != "blocked" or task["block_kind"] != "approval":
         return f"ERROR: Task {task_id} is not awaiting approval"
+    # Defect 2 (t_56369c1d, stage-12 double approval): a DELEGATED plan stays
+    # blocked/block_kind='approval' after its inline approval — the worker's
+    # `plan continue` is what flips the status. The durable authorization
+    # state, not the task status, is the discriminator: an already-resolved
+    # authorization must not re-prompt the human or re-wake the worker.
+    from hermes_cli import plan_authorizations
+
+    record = plan_authorizations.get_plan_authorization(conn, task_id)
+    if record is not None and record.state == "approved":
+        return (
+            f"Plan {task_id} is already approved — no new approval prompt was "
+            "sent and the assignee was not re-notified."
+        )
+    if record is not None and record.state != "pending":
+        return (
+            f"ERROR: Plan {task_id} authorization is {record.state}; "
+            "there is nothing to approve."
+        )
     callback = getattr(agent, "clarify_callback", None)
     if callback is None:
         return f"ERROR: No clarify callback available. Cannot present plan {task_id} for approval."
