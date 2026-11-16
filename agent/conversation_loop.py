@@ -7440,18 +7440,24 @@ def run_conversation(
                     from agent.kanban_stop import build_kanban_stop_nudge
 
                     try:
-                        from tools.plan_binding_adapter import active_plan_task_id
+                        from tools.plan_binding_adapter import (
+                            active_plan_is_top_level,
+                            active_plan_task_id,
+                        )
 
                         _bound_plan_task = active_plan_task_id(agent)
+                        _bound_plan_top_level = active_plan_is_top_level(agent)
                     except Exception:
                         logger.debug(
                             "kanban stop-guard plan lookup failed", exc_info=True
                         )
                         _bound_plan_task = None
+                        _bound_plan_top_level = False
                     _kanban_nudge = build_kanban_stop_nudge(
                         messages=messages,
                         attempts=getattr(agent, "_kanban_stop_nudges", 0),
                         plan_task_id=_bound_plan_task,
+                        plan_top_level=_bound_plan_top_level,
                     )
                 except Exception:
                     logger.debug("kanban stop-loop check failed", exc_info=True)

@@ -167,6 +167,32 @@ def test_plan_mode_wins_when_both_armed(clear_kanban_env):
     assert "kanban_complete" not in nudge
 
 
+def test_plan_top_level_suppresses_nudge(clear_kanban_env):
+    # A top-level driver plan (creator-owned) must never be nudged: its
+    # active step's real work runs in delegated plans, so advance/fail/block
+    # are all untruthful (Evan 2026-11-14).
+    messages = [
+        {"role": "user", "content": "work the step"},
+        {"role": "assistant", "content": "Stage confirmed while neo works it."},
+    ]
+    nudge = build_kanban_stop_nudge(
+        messages=messages,
+        attempts=0,
+        plan_task_id="t_plan1",
+        plan_top_level=True,
+    )
+    assert nudge is None
+
+
+def test_plan_top_level_flag_only_suppresses_plan_mode(clear_kanban_env):
+    # The top-level flag must not silence the env-armed kanban shape.
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_env")
+    nudge = build_kanban_stop_nudge(messages=[], plan_top_level=True)
+    assert nudge is not None
+    assert "kanban_complete" in nudge
+    assert "kanban_block" in nudge
+
+
 def test_plan_mode_honors_explicit_disable(clear_kanban_env):
     clear_kanban_env.setenv("HERMES_KANBAN_STOP_NUDGE", "0")
     assert kanban_stop_nudge_enabled(plan_task_id="t_plan1") is False

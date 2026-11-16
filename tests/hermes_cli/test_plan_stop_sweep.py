@@ -22,15 +22,25 @@ def _insert_task(
     status: str = "manual",
     steps: tuple[str, ...] = ("first", "second"),
     step_no: int = 1,
+    assignee: str = "ornith",
+    created_by: str | None = None,
 ) -> None:
     conn.execute(
         """
         INSERT INTO tasks (
             id, title, status, assignee, created_at, task_steps, task_stepno,
-            task_goal, board
-        ) VALUES (?, ?, ?, 'ornith', 1, ?, ?, 'goal', 'default')
+            task_goal, board, created_by
+        ) VALUES (?, ?, ?, ?, 1, ?, ?, 'goal', 'default', ?)
         """,
-        (task_id, task_id, status, json.dumps(list(steps)), step_no),
+        (
+            task_id,
+            task_id,
+            status,
+            assignee,
+            json.dumps(list(steps)),
+            step_no,
+            created_by,
+        ),
     )
     conn.commit()
 
@@ -177,6 +187,48 @@ def test_sweep_nudges_again_on_the_next_step(tmp_path):
         # One nudge per (task, step): two stalled steps → two nudges total.
         assert len(emitted2) == 2
         assert "step 2" in emitted2[-1][2]
+
+
+def test_sweep_skips_top_level_creator_owned_plan(tmp_path):
+    # A creator-owned plan (assignee == created_by) is a top-level driver
+    # plan: its step's real work runs in delegated plans, so advance/fail/
+    # block are all untruthful — never nudge it (Evan 2026-11-14).
+    with kb.connect(tmp_path / "kanban.db") as conn:
+        _insert_task(conn, "t_top", created_by="ornith")
+        opened_at = _bind_step_open(conn, "t_top")
+        db_path = _make_state_db(tmp_path)
+
+        nudged, emitted = _sweep(conn, db_path, now=opened_at + 3600)
+        assert nudged == []
+        assert emitted == []
+
+
+def test_sweep_still_nudges_delegated_plan(tmp_path):
+    # Delegated plans (assignee != created_by) are real worker contracts —
+    # the guard stays on for them.
+    with kb.connect(tmp_path / "kanban.db") as conn:
+        _insert_task(
+            conn, "t_del", assignee="ornith", created_by="wintermute"
+        )
+        opened_at = _bind_step_open(conn, "t_del")
+        db_path = _make_state_db(tmp_path)
+
+        nudged, emitted = _sweep(conn, db_path, now=opened_at + 3600)
+        assert nudged == ["t_del"]
+        assert len(emitted) == 1
+        assert "t_del" in emitted[0][2]
+
+
+def test_sweep_missing_created_by_still_nudges(tmp_path):
+    # Fail-safe: a plan that is not provably creator-owned keeps the guard.
+    with kb.connect(tmp_path / "kanban.db") as conn:
+        _insert_task(conn, "t_nocb")  # created_by stays NULL
+        opened_at = _bind_step_open(conn, "t_nocb")
+        db_path = _make_state_db(tmp_path)
+
+        nudged, emitted = _sweep(conn, db_path, now=opened_at + 3600)
+        assert nudged == ["t_nocb"]
+        assert len(emitted) == 1
 
 
 def test_sweep_skips_sign_of_life(tmp_path):

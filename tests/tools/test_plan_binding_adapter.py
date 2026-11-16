@@ -149,6 +149,36 @@ def test_stop_guard_arms_only_for_open_work(monkeypatch):
     assert plan_binding_adapter.active_plan_task_id(agent) == task_id
 
 
+def test_active_plan_is_top_level_classifies_creator_owned(monkeypatch):
+    # Evan 2026-11-14: the stop-guard must not nag top-level (creator-owned)
+    # driver plans — only provably creator-owned plans classify as top-level.
+    conn = _db()
+    monkeypatch.setattr(plan, "_get_kanban_db", lambda board=None: conn)
+    monkeypatch.setattr(
+        plan, "clarify_tool", lambda *_args, **_kwargs: '{"user_response":"Approve"}'
+    )
+    agent = _Agent()
+
+    result = plan.plan(agent, "new", title="Driver plan", goal="Drive", steps=["work"])
+    assert result.startswith("TASK APPROVED (t_")
+    task_id = conn.execute("SELECT id FROM tasks").fetchone()["id"]
+
+    # Creator-owned (no assignee given → assignee == created_by) → top-level.
+    assert plan_binding_adapter.active_plan_is_top_level(agent) is True
+
+    # Reassigned to another profile → delegated → not top-level.
+    conn.execute("UPDATE tasks SET assignee='zephyr' WHERE id=?", (task_id,))
+    assert plan_binding_adapter.active_plan_is_top_level(agent) is False
+
+    # Back to creator-owned shape → top-level again.
+    conn.execute("UPDATE tasks SET assignee='neo' WHERE id=?", (task_id,))
+    assert plan_binding_adapter.active_plan_is_top_level(agent) is True
+
+    # Missing created_by (ancient row) → not provably top-level → False.
+    conn.execute("UPDATE tasks SET created_by=NULL WHERE id=?", (task_id,))
+    assert plan_binding_adapter.active_plan_is_top_level(agent) is False
+
+
 def test_iteration_limit_parks_manual_plan_in_attention(monkeypatch):
     conn = _db()
     monkeypatch.setattr(plan, "_get_kanban_db", lambda board=None: conn)

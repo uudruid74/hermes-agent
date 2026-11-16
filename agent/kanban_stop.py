@@ -129,6 +129,7 @@ def build_kanban_stop_nudge(
     max_attempts: int = _DEFAULT_MAX_ATTEMPTS,
     task_id: Optional[str] = None,
     plan_task_id: Optional[str] = None,
+    plan_top_level: bool = False,
 ) -> Optional[str]:
     """Return a synthetic follow-up when a worker exits without a terminal tool.
 
@@ -136,12 +137,20 @@ def build_kanban_stop_nudge(
     already submitted/completed/blocked, or nudge budget exhausted).
     ``plan_task_id`` (a bound Plan) selects plan mode — plan terminal tools
     and plan vocabulary; otherwise the env-armed kanban shape is unchanged.
+    ``plan_top_level`` marks a creator-owned driver plan: its active step's
+    real work runs in delegated plans, so advance/fail/block are all
+    untruthful for the driver — plan mode is suppressed (Evan 2026-11-14).
     """
     if not kanban_stop_nudge_enabled(plan_task_id=plan_task_id):
         return None
     if attempts >= max_attempts:
         return None
     if plan_task_id:
+        # Top-level plans are creator-owned driver plans: their active step's
+        # real work runs in delegated plans, so advance/fail/block are all
+        # untruthful for the driver — never nag them (Evan 2026-11-14).
+        if plan_top_level:
+            return None
         if session_called_plan_terminal(messages):
             return None
         tid = plan_task_id.strip() or "this plan"

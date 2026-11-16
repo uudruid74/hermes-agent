@@ -726,6 +726,32 @@ def active_plan_task_id(agent) -> Optional[str]:
     return binding.task_id
 
 
+def active_plan_is_top_level(agent) -> bool:
+    """True when the session's bound Plan is a top-level driver plan.
+
+    A top-level plan is creator-owned (``assignee == created_by``): its
+    steps' real work runs in delegated plans, so the stop-guard must not
+    demand advance/fail/block from the driver (Evan 2026-11-14). Delegated
+    plans (``assignee != created_by``) keep the guard. A missing
+    ``created_by`` is treated as NOT top-level — only provably creator-owned
+    plans are suppressed (fail-safe).
+    """
+    conn = _legacy()._get_kanban_db()
+    _key, binding, _error = _current(conn, agent)
+    if binding is None:
+        return False
+    row = conn.execute(
+        "SELECT assignee, created_by FROM tasks WHERE id = ?", (binding.task_id,)
+    ).fetchone()
+    if row is None:
+        return False
+    created_by = str(row["created_by"] or "").strip()
+    if not created_by:
+        return False
+    assignee = str(row["assignee"] or "").strip()
+    return not assignee or assignee == created_by
+
+
 def block_active_plan_at_iteration_limit(agent, *, used: int, maximum: int) -> bool:
     """Park an unsubmitted active Plan step after its turn budget is exhausted.
 

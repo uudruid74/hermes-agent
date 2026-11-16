@@ -1560,6 +1560,22 @@ def _emit_plan_stop_nudge(
     )
 
 
+def _is_top_level_plan(task) -> bool:
+    """True for a creator-owned plan (``assignee == created_by``).
+
+    Top-level plans are driver plans whose active step's real work runs in
+    delegated plans — advance/fail/block are all untruthful for the driver,
+    so the stop-guard must not nudge them (Evan 2026-11-14). A missing
+    ``created_by`` keeps the guard armed: only provably creator-owned plans
+    are suppressed (fail-safe).
+    """
+    created_by = str(task[3] or "").strip()
+    if not created_by:
+        return False
+    assignee = str(task[2] or "").strip()
+    return not assignee or assignee == created_by
+
+
 def sweep_stalled_plan_workers(
     conn: sqlite3.Connection,
     *,
@@ -1585,9 +1601,16 @@ def sweep_stalled_plan_workers(
     ).fetchall()
     for profile, root_session_id, task_id, step_opened_at in rows:
         task = conn.execute(
-            "SELECT status, task_stepno FROM tasks WHERE id = ?", (task_id,)
+            "SELECT status, task_stepno, assignee, created_by"
+            " FROM tasks WHERE id = ?",
+            (task_id,),
         ).fetchone()
         if task is None or task[0] not in {"manual", "running"}:
+            continue
+        # Top-level plans are creator-owned driver plans whose active step's
+        # real work runs in delegated plans — advance/fail/block are all
+        # untruthful for the driver; never nudge them (Evan 2026-11-14).
+        if _is_top_level_plan(task):
             continue
         step_no = int(task[1] or 1)
         opened_at = int(step_opened_at or 0)
