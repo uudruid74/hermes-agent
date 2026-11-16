@@ -35,6 +35,7 @@ from agent.context_engine import ContextEngine, sanitize_memory_context
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.internal_compression_fallback import (
     INTERNAL_FALLBACK_PREFIX,
+    _newest_step_change_number,
     _tool_call_rows_by_id,
     build_internal_fallback,
     collapse_tail_tool_pairs,
@@ -1326,6 +1327,13 @@ def resolve_model_threshold(
 
 
 class ContextCompressor(ContextEngine):
+    # Opt-in marker for the boundary-compaction triggers (Evan, 2026-11-16):
+    # only this engine accepts the ``messages`` kwarg on should_compress() /
+    # should_compress_info().  Call sites gate on this so plugin engines and
+    # test doubles implementing the base ``should_compress(prompt_tokens)``
+    # contract are never handed an argument they do not understand.
+    supports_boundary_triggers = True
+
     """Default context engine — compresses conversation context via lossy summarization.
 
     Algorithm:
@@ -2463,6 +2471,21 @@ class ContextCompressor(ContextEngine):
         # Set after a completed compression boundary; consumed by the next
         # provider-reported prompt count in update_from_response().
         self._verify_compaction_cleared_threshold: bool = False
+        # ── Boundary-compaction trigger state (Evan, 2026-11-16) ─────────
+        # Plan step-changes, plan-continue, and session subject changes are
+        # hard semantic cuts: everything before the boundary is completed
+        # history, so compaction fires FRESH there instead of waiting for
+        # the size threshold.  ``_boundary_snapshot`` is the boundary state
+        # (newest plan step-change number, session subject) recorded at the
+        # last COMPLETED compaction; ``_pending_boundary_*`` hold a detected
+        # but not-yet-committed trigger so a lock-skipped/no-progress
+        # attempt re-fires instead of being lost.  Only a real completed
+        # rewrite commits the pending state (see
+        # ``_commit_boundary_snapshot``).
+        self._boundary_snapshot: dict[str, Any] = {"marker": None, "subject": None}
+        self._boundary_subject_baselined: bool = False
+        self._pending_boundary_snapshot: dict[str, Any] | None = None
+        self._pending_boundary_reason: str | None = None
         # Lets the boundary wrapper distinguish a completed rewrite from a
         # no-op/abort without inferring progress from message-list length.
         self._last_compression_made_progress: bool = False
@@ -2613,7 +2636,7 @@ class ContextCompressor(ContextEngine):
         self.last_rough_tokens_when_real_prompt_fit = max(baseline, rough_tokens)
         return True
 
-    def should_compress(self, prompt_tokens: int = None) -> bool:
+    def should_compress(self, prompt_tokens: int = None, messages=None) -> bool:
         """Check if context exceeds the compression threshold.
 
         Returns ``True`` when compression should run now. For the caller-facing
@@ -2621,15 +2644,22 @@ class ContextCompressor(ContextEngine):
         see :meth:`should_compress_info`, which returns a ``(bool, reason)``
         tuple without changing the decision logic here.
 
+        ``messages`` (optional) is the live transcript.  When present, the
+        boundary-compaction triggers (Evan, 2026-11-16) also run: a NEW plan
+        step-change marker, a session subject change, or an explicit plan-
+        continue bump fires a fresh compaction even below the size threshold.
+        Without ``messages`` (or when no boundary moved) the behaviour is
+        exactly the pre-existing threshold-only gate.
+
         Includes anti-thrashing protection: if the last two compressions
         each saved less than 10%, skip compression to avoid infinite loops
         where each pass removes only 1-2 messages.
         """
-        decision, _reason = self.should_compress_info(prompt_tokens)
+        decision, _reason = self.should_compress_info(prompt_tokens, messages=messages)
         return decision
 
     def should_compress_info(
-        self, prompt_tokens: int = None
+        self, prompt_tokens: int = None, messages=None
     ) -> "tuple[bool, str | None]":
         """Check if context exceeds the compression threshold.
 
@@ -2650,16 +2680,114 @@ class ContextCompressor(ContextEngine):
         growing until it hits the hard provider limit). Without this signal an
         over-threshold session fails opaquely.
 
+        ``messages`` (optional) arms the boundary-compaction triggers, which
+        fire fresh compactions at plan step-changes, plan-continue, and
+        subject changes even below the threshold (see :meth:`should_compress`).
+        These still respect the same automatic-compaction block guards as the
+        threshold path.
+
         Includes anti-thrashing protection: if the last two compressions
         each saved less than 10%, skip compression to avoid infinite loops
         where each pass removes only 1-2 messages.
         """
         tokens = prompt_tokens if prompt_tokens is not None else self.last_prompt_tokens
+        boundary_reason = self._boundary_trigger_reason(messages)
+        if boundary_reason:
+            if self._automatic_compression_blocked():
+                return False, self._compression_block_reason() or "blocked"
+            return True, boundary_reason
         if tokens < self.threshold_tokens:
             return False, None
         if self._automatic_compression_blocked():
             return False, self._compression_block_reason() or "blocked"
         return True, None
+
+    # ── Boundary-compaction triggers (Evan, 2026-11-16) ─────────────────
+    # Plan step-changes, plan-continue, and subject changes mark hard
+    # semantic cuts; completed-step history re-sent as cache-reads on every
+    # later call is waste, so these fire a fresh compaction at the boundary
+    # instead of waiting for the size threshold.  Threshold behaviour and
+    # the protected-tail guarantees are untouched — only the WHEN changes.
+
+    def request_boundary_compaction(self, reason: str = "plan_continue") -> None:
+        """Explicitly arm a boundary-compaction trigger (plan continue).
+
+        Called by the plan-continue handler after a plan transfers into this
+        session: the pre-continue window is noise regardless of whether any
+        marker text or subject string changed, so the trigger is explicit.
+        Consumed by the next :meth:`should_compress_info` evaluation and only
+        cleared when a compaction actually completes.
+        """
+        self._pending_boundary_reason = reason
+
+    def _boundary_snapshot_from_messages(self, messages) -> dict[str, Any]:
+        """Current boundary state: newest plan step-change number + subject."""
+        marker = None
+        if messages:
+            try:
+                marker = _newest_step_change_number(messages)
+            except Exception:
+                marker = None
+        try:
+            subject = self._session_subject()
+        except Exception:
+            subject = ""
+        return {"marker": marker, "subject": subject}
+
+    def _boundary_trigger_reason(self, messages) -> "str | None":
+        """Return a pending boundary-trigger reason, or None.
+
+        Trigger precedence: an explicit pending reason (plan continue) first,
+        then a NEW plan step-change marker, then a session subject change.
+        Detection snapshots the boundary state that triggered so a completed
+        compaction can commit it (see ``_commit_boundary_snapshot``); the
+        trigger survives until a compaction actually completes, so a lock-
+        skipped attempt re-fires instead of being lost.
+        """
+        if self._pending_boundary_reason:
+            if self._pending_boundary_snapshot is None and messages:
+                self._pending_boundary_snapshot = (
+                    self._boundary_snapshot_from_messages(messages)
+                )
+            return self._pending_boundary_reason
+        if not messages:
+            return None
+        snap = self._boundary_snapshot_from_messages(messages)
+        # Baseline the subject on first observation: a subject set before
+        # this compressor existed (or carried over from a prior process) is
+        # the session's starting point, not a change.  Confirmatory re-sets
+        # of the same subject are no-ops by construction (equal -> no fire).
+        if not self._boundary_subject_baselined:
+            if snap["subject"]:
+                self._boundary_snapshot["subject"] = snap["subject"]
+                self._boundary_subject_baselined = True
+        if (
+            snap["marker"] is not None
+            and snap["marker"] != self._boundary_snapshot["marker"]
+        ):
+            self._pending_boundary_reason = "boundary_step_change"
+            self._pending_boundary_snapshot = snap
+            return self._pending_boundary_reason
+        if snap["subject"] and snap["subject"] != self._boundary_snapshot["subject"]:
+            self._pending_boundary_reason = "boundary_subject_change"
+            self._pending_boundary_snapshot = snap
+            return self._pending_boundary_reason
+        return None
+
+    def _commit_boundary_snapshot(self) -> None:
+        """Fold the pending trigger state into the committed snapshot.
+
+        Called only after a compaction actually completes with progress.
+        Clears the pending trigger; if no pending snapshot exists (e.g. a
+        compaction path that never evaluated the triggers) the committed
+        snapshot is left untouched and the pending reason is dropped so a
+        stale trigger cannot loop.
+        """
+        if self._pending_boundary_snapshot is not None:
+            self._boundary_snapshot = self._pending_boundary_snapshot
+            self._pending_boundary_snapshot = None
+        self._pending_boundary_reason = None
+        self._boundary_subject_baselined = True
 
     def _compression_block_reason(self) -> "str | None":
         """Return a human-readable reason for the current automatic-compaction

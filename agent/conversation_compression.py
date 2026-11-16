@@ -3622,6 +3622,24 @@ def compress_context(
                 )
             else:
                 agent.context_compressor._verify_compaction_cleared_threshold = True
+            # Commit the boundary-trigger snapshot (Evan, 2026-11-16): a
+            # completed rewrite has compacted the boundary that fired it, so
+            # the pending trigger is consumed and the committed snapshot moves
+            # to the new boundary state.  Only a completed rewrite commits —
+            # a lock-skip or no-progress attempt leaves the trigger armed so
+            # it re-fires on the next evaluation.
+            _commit_snap = getattr(
+                type(agent.context_compressor),
+                "_commit_boundary_snapshot",
+                None,
+            )
+            if callable(_commit_snap):
+                try:
+                    _commit_snap(agent.context_compressor)
+                except Exception:
+                    logger.debug(
+                        "boundary snapshot commit failed", exc_info=True
+                    )
 
         # Clear the file-read dedup cache.  After compression the original
         # read content is summarised away — if the model re-reads the same

@@ -2130,6 +2130,16 @@ def run_conversation(
         _compression_cooldown = getattr(
             _compressor, "get_active_compression_failure_cooldown", lambda: None
         )()
+        # Boundary-compaction triggers (Evan, 2026-11-16) are opt-in on the
+        # engine; only engines that accept the ``messages`` kwarg receive it.
+        # ``is True`` (not truthiness): MagicMock auto-attributes would
+        # otherwise look enabled.
+        if getattr(_compressor, "supports_boundary_triggers", False) is True:
+            _should_compress_now = _compressor.should_compress(
+                request_pressure_tokens, messages=messages
+            )
+        else:
+            _should_compress_now = _compressor.should_compress(request_pressure_tokens)
         if (
             agent.compression_enabled
             and len(messages) > 1
@@ -2137,7 +2147,7 @@ def run_conversation(
             and not _preflight_compression_blocked
             and not _defer_preflight(request_pressure_tokens)
             and not _compression_cooldown
-            and _compressor.should_compress(request_pressure_tokens)
+            and _should_compress_now
         ):
             if _moa_prepared_request is not None:
                 pending_moa_prepared_request = _moa_prepared_request
@@ -6692,13 +6702,19 @@ def run_conversation(
                         False,
                     )
                 )
+                if getattr(_compressor, "supports_boundary_triggers", False) is True:
+                    _should_compress_now = _compressor.should_compress(
+                        _real_tokens, messages=messages
+                    )
+                else:
+                    _should_compress_now = _compressor.should_compress(_real_tokens)
                 if (
                     agent.compression_enabled
                     and (
                         _force_plan_completion_compression
                         or (
                             compression_attempts < max_compression_attempts
-                            and _compressor.should_compress(_real_tokens)
+                            and _should_compress_now
                         )
                     )
                 ):

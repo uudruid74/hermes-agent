@@ -234,6 +234,18 @@ _PLAN_STEP_CHANGE_RE = re.compile(
     r"|Active Step \d+ of \d+"
     r")"
 )
+# Capture form of the same markers for the boundary-compaction trigger (Evan,
+# 2026-11-16): the STEP NUMBER is the canonical identity.  Marker type is
+# deliberately ignored so a marker re-shown for the same step (remind) keys
+# identically, while advance/approve/continue moving to a new step number
+# changes the key.
+_PLAN_STEP_NUM_RE = re.compile(
+    r"(?:"
+    r"Complete Step (\d+)"
+    r"|>>>\s*STEP\s+(\d+)"
+    r"|Active Step (\d+) of \d+"
+    r")"
+)
 # ``[ROLE]: `` prefixes stack ("[USER]: [USER]: [ASSISTANT]: ") when payloads
 # are re-ingested, and repeats can sit mid-text after newlines collapsed to
 # spaces.  Only the leading run on a *fresh* message is ours — every other
@@ -2512,6 +2524,31 @@ def _plan_step_change_index(
         if _PLAN_STEP_CHANGE_RE.search(content):
             boundary = index
     return boundary
+
+
+def _newest_step_change_number(messages: list[dict[str, Any]]) -> int | None:
+    """Step number of the newest Plan step-change marker in ``messages``.
+
+    Compact trigger key for the boundary-compaction gate (Evan, 2026-11-16).
+    Returns ``None`` when no marker is present.  Marker type is ignored so a
+    marker re-shown for the same step (``remind``) keys identically, while a
+    real step move (advance/approve/continue) changes the number — that is
+    the no-double-fire discriminator: compact once when the step number
+    advances, not on every re-render of the same step.
+    """
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if not isinstance(content, str) or not content:
+            continue
+        match = _PLAN_STEP_NUM_RE.search(content)
+        if match:
+            for group in match.groups():
+                if group is not None:
+                    return int(group)
+    return None
 
 
 def _add_plan_lexrank_area(

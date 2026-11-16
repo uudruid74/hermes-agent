@@ -992,7 +992,12 @@ def build_turn_context(
                 getattr(agent, "codex_app_server_auto_compaction", "native"),
             )
         else:
-            _should_compress_now = _compressor.should_compress(_preflight_tokens)
+            if getattr(_compressor, "supports_boundary_triggers", False) is True:
+                _should_compress_now = _compressor.should_compress(
+                    _preflight_tokens, messages=messages
+                )
+            else:
+                _should_compress_now = _compressor.should_compress(_preflight_tokens)
             if not _should_compress_now:
                 # Context is over threshold but compression is blocked
                 # (summary-LLM cooldown or anti-thrashing). Ask should_compress_info
@@ -1097,7 +1102,13 @@ def build_turn_context(
                 agent._last_content_with_tools = None
                 agent._last_content_tools_all_housekeeping = False
                 agent._mute_post_response = False
-                if not _compressor.should_compress(_preflight_tokens):
+                if getattr(_compressor, "supports_boundary_triggers", False) is True:
+                    _should_compress_now = _compressor.should_compress(
+                        _preflight_tokens, messages=messages
+                    )
+                else:
+                    _should_compress_now = _compressor.should_compress(_preflight_tokens)
+                if not _should_compress_now:
                     break
                 if not _compression_warrants_another_preflight_pass(
                     _orig_tokens,
