@@ -480,6 +480,68 @@ def test_inject_with_user_context_creates_real_inbound_user_event():
 # Framing limit — t_94b593b6 (large wake payloads must survive the bridge)
 # ---------------------------------------------------------------------------
 
+def test_inject_into_fresh_topic_binds_session_before_delivery(monkeypatch, tmp_path):
+    """Regression for 2026-11-16-topic-wake-no-bound-session.
+
+    A wake targeted at a chat/thread with NO existing session must create/
+    bind the target session at intake, so the injected turn actually lands
+    instead of posting into the void ("Mirror: no session found") and
+    stranding the claimed task until an unrelated reclaim tick.
+    """
+    import hermes_state as hermes_state_mod
+    from gateway.config import GatewayConfig
+    from gateway.session import SessionStore
+
+    monkeypatch.setattr(hermes_state_mod, "DEFAULT_DB_PATH", tmp_path / "state.db")
+    store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+
+    captured = []
+
+    class Adapter:
+        async def handle_message(self, event):
+            captured.append(event)
+
+    runner = SimpleNamespace(
+        adapters={Platform.TELEGRAM: Adapter()},
+        config=SimpleNamespace(get_home_channel=lambda _platform: None),
+        session_store=store,
+    )
+    writer = _Writer()
+
+    asyncio.run(
+        _handle_inject(
+            runner,
+            {
+                "platform": "telegram",
+                "chat_id": "-1004406953125",
+                "text": "work kanban task t_test123",
+                "thread_id": "6",
+                "chat_type": "group",
+                "user_context": {
+                    "user_id": "cli",
+                    "platform_user_id": "cli",
+                    "sender_name": "CLI User",
+                },
+            },
+            cast(asyncio.StreamWriter, writer),
+        )
+    )
+
+    assert writer.payload == {"ok": True}
+    assert len(captured) == 1
+    assert captured[0].source.chat_type == "group"
+    assert captured[0].source.thread_id == "6"
+    # The intake must have created a LIVE session bound to the topic origin
+    # before delivery — the mirror/visible-copy then lands in it.
+    assert store._db is not None
+    sid = store._db.find_session_by_origin(
+        platform="telegram",
+        chat_id="-1004406953125",
+        thread_id="6",
+    )
+    assert sid is not None
+
+
 def test_bridge_reader_reads_over_64k_payloads():
     """A 106K-char wake brief (the gopher journal defect) frames cleanly."""
     payload = json.dumps({"action": "send", "text": "B" * (106 * 1024)}).encode() + b"\n"

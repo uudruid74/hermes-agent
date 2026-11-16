@@ -351,6 +351,20 @@ async def _handle_inject(runner, cmd: dict, writer: asyncio.StreamWriter) -> Non
             session_source.user_id = user_context.get("user_id")
             session_source.user_name = user_context.get("sender_name")
             event_metadata["platform_user_id"] = user_context.get("platform_user_id")
+        # Wake intake — topic-wake-no-bound-session: a wake targeted at a
+        # chat/thread that has NO existing session must still create/bind one
+        # BEFORE delivery, or the message posts into the void ("Mirror: no
+        # session found") and the worker never starts — the claimed task then
+        # strands until an unrelated tick reclaims it. Resolve the target
+        # session unconditionally for every injected wake; task-id binding and
+        # duplicate suppression below apply only to dispatch wakes.
+        try:
+            runner.session_store.get_or_create_session(session_source)
+        except Exception as exc:
+            logger.warning(
+                "wake session resolve failed for %s:%s:%s: %s",
+                platform_name, chat_id, thread_id, exc,
+            )
         # Wake intake (t_a8031c32 gap 1/4): bind the carried task id to the
         # exact session this wake lands in before the turn runs; a duplicate
         # (the session is already engaged on live work) is suppressed — never

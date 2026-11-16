@@ -119,17 +119,21 @@ def test_bridge_default_cap_is_sane():
 # 2/3. Payload discipline + visible-copy caps
 # ---------------------------------------------------------------------------
 
-def test_visible_copy_caps_large_payload():
-    """t_94b593b6: the -u copy is a short notice, never the raw wake payload."""
+def test_visible_copy_keeps_full_payload_verbatim():
+    """Evan 2026-11-11: the -u copy IS the full payload (cap removed).
+
+    The visible copy must never hide what travels through the system — a
+    long wake arrives in full (chunked by the platform), never truncated to
+    a short notice (t_94b593b6's cap was removed by design).
+    """
     import hermes_cli.send_cmd as send_cmd
 
     assert callable(send_cmd._wake_visible_copy_message)
 
     long_payload = "[cron-wake] Journals\njob_id: jw\n" + ("This is a very long brief " * 4000)
-    short = send_cmd._wake_visible_copy_message("neo", long_payload)
-    assert len(short) < 400
-    assert "wake payload" in short and "run continues" in short
-    assert "very long brief" not in short  # never the raw payload
+    visible = send_cmd._wake_visible_copy_message("neo", long_payload)
+    assert visible == long_payload.strip()
+    assert "very long brief" in visible  # full payload, never truncated
 
 
 def test_visible_copy_keeps_short_wakes_verbatim():
