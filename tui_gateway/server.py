@@ -8821,171 +8821,71 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
     return (evt_sid, evt_type)
 
 
-# Kanban terminal kinds — the old gateway notifier's list (that polling
-# watcher was deleted 2026-10-19; this is the TUI's own display-side copy).
-# Claim silent kinds too so the cursor advances past them and they can't
-# wedge a later completed/blocked event behind an unclaimed row.
-_KANBAN_NOTIFY_KINDS = (
-    "completed", "blocked", "gave_up", "crashed", "timed_out",
-    "status", "archived", "unblocked",
-)
-_KANBAN_SILENT_KINDS = frozenset({"archived", "unblocked"})
+# Kanban notice drain cadence for the TUI poller (seconds). Kanban
+# notifications arrive as origin-routed session notices at event time
+# (hermes_cli/kanban.py::_deliver_kanban_notification); the poller just
+# drains the queue on this cadence — there is no cursor to advance.
 _KANBAN_POLL_SECONDS = 5.0
 
 
-def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[str]:
-    """Single-line notification text for one kanban event.
-
-    Wording matches the event-time notification text (the old gateway
-    notifier, now hermes_cli/kanban.py::_notify_kanban_status_change) so a
-    task completion reads the same in the TUI as it does on Telegram.
-    Returns None for kinds that are claimed but intentionally silent.
-    """
-    kind = getattr(ev, "kind", "")
-    if not kind or kind in _KANBAN_SILENT_KINDS:
-        return None
-    task_id = sub.get("task_id", "")
-    title = (getattr(task, "title", None) or task_id)[:120]
-    board_tag = f"[{board_slug}] " if board_slug else ""
-    who = getattr(task, "assignee", None) or ""
-    tag = f"@{who} " if who else ""
-    payload = getattr(ev, "payload", None) or {}
-    if kind == "completed":
-        handoff = ""
-        summary = payload.get("summary")
-        if summary:
-            lines = str(summary).strip().splitlines()
-            handoff = f"\n{lines[0][:200]}" if lines else ""
-        elif getattr(task, "result", None):
-            lines = str(task.result).strip().splitlines()
-            handoff = f"\n{lines[0][:160]}" if lines else ""
-        return f"✔ {board_tag}{tag}Kanban {task_id} done — {title}{handoff}"
-    if kind == "blocked":
-        reason = f": {str(payload.get('reason'))[:160]}" if payload.get("reason") else ""
-        return f"⏸ {board_tag}{tag}Kanban {task_id} blocked{reason}"
-    if kind == "gave_up":
-        err = f"\n{str(payload.get('error'))[:200]}" if payload.get("error") else ""
-        return f"✖ {board_tag}{tag}Kanban {task_id} gave up after repeated spawn failures{err}"
-    if kind == "crashed":
-        return f"✖ {board_tag}{tag}Kanban {task_id} worker crashed (pid gone); dispatcher will retry"
-    if kind == "timed_out":
-        limit = 0
-        try:
-            limit = int(payload.get("limit_seconds") or 0)
-        except (TypeError, ValueError):
-            pass
-        return f"⏱ {board_tag}{tag}Kanban {task_id} timed out (max_runtime={limit}s); will retry"
-    if kind == "status":
-        return f"🔄 {board_tag}{tag}Kanban {task_id} → {payload.get('status') or ''}"
-    return None
-
-
 def _collect_kanban_notifications(session: dict) -> list:
-    """Claim unseen terminal kanban events for this TUI session's subscriptions.
+    """Drain kanban notices queued for this TUI session (origin routing).
 
-    ``kanban_create`` auto-subscribes TUI/desktop sessions with
-    ``platform="tui"`` and ``chat_id=HERMES_SESSION_KEY`` (see
-    tools/kanban_tools.py ``_maybe_auto_subscribe``). The gateway notifier
-    can't deliver those — there is no "tui" messaging adapter — so this
-    poller is the delivery path for them (issue #59890). Uses the same
-    atomic cursor-claim (``claim_unseen_events_for_sub``) as the gateway
-    notifier, so a subscription is delivered exactly once even if a gateway
-    and a TUI poll the same board DB.
+    Kanban delivery is origin-routed at event time
+    (``hermes_cli/kanban.py::_deliver_kanban_notification``): the task's
+    origin comment resolves to a chat platform, and local surfaces (CLI
+    workers, TUI/desktop sessions) land in the origin profile's
+    ``session_notices`` queue instead — the same queue the CLI drains via
+    SIGUSR1 (``cli.py::_flush_credit_notices``). The TUI's agent is an
+    AIAgent, not a HermesCLI, so nothing drained its notices; this poller
+    is the TUI's drain half (the subscription-table walk it replaced was
+    removed with ``kanban_notify_subs`` — 2026-11-17, t_80386714).
 
-    Returns the list of formatted notification texts (may be empty).
+    Notices are atomically claimed by ``drain_session_notices`` (single
+    DELETE-returning SELECT), so a notice is delivered exactly once even
+    if multiple surfaces poll the same state.db.
+
+    Returns the list of notice texts (may be empty).
     """
     session_key = str(session.get("session_key") or "")
     if not session_key or session.get("_finalized"):
         return []
-    try:
-        from hermes_cli import kanban_db as _kb
-    except Exception:
+    agent = session.get("agent")
+    # Prefer the agent's durable session id — the same id derivation the
+    # env bridge uses (see _agent_session_context): the task's origin
+    # routing records it, so notices are keyed on it. Fall back to the
+    # session_key (matching session-finalize's id derivation).
+    session_id = (
+        getattr(agent, "session_id", None) or session_key
+    )
+    # Profile-aware handle, mirroring _ensure_session_db_row/_session_db:
+    # a remote/profile session's notices live in ITS profile's state.db.
+    db, close_db = None, False
+    profile_home = session.get("profile_home")
+    if profile_home:
+        from hermes_state import SessionDB
+
+        try:
+            db, close_db = SessionDB(db_path=Path(profile_home) / "state.db"), True
+        except Exception:
+            logger.debug("failed to open profile db for kanban notices", exc_info=True)
+    else:
+        db = _get_db()
+    if db is None:
         return []
     texts: list = []
     try:
-        boards = _kb.list_boards(include_archived=False)
+        notices = db.drain_session_notices(session_id)
     except Exception:
-        try:
-            boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
-        except Exception:
-            return []
-    # Poll each resolved DB path once — multiple slugs can point at the same
-    # DB when HERMES_KANBAN_DB pins the board path (same guard as the gateway
-    # notifier).
-    seen_db_paths: set = set()
-    for board_meta in boards:
-        slug = (board_meta or {}).get("slug") or _kb.DEFAULT_BOARD
-        db_path = (board_meta or {}).get("db_path")
-        try:
-            resolved = (
-                str(Path(db_path).expanduser().resolve())
-                if db_path else str(_kb.kanban_db_path(slug).resolve())
-            )
-        except Exception:
-            resolved = f"slug:{slug}"
-        if resolved in seen_db_paths:
-            continue
-        seen_db_paths.add(resolved)
-        # A poller runs per live TUI/Desktop session. Avoid opening this board
-        # writable unless it has a subscription owned by this exact session;
-        # subscriptions for gateways or other sessions are not actionable here.
-        try:
-            if _kb.count_notify_subs(
-                board=slug,
-                platform="tui",
-                chat_id=session_key,
-            ) == 0:
-                continue
-        except Exception:
-            # Preserve delivery if the read-only probe cannot inspect a
-            # locked, corrupt, or otherwise unusual database.
-            pass
-        try:
-            conn = _kb.connect(board=slug)
-        except Exception:
-            continue
-        try:
-            try:
-                subs = _kb.list_notify_subs(conn)
-            except Exception:
-                continue
-            for sub in subs:
-                if (sub.get("platform") or "").lower() != "tui":
-                    continue
-                if sub.get("chat_id") != session_key:
-                    continue
-                _old, _new, events = _kb.claim_unseen_events_for_sub(
-                    conn,
-                    task_id=sub["task_id"],
-                    platform=sub["platform"],
-                    chat_id=sub["chat_id"],
-                    thread_id=sub.get("thread_id") or "",
-                    kinds=_KANBAN_NOTIFY_KINDS,
-                )
-                if not events:
-                    continue
-                task = _kb.get_task(conn, sub["task_id"])
-                for ev in events:
-                    text = _format_kanban_event_text(sub, task, ev, slug)
-                    if text:
-                        texts.append(text)
-                # Unsubscribe only at a truly final status (done/archived);
-                # blocked/crashed subs stay live so a respawned task's next
-                # terminal event still reaches the user (same rule as the
-                # gateway notifier).
-                if task and getattr(task, "status", "") in {"done", "archived"}:
-                    try:
-                        _kb.remove_notify_sub(
-                            conn,
-                            task_id=sub["task_id"],
-                            platform=sub["platform"],
-                            chat_id=sub["chat_id"],
-                            thread_id=sub.get("thread_id") or "",
-                        )
-                    except Exception:
-                        pass
-        finally:
-            conn.close()
+        return []
+    finally:
+        if close_db:
+            with contextlib.suppress(Exception):
+                db.close()
+    for notice in notices:
+        text = str(notice.get("text") or "").strip()
+        if text:
+            texts.append(text)
     return texts
 
 
@@ -9002,10 +8902,11 @@ def _notification_poller_loop(
     poller requeues events owned by another live session and drops addressed
     events whose owner is gone; ownerless legacy notifications remain global.
 
-    Also polls ``kanban_notify_subs`` every ``_KANBAN_POLL_SECONDS`` for this
-    session's TUI kanban subscriptions and delivers terminal task events the
-    same way (status.update + agent turn) — the delivery path
-    tools/kanban_tools.py documents for platform="tui" rows (issue #59890).
+    Also drains this session's kanban session notices every
+    ``_KANBAN_POLL_SECONDS`` (origin-routed at event time by the kanban
+    state-change hook; the TUI agent has no CLI wake-signal path, so this
+    poller is the TUI's drain half) and delivers them the same way
+    (status.update + agent turn).
     """
     from tools.process_registry import process_registry, format_process_notification
 
