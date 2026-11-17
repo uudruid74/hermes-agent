@@ -1046,6 +1046,16 @@ async def _send_bridge_command(payload, *, bridge_path=None, operation: str):
                 "queued": _status == "queued",
                 "status": str(_status),
             }
+        # A duplicate-wake suppress answer ({ok, suppressed, note}) has
+        # no intake status; carry ``suppressed`` through so CLI consumers
+        # (cron's _bridge_cli_wake) can tell a benign duplicate from a
+        # fresh delivery instead of reading a generic success envelope.
+        if response.get("suppressed"):
+            return {
+                "success": True,
+                "suppressed": True,
+                "note": response.get("note") or "duplicate wake suppressed",
+            }
         # Legacy delivery bridge: no intake status, keep the queue field.
         return {"success": True, "queued": bool(response.get("queued", False))}
     return {

@@ -332,6 +332,16 @@ def _emit_result(
 
     if payload.get("error"):
         return _FAILURE_EXIT
+    # L1 law 1 (tests/dispatch/CONTRACT.md): DROPPED IS NEVER SUCCESS.
+    # A wake the gateway dropped (inject accepted, no processing task
+    # started) is a delivery failure at the CLI boundary too — callers
+    # like cron's ``_bridge_cli_wake`` read BOTH this exit code and the
+    # JSON payload, and a shell caller reads only the code. ``success``
+    # alone is the transport ack; without this, ``{"success": true,
+    # "status": "dropped"}`` exits 0 and spawn success masquerades as a
+    # delivered wake (the false-green class this suite locks out).
+    if payload.get("status") == "dropped":
+        return _FAILURE_EXIT
     if payload.get("skipped"):
         return _SUCESS_EXIT
     if payload.get("success"):
