@@ -3528,7 +3528,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             parent = conn.execute(
                 """SELECT ended_at, cwd, git_branch, git_repo_root,
                           user_id, session_key, chat_id, chat_type,
-                          thread_id, display_name, origin_json, profile_name
+                          thread_id, display_name, origin_json, profile_name,
+                          task_id
                    FROM sessions WHERE id = ?""",
                 (parent_session_id,),
             ).fetchone()
@@ -3546,8 +3547,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                    system_prompt_hash,
                    parent_session_id, cwd, git_branch, git_repo_root,
                    profile_name, user_id, session_key, chat_id, chat_type,
-                   thread_id, display_name, origin_json, started_at
-                ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   thread_id, display_name, origin_json, task_id, started_at
+                ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     child_session_id,
                     source,
@@ -3571,6 +3572,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     parent["thread_id"],
                     parent["display_name"],
                     parent["origin_json"],
+                    # The plan/task binding rides the rotation too (the
+                    # t_2b7a77b2 contract, previously only honoured by the
+                    # adoption recovery path): a compression child inherits
+                    # the parent's sessions.task_id, so the worker's task
+                    # scope and the find_task_session_id wake target survive
+                    # compaction instead of being orphaned on the ended
+                    # parent (plan-gate-relocks-on-compaction).
+                    parent["task_id"],
                     time.time(),
                 ),
             )
