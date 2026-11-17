@@ -205,6 +205,27 @@ def normalize_slug(value: str) -> str:
     return value
 
 
+DATE_PREFIX_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})-(.*)$")
+
+
+def strip_date_prefix(value: str) -> str:
+    """Strip a leading YYYY-MM-DD date prefix from a slug, if present.
+
+    cmd_new prepends today's date to the generated filename; when a caller
+    already passes a dated slug (e.g. '2026-11-16-tell-wake-delivered-no-turn')
+    the filename would become double-dated (2026-11-17). Only genuine calendar
+    dates are stripped — anything that fails ISO parsing stays part of the slug.
+    """
+    match = DATE_PREFIX_RE.match(value)
+    if not match:
+        return value
+    try:
+        dt.date.fromisoformat(match.group(1))
+    except ValueError:
+        return value
+    return match.group(2)
+
+
 def normalize_project(value: str) -> str:
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", value):
         die("project must be a single safe directory name")
@@ -1198,7 +1219,7 @@ def escalate(path: Path, text: str) -> None:
 
 def cmd_new(args: argparse.Namespace) -> None:
     project = normalize_project(args.project)
-    slug = normalize_slug(args.slug)
+    slug = normalize_slug(strip_date_prefix(args.slug))
     date = dt.date.fromisoformat(os.environ.get("BUGTOOL_DATE", dt.date.today().isoformat()))
     path = PROJECTS_ROOT / project / "bugs" / "pending" / f"{date.isoformat()}-{slug}.md"
     agent_name = os.environ.get("USERNAME", "").strip() or "unknown"
