@@ -355,7 +355,39 @@ def scan_and_dispatch(vault: Path, settings: dict, decisions: DecisionLog, dry_r
                 "skip", bug=name,
                 reason=f"bugtool dispatch refused: {output.strip()[:200]}",
             )
+    if dispatched == 0:
+        maybe_spawn_verify(bugtool, projects_root, decisions, dry_run)
     return dispatched
+
+
+def maybe_spawn_verify(bugtool, projects_root: Path, decisions, dry_run: bool) -> None:
+    """Queue-drain verification (Evan 2026-11-17): when the hermes-agent bug
+    queue empties, run the big suite ONCE — detached so the watch loop never
+    blocks on a long run. `bugtool verify --on-drain` re-checks drain and the
+    sha marker authoritatively in the child; RED there auto-files the Neo fix
+    job through the normal gates. Fast-lane rules (graph + review + targeted
+    tests) cover everything while the queue is moving."""
+    if "hermes-agent" not in getattr(bugtool, "VERIFY_SUITES", {}):
+        return
+    if not bugtool.queue_is_drained("hermes-agent"):
+        return
+    marker = bugtool.verify_marker()
+    if bugtool.verify_in_flight(marker):
+        return
+    if dry_run:
+        decisions.append("verify", reason="dry-run: queue drained, suite verify suppressed")
+        return
+    log_path = bugtool.VERIFY_LOG
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = log_path.open("a", encoding="utf-8")
+    subprocess.Popen(
+        [sys.executable, str(Path(__file__).resolve().parent / "bugtool.py"), "verify", "--on-drain"],
+        stdout=handle, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+        start_new_session=True, close_fds=True,
+        env={**os.environ, "BUGTOOL_PROJECTS_ROOT": str(projects_root)},
+    )
+    handle.close()
+    decisions.append("verify", reason="queue drained: suite verify spawned (detached)")
 
 
 def cycle(vault: Path, settings: dict, decisions: DecisionLog, killswitch: Path,

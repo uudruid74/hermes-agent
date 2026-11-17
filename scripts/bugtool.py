@@ -18,6 +18,36 @@ from typing import Iterator, NoReturn, Optional
 PROJECTS_ROOT = Path(os.environ.get("BUGTOOL_PROJECTS_ROOT", "/home/ekl/vault/wiki/Projects"))
 STATE_ROOT = Path(os.environ.get("BUGTOOL_STATE_ROOT", "/home/ekl/.local/state/bugtool"))
 DISPATCH_LOG = STATE_ROOT / "bugs-dispatched.log"
+
+# --- Queue-drain verification (Evan, 2026-11-17) -------------------------
+# The FAST lane keeps the queue moving: code-review-graph blast radius +
+# agent review + targeted tests per change. The SLOW lane validates a night
+# of changes ONCE, when the hermes-agent bug queue drains: run the big
+# suite a single time; a RED run dispatches a fix job to Neo through the
+# normal gates. Evan's standing order (verbatim): "let's change this massive
+# test suite to only run once after a night of changes. Instead of running it
+# after every job, we let bugtool run it when the queue empties, and if it
+# fails, it dispatches another job to Neo to fix the failures."
+# Scope: hermes-agent only ("Only run the big test for hermes-agent bugs!
+# No need for other board slugs") — other boards get named suites later,
+# registered in VERIFY_SUITES. Artifact law (Evan, same night): "We should
+# not be chewing 1.7G of data, ever" — the run measures tmp growth and a run
+# over budget is RED with the top offenders named.
+VERIFY_STATE = STATE_ROOT / "suite-verify.json"
+VERIFY_LOG = STATE_ROOT / "suite-verify.log"
+VERIFY_SUITES: dict[str, list[str]] = {
+    "hermes-agent": [
+        sys.executable, "-m", "pytest", "tests/", "-q", "--tb=line",
+        "-p", "no:cacheprovider", "--durations=10",
+    ],
+}
+VERIFY_BUDGET_MB = int(os.environ.get("BUGTOOL_VERIFY_BUDGET_MB", "512"))
+VERIFY_APPROVAL_NOTE = (
+    "- [x] approved by Evan (auto-filed by `bugtool verify` under Evan's "
+    "standing queue-drain order 2026-11-17 — \"we let bugtool run it when "
+    "the queue empties, and if it fails, it dispatches another job to Neo "
+    "to fix the failures\")"
+)
 HERMES = os.environ.get("BUGTOOL_HERMES", "hermes")
 LIVE_STATUSES = {"todo", "ready", "running", "blocked", "scheduled"}
 # Cap-counting statuses: a BLOCKED task is not consuming the agent's attention
@@ -1652,6 +1682,232 @@ def cmd_check_and_dispatch(args: argparse.Namespace) -> None:
             print("dispatch deferred: a live task exists or four failures require manual redispatch")
 
 
+# --- Queue-drain verification engine (see VERIFY_SUITES block above) -----
+
+def verify_marker() -> dict:
+    try:
+        return json.loads(VERIFY_STATE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def verify_in_flight(marker: Optional[dict] = None) -> bool:
+    """True while a verify run is alive (pid probe on the marker)."""
+    marker = verify_marker() if marker is None else marker
+    pid = marker.get("pid")
+    if not pid or marker.get("result"):
+        return False
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def queue_is_drained(project: str = "hermes-agent") -> bool:
+    """True when the project's bug queue has no work left: no live bug tasks
+    and no checked, gate-complete pending bug waiting to go out. Unchecked
+    bugs wait on Evan's tick and do NOT hold the queue."""
+    pending = PROJECTS_ROOT / project / "bugs" / "pending"
+    if not pending.is_dir():
+        return True
+    for path in sorted(pending.glob("*.md")):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            return False  # unreadable = unknown state; never claim drain
+        if live_task_ids(text):
+            return False
+        if (
+            bug_status(text) != DISPATCHED_STATUS
+            and approved_to_run(text)
+            and not missing_dispatch_fields(text)
+        ):
+            return False  # a checked bug still waiting to go out
+    return True
+
+
+def _verify_repo_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def _verify_git_sha() -> str:
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(_verify_repo_root()), "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, check=False,
+        ).stdout.strip()
+        return out or "unknown"
+    except OSError:
+        return "unknown"
+
+
+def _measure_mb(path: Path) -> int:
+    try:
+        out = subprocess.run(["du", "-sm", str(path)], capture_output=True, text=True, check=False).stdout
+        return int(out.split()[0])
+    except (OSError, ValueError, IndexError):
+        return 0
+
+
+def _top_offenders(tmpdir: Path, n: int = 8) -> list[str]:
+    """Per-test-dir artifact sizes under the pytest tmp tree — the 1.7G-class
+    offenders get named here so bloat is never anonymous."""
+    rows: list[tuple[int, str]] = []
+    for run_dir in sorted(tmpdir.glob("pytest-*/pytest-*")):
+        if not run_dir.is_dir():
+            continue
+        try:
+            children = list(run_dir.iterdir())
+        except OSError:
+            continue
+        for child in children:
+            rows.append((_measure_mb(child), f"{run_dir.name}/{child.name}"))
+    rows.sort(reverse=True)
+    return [f"{mb} MB {name}" for mb, name in rows[:n] if mb > 0]
+
+
+def run_full_suite(project: str, tmpdir: Path) -> dict:
+    """Run the project's named big suite once. Returns a result dict:
+    ok, summary, failures, budget_mb, offenders, duration_s."""
+    cmd = VERIFY_SUITES[project]
+    tmpdir.mkdir(parents=True, exist_ok=True)
+    before = _measure_mb(tmpdir)
+    started = dt.datetime.now().timestamp()
+    proc = subprocess.run(
+        cmd, cwd=str(_verify_repo_root()), capture_output=True, text=True,
+        check=False, env={**os.environ, "TMPDIR": str(tmpdir)},
+    )
+    duration_s = round(dt.datetime.now().timestamp() - started, 1)
+    output = (proc.stdout or "") + (proc.stderr or "")
+    lines = output.splitlines()
+    failures = [ln.strip()[:200] for ln in lines if ln.startswith(("FAILED", "ERROR"))][:40]
+    summary = next((ln for ln in reversed(lines) if ln.strip()), "")
+    growth = max(0, _measure_mb(tmpdir) - before)
+    offenders = _top_offenders(tmpdir) if growth > 0 else []
+    ok = proc.returncode == 0 and growth <= VERIFY_BUDGET_MB
+    return {
+        "ok": ok, "returncode": proc.returncode, "summary": summary[:300],
+        "failures": failures, "budget_mb": growth, "budget_cap_mb": VERIFY_BUDGET_MB,
+        "offenders": offenders, "duration_s": duration_s,
+    }
+
+
+def file_suite_red_card(project: str, result: dict, sha: str) -> Optional[Path]:
+    """File the suite-red bug (auto-approved per Evan's standing order) and
+    push it through the NORMAL dispatch gates (one-at-a-time still applies).
+    Returns the bug path, or None when a card for this sha already exists."""
+    slug = f"suite-red-{sha[:8]}"
+    date = dt.date.fromisoformat(os.environ.get("BUGTOOL_DATE", dt.date.today().isoformat()))
+    path = PROJECTS_ROOT / normalize_project(project) / "bugs" / "pending" / f"{date.isoformat()}-{normalize_slug(slug)}.md"
+    if path.exists():
+        return None  # idempotent: one card per red sha
+    body_lines = [
+        f"Full suite verify run (queue-drain, `bugtool verify`) is RED at `{sha}`.",
+        "",
+        f"Summary: {result['summary'] or '(no summary line)'}",
+        f"Exit code: {result['returncode']}   Duration: {result['duration_s']}s",
+        f"Artifact growth: {result['budget_mb']} MB (budget {result['budget_cap_mb']} MB)",
+    ]
+    if result["budget_mb"] > result["budget_cap_mb"]:
+        body_lines.append(f"OVER BUDGET — top offenders: {'; '.join(result['offenders']) or 'unattributed'}")
+    body = "\n".join(body_lines)
+    failures = "\n".join(result["failures"][:30]) or "(none parsed)"
+    args = argparse.Namespace(
+        project=project, slug=slug,
+        title=f"{slug}: full suite red at {sha}",
+        assignee="neo", tags="suite-red", severity="high",
+    )
+    try:
+        cmd_new(args)
+    except SystemExit:
+        return None  # raced with another filer — treat as filed
+    if not path.exists():
+        return None  # cmd_new normalized differently; do not guess
+    text = path.read_text(encoding="utf-8")
+    text = replace_section(text, "Description", "\n" + body + "\n")
+    text = replace_section(
+        text, "How To Reproduce",
+        "\nRun the queue-drain verify at this commit: `cd /home/ekl/.hermes/hermes-agent "
+        "&& python3 scripts/bugtool.py verify` (or `make test` directly). The suite "
+        f"reproduces red at `{sha}`.\n",
+    )
+    text = replace_section(text, "Actual Behavior", "\n```\n" + failures + "\n```\n")
+    text = replace_section(text, APPROVED_SECTION, "\n" + VERIFY_APPROVAL_NOTE + "\n")
+    atomic_write_text(path, text)
+    rel = os.path.relpath(path, "/home/ekl/vault")
+    subprocess.run(["git", "-C", "/home/ekl/vault", "add", rel], check=False, capture_output=True)
+    subprocess.run(
+        ["git", "-C", "/home/ekl/vault", "commit", "-m", f"bugs: auto-file {path.name} (queue-drain verify red at {sha})"],
+        check=False, capture_output=True,
+    )
+    # Dispatch now through the NORMAL gates (one-at-a-time still applies —
+    # deferred cards stay checked and the daemon's next pass picks them up).
+    with locked_root():
+        fresh = path.read_text(encoding="utf-8")
+        maybe_dispatch_locked(path, fresh)
+    return path
+
+
+def cmd_verify(args: argparse.Namespace) -> None:
+    """Queue-drain verification: run the named big suite ONCE and act on it.
+
+    --on-drain: only start when the hermes-agent bug queue is drained and
+    this sha hasn't been verified yet (the daemon spawns this detached).
+    Without --on-drain it runs unconditionally (manual invocation).
+    RED -> auto-files a suite-red bug assigned to Neo and dispatches it
+    through the normal gates (Evan's standing order, recorded in the file).
+    """
+    project = normalize_project(getattr(args, "project", None) or "hermes-agent")
+    if project not in VERIFY_SUITES:
+        die(f"no named suite for project '{project}' — only hermes-agent verifies "
+            "(Evan 2026-11-17); other boards get named tests later")
+    marker = verify_marker()
+    if verify_in_flight(marker):
+        print(f"verify already running (pid {marker.get('pid')}) — not starting")
+        return
+    sha = _verify_git_sha()
+    if getattr(args, "on_drain", False):
+        if not queue_is_drained(project):
+            print("queue not drained — verify not started")
+            return
+        if marker.get("sha") == sha and marker.get("result"):
+            print(f"already verified at {sha}: {marker['result']} — not re-running")
+            return
+    tmpdir = Path(os.environ.get("BUGTOOL_VERIFY_TMPDIR", "/home/ekl/tmp-bugtool-verify"))
+    if tmpdir.exists():
+        subprocess.run(["rm", "-rf", str(tmpdir)], check=False, capture_output=True)
+    tmpdir.mkdir(parents=True, exist_ok=True)
+    VERIFY_STATE.parent.mkdir(parents=True, exist_ok=True)
+    VERIFY_STATE.write_text(
+        json.dumps({"pid": os.getpid(), "sha": sha, "started": dt.datetime.now().isoformat()}),
+        encoding="utf-8",
+    )
+    print(f"verify: running {VERIFY_SUITES[project][1:4]}… at {sha} (budget {VERIFY_BUDGET_MB} MB)")
+    result = run_full_suite(project, tmpdir)
+    final = {"pid": os.getpid(), "sha": sha, "result": "green" if result["ok"] else "red",
+             "finished": dt.datetime.now().isoformat(), **{k: result[k] for k in ("summary", "budget_mb", "duration_s")}}
+    if result["ok"]:
+        VERIFY_STATE.write_text(json.dumps(final), encoding="utf-8")
+        print(f"verify GREEN at {sha}: {result['summary']} (artifacts {result['budget_mb']} MB, {result['duration_s']}s)")
+        return
+    card = file_suite_red_card(project, result, sha)
+    final["card"] = str(card) if card else None
+    VERIFY_STATE.write_text(json.dumps(final), encoding="utf-8")
+    print(f"verify RED at {sha}: {result['summary']} (artifacts {result['budget_mb']} MB)")
+    for ln in result["failures"][:15]:
+        print("  " + ln)
+    if result["budget_mb"] > result["budget_cap_mb"]:
+        print(f"  artifact budget blown: {result['budget_mb']} MB > {result['budget_cap_mb']} MB")
+        for off in result["offenders"]:
+            print("    " + off)
+    print(f"fix job: {card}" if card else "fix job: already filed for this sha")
+
+
 def cmd_list(args: argparse.Namespace) -> None:
     for path in all_bug_files(args.project):
         print(f"{path.parent.name}\t{failure_count(path.read_text(encoding='utf-8'))}/4\t{path}")
@@ -1778,6 +2034,19 @@ def parser() -> argparse.ArgumentParser:
     )
     search.add_argument("keywords", nargs="+")
     search.set_defaults(func=cmd_search)
+    verify = commands.add_parser(
+        "verify",
+        help=(
+            "QUEUE-DRAIN: run the named big suite ONCE (hermes-agent only). "
+            "RED auto-files a suite-red bug for Neo through the normal gates. "
+            "--on-drain only starts when the queue is drained and the sha is "
+            "unverified (the daemon spawns this detached)."
+        ),
+    )
+    verify.add_argument("project", nargs="?", default="hermes-agent")
+    verify.add_argument("--on-drain", dest="on_drain", action="store_true",
+                        help="only run when the hermes-agent bug queue is drained and this sha is unverified")
+    verify.set_defaults(func=cmd_verify)
     return root
 
 
