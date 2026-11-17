@@ -281,24 +281,47 @@ def test_section_alias_resolves_related_bugs(monkeypatch, tmp_path):
 # --- the old entry point is gone ---------------------------------------------
 
 
-def test_cmd_check_no_longer_exists(monkeypatch, tmp_path):
-    """A stale caller must fail loudly instead of silently dispatching.
-
-    This is the regression guard for the 2026-09-16 incident: I ran `bugtool
-    check` believing it was a status query, and it wrote Evan's approval and
-    dispatched a paid worker. There is deliberately NO `cmd_check` alias -- an
-    AttributeError is a loud failure, a working shim would be a silent one.
-    """
-    bugtool, _projects_root, _ = load_bugtool(monkeypatch, tmp_path)
-    assert not hasattr(bugtool, "cmd_check")
-
-
-def test_parser_has_no_bare_check_subcommand(monkeypatch, tmp_path):
-    bugtool, _projects_root, _ = load_bugtool(monkeypatch, tmp_path)
-    parsed = bugtool.parser().parse_args(["check-and-dispatch", "somefile.md", "--i-am-evan"])
-    assert parsed.i_am_evan is True
+def test_check_restored_requires_i_am_evan(monkeypatch, tmp_path):
+    """`check` is RESTORED law (Evan 2026-09-22 — the Obsidian tick-box sweep:
+    one command dispatches every already-checked bug). The 2026-09-16 incident
+    class (a status query silently dispatching paid work) stays dead via the
+    hard --i-am-evan gate: without the flag nothing runs and nothing writes."""
+    bugtool, projects_root, _ = load_bugtool(monkeypatch, tmp_path)
+    assert hasattr(bugtool, "cmd_check")
+    bug = write_pending_bug(projects_root, text=complete_bug_text(approved=True))
+    before = bug.read_text(encoding="utf-8")
+    created = mock_kanban(monkeypatch, bugtool)
+    args = bugtool.parser().parse_args(["check"])
+    args.project = None
     with pytest.raises(SystemExit):
-        bugtool.parser().parse_args(["check", "somefile.md"])
+        bugtool.cmd_check(args)
+    assert created == []
+    assert bug.read_text(encoding="utf-8") == before
+
+
+def test_check_never_stamps_approval(monkeypatch, tmp_path, capsys):
+    """The sweep DISPATCHES checked bugs only; an unchecked bug is reported and
+    skipped — the box is never written (2026-09-16 stamping danger stays dead)."""
+    bugtool, projects_root, _ = load_bugtool(monkeypatch, tmp_path)
+    bug = write_pending_bug(projects_root, text=complete_bug_text(approved=False))
+    before = bug.read_text(encoding="utf-8")
+    created = mock_kanban(monkeypatch, bugtool)
+    args = bugtool.parser().parse_args(["check", "--i-am-evan"])
+    args.project = None
+    bugtool.cmd_check(args)
+    assert created == []
+    assert bug.read_text(encoding="utf-8") == before
+    assert "NOT checked, skipped" in capsys.readouterr().out
+
+
+def test_parser_check_subcommand_is_registered(monkeypatch, tmp_path):
+    """`check` is a real registered subcommand since the 2026-09-22 restore;
+    --i-am-evan defaults to False (the gate — not the parser — refuses)."""
+    bugtool, _projects_root, _ = load_bugtool(monkeypatch, tmp_path)
+    parsed = bugtool.parser().parse_args(["check"])
+    assert parsed.i_am_evan is False
+    parsed = bugtool.parser().parse_args(["check", "--i-am-evan"])
+    assert parsed.i_am_evan is True
 
 
 def test_parser_flag_defaults_to_false(monkeypatch, tmp_path):

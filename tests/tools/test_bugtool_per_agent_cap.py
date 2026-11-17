@@ -80,19 +80,24 @@ def mock_kanban(monkeypatch, bugtool, board=()):
 
 
 def test_two_bugs_one_busy_agent_creates_exactly_zero_new_tasks(monkeypatch, tmp_path):
-    """Two checked bugs, agent already holds one live task -> exactly ONE task
-    exists for the agent (the pre-existing live one); neither bug dispatches."""
+    """Two checked bugs, agent already holds MAX_LIVE_TASKS_PER_AGENT live
+    tasks -> no NEW task; neither bug dispatches (defer, never drop)."""
     bugtool, projects_root, _state_root = load_bugtool(monkeypatch, tmp_path)
     bug1 = write_pending_bug(projects_root, "capped-one")
     bug2 = write_pending_bug(projects_root, "capped-two")
-    live_board = [{"id": "t_live1", "status": "running", "assignee": "neo"}]
+    # Cap is 5 (raised from 1 on 2026-10-14): busy = the agent already holds
+    # the cap, not merely one task.
+    live_board = [
+        {"id": f"t_live{i}", "status": "running", "assignee": "neo"}
+        for i in range(1, bugtool.MAX_LIVE_TASKS_PER_AGENT + 1)
+    ]
     created = mock_kanban(monkeypatch, bugtool, board=live_board)
 
     with bugtool.locked_root():
         assert bugtool.maybe_dispatch_locked(bug1, bug1.read_text(encoding="utf-8")) is None
         assert bugtool.maybe_dispatch_locked(bug2, bug2.read_text(encoding="utf-8")) is None
 
-    assert created == []  # no NEW task: the agent's one live task is the only one
+    assert created == []  # no NEW task: the agent is at the cap
 
 
 def test_deferred_bug_stays_pending_and_checked(monkeypatch, tmp_path):
@@ -100,7 +105,10 @@ def test_deferred_bug_stays_pending_and_checked(monkeypatch, tmp_path):
     bugtool, projects_root, _state_root = load_bugtool(monkeypatch, tmp_path)
     bug1 = write_pending_bug(projects_root, "capped-one")
     before = bug1.read_text(encoding="utf-8")
-    mock_kanban(monkeypatch, bugtool, board=[{"id": "t_live1", "status": "running"}])
+    mock_kanban(monkeypatch, bugtool, board=[
+        {"id": f"t_live{i}", "status": "running"}
+        for i in range(1, bugtool.MAX_LIVE_TASKS_PER_AGENT + 1)
+    ])
 
     with bugtool.locked_root():
         assert bugtool.maybe_dispatch_locked(bug1, before) is None
@@ -167,7 +175,9 @@ def test_cap_fails_open_when_board_query_fails(monkeypatch, tmp_path):
 
 
 def test_live_task_count_counts_only_live_statuses(monkeypatch, tmp_path):
-    """Direct helper check: todo/running/blocked count; done/archived do not."""
+    """Direct helper check: CAP_COUNT_STATUSES only (Evan 2026-10-14: a BLOCKED
+    task is not consuming the agent's attention and must not count toward the
+    cap). todo counts; blocked/done/manual do not."""
     bugtool, _projects_root, _state_root = load_bugtool(monkeypatch, tmp_path)
     board = [
         {"id": "t_a", "status": "todo"},
@@ -179,4 +189,4 @@ def test_live_task_count_counts_only_live_statuses(monkeypatch, tmp_path):
         bugtool.subprocess, "run",
         lambda args, **_kw: subprocess.CompletedProcess(args, 0, json.dumps(board), ""),
     )
-    assert bugtool.live_task_count_by_agent("neo") == 2
+    assert bugtool.live_task_count_by_agent("neo") == 1

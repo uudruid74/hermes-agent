@@ -130,7 +130,8 @@ def dispatch_identity(path: Path, text: str, directive: Optional[str]) -> dict[s
 
 
 def append_dispatch_record(
-    identity: dict[str, object], status: str, task_id: Optional[str] = None
+    identity: dict[str, object], status: str, task_id: Optional[str] = None,
+    ambiguous: bool = False,
 ) -> None:
     STATE_ROOT.mkdir(parents=True, exist_ok=True)
     new_log = not DISPATCH_LOG.exists()
@@ -140,6 +141,10 @@ def append_dispatch_record(
         "status": status,
         "task_id": task_id,
     }
+    if ambiguous:
+        # A create attempt whose side effect could not be confirmed (2026-11-17):
+        # see dispatch_is_recorded — such records block auto-retry.
+        record["ambiguous"] = True
     fd = os.open(DISPATCH_LOG, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
         payload = (json.dumps(record, sort_keys=True) + "\n").encode("utf-8")
@@ -171,17 +176,23 @@ def latest_dispatch_record(identity: dict[str, object]) -> Optional[dict[str, ob
 
 
 def dispatch_is_recorded(identity: dict[str, object]) -> bool:
-    """True when a prior dispatch attempt for this identity actually RESERVED.
+    """True when a prior dispatch attempt for this identity must block retry.
 
-    Records with status 'failed' do NOT count: a failed attempt (e.g. an
-    infrastructure error like a rejected CLI flag) must not permanently block
-    redispatch — only a genuine reserve/create does (2026-09-21: the --channel
+    Definite failures (status 'failed' WITHOUT the ambiguous marker) do NOT
+    count: a rejected CLI flag (argparse, exit 2) never reached the backend
+    and must not permanently block redispatch (2026-09-21: the --channel
     argparse failure deadlocked every retry of the notify-silent-fail bug).
+    But an AMBIGUOUS failure (2026-11-17) — the request may have created a
+    task we never read back, e.g. "connection lost after request" — DOES
+    count: auto-retrying it is the duplicate-spew class. `bugtool redispatch`
+    (force=True) revives both.
     """
     record = latest_dispatch_record(identity)
     if record is None:
         return False
-    return record.get("status") in ("reserved", "created")
+    if record.get("status") in ("reserved", "created"):
+        return True
+    return record.get("status") == "failed" and bool(record.get("ambiguous"))
 
 
 def die(message: str) -> None:
@@ -942,6 +953,61 @@ def live_task_count_by_agent(assignee: str) -> int:
     return sum(1 for record in records if record.get("status") in CAP_COUNT_STATUSES)
 
 
+# Global one-at-a-time gate (Evan 2026-11-17): "We should be able to dispatch
+# these just by setting the assignee and checking the box. We need to make sure
+# we don't dispatch more than 1 task at a time though." The checkbox flow must
+# never fan out across assignees (the per-agent cap below does not stop N bugs
+# going to N different agents in one hook pass).
+MAX_LIVE_BUG_TASKS = 1
+
+
+def live_bug_task_count() -> int:
+    """How many live BUG tasks the queue currently holds (global gate).
+
+    Counts tasks titled with this tool's own convention (``BUG: <slug>``,
+    see create_task / the auto-resolve lifecycle) in CAP_COUNT_STATUSES — a
+    blocked bug task does not hold the queue (Evan 2026-10-14: blocked is not
+    consuming attention), and done/archived are not live.
+
+    Fails OPEN with a loud stderr warning, same contract as the per-agent cap:
+    this is overload protection, not a correctness gate (correctness lives in
+    the dispatch log + owned_live_task_ids + is_dispatched_marker).
+    """
+    result = subprocess.run(
+        [HERMES, "kanban", "list", "--json"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    output = result.stdout if result.returncode == 0 else ""
+    if not output.strip():
+        if result.returncode:
+            print(
+                f"bugtool: global one-at-a-time gate unavailable (kanban list "
+                f"exit {result.returncode}: {(result.stderr or '').strip()[:200]}); "
+                f"gate bypassed this pass",
+                file=sys.stderr,
+            )
+        return 0
+    try:
+        records = json.loads(output)
+    except json.JSONDecodeError:
+        print(
+            "bugtool: global one-at-a-time gate unavailable (kanban list "
+            "returned invalid JSON); gate bypassed this pass",
+            file=sys.stderr,
+        )
+        return 0
+    if not isinstance(records, list):
+        return 0
+    return sum(
+        1
+        for record in records
+        if record.get("status") in CAP_COUNT_STATUSES
+        and str(record.get("title", "")).startswith("BUG:")
+    )
+
+
 def task_body(path: Path, text: str, directive: Optional[str] = None) -> str:
     parts = [f"Bug file: {path}"]
     for section in (*REQUIRED_SECTIONS, ASSIGNEE_SECTION, APPROVED_SECTION, RELATED_SECTION, "Failure Reports"):
@@ -1011,7 +1077,16 @@ def create_task(
             if isinstance(candidate, str) and re.fullmatch(r"t_[A-Za-z0-9]+", candidate):
                 created = candidate
     if created is None:
-        append_dispatch_record(identity, "failed")
+        # Definite vs ambiguous failure (2026-11-17, the spew guard): an
+        # argparse/usage rejection (exit 2) provably never reached the backend,
+        # so the bug must stay retryable (2026-09-21: a rejected CLI flag must
+        # not deadlock every retry). Anything else may have created a task we
+        # failed to read back ("connection lost after request") — record it as
+        # ambiguous so dispatch_is_recorded suppresses auto-retry; `bugtool
+        # redispatch` (force=True) is the deliberate revive path.
+        append_dispatch_record(
+            identity, "failed", ambiguous=(result.returncode != 2)
+        )
         print(f"dispatch failed for {path}: {output.strip()}", file=sys.stderr)
         return None
     append_dispatch_record(identity, "created", created)
@@ -1051,6 +1126,17 @@ def maybe_dispatch_locked(path: Path, text: str, directive: Optional[str] = None
     unresolved_deps = dependency_gate(text)
     if unresolved_deps:
         print(f"nothing to dispatch for {path.name}: blocked by {', '.join(unresolved_deps)}")
+        return None
+    # Global one-at-a-time gate (Evan 2026-11-17): at most MAX_LIVE_BUG_TASKS
+    # live bug task fleet-wide, regardless of assignee. DEFER, never drop
+    # (same semantics as the per-agent cap): the file stays pending+checked
+    # and the next pass picks it up when the live task completes. force=True
+    # (bugtool redispatch) bypasses: the human asked for it.
+    if not force and live_bug_task_count() >= MAX_LIVE_BUG_TASKS:
+        print(
+            f"nothing to dispatch for {path.name}: deferred, a bug task is "
+            f"already live (one at a time)"
+        )
         return None
     # Per-agent cap (t_cd44bbde, Phase B): defer, never drop. The bug file is
     # deliberately left untouched — still pending + checked — so the next
