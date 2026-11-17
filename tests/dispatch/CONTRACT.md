@@ -35,16 +35,16 @@ This suite completes the contract across every wake path and locks the
 
 | # | Wake path | L1 outcome truth | L2 row→turn | status |
 |---|-----------|------------------|-------------|--------|
-| 1 | bridge inject (tell → mcp_bridge `_handle_inject`) | ✅ Neo 537a10306c (5 tests) | 🔲 PENDING | core |
-| 2 | `send_message_tool` bare `hermes send -t` / internal=True | ✅ fail-loud on dropped (Neo) | 🔲 PENDING | core |
-| 3 | `tell_tool` with session_id (`session_wake_target`) | 🔲 PENDING | 🔲 PENDING | core |
-| 4 | kanban `wake_fired` (worker spawn / task events) | 🔲 PENDING | 🔲 PENDING | core |
-| 5 | kanban notify-complete → subscriber delivery | 🔲 PENDING | n/a (chat delivery) | medium |
-| 6 | plan dispatch / plan-review response wake | 🔲 PENDING | 🔲 PENDING | core |
-| 7 | plan stop-guard / step-nudge wake | 🔲 PENDING | n/a | easy |
+| 1 | bridge inject (tell → mcp_bridge `_handle_inject`) | ✅ Neo 537a10306c (5 tests) | ✅ Neo 97341cfeff | core |
+| 2 | `send_message_tool` bare `hermes send -t` / internal=True | ✅ fail-loud on dropped (Neo) | ✅ Neo 97341cfeff | core |
+| 3 | `tell_tool` with session_id (`session_wake_target`) | 🔲 PENDING | ✅ Neo 97341cfeff | core |
+| 4 | kanban `wake_fired` (worker spawn / task events) | 🔲 PENDING | ✅ Neo 97341cfeff | core |
+| 5 | kanban notify-complete → subscriber delivery | 🔲 PENDING (Zephyr t_df8b6cf6) | n/a (chat delivery) | medium |
+| 6 | plan dispatch / plan-review response wake | 🔲 PENDING | ✅ Neo 97341cfeff | core |
+| 7 | plan stop-guard / step-nudge wake | 🔲 PENDING (Zephyr t_df8b6cf6) | n/a | easy |
 | 8 | bugtool dispatch wake (bugtoold → assignee) | 🔲 PENDING | 🔲 PENDING | medium |
-| 9 | cron job wake (CLI-wake primary, in-process injection) | 🔲 PENDING | 🔲 PENDING | medium |
-| 10 | board-topic wake routing (board_topic rows) | 🔲 PENDING | n/a | medium |
+| 9 | cron job wake (CLI-wake primary, in-process injection) | 🔲 PENDING (Zephyr t_df8b6cf6) | 🔲 PENDING | medium |
+| 10 | board-topic wake routing (board_topic rows) | 🔲 PENDING (Zephyr t_df8b6cf6) | n/a | medium |
 | 11 | telegram topic/session binding wake (7f4d801016 class) | 🔲 PENDING | 🔲 PENDING | medium |
 | 12 | LIVE end-to-end smoke (Gopher repro protocol) | n/a | ✅ `live_wake_smoke.py` | AUTHORITATIVE |
 
@@ -66,8 +66,12 @@ L2 = after the row lands, the intake handler runs and a turn actually spawns.
 ## Gap ledger (fills as cells land; suite is the gate only when core cells are green)
 
 - 2026-11-17: matrix created. L1 bridge + send_message_tool = Neo 537a10306c.
-- PENDING core cells: 1-L2, 2-L2, 3, 4, 6 → these gate the commit rule.
-- PENDING medium cells: 5, 8, 9, 10, 11.
+- 2026-11-17: L2 core cells (1,2,3,4,6) landed — Neo 97341cfeff, 11 tests
+  (test_wake_intake_turn / test_tell_wake_turn / test_kanban_wake_turn /
+  test_plan_wake_turn + wake_harness.py), verified green by Wintermute
+  (11 passed / 1 skipped = opt-in live). L1 outcome-truth for cells 3/4/6
+  still open; Zephyr t_df8b6cf6 covers 5/7/9/10.
+- PENDING before the commit gate goes hard: 3-L1, 4-L1, 6-L1, 8, 11.
 
 ## Prior art to build on (do not duplicate)
 
