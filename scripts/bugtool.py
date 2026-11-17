@@ -433,7 +433,14 @@ def bug_lint_issues(text: str, path: Path) -> tuple[list[str], list[str]]:
         if legacy in raw and canonical not in raw:
             auto.append(f"non-canonical key `{legacy}:` -> `{canonical}:`")
     canonical = {FRONTMATTER_ALIASES.get(k, k): v for k, v in raw.items()}
-    for key in REQUIRED_FRONTMATTER_KEYS:
+    # Resolved bugs are archive records: routing fields (session/assignee) are
+    # only required while a bug is live (pending) — backfilling them
+    # post-hoc would be fabrication, not repair (2026-11-16).
+    is_resolved = "resolved" in path.parts or canonical.get("status", "").lower() == "resolved"
+    required = REQUIRED_FRONTMATTER_KEYS if not is_resolved else tuple(
+        k for k in REQUIRED_FRONTMATTER_KEYS if k not in ("session", "assignee")
+    )
+    for key in required:
         value = canonical.get(key, "").strip()
         if not value:
             if key == "tags":
@@ -450,6 +457,16 @@ def bug_lint_issues(text: str, path: Path) -> tuple[list[str], list[str]]:
         section = section_value(text, APPROVED_SECTION)
         if not re.search(r"- \[[ xX]\]", section):
             auto.append(f"`## {APPROVED_SECTION}` section has no checkbox line — repair inserts UNCHECKED box")
+
+    # 5. Dispatch-gate body sections (2026-11-16): a bug file without
+    # Description/How To Reproduce/Actual Behavior (or fix-spec equivalents)
+    # passes frontmatter lint yet is UNDISPATCHABLE — bugtoold skips it
+    # forever with "incomplete" and nobody notices. Lint must flag it.
+    is_resolved_check = "resolved" in path.parts
+    if not is_resolved_check:
+        missing_sections = missing_dispatch_fields(text)
+        for sec in missing_sections:
+            manual.append(f"missing `## {sec}` section (dispatch gate; needs content from the filing context — rename an equivalent section or write it)")
     return auto, manual
 
 
