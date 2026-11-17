@@ -2275,13 +2275,6 @@ DEFAULT_CONFIG = {
     # each claimable ready task. One dispatcher per profile is sufficient;
     # running more than one on the same kanban.db will race for claims.
     "kanban": {
-        # Subscribe the originating TUI session to task terminal events
-        # when ``kanban_create`` is called from inside a session with a
-        # persistent delivery channel. The TUI panel poller reads these
-        # rows and posts task events into the running session. Chat
-        # sessions get no row — their delivery rides the wake event and
-        # routes by the task origin. Disable to turn the TUI feed off.
-        "auto_subscribe_on_create": True,
         # Run the dispatcher inside the gateway process. On by default —
         # the cost is ~300µs every `dispatch_interval_seconds` when idle,
         # and gateway is the supervisor users already have. Set to false

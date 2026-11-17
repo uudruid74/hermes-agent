@@ -1416,12 +1416,13 @@ class TestProviderEnabledRuntimeGate:
 
 def test_default_config_kanban_block_not_dropped_by_duplicate_key():
     """DEFAULT_CONFIG previously declared ``"kanban"`` twice, so Python kept
-    only the second literal and silently dropped the first — losing the
-    ``auto_subscribe_on_create`` default. Both sets of defaults must survive.
+    only the second literal and silently dropped the first — losing
+    defaults. Both sets of defaults must survive. (The
+    ``auto_subscribe_on_create`` sentinel from the first block was removed
+    with the notify-subs table, 2026-11-17, t_80386714 —
+    ``dispatch_in_gateway`` still proves the second block survived.)
     """
     kanban = DEFAULT_CONFIG["kanban"]
-    # From the first (dropped) block:
-    assert kanban.get("auto_subscribe_on_create") is True
     # From the second block:
     assert "dispatch_in_gateway" in kanban
     assert "auto_decompose" in kanban

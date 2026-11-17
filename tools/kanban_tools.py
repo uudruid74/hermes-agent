@@ -1383,9 +1383,7 @@ def _handle_create(args: dict, **kw) -> str:
                 session_id=session_id,
             )
             new_task = kb.get_task(conn, new_tid)
-            subscribed = _maybe_auto_subscribe(
-                conn, new_tid, origin_session_id=session_id
-            )
+            _store_task_origin(conn, new_tid, origin_session_id=session_id)
             # Event-driven dispatch (no polling): a new task may be runnable
             # now — kick one tick; a fresh triage task wakes the decomposer.
             from hermes_cli.kanban import kick_dispatch, spawn_triage_decompose
@@ -1400,7 +1398,6 @@ def _handle_create(args: dict, **kw) -> str:
                 workspace_kind=new_task.workspace_kind if new_task else None,
                 workspace_path=new_task.workspace_path if new_task else None,
                 project_id=new_task.project_id if new_task else None,
-                subscribed=subscribed,
             )
         finally:
             conn.close()
@@ -1411,101 +1408,41 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(f"kanban_create: {e}")
 
 
-def _maybe_auto_subscribe(
+def _store_task_origin(
     conn: Any, task_id: str, *, origin_session_id: str | None
-) -> bool:
-    """Store the task's origin routing and subscribe TUI sessions to its feed.
+) -> None:
+    """Store the task's origin routing (the delivery source of truth).
 
-    Origin routing is stored for every scope: it is the delivery source of
-    truth the state-change hook and plan-binding messages route by.
+    Origin routing is stored for every scope: the state-change hook
+    (``hermes_cli/kanban.py::_deliver_kanban_notification``) and the
+    plan-binding messages resolve delivery with it at use time — chat
+    platforms get a gateway wake; local surfaces (CLI workers,
+    TUI/desktop sessions) land in the origin profile's
+    ``session_notices`` queue. The marker is a system comment, so it
+    survives everything else.
 
-    The notification subscription is TUI-only. The TUI panel poller
-    (``tui_gateway/server.py``) reads ``platform="tui"`` rows (``chat_id`` =
-    ``HERMES_SESSION_KEY``) and posts the task's terminal events into the
-    running session. Chat-platform rows (telegram/discord/...) existed for
-    the gateway notification watcher, which was deleted on Evan's directive
-    (2026-10-19) — chat delivery rides the wake event and routes by the task
-    origin, so those rows are write-only and are no longer created.
+    The notification-subscription half this function used to have
+    (TUI-only ``kanban_notify_subs`` rows) was removed with that table
+    (2026-11-17, t_80386714): the TUI poller now drains origin-routed
+    session notices, so nothing needs a subscription row.
 
-    Returns True when a subscription row was written, False otherwise (chat
-    session, no session context, config gate disabled, or best-effort
-    failure). The caller surfaces this in the ``subscribed`` field of the
-    kanban_create response.
-
-    Gated by ``kanban.auto_subscribe_on_create`` in config.yaml (default
-    True). The gate covers the subscription only — origin routing is
-    delivery addressing, not a notification preference.
-
-    HERMES_SESSION_ID is intentionally NOT a session fallback for the
-    subscription: ACP / the agent subprocess export it for telemetry
-    regardless of the parent, so treating it as a notification target would
-    auto-subscribe every CLI invocation — the over-eager behaviour that got
-    #19718 reverted upstream. The TUI poller keys on HERMES_SESSION_KEY.
-
-    Failure mode: any exception inside the function is logged at WARNING
-    with the offending exception + diagnostic env vars and swallowed.
-    We never want a notification bookkeeping failure to fail the
-    kanban_create that the agent is mid-conversation about.
+    Failure mode: any exception inside is logged at WARNING and
+    swallowed. We never want an origin bookkeeping failure to fail the
+    kanban_create the agent is mid-conversation about.
     """
-    subscribe = True
     try:
-        cfg = load_config()
-        if not cfg_get(cfg, "kanban", "auto_subscribe_on_create", default=True):
-            subscribe = False
-    except Exception:
-        # If config can't load we still default to True — the
-        # user-friendly behaviour that mirrors the pre-gate implementation.
-        pass
-
-    platform = ""
-    chat_id = ""
-    try:
-        from gateway.session_context import get_session_env
-
-        # Lazy-import to keep the module-level dependency light
         from hermes_cli import kanban_db as _kb
 
-        # Origin routing first — every scope, gate-independent. The wake and
-        # plan-binding message paths resolve delivery with it at use time; the
-        # row survives subscription loss because it is a system comment.
-        try:
-            _kb.store_origin_routing(
-                conn, task_id=task_id,
-                platform="session", chat_id=origin_session_id or "",
-                profile=(os.environ.get("USERNAME") or "").strip(),
-                overwrite=True,
-            )
-        except ValueError as exc:
-            logger.warning(
-                "origin routing not stored for %s: %s", task_id, exc
-            )
-
-        platform = get_session_env("HERMES_SESSION_PLATFORM", "")
-        chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
-        if platform and chat_id:
-            return False  # chat session — delivery rides the wake/origin path
-        # TUI / desktop fallback: platform/chat_id ContextVars are
-        # cleared for TUI sessions, but the parent process exports
-        # HERMES_SESSION_KEY into the subprocess env. The TUI notification
-        # poller (tui_gateway/server.py) keys on it.
-        session_key = (
-            get_session_env("HERMES_SESSION_KEY", "")
-            or os.environ.get("HERMES_SESSION_KEY", "")
-        )
-        if not session_key or not subscribe:
-            return False
-        _kb.add_notify_sub(
+        _kb.store_origin_routing(
             conn, task_id=task_id,
-            platform="tui", chat_id=session_key,
-            notifier_profile=(os.environ.get("USERNAME") or "").strip(),
+            platform="session", chat_id=origin_session_id or "",
+            profile=(os.environ.get("USERNAME") or "").strip(),
+            overwrite=True,
         )
-        return True
+    except ValueError as exc:
+        logger.warning("origin routing not stored for %s: %s", task_id, exc)
     except Exception as _exc:
-        logger.warning(
-            "_maybe_auto_subscribe failed: %r (platform=%r key_set=%r)",
-            _exc, platform, bool(chat_id),
-        )
-        return False
+        logger.warning("origin routing failed for %s: %r", task_id, _exc)
 
 
 def _handle_unblock(args: dict, **kw) -> str:
