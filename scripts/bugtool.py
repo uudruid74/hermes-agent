@@ -462,11 +462,18 @@ def bug_lint_issues(text: str, path: Path) -> tuple[list[str], list[str]]:
     # Description/How To Reproduce/Actual Behavior (or fix-spec equivalents)
     # passes frontmatter lint yet is UNDISPATCHABLE — bugtoold skips it
     # forever with "incomplete" and nobody notices. Lint must flag it.
+    # NOTE: an UNCHECKED approval box is the normal filed state (awaiting
+    # Evan) — NOT a lint failure. Only a missing SECTION (no box at all,
+    # checked above) or missing body content is structural.
     is_resolved_check = "resolved" in path.parts
     if not is_resolved_check:
-        missing_sections = missing_dispatch_fields(text)
+        missing_sections = [
+            s for s in REQUIRED_SECTIONS if not section_value(text, s)
+        ]
         for sec in missing_sections:
             manual.append(f"missing `## {sec}` section (dispatch gate; needs content from the filing context — rename an equivalent section or write it)")
+        if not assigned_worker(text):
+            manual.append("missing `## Assignee` section (dispatch gate; needs a valid fleet agent from the filing context)")
     return auto, manual
 
 
