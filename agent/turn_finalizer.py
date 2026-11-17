@@ -293,7 +293,7 @@ def finalize_turn(
                 from hermes_cli import kanban_db as _kb
                 _conn = _kb.connect()
                 try:
-                    _kb._record_task_failure(
+                    _blocked = _kb._record_task_failure(
                         _conn,
                         _kanban_task,
                         error=(
@@ -314,6 +314,27 @@ def finalize_turn(
                         "recorded budget-exhausted failure for task %s (%d/%d)",
                         _kanban_task, api_call_count, agent.max_iterations,
                     )
+                    # ``_record_task_failure`` requeues the task back to
+                    # ``ready`` (unless the circuit breaker tripped and
+                    # blocked it). Dispatch is event-driven here — nothing
+                    # will re-spawn the retry until a kick fires a tick.
+                    # Without this, a timed-out task sits unclaimed until an
+                    # unrelated mutation or a gateway restart ticks the
+                    # dispatcher (t_c140fdd5: 5h33m dead air after timed_out).
+                    if not _blocked:
+                        try:
+                            from hermes_cli.kanban import kick_dispatch
+                            _task = _kb.get_task(_conn, _kanban_task)
+                            kick_dispatch(
+                                board=_task.board if _task is not None else None
+                            )
+                        except Exception:
+                            logger.warning(
+                                "Failed to kick dispatch after budget-exhausted "
+                                "failure for task %s",
+                                _kanban_task,
+                                exc_info=True,
+                            )
                 finally:
                     try:
                         _conn.close()

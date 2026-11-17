@@ -4143,6 +4143,100 @@ class TestRunConversation:
             "_record_task_failure should not be called outside kanban mode"
         )
 
+    def test_iteration_exhaustion_kicks_dispatch_when_requeued(
+        self, agent, monkeypatch
+    ):
+        """Regression (t_c140fdd5): after a worker exhausts its iteration
+        budget, ``_record_task_failure`` requeues the task to ``ready``
+        (breaker below threshold). Dispatch is event-driven — the worker
+        must kick a tick or the retry sits unclaimed until a gateway
+        restart.
+        """
+        self._setup_agent(agent)
+        agent.max_iterations = 2
+
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_test_task_123")
+
+        tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
+        tool_resp = _mock_response(
+            content="", finish_reason="tool_calls", tool_calls=[tc],
+        )
+        summary_resp = _mock_response(
+            content="Could not finish — budget exhausted.", finish_reason="stop",
+        )
+        agent.client.chat.completions.create.side_effect = [
+            tool_resp, tool_resp, summary_resp,
+        ]
+
+        # Breaker below threshold → task requeued to ready (not blocked).
+        mock_record_failure = MagicMock(return_value=False)
+        mock_connect = MagicMock(return_value=MagicMock())
+        mock_get_task = MagicMock(
+            return_value=SimpleNamespace(board="testboard")
+        )
+        mock_kick_dispatch = MagicMock()
+
+        with (
+            patch("run_agent.handle_function_call", return_value="ok"),
+            patch("hermes_cli.kanban_db._record_task_failure",
+                  mock_record_failure),
+            patch("hermes_cli.kanban_db.connect", mock_connect),
+            patch("hermes_cli.kanban_db.get_task", mock_get_task),
+            patch("hermes_cli.kanban.kick_dispatch", mock_kick_dispatch),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("do the kanban work")
+
+        assert result["completed"] is False
+        assert mock_record_failure.call_count == 1
+        # The kick must carry the task's board so the right board ticks.
+        mock_kick_dispatch.assert_called_once_with(board="testboard")
+
+    def test_iteration_exhaustion_no_kick_when_blocked(
+        self, agent, monkeypatch
+    ):
+        """When the circuit breaker trips (task blocked, not requeued),
+        no dispatch kick is needed — there is nothing to re-spawn.
+        """
+        self._setup_agent(agent)
+        agent.max_iterations = 2
+
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_test_task_123")
+
+        tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
+        tool_resp = _mock_response(
+            content="", finish_reason="tool_calls", tool_calls=[tc],
+        )
+        summary_resp = _mock_response(
+            content="Could not finish — budget exhausted.", finish_reason="stop",
+        )
+        agent.client.chat.completions.create.side_effect = [
+            tool_resp, tool_resp, summary_resp,
+        ]
+
+        # Breaker tripped → task blocked; no requeue, no kick.
+        mock_record_failure = MagicMock(return_value=True)
+        mock_kick_dispatch = MagicMock()
+
+        with (
+            patch("run_agent.handle_function_call", return_value="ok"),
+            patch("hermes_cli.kanban_db._record_task_failure",
+                  mock_record_failure),
+            patch("hermes_cli.kanban_db.connect",
+                  MagicMock(return_value=MagicMock())),
+            patch("hermes_cli.kanban.kick_dispatch", mock_kick_dispatch),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("do the kanban work")
+
+        assert result["completed"] is False
+        assert mock_record_failure.call_count == 1
+        mock_kick_dispatch.assert_not_called()
+
     # ── Output-cap retry: safe_out uses provider available_out + request estimate ──
 
     def test_output_cap_retry_uses_provider_available_out(self, agent):
