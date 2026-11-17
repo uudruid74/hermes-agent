@@ -6,6 +6,10 @@ from agent.conversation_compression import (
     CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE,
     ROUTINE_COMPRESSION_STATUS_SAMPLES,
 )
+from agent.message_sanitization import (
+    INTERRUPT_CHECKPOINT_SENTINEL,
+    INTERRUPT_CLOSE_PLACEHOLDER,
+)
 from gateway.config import Platform
 from gateway.run import (
     _prepare_gateway_status_message,
@@ -247,10 +251,22 @@ def test_chat_gateways_keep_normal_answers(platform):
 
 
 @pytest.mark.parametrize("platform", CHAT_PLATFORMS)
-def test_chat_gateways_drop_interrupt_sentinel(platform):
-    """The interrupt-while-waiting sentinel is metadata, not a reply (#7921)."""
-    sentinel = "Operation interrupted: waiting for model response (1.7s elapsed)."
+@pytest.mark.parametrize(
+    "sentinel",
+    [
+        "Operation interrupted: waiting for model response (1.7s elapsed).",
+        INTERRUPT_CHECKPOINT_SENTINEL,
+        INTERRUPT_CLOSE_PLACEHOLDER,
+    ],
+    ids=["waiting-prefix", "checkpoint-sentinel", "close-placeholder"],
+)
+def test_chat_gateways_drop_interrupt_sentinel(platform, sentinel):
+    """Interruption machinery is metadata, not a reply (#7921, t_d38530e8).
 
+    The checkpoint sentinel ([This response was interrupted by a user
+    correction.]) and the close placeholder must never reach chat surfaces —
+    they are provider-replay machinery, not assistant prose.
+    """
     assert _sanitize_gateway_final_response(platform, sentinel) == ""
     assert _sanitize_gateway_final_response("local", sentinel) == sentinel
 

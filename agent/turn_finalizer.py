@@ -902,6 +902,15 @@ def finalize_turn(
                 "as its own turn",
                 len(_folded_redirects),
             )
+    # A degenerate final_response is interruption machinery, not an answer —
+    # never ship it as the assistant message, even when no OOB text was
+    # folded (t_d38530e8; the gateway drops the waiting prefix too, but the
+    # checkpoint echo must be dropped here at the source).
+    from agent.message_sanitization import is_degenerate_interrupt_response
+
+    if is_degenerate_interrupt_response(final_response):
+        final_response = ""
+        result["final_response"] = ""
     agent._response_was_previewed = False
 
     # Include interrupt message if one triggered the interrupt

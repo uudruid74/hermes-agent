@@ -57,9 +57,9 @@ from agent.conversation_compression import (
     PRE_API_COMPRESSION_STATUS_TEMPLATE,
     PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,
 )
-from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.i18n import t
 from agent.interrupt_compat import request_hard_interrupt
+from agent.message_sanitization import is_degenerate_interrupt_response
 from hermes_cli.config import cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
 
@@ -592,9 +592,11 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     if _gateway_surface_passes_raw_text(platform):
         return text
 
-    # Cancellation metadata, not assistant prose. ACP/TUI already suppress
-    # this sentinel; chat surfaces should too (#7921).
-    if str(text).strip().startswith(INTERRUPT_WAITING_FOR_MODEL_PREFIX):
+    # Interruption machinery, not assistant prose (#7921, t_d38530e8).
+    # ACP/TUI already suppress the checkpoint sentinel; chat surfaces must
+    # too. The shared degenerate detector covers the checkpoint echo, the
+    # close placeholder, and the waiting prefix (previously handled alone).
+    if is_degenerate_interrupt_response(text):
         return ""
 
     redacted = _redact_gateway_user_facing_secrets(str(text))
@@ -5607,6 +5609,15 @@ class TurnRunner:
                 "model": _resolved_model,
                 "context_length": _context_length,
             }
+
+        # Non-empty path — apply the same gateway sanitizer the empty branch
+        # uses above (t_d38530e8). Previously it ran only in the empty
+        # branch, so a degenerate final_response here (the model echoing the
+        # interrupt checkpoint sentinel back via api_content) bypassed it and
+        # shipped the sentinel straight to chat.
+        final_response = _sanitize_gateway_final_response(ctx.source.platform, final_response)
+        if not final_response:
+            final_response = f"⚠️ {result['error']}" if result.get("error") else ""
 
         # Scan tool results for MEDIA:<path> tags that need to be delivered
         # as native audio/file attachments.  The TTS tool embeds MEDIA: tags

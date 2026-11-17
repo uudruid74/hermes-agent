@@ -345,8 +345,31 @@ class TestOobRequeueOnUnserviced:
         messages = [{"role": "user", "content": "ornith's ready when you are"}]
         result = _finalize(agent, messages, CHECKPOINT)
         assert result["unserviced_redirect_text"] == "ornith's ready when you are"
+        # The degenerate final_response (the checkpoint echo) must NOT ship as
+        # the assistant message (t_d38530e8) — requeue only.
+        assert result["final_response"] == ""
         # Drained once — a later turn must not requeue it again.
         assert agent._turn_folded_redirect_texts == []
+
+    def test_degenerate_final_without_folded_text_is_cleared(self, monkeypatch):
+        """A degenerate turn-final is cleared even with no OOB text folded
+        (t_d38530e8) — the sentinel never ships as the assistant message."""
+        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+        agent = _FinalizeAgent()
+        messages = [{"role": "user", "content": "hi"}]
+        result = _finalize(agent, messages, CHECKPOINT)
+        assert result["final_response"] == ""
+        assert "unserviced_redirect_text" not in result
+
+    def test_healthy_final_is_preserved(self, monkeypatch):
+        """A real answer survives finalization untouched — the degenerate
+        clearing must never eat genuine responses."""
+        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+        agent = _FinalizeAgent(folded=["ornith's ready when you are"])
+        messages = [{"role": "user", "content": "hi"}]
+        result = _finalize(agent, messages, "Ornith's ready — firing the plan now.")
+        assert result["final_response"] == "Ornith's ready — firing the plan now."
+        assert "unserviced_redirect_text" not in result
 
     def test_serviced_oob_text_is_not_requeued(self, monkeypatch):
         monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
