@@ -589,3 +589,115 @@ def test_mark_job_run_default_status_unchanged(tmp_path):
         jobs = load_jobs()
         # Last call wins: error status preserved when no override is given.
         assert jobs[0]["last_status"] == "error"
+
+
+# ---------------------------------------------------------------------------
+# Cell 9-L1 (t_1afbfd87): the fallback's outcome reaches the job record
+# ---------------------------------------------------------------------------
+#
+# _dispatch_cron_wake records "wake fired" only for a verified delivery. The
+# CLI path's truth is pinned in tests/dispatch/test_cron_wake_outcome.py; the
+# in-process fallback's truth is pinned in test_cron_wake_transport.py. This
+# closes the loop: when the official CLI wake cannot confirm AND the fallback
+# drops the wake, the job must be recorded as a FAILED run — never "wake
+# fired" for a turn that never spawned.
+
+
+def _install_bookkeeping_mocks(monkeypatch):
+    """Mocks for _dispatch_cron_wake's record-keeping ONLY — fire_cron_wake
+    stays REAL so the CLI->fallback composition is actually exercised."""
+    rec = {"marks": [], "finish": []}
+    monkeypatch.setattr("cron.scheduler._build_wake_payload", lambda job: "payload")
+    monkeypatch.setattr(
+        "cron.scheduler.mark_job_run",
+        lambda job_id, success, error=None, delivery_error=None, status=None: rec[
+            "marks"
+        ].append((job_id, success, error, status)),
+    )
+    monkeypatch.setattr(
+        "cron.scheduler.finish_execution",
+        lambda eid, **kw: rec["finish"].append((eid, kw)),
+    )
+    return rec
+
+
+def test_dispatch_records_failure_when_cli_and_fallback_both_fail(monkeypatch):
+    import subprocess
+
+    rec = _install_bookkeeping_mocks(monkeypatch)
+    # Official path cannot confirm delivery.
+    monkeypatch.setattr(
+        "cron.scheduler.subprocess.run",
+        lambda argv, **kw: subprocess.CompletedProcess(argv, 1, stdout="", stderr="boom"),
+    )
+    # Fallback is a candidate but drops the wake (adapter swallows the event).
+    class SwallowAdapter:
+        config = type("C", (), {"extra": {}})()
+        _active_sessions = {}
+
+        async def handle_message(self, event):
+            return None
+
+    loop = _live_loop()
+    try:
+        from cron.scheduler import CronWakeRoute, _dispatch_cron_wake
+
+        job = {"id": "jid-drop", "skills": ["neo-journal"]}
+        route = CronWakeRoute(mode="wake", target="neo", reason="journal")
+        _dispatch_cron_wake(
+            job, route, "exec-drop", adapters={"telegram": SwallowAdapter()}, loop=loop
+        )
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+
+    # No "wake fired": the run is recorded as a failure with the true reason.
+    assert len(rec["marks"]) == 1
+    job_id, success, error, status = rec["marks"][0]
+    assert job_id == "jid-drop"
+    assert success is False
+    assert error and "never landed" in error
+    assert status is None
+    assert rec["finish"][0][1]["success"] is False
+
+
+def test_dispatch_records_wake_fired_when_fallback_spawns(monkeypatch):
+    """The positive half: CLI cannot confirm, the fallback genuinely spawns a
+    turn -> the job IS recorded as wake fired."""
+    import subprocess
+
+    rec = _install_bookkeeping_mocks(monkeypatch)
+    monkeypatch.setattr(
+        "cron.scheduler.subprocess.run",
+        lambda argv, **kw: subprocess.CompletedProcess(argv, 1, stdout="", stderr="boom"),
+    )
+
+    class SpawningAdapter:
+        config = type("C", (), {"extra": {}})()
+
+        def __init__(self):
+            self._active_sessions = {}
+
+        async def handle_message(self, event):
+            from gateway.session import build_session_key
+
+            self._active_sessions[
+                build_session_key(
+                    event.source,
+                    group_sessions_per_user=True,
+                    thread_sessions_per_user=False,
+                )
+            ] = asyncio.Event()
+
+    loop = _live_loop()
+    try:
+        from cron.scheduler import WAKE_FIRED_STATUS, CronWakeRoute, _dispatch_cron_wake
+
+        job = {"id": "jid-spawn", "skills": ["neo-journal"]}
+        route = CronWakeRoute(mode="wake", target="neo", reason="journal")
+        _dispatch_cron_wake(
+            job, route, "exec-spawn", adapters={"telegram": SpawningAdapter()}, loop=loop
+        )
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+
+    assert rec["marks"] == [("jid-spawn", True, None, WAKE_FIRED_STATUS)]

@@ -149,3 +149,178 @@ def test_visible_copy_handles_empty_payload():
 
     assert "empty payload" in send_cmd._wake_visible_copy_message("neo", "")
     assert "wake fired" in send_cmd._wake_visible_copy_message("neo", "   ")
+
+# ---------------------------------------------------------------------------
+# 4. In-process fallback intake truth (cell 9-L1, t_1afbfd87)
+# ---------------------------------------------------------------------------
+#
+# The fallback is the LAST-RESORT path in fire_cron_wake. It used to treat
+# "adapter.handle_message returned without raising" as delivery — a wake an
+# adapter swallows (no handler attached, event dropped) reported success and
+# the job recorded "wake fired" for a turn that never ran. It now reports the
+# TRUE intake outcome by observing the session guard around the call, exactly
+# like gateway.mcp_bridge._handle_inject:
+#
+#   busy guard already installed -> queued (the turn runs when the active
+#                                    one finishes; a delivery)
+#   guard installed after         -> spawned (a delivery)
+#   neither                       -> dropped (NOT a delivery: hard failure)
+
+
+def _adapter_loop():
+    """A running loop in a background thread the fallback can schedule onto."""
+    import asyncio
+    import threading
+
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=lambda: (asyncio.set_event_loop(loop), loop.run_forever()), daemon=True)
+    thread.start()
+    return loop
+
+
+def _source_for(target="telegram:8900123006"):
+    from gateway.config import Platform
+    from gateway.session import SessionSource
+
+    return SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="8900123006",
+        chat_type="dm",
+        user_id="cli",
+        user_name="CLI User",
+    )
+
+
+def _key_for(source):
+    from gateway.session import build_session_key
+
+    return build_session_key(
+        source, group_sessions_per_user=True, thread_sessions_per_user=False
+    )
+
+
+class _RealisticAdapter:
+    """Models BasePlatformAdapter.handle_message: install the session guard,
+    then spawn the turn. ``guard=False`` models an adapter that swallows the
+    event (no message handler attached) — the dropped case."""
+
+    def __init__(self, *, guard=True):
+        from types import SimpleNamespace
+
+        self.config = SimpleNamespace(extra={})
+        self._active_sessions = {}
+        self.guard = guard
+        self.events = []
+
+    async def handle_message(self, event):
+        self.events.append(event)
+        if not self.guard:
+            return
+        self._active_sessions[_key_for(event.source)] = __import__("asyncio").Event()
+
+
+def test_in_process_wake_spawned_is_delivery():
+    from cron.scheduler import _in_process_wake
+
+    adapter = _RealisticAdapter()
+    loop = _adapter_loop()
+    try:
+        assert (
+            _in_process_wake(
+                "telegram:8900123006",
+                "the brief",
+                adapters={"telegram": adapter},
+                loop=loop,
+            )
+            is True
+        )
+        assert len(adapter.events) == 1
+        assert adapter.events[0].text.startswith("Incoming user wake (cron):")
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+
+
+def test_in_process_wake_queued_is_delivery():
+    """A wake queued behind a busy session WILL run — a delivery, not a drop."""
+    from cron.scheduler import _in_process_wake
+
+    adapter = _RealisticAdapter()
+    source = _source_for()
+    adapter._active_sessions[_key_for(source)] = __import__("asyncio").Event()
+    loop = _adapter_loop()
+    try:
+        assert (
+            _in_process_wake(
+                "telegram:8900123006",
+                "the brief",
+                adapters={"telegram": adapter},
+                loop=loop,
+            )
+            is True
+        )
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+
+
+def test_in_process_wake_dropped_is_hard_failure():
+    """THE cell-9-L1 fallback bug: an adapter that accepts the event and
+    starts no turn is a DROPPED wake. Reporting success there is the exact
+    'wake fired for a turn that never spawned' false green."""
+    from cron.scheduler import _in_process_wake
+
+    adapter = _RealisticAdapter(guard=False)
+    loop = _adapter_loop()
+    try:
+        assert (
+            _in_process_wake(
+                "telegram:8900123006",
+                "the brief",
+                adapters={"telegram": adapter},
+                loop=loop,
+            )
+            is False
+        ), "a wake with no turn must never report delivery"
+        assert len(adapter.events) == 1, "the event was offered; it just dropped"
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+
+
+def test_in_process_wake_adapter_raising_is_failure():
+    from cron.scheduler import _in_process_wake
+
+    class Rejecting(_RealisticAdapter):
+        async def handle_message(self, event):
+            raise RuntimeError("wedged")
+
+    loop = _adapter_loop()
+    try:
+        assert (
+            _in_process_wake(
+                "telegram:8900123006",
+                "the brief",
+                adapters={"telegram": Rejecting()},
+                loop=loop,
+            )
+            is False
+        )
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+
+
+def test_fire_cron_wake_never_launders_a_dropped_fallback(monkeypatch):
+    """fire_cron_wake composes CLI + fallback: a confirmed-failed CLI wake
+    followed by a DROPPED in-process fallback is an honest False."""
+    import subprocess
+
+    monkeypatch.setattr(
+        "cron.scheduler.subprocess.run",
+        lambda argv, **kw: subprocess.CompletedProcess(argv, 1, stdout="", stderr="boom"),
+    )
+    adapter = _RealisticAdapter(guard=False)
+    loop = _adapter_loop()
+    try:
+        from cron.scheduler import fire_cron_wake
+
+        assert fire_cron_wake("neo", "the brief", adapters={"telegram": adapter}, loop=loop) is False
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
