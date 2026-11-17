@@ -39,11 +39,11 @@ This suite completes the contract across every wake path and locks the
 | 2 | `send_message_tool` bare `hermes send -t` / internal=True | ✅ fail-loud on dropped (Neo) | ✅ Neo 97341cfeff | core |
 | 3 | `tell_tool` with session_id (`session_wake_target`) | 🔲 PENDING | ✅ Neo 97341cfeff | core |
 | 4 | kanban `wake_fired` (worker spawn / task events) | 🔲 PENDING | ✅ Neo 97341cfeff | core |
-| 5 | kanban notify-complete → subscriber delivery | 🔲 PENDING (follow-up card, ex-t_df8b6cf6) | n/a (chat delivery) | medium |
+| 5 | kanban notify-complete → subscriber delivery | ✅ Zephyr t_1afbfd87 (test_kanban_notify_delivery.py) | n/a (chat delivery) | medium |
 | 6 | plan dispatch / plan-review response wake | 🔲 PENDING | ✅ Neo 97341cfeff | core |
 | 7 | plan stop-guard / step-nudge wake | ✅ Zephyr t_c022c264 (test_plan_nudge_outcome.py) | n/a | easy |
 | 8 | bugtool dispatch wake (bugtoold → assignee) | 🔲 PENDING | 🔲 PENDING | medium |
-| 9 | cron job wake (CLI-wake primary, in-process injection) | 🔲 PENDING (follow-up card, ex-t_df8b6cf6) | 🔲 PENDING | medium |
+| 9 | cron job wake (CLI-wake primary, in-process injection) | ✅ Zephyr t_1afbfd87 (test_cron_wake_outcome.py + test_cron_wake_transport.py + test_cron_wake_route.py) | 🔲 PENDING | medium |
 | 10 | board-topic wake routing (board_topic rows) | ✅ Zephyr t_c022c264 (test_board_wake_outcome.py) | n/a | easy |
 | 11 | telegram topic/session binding wake (7f4d801016 class) | 🔲 PENDING | 🔲 PENDING | medium |
 | 12 | LIVE end-to-end smoke (Gopher repro protocol) | n/a | ✅ `live_wake_smoke.py` | AUTHORITATIVE |
@@ -82,6 +82,21 @@ L2 = after the row lands, the intake handler runs and a turn actually spawns.
   a follow-up card; take-1's cell-9/5 source edits (cron/scheduler.py,
   hermes_cli/kanban.py, tui_gateway/server.py) remain uncommitted in the
   tree for that card.
+- 2026-11-17: cells 5-L1 + 9-L1 landed — Zephyr t_1afbfd87 (runs 1811/1813
+  burned their budget; the in-flight sender-side work was landed by Wintermute
+  as 5d59599dec, and this card completed the remaining scope). Cell 5: the
+  per-task delivery watermark advances only on a CONFIRMED adapter send (a
+  pre-send watermark permanently suppressed the retry of a failed
+  notification, silently losing a notify-complete), and a failed human notice
+  now falls back to the creator-session notice — tests/dispatch/
+  test_kanban_notify_delivery.py (9 tests). Cell 9-L1: the in-process fallback
+  reports the true intake outcome (spawned | queued | dropped) by observing
+  the session guard, mirroring `_handle_inject`; a guard-less adapter is a
+  DROPPED wake and records a failed run, never "wake fired" — extended
+  tests/cron/test_cron_wake_route.py + test_cron_wake_transport.py.
+  Also corrected `test_cli_implicit_origin_rejects_channel_fallback_without_session`,
+  stale-red since e8ed311e0f (2026-09-22) restored the env-bridge origin
+  fallback.
 - PENDING before the commit gate goes hard: 3-L1, 4-L1, 6-L1, 8, 11.
 
 ## Prior art to build on (do not duplicate)
