@@ -118,6 +118,9 @@ class _SecondaryRecoveryAdapter:
     def set_session_store(self, store):
         self.session_store = store
 
+    def set_session_db(self, db):
+        self.session_db = db
+
     def set_busy_session_handler(self, handler):
         self.busy_session_handler = handler
 
@@ -136,6 +139,7 @@ def _secondary_recovery_runner(*, running=True):
     runner._profile_failed_platforms = {}
     runner._background_tasks = set()
     runner.session_store = object()
+    runner._session_db = object()
     runner._handle_active_session_busy_message = object()
     runner._recover_telegram_topic_thread_id = object()
     runner._busy_text_mode = "queue"
@@ -379,6 +383,7 @@ class TestSecondaryProfileConfigHandling:
         runner.config = GatewayConfig(multiplex_profiles=True)
         runner._profile_adapters = {}
         runner.session_store = None
+        runner._session_db = None
         runner._busy_text_mode = "queue"
 
         photon = Platform("photon")
@@ -439,6 +444,7 @@ class TestSecondaryProfileConfigHandling:
         runner.config = GatewayConfig(multiplex_profiles=True)
         runner._profile_adapters = {}
         runner.session_store = None
+        runner._session_db = None
         runner._busy_text_mode = "queue"
 
         photon = Platform("photon")
