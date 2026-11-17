@@ -240,8 +240,15 @@ def section_name(value: str) -> str:
 
 
 def section_value(text: str, section: str) -> str:
-    match = re.search(rf"(?ms)^## {re.escape(section)}\n(.*?)(?=^## |\Z)", text)
-    return match.group(1).strip() if match else ""
+    # Exact heading, or heading with a parenthetical/annotation suffix
+    # (e.g. "## How To Reproduce (current behaviour — the gap)") — the
+    # dispatch gate must not fail files whose authors qualified the title.
+    match = re.search(
+        rf"(?m)^## {re.escape(section)}[ \t]*(?:[（(—-][^\n]*)?\n(?P<body>.*?)(?=\n^## |\n?\Z)",
+        text,
+        re.S,
+    )
+    return match.group("body").strip() if match else ""
 
 
 def replace_section(text: str, section: str, value: str) -> str:
@@ -473,7 +480,11 @@ def bug_lint_issues(text: str, path: Path) -> tuple[list[str], list[str]]:
         for sec in missing_sections:
             manual.append(f"missing `## {sec}` section (dispatch gate; needs content from the filing context — rename an equivalent section or write it)")
         if not assigned_worker(text):
-            manual.append("missing `## Assignee` section (dispatch gate; needs a valid fleet agent from the filing context)")
+            fm_asg = (frontmatter_raw(text).get("assignee") or "").strip().strip('"').lower()
+            if fm_asg == "unassigned":
+                pass  # explicit "awaiting Evan's routing" — legitimate filed state
+            else:
+                manual.append("missing `## Assignee` section (dispatch gate; needs a valid fleet agent from the filing context)")
     return auto, manual
 
 
