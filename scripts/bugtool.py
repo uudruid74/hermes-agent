@@ -307,6 +307,16 @@ def resolve_section(requested: str, text: str) -> str:
     )
 
 
+def section_name(value: str) -> str:
+    """Resolve a section spelling to its canonical heading name.
+
+    Alias table first (``depends-on`` -> ``Depends on`` etc.), else the
+    stripped value. Public contract — callers and tests rely on this name
+    (regression 2026-11-17: dropped in the set-rework, restored).
+    """
+    return SECTION_ALIASES.get(value.strip().lower(), value.strip())
+
+
 def section_value(text: str, section: str) -> str:
     # Exact heading, or heading with a parenthetical/annotation suffix
     # (e.g. "## How To Reproduce (current behaviour — the gap)") — the
@@ -1010,20 +1020,21 @@ def live_task_count_by_agent(assignee: str) -> int:
     return sum(1 for record in records if record.get("status") in CAP_COUNT_STATUSES)
 
 
-# Global one-at-a-time gate (Evan 2026-11-17): "We should be able to dispatch
-# these just by setting the assignee and checking the box. We need to make sure
-# we don't dispatch more than 1 task at a time though." The checkbox flow must
-# never fan out across assignees (the per-agent cap below does not stop N bugs
-# going to N different agents in one hook pass).
+# One-at-a-time gate, PER ASSIGNEE (Evan 2026-11-17: "can we make this gate per
+# assignee? That way we can reassign some of these to Zephyr who is currently
+# free"). At most MAX_LIVE_BUG_TASKS live bug task per assignee — different
+# assignees run in parallel; the same assignee drains one at a time. FIFO is
+# the sweep's own scan order (all_bug_files is date-sorted, oldest first): when
+# a slot frees, the next checked bug for that assignee dispatches.
 MAX_LIVE_BUG_TASKS = 1
 
 
-def live_bug_task_count() -> int:
-    """How many live BUG tasks the queue currently holds (global gate).
+def live_bug_task_count(worker: str) -> int:
+    """How many live BUG tasks ``worker`` currently holds (per-assignee gate).
 
     Counts tasks titled with this tool's own convention (``BUG: <slug>``,
     see create_task / the auto-resolve lifecycle) in CAP_COUNT_STATUSES — a
-    blocked bug task does not hold the queue (Evan 2026-10-14: blocked is not
+    blocked bug task does not hold the slot (Evan 2026-10-14: blocked is not
     consuming attention), and done/archived are not live.
 
     Fails OPEN with a loud stderr warning, same contract as the per-agent cap:
@@ -1031,7 +1042,7 @@ def live_bug_task_count() -> int:
     the dispatch log + owned_live_task_ids + is_dispatched_marker).
     """
     result = subprocess.run(
-        [HERMES, "kanban", "list", "--json"],
+        [HERMES, "kanban", "list", "--assignee", worker, "--json"],
         text=True,
         capture_output=True,
         check=False,
@@ -1040,9 +1051,9 @@ def live_bug_task_count() -> int:
     if not output.strip():
         if result.returncode:
             print(
-                f"bugtool: global one-at-a-time gate unavailable (kanban list "
-                f"exit {result.returncode}: {(result.stderr or '').strip()[:200]}); "
-                f"gate bypassed this pass",
+                f"bugtool: per-assignee one-at-a-time gate unavailable (kanban "
+                f"list exit {result.returncode}: "
+                f"{(result.stderr or '').strip()[:200]}); gate bypassed this pass",
                 file=sys.stderr,
             )
         return 0
@@ -1050,7 +1061,7 @@ def live_bug_task_count() -> int:
         records = json.loads(output)
     except json.JSONDecodeError:
         print(
-            "bugtool: global one-at-a-time gate unavailable (kanban list "
+            "bugtool: per-assignee one-at-a-time gate unavailable (kanban list "
             "returned invalid JSON); gate bypassed this pass",
             file=sys.stderr,
         )
@@ -1062,6 +1073,7 @@ def live_bug_task_count() -> int:
         for record in records
         if record.get("status") in CAP_COUNT_STATUSES
         and str(record.get("title", "")).startswith("BUG:")
+        and str(record.get("assignee", worker)) == worker
     )
 
 
@@ -1184,15 +1196,16 @@ def maybe_dispatch_locked(path: Path, text: str, directive: Optional[str] = None
     if unresolved_deps:
         print(f"nothing to dispatch for {path.name}: blocked by {', '.join(unresolved_deps)}")
         return None
-    # Global one-at-a-time gate (Evan 2026-11-17): at most MAX_LIVE_BUG_TASKS
-    # live bug task fleet-wide, regardless of assignee. DEFER, never drop
-    # (same semantics as the per-agent cap): the file stays pending+checked
-    # and the next pass picks it up when the live task completes. force=True
-    # (bugtool redispatch) bypasses: the human asked for it.
-    if not force and live_bug_task_count() >= MAX_LIVE_BUG_TASKS:
+    # One-at-a-time gate, PER ASSIGNEE (Evan 2026-11-17): at most
+    # MAX_LIVE_BUG_TASKS live bug task per assignee. Different assignees run
+    # in parallel; the same assignee drains in FIFO order (the sweep scans
+    # oldest-first, so the next checked bug goes when the slot frees).
+    # DEFER, never drop: the file stays pending+checked. force=True (bugtool
+    # redispatch) bypasses: the human asked for it.
+    if not force and worker and live_bug_task_count(worker) >= MAX_LIVE_BUG_TASKS:
         print(
-            f"nothing to dispatch for {path.name}: deferred, a bug task is "
-            f"already live (one at a time)"
+            f"nothing to dispatch for {path.name}: deferred, {worker} already "
+            f"has a live bug task (one at a time per assignee)"
         )
         return None
     # Per-agent cap (t_cd44bbde, Phase B): defer, never drop. The bug file is
