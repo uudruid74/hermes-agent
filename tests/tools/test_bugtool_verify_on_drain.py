@@ -110,6 +110,24 @@ def test_queue_drain_semantics(monkeypatch, tmp_path):
     waiting = projects_root / "hermes-agent" / "bugs" / "pending" / "2026-11-17-waiting.md"
     waiting.write_text(checked_bug_text("waiting").replace("[x]", "[ ]"), encoding="utf-8")
     assert bugtool.queue_is_drained("hermes-agent") is True
+    # A BLOCKED task does not hold the drain either (Evan 2026-10-14
+    # "blocked isn't attention" — otherwise one blocked bug starves the
+    # queue-drain verify forever); a running one does.
+    with_task = checked_bug_text("blocked-holder").replace(
+        "## Kanban tasks\n\n", "## Kanban tasks\n\n- t_holder1\n"
+    )
+    waiting.write_text(with_task.replace("[x]", "[ ]"), encoding="utf-8")
+
+    import subprocess as sp
+
+    def fake_show(args, **_kw):
+        return sp.CompletedProcess(args, 0, f"Status: {holder_status}\n", "")
+
+    monkeypatch.setattr(bugtool.subprocess, "run", fake_show)
+    holder_status = "blocked"
+    assert bugtool.queue_is_drained("hermes-agent") is True
+    holder_status = "running"
+    assert bugtool.queue_is_drained("hermes-agent") is False
 
 
 def test_verify_green_no_card(monkeypatch, tmp_path):

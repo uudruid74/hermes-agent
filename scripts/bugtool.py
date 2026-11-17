@@ -1723,7 +1723,16 @@ def queue_is_drained(project: str = "hermes-agent") -> bool:
             text = path.read_text(encoding="utf-8")
         except OSError:
             return False  # unreadable = unknown state; never claim drain
-        if live_task_ids(text):
+        # A BLOCKED task does not hold the drain (Evan 2026-10-14: "blocked
+        # isn't attention" — same law as the dispatch caps via
+        # CAP_COUNT_STATUSES). Otherwise one permanently blocked bug starves
+        # the queue-drain verify forever. Blocked work resumes later; its
+        # completion re-drains and re-verifies at the then-HEAD sha.
+        holding = [
+            tid for tid in task_ids(text)
+            if status_for_task(tid) in CAP_COUNT_STATUSES
+        ]
+        if holding:
             return False
         if (
             bug_status(text) != DISPATCHED_STATUS
