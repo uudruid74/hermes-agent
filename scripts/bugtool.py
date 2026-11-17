@@ -13,7 +13,7 @@ import sys
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Iterator, NoReturn, Optional
 
 PROJECTS_ROOT = Path(os.environ.get("BUGTOOL_PROJECTS_ROOT", "/home/ekl/vault/wiki/Projects"))
 STATE_ROOT = Path(os.environ.get("BUGTOOL_STATE_ROOT", "/home/ekl/.local/state/bugtool"))
@@ -195,7 +195,7 @@ def dispatch_is_recorded(identity: dict[str, object]) -> bool:
     return record.get("status") == "failed" and bool(record.get("ambiguous"))
 
 
-def die(message: str) -> None:
+def die(message: str) -> NoReturn:
     raise SystemExit(f"bugtool: {message}")
 
 
@@ -267,8 +267,44 @@ def all_bug_files(project: Optional[str] = None) -> list[Path]:
     return sorted(files)
 
 
-def section_name(value: str) -> str:
-    return SECTION_ALIASES.get(value.strip().lower(), value.strip())
+# Canonical sections known to bugtool (template + standard lifecycle sections).
+KNOWN_SECTIONS = (
+    "Description", "How To Reproduce", "Expected Behavior", "Actual Behavior",
+    "Comments", "Supporting Evidence", "Approved to run", "Kanban tasks",
+    "Assignee", "Reporter session", "Symptom", "Repro", "Suspected cause",
+    "Related bugs", "Depends on", "Updates", "Resolution", "Failure Reports",
+)
+
+
+def _normalize_section_name(value: str) -> str:
+    """Fold a heading to a comparable form: kebab/snake -> spaces, case-folded."""
+    return re.sub(r"[-_]+", " ", value).strip().lower()
+
+
+def resolve_section(requested: str, text: str) -> str:
+    """Resolve a user-supplied section name to the exact heading to fill.
+
+    Priority: explicit alias -> case-insensitive match against headings
+    present in the file -> known canonical template section. Anything else
+    is a hard error: cmd_set must NEVER append a mis-named duplicate section
+    (t_ce1eb644).
+    """
+    requested = requested.strip()
+    alias = SECTION_ALIASES.get(requested.lower())
+    if alias:
+        return alias
+    target = _normalize_section_name(requested)
+    if target:
+        for heading in re.findall(r"(?m)^##[ \t]+(.+)$", text):
+            if _normalize_section_name(heading) == target:
+                return heading.strip()
+        for section in KNOWN_SECTIONS:
+            if _normalize_section_name(section) == target:
+                return section
+    die(
+        f"unknown section {requested!r} "
+        f"(known sections: {', '.join(KNOWN_SECTIONS)})"
+    )
 
 
 def section_value(text: str, section: str) -> str:
@@ -1309,9 +1345,9 @@ def cmd_new(args: argparse.Namespace) -> None:
 
 def cmd_set(args: argparse.Namespace) -> None:
     path = bug_path(args.file)
-    section = section_name(args.section)
     with locked_root():
         text = path.read_text(encoding="utf-8")
+        section = resolve_section(args.section, text)
         updated = replace_section(text, section, args.text)
         path.write_text(updated, encoding="utf-8")
         created = maybe_dispatch_locked(path, updated)
