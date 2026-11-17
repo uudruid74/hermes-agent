@@ -1466,6 +1466,19 @@ def _send_kanban_wake(
             bridge_path=bridge_path,
         )
     )
+    # L1 law 1 (tests/dispatch/CONTRACT.md): DROPPED IS NEVER SUCCESS.
+    # ``_send_via_bridge`` returns the bridge's raw envelope — ``success`` is
+    # the transport ack, and post-537a10306c the *intake* outcome rides in
+    # ``status``. A wake the gateway dropped (inject accepted, no processing
+    # task started) is a hard sender-side error here, otherwise the caller
+    # records a wake it never made and skips its session-notice fallback.
+    if isinstance(result, dict) and result.get("status") == "dropped":
+        return f"mcp_bridge:{bridge_path}", {
+            "success": False,
+            "status": "dropped",
+            "error": result.get("error")
+            or f"gateway dropped the wake for {platform}:{chat_id} — no turn spawned",
+        }
     return f"mcp_bridge:{bridge_path}", result
 
 

@@ -169,7 +169,9 @@ def test_the_send_carries_the_review_answer_as_the_worker_turn(monkeypatch):
     )
     wake = sink[-1]
     assert wake[:3] == ["hermes", "send", "-t"]
-    body = wake[4]
+    # --json rides before the body so delivery is verified, not exit-code-only
+    assert wake[4] == "--json"
+    body = wake[5]
     assert "responded to your tool-call-limit ask on" in body
     assert task_id in body
     assert "Split the step: probe first." in body

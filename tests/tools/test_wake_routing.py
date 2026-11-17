@@ -276,4 +276,6 @@ def test_send_user_passes_live_session_target_to_send_t(tmp_path, monkeypatch):
     error = plan_binding_adapter._send_user("gopher", "ping", conn=conn, task_id=tid)
     assert error is None
     # t_de2a9b4a contract: the resolved target is the CHAT shape.
-    assert sent == [["hermes", "send", "-t", "gopher:telegram:8900123006", "ping"]]
+    assert sent == [[
+        "hermes", "send", "-t", "gopher:telegram:8900123006", "--json", "ping"
+    ]]

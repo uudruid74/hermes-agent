@@ -3246,10 +3246,17 @@ def _bridge_cli_wake(
     if not (target or "").strip():
         logger.error("cron wake: no wake target resolved — refusing to fire into the void")
         return False
+    _target = str(target)
 
     try:
         proc = subprocess.run(
-            ["hermes", "send", "-t", target, body],
+            # ``--json`` is what makes the delivery check below real. Without
+            # it ``hermes send`` prints human text ("sent"), the JSON parse
+            # falls through to ``{}``, and the outcome keys this function
+            # documents (``error`` / ``suppressed`` / ``queued``) can never be
+            # read — the check degraded to exit-code-only. Requesting the
+            # machine shape keeps the documented contract honest.
+            ["hermes", "send", "-t", _target, "--json", str(body)],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -3258,12 +3265,12 @@ def _bridge_cli_wake(
             timeout=timeout,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        logger.error("cron wake: 'hermes send -t' failed to run for %r: %s", target, exc)
+        logger.error("cron wake: 'hermes send -t' failed to run for %r: %s", _target, exc)
         return False
     if proc.returncode != 0:
         logger.error(
             "cron wake: 'hermes send -t %s' exited %s: %s",
-            target,
+            _target,
             proc.returncode,
             (proc.stderr or "").strip()[:400],
         )
@@ -3275,10 +3282,19 @@ def _bridge_cli_wake(
     if payload.get("error"):
         logger.error("cron wake: delivery reported error: %s", payload["error"])
         return False
+    # L1 law 1 (tests/dispatch/CONTRACT.md): DROPPED IS NEVER SUCCESS. The
+    # bridge reports the true intake outcome; a wake the gateway dropped
+    # (inject accepted but no processing task started) must fail loudly here
+    # even if a caller-side wrapper flattened it into a success envelope.
+    if payload.get("status") == "dropped":
+        logger.error(
+            "cron wake: gateway DROPPED the wake for %r — no turn spawned", _target
+        )
+        return False
     if payload.get("suppressed"):
-        logger.info("cron wake: duplicate wake for %r suppressed (already engaged)", target)
+        logger.info("cron wake: duplicate wake for %r suppressed (already engaged)", _target)
         return True
-    logger.info("cron wake: 'hermes send -t %s' confirmed delivery", target)
+    logger.info("cron wake: 'hermes send -t %s' confirmed delivery", _target)
     return True
 
 

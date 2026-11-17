@@ -9049,6 +9049,16 @@ def _notification_poller_loop(
                             f"{type(exc).__name__}: {exc}",
                             file=sys.stderr,
                         )
+                        # L1 outcome truth (tests/dispatch/CONTRACT.md): the
+                        # events were already cursor-claimed, so dropping the
+                        # batch here silently loses the notification forever —
+                        # "claimed but never delivered". Restore it to the
+                        # pending buffer (ahead of anything queued since) so
+                        # the next poll retries delivery once the session is
+                        # idle again.
+                        session["_kanban_pending"] = _batch + (
+                            session.get("_kanban_pending") or []
+                        )
                         with session["history_lock"]:
                             session["running"] = False
         try:

@@ -164,11 +164,13 @@ def test_cli_wake_is_primary_when_no_candidate(monkeypatch):
     assert ok is True
     assert calls == [
         (
-            ["hermes", "send", "-t", "gopher", "short prompt"],
+            # "--json" makes the delivery check real: without it the CLI
+            # prints human text and the outcome keys can never be read.
+            ["hermes", "send", "-t", "gopher", "--json", "short prompt"],
             90.0,
         )
     ]
-    assert calls[0][0] == ["hermes", "send", "-t", "gopher", "short prompt"]
+    assert calls[0][0] == ["hermes", "send", "-t", "gopher", "--json", "short prompt"]
     # The CLI was RUN synchronously (blocking, bounded) — never detached.
     assert calls[0][1] is not None
 
@@ -267,7 +269,7 @@ def test_cli_win_is_used_without_failed_attempt(monkeypatch):
 
     # Exactly one delivery attempt: the official CLI wake.  The fragile
     # in-process path was never consulted.
-    assert calls == [["hermes", "send", "-t", "gopher", "short prompt"]]
+    assert calls == [["hermes", "send", "-t", "gopher", "--json", "short prompt"]]
     assert optimization_calls == []
 
 
@@ -344,7 +346,7 @@ def test_optimization_never_precedes_official_wake(monkeypatch):
 
         ok = fire_cron_wake("neo", "prompt", adapters=adapters, loop=loop)
         assert ok is True
-        assert cli_calls == [["hermes", "send", "-t", "neo", "prompt"]]
+        assert cli_calls == [["hermes", "send", "-t", "neo", "--json", "prompt"]]
         # The fragile path was never consulted — no failed first attempt,
         # no fallback chain.
         assert optimization_calls == []
