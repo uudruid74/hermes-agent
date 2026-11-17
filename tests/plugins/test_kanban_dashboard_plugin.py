@@ -544,6 +544,77 @@ def test_home_channels_lists_only_platforms_with_home(client, with_home_channels
         assert h["subscribed"] is False
 
 
+def _make_task(title: str = "route me") -> str:
+    conn = kb.connect()
+    try:
+        return kb.create_task(conn, title=title, assignee="worker")
+    finally:
+        conn.close()
+
+
+def test_home_subscribe_routes_origin_not_subs(client, with_home_channels):
+    """POST home-subscribe stores the platform home as origin routing —
+    the delivery path the state-change hook reads at event time — and
+    writes no kanban_notify_subs row."""
+    t = _make_task()
+    r = client.post(f"/api/plugins/kanban/tasks/{t}/home-subscribe/telegram")
+    assert r.status_code == 200, r.text
+    assert r.json()["ok"] is True
+
+    conn = kb.connect()
+    try:
+        origin = kb.get_origin_routing(conn, t)
+        assert origin is not None, "origin routing must be stored"
+        assert origin["platform"] == "telegram"
+        assert str(origin["chat_id"]) == "1234567"
+        assert str(origin["thread_id"]) == "42"
+    finally:
+        conn.close()
+
+    # GET now reports the task routed to telegram's home only.
+    r2 = client.get(f"/api/plugins/kanban/home-channels?task_id={t}")
+    assert r2.status_code == 200
+    subs = {h["platform"]: h["subscribed"] for h in r2.json()["home_channels"]}
+    assert subs == {"telegram": True, "discord": False}
+
+
+def test_home_unsubscribe_clears_matching_origin(client, with_home_channels):
+    """DELETE home-subscribe clears origin routing only when it points at
+    that platform's home; un-routing falls back to default delivery."""
+    t = _make_task()
+    # Route to telegram first.
+    r = client.post(f"/api/plugins/kanban/tasks/{t}/home-subscribe/telegram")
+    assert r.status_code == 200
+    # Un-route via a DIFFERENT platform: idempotent no-op, origin stays.
+    r = client.delete(f"/api/plugins/kanban/tasks/{t}/home-subscribe/discord")
+    assert r.status_code == 200
+    conn = kb.connect()
+    try:
+        assert kb.get_origin_routing(conn, t) is not None
+    finally:
+        conn.close()
+    # Un-route via the matching platform: origin is cleared.
+    r = client.delete(f"/api/plugins/kanban/tasks/{t}/home-subscribe/telegram")
+    assert r.status_code == 200
+    conn = kb.connect()
+    try:
+        assert kb.get_origin_routing(conn, t) is None
+    finally:
+        conn.close()
+
+
+def test_home_subscribe_unknown_platform_404(client, with_home_channels):
+    """A platform without a configured home channel is a 404."""
+    t = _make_task()
+    r = client.post(f"/api/plugins/kanban/tasks/{t}/home-subscribe/slack")
+    assert r.status_code == 404
+
+
+def test_home_subscribe_unknown_task_404(client, with_home_channels):
+    r = client.post("/api/plugins/kanban/tasks/t_missing000000/home-subscribe/telegram")
+    assert r.status_code == 404
+
+
 # ---------------------------------------------------------------------------
 # Recovery endpoints (reclaim + reassign) and warnings field
 # ---------------------------------------------------------------------------

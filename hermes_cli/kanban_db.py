@@ -4601,6 +4601,24 @@ def get_origin_routing(
     return None
 
 
+def clear_origin_routing(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Remove the task's origin-routing marker comment(s).
+
+    Used when the user explicitly un-routes a task (dashboard home-channel
+    toggle-off): future state-change notifications fall back to the
+    worker-session wake / creator-session notice paths. Returns True when a
+    marker was removed.
+    """
+    _escaped_marker = _ORIGIN_MARKER.replace("_", "\\_")
+    with write_txn(conn):
+        cur = conn.execute(
+            "DELETE FROM task_comments"
+            " WHERE task_id = ? AND author = 'system' AND body LIKE ? ESCAPE '\\'",
+            (task_id, f"{_escaped_marker}%"),
+        )
+    return cur.rowcount > 0
+
+
 # ---------------------------------------------------------------------------
 # Attachments
 # ---------------------------------------------------------------------------

@@ -1936,19 +1936,24 @@ def get_config():
 
 
 # ---------------------------------------------------------------------------
-# Home-channel subscriptions (per-task, per-platform toggles)
+# Home-channel delivery routing (origin routing — the real delivery path)
 # ---------------------------------------------------------------------------
 #
 # Home channels are a first-class gateway concept — each configured platform
 # can have exactly one (chat_id, thread_id, name) it considers "home". The
-# dashboard surfaces these as per-task toggles so a user can opt a specific
-# task into receiving terminal notifications (completed / blocked / gave_up)
-# at their telegram/discord/slack home, without touching the CLI.
+# dashboard surfaces these as per-task toggles so a user can route a task's
+# terminal notifications (completed / blocked / gave_up) to their
+# telegram/discord/slack home.
 #
-# The wire format mirrors kanban_db.add_notify_sub — (task_id, platform,
-# chat_id, thread_id) — so toggle-on creates exactly the same row the
-# `/kanban create` slash command would, and the existing gateway notifier
-# watcher delivers events without any additional plumbing.
+# Delivery is origin routing: the kanban state-change hook
+# (hermes_cli/kanban.py::_deliver_kanban_notification) reads the task's
+# origin marker (__kanban_origin__ system comment) at event time and wakes
+# that chat via the origin profile's gateway bridge. These endpoints edit
+# that marker — subscribe stores the platform's home channel as the origin
+# (an explicit user-chosen destination, allow_non_session), unsubscribe
+# clears it. The old implementation wrote kanban_notify_subs rows; that
+# table was removed (2026-11-17, t_80386714) — its delivery watcher had been
+# dead since 2026-10-19, so toggle rows silently delivered nothing.
 
 
 def _configured_home_channels() -> list[dict]:
@@ -1982,22 +1987,24 @@ def _configured_home_channels() -> list[dict]:
     return result
 
 
+def _origin_matches_home(origin: Optional[dict], home: dict) -> bool:
+    """True if the task's origin routing points at the given home channel."""
+    if not origin:
+        return False
+    return (
+        origin.get("platform") == home["platform"]
+        and str(origin.get("chat_id", "")) == str(home["chat_id"])
+        and str(origin.get("thread_id") or "") == str(home["thread_id"] or "")
+    )
+
+
 def _active_profile_name() -> str:
-    """Return the current Hermes profile name for notify-sub ownership."""
+    """Return the current Hermes profile name for origin routing stamps."""
     try:
         from hermes_cli.profiles import get_active_profile_name
         return get_active_profile_name() or "default"
     except Exception:
         return "default"
-
-
-def _home_sub_matches(sub: dict, home: dict) -> bool:
-    """True if a notify_subs row corresponds to the given home channel."""
-    return (
-        sub.get("platform") == home["platform"]
-        and str(sub.get("chat_id", "")) == str(home["chat_id"])
-        and str(sub.get("thread_id") or "") == str(home["thread_id"] or "")
-    )
 
 
 @router.get("/home-channels")
@@ -2006,39 +2013,36 @@ def get_home_channels(
     board: Optional[str] = Query(None),
 ):
     """List every platform with a home channel, plus whether *task_id*
-    (if given) is currently subscribed to that home.
+    (if given) is currently routed to that home.
 
     When ``task_id`` is omitted, every entry's ``subscribed`` is ``false``
     — useful for the "no task selected" state of the UI.
     """
     homes = _configured_home_channels()
-    subscribed_homes: set[tuple[str, str, str]] = set()
+    routed_home: dict[str, dict] | None = None
     if task_id:
         board = _resolve_board(board)
         conn = _conn(board=board)
         try:
-            subs = kanban_db.list_notify_subs(conn, task_id)
+            origin = kanban_db.get_origin_routing(conn, task_id)
         finally:
             conn.close()
-        for sub in subs:
-            key = (
-                str(sub.get("platform") or ""),
-                str(sub.get("chat_id") or ""),
-                str(sub.get("thread_id") or ""),
-            )
-            subscribed_homes.add(key)
+        routed_home = origin
     result = []
     for home in homes:
-        key = (home["platform"], home["chat_id"], home["thread_id"])
-        result.append({**home, "subscribed": key in subscribed_homes})
+        result.append({
+            **home,
+            "subscribed": _origin_matches_home(routed_home, home),
+        })
     return {"home_channels": result}
 
 
 @router.post("/tasks/{task_id}/home-subscribe/{platform}")
 def subscribe_home(task_id: str, platform: str, board: Optional[str] = Query(None)):
-    """Subscribe *task_id* to notifications routed to *platform*'s home channel.
+    """Route *task_id*'s terminal notifications to *platform*'s home channel.
 
-    Idempotent — re-subscribing is a no-op at the DB layer. 404 if the
+    Stores the home channel as the task's origin routing (the delivery
+    source of truth the state-change hook reads at event time). 404 if the
     platform has no home channel configured. 404 if the task doesn't exist.
     """
     homes = _configured_home_channels()
@@ -2056,13 +2060,16 @@ def subscribe_home(task_id: str, platform: str, board: Optional[str] = Query(Non
         task = kanban_db.get_task(conn, task_id)
         if task is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
-        kanban_db.add_notify_sub(
+        kanban_db.store_origin_routing(
             conn,
-            task_id=task_id,
+            task_id,
             platform=platform,
             chat_id=home["chat_id"],
-            thread_id=home["thread_id"] or None,
-            notifier_profile=_active_profile_name(),
+            thread_id=home["thread_id"] or "",
+            chat_type="group" if home["thread_id"] else "dm",
+            profile=_active_profile_name(),
+            allow_non_session=True,  # explicit user-chosen destination
+            overwrite=True,
         )
         return {"ok": True, "task_id": task_id, "home_channel": home}
     finally:
@@ -2071,7 +2078,7 @@ def subscribe_home(task_id: str, platform: str, board: Optional[str] = Query(Non
 
 @router.delete("/tasks/{task_id}/home-subscribe/{platform}")
 def unsubscribe_home(task_id: str, platform: str, board: Optional[str] = Query(None)):
-    """Remove any notify subscription on *task_id* that matches *platform*'s home."""
+    """Clear *task_id*'s origin routing when it points at *platform*'s home."""
     homes = _configured_home_channels()
     home = next((h for h in homes if h["platform"] == platform), None)
     if not home:
@@ -2082,13 +2089,14 @@ def unsubscribe_home(task_id: str, platform: str, board: Optional[str] = Query(N
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        kanban_db.remove_notify_sub(
-            conn,
-            task_id=task_id,
-            platform=platform,
-            chat_id=home["chat_id"],
-            thread_id=home["thread_id"] or None,
-        )
+        task = kanban_db.get_task(conn, task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+        origin = kanban_db.get_origin_routing(conn, task_id)
+        if not _origin_matches_home(origin, home):
+            # Not routed here — nothing to clear. Idempotent success.
+            return {"ok": True, "task_id": task_id, "home_channel": home}
+        kanban_db.clear_origin_routing(conn, task_id)
         return {"ok": True, "task_id": task_id, "home_channel": home}
     finally:
         conn.close()
