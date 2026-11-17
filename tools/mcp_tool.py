@@ -446,11 +446,20 @@ def _build_safe_env(user_env: Optional[dict]) -> dict:
     credentials to MCP server subprocesses.
     """
     env = {}
+    # Vars injected by an external secret source (Bitwarden/1Password) are
+    # deliberately allowed through: the user opted in to that source, so its
+    # values may reach MCP stdio server subprocesses.
+    secret_sources = {}
+    try:
+        from hermes_cli.env_loader import _SECRET_SOURCES as secret_sources
+    except ImportError:
+        pass
     for key, value in os.environ.items():
         if (
             key in _SAFE_ENV_KEYS
             or key.upper() in _SAFE_ENV_KEYS_CASE_INSENSITIVE
             or key.startswith("XDG_")
+            or key in secret_sources
         ):
             env[key] = value
     if user_env:
@@ -5604,6 +5613,23 @@ def _existing_tool_names() -> List[str]:
     return names
 
 
+def get_registered_mcp_server_names() -> set:
+    """Return the set of MCP server names that have actually registered at
+    least one tool into the registry (post-connection, post check_fn/include-
+    exclude filtering) — i.e. the real, availability-filtered signal, not
+    just what's present in config.yaml under ``mcp_servers``.
+
+    Values are sanitized server names (provider-safe normalization), matching
+    the provenance stored by ``_track_mcp_tool_server``.
+
+    Used by capability-aware prompt building (e.g. gateway/session.py's
+    Slack platform note) to detect an MCP server that provides a given
+    platform's capability regardless of what its config key is named.
+    """
+    with _lock:
+        return set(_mcp_tool_server_names.values())
+
+
 def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> List[str]:
     """Register tools from an already-connected server into the registry.
 
@@ -5638,6 +5664,15 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             return tool_name not in exclude_set
         return True
 
+    # First pass: collect registration candidates. Collisions — with
+    # built-ins or with another server's already-registered tools — fail
+    # closed: the entry is skipped rather than shadowing the owner. Tools
+    # whose lossy provider-safe names normalize to the SAME registry name
+    # within this server (e.g. `read-file` and `read_file`) are also
+    # skipped: every ambiguous entry is dropped instead of selecting an
+    # arbitrary handler.
+    candidates: List[dict] = []
+    origin_by_registry_name: Dict[str, list] = {}
     for mcp_tool in server._tools:
         if not _should_register(mcp_tool.name):
             logger.debug("MCP server '%s': skipping tool '%s' (filtered by config)", name, mcp_tool.name)
@@ -5649,12 +5684,14 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
         schema = _convert_mcp_schema(name, mcp_tool)
         tool_name_prefixed = schema["name"]
 
-        # Guard against collisions with built-in (non-MCP) tools.
+        # Guard against collisions with tools owned by a different toolset
+        # (built-in, or another MCP server). Same-server refresh/re-register
+        # keeps its own toolset and remains allowed.
         existing_toolset = registry.get_toolset_for_tool(tool_name_prefixed)
-        if existing_toolset and not existing_toolset.startswith("mcp-"):
+        if existing_toolset and existing_toolset != toolset_name:
             logger.warning(
-                "MCP server '%s': tool '%s' (→ '%s') collides with built-in "
-                "tool in toolset '%s' — skipping to preserve built-in",
+                "MCP server '%s': tool '%s' (→ '%s') collides with existing "
+                "tool in toolset '%s' — skipping to preserve existing owner",
                 name, mcp_tool.name, tool_name_prefixed, existing_toolset,
             )
             continue
@@ -5671,17 +5708,38 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
                     "description": "Optional: set session temperature during thinking. Reasoning is temporarily disabled."
                 }
 
+        candidates.append({
+            "registry_name": tool_name_prefixed,
+            "handler": _make_tool_handler(name, mcp_tool.name, server.tool_timeout),
+            "schema": schema,
+        })
+        origin_by_registry_name.setdefault(tool_name_prefixed, []).append(mcp_tool.name)
+
+    ambiguous = {rn for rn, origins in origin_by_registry_name.items() if len(origins) > 1}
+    for candidate in candidates:
+        registry_name = candidate["registry_name"]
+        if registry_name in ambiguous:
+            origins = origin_by_registry_name[registry_name]
+            logger.error(
+                "MCP server '%s': tools %s have a name normalization collision "
+                "('%s') — skipping every colliding entry instead of choosing an "
+                "arbitrary handler",
+                name,
+                " and ".join(f"tool '{o}'" for o in origins),
+                registry_name,
+            )
+            continue
         registry.register(
-            name=tool_name_prefixed,
+            name=registry_name,
             toolset=toolset_name,
-            schema=schema,
-            handler=_make_tool_handler(name, mcp_tool.name, server.tool_timeout),
+            schema=candidate["schema"],
+            handler=candidate["handler"],
             check_fn=_make_check_fn(name),
             is_async=False,
-            description=schema["description"],
+            description=candidate["schema"]["description"],
         )
-        _track_mcp_tool_server(tool_name_prefixed, name)
-        registered_names.append(tool_name_prefixed)
+        _track_mcp_tool_server(registry_name, name)
+        registered_names.append(registry_name)
 
     # Register MCP Resources & Prompts utility tools, filtered by config and
     # only when the server actually supports the corresponding capability.
@@ -5692,19 +5750,22 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
         "get_prompt": _make_get_prompt_handler,
     }
     check_fn = _make_check_fn(name)
+    claimed = set(registered_names)
     for entry in _select_utility_schemas(name, server, config):
         schema = entry["schema"]
         handler_key = entry["handler_key"]
         handler = _handler_factories[handler_key](name, server.tool_timeout)
         util_name = schema["name"]
 
-        # Same collision guard for utility tools.
+        # Same fail-closed collision guards for utility tools: never shadow a
+        # tool owned by another toolset, and never duplicate a registry name
+        # already claimed by this server's own tools.
         existing_toolset = registry.get_toolset_for_tool(util_name)
-        if existing_toolset and not existing_toolset.startswith("mcp-"):
+        if (existing_toolset and existing_toolset != toolset_name) or util_name in claimed:
             logger.warning(
-                "MCP server '%s': utility tool '%s' collides with built-in "
-                "tool in toolset '%s' — skipping to preserve built-in",
-                name, util_name, existing_toolset,
+                "MCP server '%s': utility tool '%s' collides with existing "
+                "tool in toolset '%s' — skipping to preserve existing owner",
+                name, util_name, existing_toolset or toolset_name,
             )
             continue
 
@@ -5719,6 +5780,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
         )
         _track_mcp_tool_server(util_name, name)
         registered_names.append(util_name)
+        claimed.add(util_name)
 
     if registered_names:
         registry.register_toolset_alias(name, toolset_name)
@@ -5781,10 +5843,15 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     # Only attempt servers that aren't already connected and are enabled
     # (enabled: false skips the server entirely without removing its config)
     with _lock:
+        # Snapshot the connecting set so a concurrent caller's in-flight
+        # servers are not re-spawned here (duplicate stdio subprocesses,
+        # #58862).
+        connecting = set(_server_connecting)
         new_servers = {
             k: v
             for k, v in servers.items()
             if k not in _servers
+            and k not in connecting
             and _parse_boolish(v.get("enabled", True), default=True)
             # Skip a server still serving its post-failure backoff. Without
             # this, a server that fails to connect (and is therefore never
@@ -5870,6 +5937,28 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         _set_interrupt(False)
     try:
         _run_on_mcp_loop(_discover_all, timeout=120)
+    except (TimeoutError, InterruptedError) as _e:
+        # When the outer timeout fires or the user interrupts,
+        # _discover_all's gather may not have finished, leaving
+        # entries stranded in _server_connecting. Those stale
+        # entries would block future reconnection attempts (#58862).
+        with _lock:
+            stale = [n for n in new_servers if n in _server_connecting]
+            if stale:
+                logger.warning(
+                    "MCP discovery %s while %d server(s) were still "
+                    "connecting; clearing stale connecting set: %s",
+                    "timed out" if isinstance(_e, TimeoutError) else "interrupted",
+                    len(stale),
+                    ", ".join(stale),
+                )
+                _server_connecting.difference_update(stale)
+                for _sn in stale:
+                    _server_connect_errors.setdefault(
+                        _sn,
+                        f"Connection attempt {'timed out' if isinstance(_e, TimeoutError) else 'interrupted'} during discovery",
+                    )
+        raise
     finally:
         if _was_interrupted:
             _set_interrupt(True)
@@ -6058,10 +6147,12 @@ def discover_mcp_tools() -> List[str]:
 
     try:
         with _lock:
+            connecting = set(_server_connecting)
             new_server_names = [
                 name
                 for name, cfg in servers.items()
                 if name not in _servers
+                and name not in connecting
                 and _parse_boolish(cfg.get("enabled", True), default=True)
             ]
 
@@ -6517,6 +6608,58 @@ def shutdown_mcp_servers():
                 future.result(timeout=15)
             except BaseException as exc:
                 logger.debug("Error during MCP shutdown: %s", exc)
+                # The bounded wait expired (or scheduling failed): force-cancel
+                # the scheduled shutdown task so it cannot outlive the loop.
+                # The parked-task drain below then reaps whatever it left
+                # behind.
+                done = getattr(future, "done", None)
+                cancel = getattr(future, "cancel", None)
+                if cancel is not None and (done is None or not done()):
+                    try:
+                        cancel()
+                    except BaseException:
+                        pass
+
+        # The bounded wait above may have expired while some server tasks are
+        # still pending (e.g. a parked reconnect/shutdown waiter, or a shutdown
+        # coroutine stalled on a slow transport). Cancel and drain them before
+        # closing the loop so no task is destroyed mid-await.
+        pending_tasks = [
+            s._task for s in servers_snapshot
+            if getattr(s, "_task", None) is not None
+        ]
+        if pending_tasks:
+            async def _drain_parked():
+                targets = [t for t in pending_tasks if not t.done()]
+                # A scheduled-but-stranded shutdown wrapper (e.g. when the
+                # bounded-wait proxy masked the real future) must also be
+                # completed: cancel every task owned by the shutdown path so
+                # the loop can close cleanly.
+                for t in asyncio.all_tasks(loop):
+                    qn = getattr(getattr(t, "get_coro", lambda: None)(), "__qualname__", "") or ""
+                    if (
+                        qn.startswith("shutdown_mcp_servers.<locals>._shutdown")
+                        or qn.startswith("MCPServerTask.shutdown")
+                    ) and not t.done():
+                        targets.append(t)
+                if not targets:
+                    return
+                _, still = await asyncio.wait(targets, timeout=5)
+                for t in still:
+                    t.cancel()
+                if still:
+                    await asyncio.wait(still, timeout=5)
+
+            try:
+                drain_future = safe_schedule_threadsafe(
+                    _drain_parked(), loop,
+                    logger=logger,
+                    log_message="MCP shutdown: failed to schedule drain",
+                )
+                if drain_future is not None:
+                    drain_future.result(timeout=12)
+            except BaseException as exc:
+                logger.debug("Error draining parked MCP tasks: %s", exc)
 
     # Unconditional final sweep: whether the async ``_shutdown`` ran,
     # timed out, or was never scheduled (loop already stopped), a full

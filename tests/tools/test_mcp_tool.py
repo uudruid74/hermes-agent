@@ -130,7 +130,7 @@ class TestMCPParallelSafetyProvenance:
             saved_servers = dict(mcp_tool._servers)
             saved_parallel = set(mcp_tool._parallel_safe_servers)
             mcp_tool._servers.clear()
-            mcp_tool._servers.update({"foo-bar": first, "foo_bar": second})
+            mcp_tool._servers.update({"foo-bar": first, "baz": second})
             mcp_tool._parallel_safe_servers.clear()
 
         try:
@@ -141,12 +141,15 @@ class TestMCPParallelSafetyProvenance:
             mcp_tool.register_mcp_servers(
                 {
                     "foo-bar": {"supports_parallel_tool_calls": True},
-                    "foo_bar": {"supports_parallel_tool_calls": False},
+                    "baz": {"supports_parallel_tool_calls": False},
                 }
             )
             with mcp_tool._lock:
-                assert "foo-bar" in mcp_tool._parallel_safe_servers
-                assert "foo_bar" not in mcp_tool._parallel_safe_servers
+                # Parallel-safe tracking keys on the SANITIZED server name
+                # (provider-safe normalization maps "foo-bar" → "foo_bar"),
+                # so policy stays consistent with tool-name provenance.
+                assert "foo_bar" in mcp_tool._parallel_safe_servers
+                assert "baz" not in mcp_tool._parallel_safe_servers
         finally:
             with mcp_tool._lock:
                 mcp_tool._servers.clear()
@@ -158,23 +161,23 @@ class TestMCPParallelSafetyProvenance:
         import tools.mcp_tool as mcp_tool
 
         first_tool = "mcp__foo_bar__first"
-        second_tool = "mcp__foo_bar__second"
+        second_tool = "mcp__baz__second"
         with mcp_tool._lock:
             saved_map = dict(mcp_tool._mcp_tool_server_names)
             saved_parallel = set(mcp_tool._parallel_safe_servers)
             mcp_tool._mcp_tool_server_names.clear()
             mcp_tool._parallel_safe_servers.clear()
-            mcp_tool._parallel_safe_servers.add("foo-bar")
+            mcp_tool._parallel_safe_servers.add("foo_bar")
 
         try:
             mcp_tool._track_mcp_tool_server(first_tool, "foo-bar")
-            mcp_tool._track_mcp_tool_server(second_tool, "foo_bar")
+            mcp_tool._track_mcp_tool_server(second_tool, "baz")
 
             assert mcp_tool.is_mcp_tool_parallel_safe(first_tool) is True
             assert mcp_tool.is_mcp_tool_parallel_safe(second_tool) is False
             assert mcp_tool.get_registered_mcp_server_names() == {
-                "foo-bar",
                 "foo_bar",
+                "baz",
             }
         finally:
             with mcp_tool._lock:
