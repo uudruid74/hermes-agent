@@ -595,6 +595,12 @@ def bug_lint_issues(text: str, path: Path) -> tuple[list[str], list[str]]:
                 pass  # explicit "awaiting Evan's routing" — legitimate filed state
             else:
                 manual.append("missing `## Assignee` section (dispatch gate; needs a valid fleet agent from the filing context)")
+    # Obsidian-rendering guard (Evan 2026-11-17: "many of those bugs aren't
+    # showing as valid markdown in obsidian because you have what looks like
+    # html in the title"): angle brackets render as broken HTML tags.
+    _tm = re.search(r"^title:\s*[\"']?(.*?)[\"']?\s*$", text, re.M)
+    if _tm and re.search(r"[<>]", _tm.group(1)):
+        auto.append("title contains HTML-like angle brackets — repair strips them (breaks Obsidian rendering)")
     return auto, manual
 
 
@@ -651,6 +657,15 @@ def _lint_apply_fixes(
     if "summary" in raw and not raw["summary"].strip(" \""):
         text = re.sub(r'(?m)^summary:\s*""?\s*$', 'summary: ""', text, count=1)
         applied.append("normalized empty `summary:`")
+    # 3b. Strip HTML-like angle brackets from title AND the body's H1 (Evan
+    # 2026-11-17 — Obsidian shows bracket titles as broken markdown).
+    def _sb(m):
+        return m.group(1) + re.sub(r"[<>]", "", m.group(2)) + m.group(3)
+    _nt = re.sub(r"^(title:\s*[\"']?)(.*?)([\"']?\s*)$", _sb, text, count=1, flags=re.M)
+    _nt = re.sub(r"^# (.*)$", lambda m: "# " + re.sub(r"[<>]", "", m.group(1)), _nt, count=1, flags=re.M)
+    if _nt != text:
+        text = _nt
+        applied.append("stripped HTML-like angle brackets from title/H1")
 
     # 4. Missing approval section -> insert UNCHECKED box before `## Kanban tasks`,
     #    or append at end. NEVER touch an existing checkbox state.
@@ -1350,9 +1365,12 @@ def cmd_new(args: argparse.Namespace) -> None:
         if path.exists():
             die(f"bug already exists: {path}")
         path.parent.mkdir(parents=True, exist_ok=True)
+        # Angle brackets break Obsidian's markdown rendering (Evan 2026-11-17)
+        # — sanitize titles at generation so the lint never has to catch them.
+        clean_title = re.sub(r"[<>]", "", args.title)
         path.write_text(
             frontmatter_block(
-                title=args.title,
+                title=clean_title,
                 type="bug",
                 status="pending",
                 date=date.isoformat(),
