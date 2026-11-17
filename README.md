@@ -118,6 +118,17 @@ Found a bug? `bugtool` writes it straight into the wiki — a dated, front-matte
 
 Because the wiki is the knowledge layer, a filed bug **auto-injects into context** for any agent that touches the area — the next session that loads that subject sees the open bug without being told to look for it. Bug reports stop being emails to yourself and start being part of the ambient intelligence.
 
+### 🚦 The Bugtool Dispatch Queue
+
+A checked bug doesn't just sit in the wiki — it enters a dispatch queue. The queue runs on two lanes: a **fast lane** (code-review-graph blast radius + agent review + targeted tests per change, so work keeps moving) and a **slow lane** (the big suite runs **once** after a night of changes, not after every job).
+
+- **Queue-drain verify** — when the hermes-agent bug queue empties, `bugtoold` spawns a detached `bugtool verify --on-drain` that runs the named suite once. A RED run auto-files `suite-red-<sha>` for Neo (with the failure list) and dispatches it through the normal gates, under Evan's standing order recorded verbatim on the card.
+- **One at a time per assignee** — `MAX_LIVE_BUG_TASKS=1`. Different assignees run in parallel; the same assignee drains FIFO. Deferred, never dropped; `bugtool redispatch --directive` forces through. Non-bug tasks don't hold the queue; blocked tasks don't count.
+- **Completion triggers** — a kanban completion fires `kick_dispatch`, so the queue self-drains and the next checked bug goes out automatically. Red fix cards re-enter the same queue: fix → drain → verify → green.
+- **Artifact law** — verify measures tmp growth against a 512 MB budget; over-budget is RED with top offenders named. No test may outlast real usage (`timeout = 120`).
+
+See [docs/bugtool-dispatch-queue.md](docs/bugtool-dispatch-queue.md) for the full reference.
+
 ### 🗣️ Agent-to-Agent `tell`
 
 Agents wake each other directly. `tell(agent, message)` wraps the message, injects it into the target profile's Telegram DM session via `hermes send -t` (the from-user wake, which also posts the visible copy down the `-u` path), and signs it with the sender's profile name. No group chat, no relay board, no human in the middle — Zephyr pings Gopher, Gopher pings back.
