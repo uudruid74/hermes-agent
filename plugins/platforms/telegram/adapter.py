@@ -22,6 +22,11 @@ from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set, Any
 
+from plugins.platforms.telegram.topic_agents import (
+    last_mentioned_agent_for,
+    remember_last_mentioned_agent,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -8671,6 +8676,68 @@ class TelegramAdapter(BasePlatformAdapter):
         user_id = getattr(from_user, "id", None)
         return bot_id is not None and user_id is not None and bot_id == user_id
 
+    def _topic_agent_key(self, message: Message) -> tuple[str, str]:
+        """Return the (chat_id, thread_id) key used for the sticky-agent pointer.
+
+        Uses the same normalized thread-id convention as the rest of the
+        adapter (``_effective_message_thread_id``): forum General-topic
+        messages arrive with no ``message_thread_id`` and normalize to
+        topic ``1``; non-forum group messages key on the General sentinel.
+        """
+        chat_id_str = str(getattr(getattr(message, "chat", None), "id", ""))
+        thread_id = self._effective_message_thread_id(message)
+        topic_id = str(thread_id) if thread_id is not None else self._GENERAL_TOPIC_THREAD_ID
+        return chat_id_str, topic_id
+
+    def _remember_last_mentioned_agent(self, message: Message) -> None:
+        """Persist a single explicit bot mention as this topic's sticky target.
+
+        Per the spec, only a message that names exactly one bot handle moves
+        the pointer; two or more mentions leave it untouched.  This runs on
+        every gateway (privacy off delivers the same stream to each), and
+        each writes the identical handle, so the per-profile copies converge.
+        """
+        mentions = self._extract_bot_mention_usernames(
+            message, self._current_bot_username()
+        )
+        if len(mentions) != 1:
+            return
+        chat_id_str, topic_id = self._topic_agent_key(message)
+        if not chat_id_str:
+            return
+        try:
+            remember_last_mentioned_agent(
+                chat_id_str, topic_id, next(iter(mentions))
+            )
+        except Exception as exc:
+            logger.warning(
+                "[%s] Failed to persist last-mentioned agent for chat %s topic %s: %s",
+                self.name, chat_id_str, topic_id, exc,
+            )
+
+    def _is_last_mentioned_agent(self, message: Message) -> bool:
+        """Return True when this topic's sticky agent is this bot.
+
+        Consulted only at the ``require_mention`` drop edge: an un-mentioned
+        group message is accepted as if mention when the topic's last
+        single-mentioned agent is this profile's own handle.
+        """
+        bot_username = self._current_bot_username()
+        if not bot_username:
+            return False
+        chat_id_str, topic_id = self._topic_agent_key(message)
+        if not chat_id_str:
+            return False
+        try:
+            handle = last_mentioned_agent_for(chat_id_str, topic_id)
+        except Exception as exc:
+            logger.warning(
+                "[%s] Failed to read last-mentioned agent for chat %s topic %s: %s",
+                self.name, chat_id_str, topic_id, exc,
+            )
+            return False
+        return bool(handle) and handle == bot_username
+
     def _should_process_message(self, message: Message, *, is_command: bool = False) -> bool:
         """Apply Telegram group trigger rules.
 
@@ -8682,6 +8749,9 @@ class TelegramAdapter(BasePlatformAdapter):
         - the message replies to the bot
         - the bot is @mentioned
         - the text/caption matches a configured regex wake-word pattern
+        - this topic's last singly-mentioned agent is this bot (the sticky
+          "last mentioned agent" pointer — see
+          ``_remember_last_mentioned_agent`` / ``_is_last_mentioned_agent``)
 
         When ``allowed_chats`` is non-empty, it remains a hard gate except for
         the narrow ``guest_mode`` bypass: group/supergroup messages that
@@ -8735,9 +8805,6 @@ class TelegramAdapter(BasePlatformAdapter):
 
         chat_id_str = str(getattr(getattr(message, "chat", None), "id", ""))
 
-        if self._telegram_exclusive_bot_mentions() and self._explicit_bot_mentions_exclude_self(message):
-            return False
-
         # Resolve guest-mode mention bypass once so _message_mentions_bot
         # is not called redundantly in the normal flow below.
         guest_mention = self._is_guest_mention(message)
@@ -8748,6 +8815,17 @@ class TelegramAdapter(BasePlatformAdapter):
         allowed = self._telegram_allowed_chats()
         if allowed and chat_id_str not in allowed:
             return guest_mention
+
+        # Sticky-agent pointer: a group message naming exactly one bot handle
+        # becomes that topic's "last mentioned agent" (see
+        # ``_remember_last_mentioned_agent``).  Recorded before the exclusive
+        # mention check so every gateway that sees the same stream converges
+        # on the same handle.  Slash commands never move the pointer.
+        if not is_command:
+            self._remember_last_mentioned_agent(message)
+
+        if self._telegram_exclusive_bot_mentions() and self._explicit_bot_mentions_exclude_self(message):
+            return False
 
         if guest_mention:
             return True
@@ -8763,7 +8841,15 @@ class TelegramAdapter(BasePlatformAdapter):
         # _message_mentions_bot above — skip the redundant second call.
         if not self._telegram_guest_mode() and self._message_mentions_bot(message):
             return True
-        return self._message_matches_mention_patterns(message)
+        if self._message_matches_mention_patterns(message):
+            return True
+        # Last resort: this topic's sticky agent (the last singly-mentioned
+        # bot) is this bot, so accept the un-mentioned message as if mention.
+        # Commands are excluded: they must still pass the mention/reply gate
+        # (a slash command typed without a mention targets nobody).
+        if not is_command:
+            return self._is_last_mentioned_agent(message)
+        return False
 
     async def _ensure_forum_commands(self, message) -> None:
         """Lazy-register bot commands for forum supergroups.
