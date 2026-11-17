@@ -97,9 +97,19 @@ def test_cli_origin_routing_uses_username_only(monkeypatch):
     assert captured["allow_non_session"] is True
 
 
-def test_cli_implicit_origin_rejects_channel_fallback_without_session(
+def test_cli_implicit_origin_uses_env_bridge_chat_without_session(
     monkeypatch, capsys
 ):
+    """The env-bridge fallback stores platform/chat when no session id exists.
+
+    History: 432363c37c required a session origin and this test pinned the
+    refusal. e8ed311e0f (2026-09-22) deliberately restored the pre-432363c37c
+    mechanism — tool shells carry HERMES_SESSION_PLATFORM/CHAT_ID but not the
+    session id, and refusing them silently lost the origin. The env vars were
+    set BY the gateway for this very conversation, so the origin is as
+    trustworthy as a session origin (``allow_non_session=True``). This test
+    was left asserting the abandoned refusal and had been red since.
+    """
     calls = []
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
     monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "8900123006")
@@ -112,8 +122,11 @@ def test_cli_implicit_origin_rejects_channel_fallback_without_session(
 
     kanban._store_cli_implicit_origin(object(), "t_test")
 
-    assert calls == []
-    assert "refusing implicit channel origin" in capsys.readouterr().err
+    assert len(calls) == 1
+    assert calls[0]["platform"] == "telegram"
+    assert calls[0]["chat_id"] == "8900123006"
+    assert calls[0]["allow_non_session"] is True
+    assert "refusing implicit channel origin" not in capsys.readouterr().err
 
 
 def test_cli_implicit_origin_uses_durable_session_id(monkeypatch):

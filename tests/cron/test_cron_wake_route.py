@@ -10,6 +10,7 @@ never delivery.
 """
 from __future__ import annotations
 
+import asyncio
 import subprocess as _real_subprocess
 
 import pytest
@@ -200,9 +201,25 @@ def test_in_process_optimization_is_last_resort(monkeypatch):
 
     class FakeAdapter:
         name = "FakeAdapter"
+        # The real adapter installs a session guard before spawning the turn
+        # (base.handle_message -> _start_session_processing). The fallback's
+        # L1 outcome computation observes exactly that guard (cell 9-L1), so
+        # the fake must model the real adapter or it reads as a dropped wake.
+        config = type("C", (), {"extra": {}})()
+
+        def __init__(self):
+            self._active_sessions = {}
 
         async def handle_message(self, event):
             accepted.append(event)
+            from gateway.session import build_session_key
+
+            key = build_session_key(
+                event.source,
+                group_sessions_per_user=True,
+                thread_sessions_per_user=False,
+            )
+            self._active_sessions[key] = asyncio.Event()
 
     fake_adapter = FakeAdapter()
     fake_runner = type(

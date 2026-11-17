@@ -472,7 +472,14 @@ async def _handle_send(runner, cmd: dict, writer: asyncio.StreamWriter) -> None:
     if not order_task or not isinstance(order_seq, int):
         order_task, order_seq = "", None
 
-    async def _do_send() -> None:
+    async def _do_send() -> bool:
+        """Deliver once; True only when the adapter confirmed the send.
+
+        Delivery contract (tests/dispatch/CONTRACT.md cell 5): a failed
+        platform send must never be recorded as an advanced delivery
+        watermark — the subscriber did not receive the notification, so a
+        retry of that same seq must still be allowed through.
+        """
         try:
             result = await adapter.send(
                 chat_id=chat_id,
@@ -487,7 +494,7 @@ async def _handle_send(runner, cmd: dict, writer: asyncio.StreamWriter) -> None:
                 platform_name,
                 chat_id,
             )
-            return
+            return False
         if not getattr(result, "success", False):
             logger.error(
                 "Bridge outbound delivery failed platform=%s chat_id=%s: %s",
@@ -495,6 +502,8 @@ async def _handle_send(runner, cmd: dict, writer: asyncio.StreamWriter) -> None:
                 chat_id,
                 getattr(result, "error", None) or "unknown error",
             )
+            return False
+        return True
 
     async def _deliver() -> None:
         if order_task:
@@ -510,11 +519,23 @@ async def _handle_send(runner, cmd: dict, writer: asyncio.StreamWriter) -> None:
                         last,
                     )
                     return
-                # Mark before the send: under the per-task lock the watermark
-                # advances exactly once per delivered notification, and any
-                # lower-seq straggler that arrives later is dropped.
-                state["seq"] = order_seq
-                await _do_send()
+                # Advance the watermark only after a CONFIRMED delivery. The
+                # per-task lock already serializes this task's notifications,
+                # so marking post-send keeps event order while ensuring a
+                # failed send does not permanently suppress the retry of that
+                # same notification (2026-11-17 cell 5 — a pre-send watermark
+                # turned one transport hiccup into a silently lost
+                # notify-complete).
+                if await _do_send():
+                    state["seq"] = order_seq
+                else:
+                    logger.error(
+                        "Bridge kanban notify NOT delivered task=%s seq=%s — "
+                        "watermark left at %s so a retry can still land",
+                        order_task,
+                        order_seq,
+                        last,
+                    )
         else:
             await _do_send()
 

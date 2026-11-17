@@ -2055,6 +2055,12 @@ def _deliver_kanban_notification(
     _load_user_profile_env(notify_env, origin.get("profile"))
     profile = notify_env.get("HERMES_PROFILE", "inherited")
 
+    # A failed human delivery must not vanish: the subscriber still has to
+    # learn the task reached this state. The wake path below already falls
+    # back to the creator's session notice; the human notice needs the same
+    # guarantee (2026-11-17 cell 5 — notify-complete delivery contract).
+    session_notice_sent = False
+
     try:
         human_adapter, human_result = _send_kanban_human_notification(
             platform=platform,
@@ -2080,6 +2086,20 @@ def _deliver_kanban_notification(
             human_adapter,
             "queued" if human_ok else human_result.get("error", "error"),
         )
+        if not human_ok:
+            # The chat notice never reached the subscriber. Queue the
+            # creator-session notice so the completion is not silently lost.
+            try:
+                _enqueue_kanban_session_notice(task, human_msg)
+                session_notice_sent = True
+            except Exception:
+                logger.exception(
+                    "kanban notify task=%s status=%s target=%s human-notice "
+                    "fallback session notice failed",
+                    task_id,
+                    new_status,
+                    target,
+                )
     except (RuntimeError, ValueError):
         logger.exception(
             "kanban notify task=%s status=%s target=%s profile=%s "
@@ -2089,6 +2109,17 @@ def _deliver_kanban_notification(
             target,
             profile,
         )
+        try:
+            _enqueue_kanban_session_notice(task, human_msg)
+            session_notice_sent = True
+        except Exception:
+            logger.exception(
+                "kanban notify task=%s status=%s target=%s human-notice "
+                "fallback session notice failed",
+                task_id,
+                new_status,
+                target,
+            )
 
     # Artifact wake delivery: each existing deliverable rides the same event
     # into the origin chat as a native MEDIA: upload. `hermes send -u` is the
@@ -2155,7 +2186,16 @@ def _deliver_kanban_notification(
             "success" if wake_ok else wake_result.get("error", "error"),
         )
         if not wake_ok:
-            _enqueue_kanban_session_notice(task, human_msg)
+            if session_notice_sent:
+                logger.info(
+                    "kanban notify task=%s status=%s target=%s wake failed but "
+                    "the creator-session notice was already queued",
+                    task_id,
+                    new_status,
+                    target,
+                )
+            else:
+                _enqueue_kanban_session_notice(task, human_msg)
     except Exception:
         logger.exception(
             "kanban notify task=%s status=%s target=%s profile=%s "
@@ -2165,17 +2205,18 @@ def _deliver_kanban_notification(
             target,
             profile,
         )
-        try:
-            _enqueue_kanban_session_notice(task, human_msg)
-        except Exception:
-            logger.exception(
-                "kanban notify task=%s status=%s target=%s profile=%s "
-                "adapter=session_notice result=error",
-                task_id,
-                new_status,
-                target,
-                profile,
-            )
+        if not session_notice_sent:
+            try:
+                _enqueue_kanban_session_notice(task, human_msg)
+            except Exception:
+                logger.exception(
+                    "kanban notify task=%s status=%s target=%s profile=%s "
+                    "adapter=session_notice result=error",
+                    task_id,
+                    new_status,
+                    target,
+                    profile,
+                )
 
 def _notify_via_gateway(message: str) -> None:
     """Send *message* to every enabled gateway platform's home channel.

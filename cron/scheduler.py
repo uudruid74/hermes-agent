@@ -3203,6 +3203,27 @@ def _in_process_wake(
     try:
         from agent.async_utils import safe_schedule_threadsafe
 
+        # L1 law 1 (tests/dispatch/CONTRACT.md cell 9): the fallback must
+        # report the TRUE intake outcome, exactly as the bridge's
+        # ``_handle_inject`` does. "handle_message returned without raising"
+        # is not delivery — an adapter with no handler attached returns
+        # immediately and the wake is DROPPED. Observe the session guard
+        # around the call: busy => queued (the turn runs when the active one
+        # finishes), guard installed => spawned, neither => dropped.
+        try:
+            from gateway.session import build_session_key
+
+            _cfg_extra = getattr(getattr(adapter, "config", None), "extra", {}) or {}
+            session_key = build_session_key(
+                source,
+                group_sessions_per_user=_cfg_extra.get("group_sessions_per_user", True),
+                thread_sessions_per_user=_cfg_extra.get("thread_sessions_per_user", False),
+            )
+        except Exception:
+            session_key = None
+        _active_before = getattr(adapter, "_active_sessions", None) or {}
+        was_busy = bool(session_key and session_key in _active_before)
+
         future = safe_schedule_threadsafe(adapter.handle_message(event), wake_loop)
         if future is None:
             logger.error("cron wake: could not schedule wake onto the gateway loop")
@@ -3212,15 +3233,37 @@ def _in_process_wake(
         except Exception as exc:
             logger.error("cron wake: adapter rejected the wake for %r: %s", target, exc)
             return False
+
+        _active_after = getattr(adapter, "_active_sessions", None) or {}
+        if was_busy:
+            outcome = "queued"
+        elif session_key and session_key in _active_after:
+            outcome = "spawned"
+        else:
+            outcome = "dropped"
+        if outcome == "dropped":
+            logger.error(
+                "cron wake: in-process injection DROPPED for %r — the adapter "
+                "accepted the event but no turn started",
+                target,
+            )
+            return False
+        if outcome == "queued":
+            logger.info(
+                "cron wake: in-process wake QUEUED for %r — the turn runs when "
+                "the active one finishes",
+                target,
+            )
     except Exception as exc:
         logger.error("cron wake: injection failed for %r: %s", target, exc)
         return False
 
     logger.info(
-        "cron wake: injected user turn into %s:%s (target profile %r)",
+        "cron wake: injected user turn into %s:%s (target profile %r, outcome=%s)",
         platform_name,
         chat_id or "<home>",
         target,
+        outcome,
     )
     return True
 
