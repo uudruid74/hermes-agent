@@ -288,7 +288,9 @@ def all_bug_files(project: Optional[str] = None) -> list[Path]:
         for status in ("pending", "resolved"):
             directory = root / "bugs" / status
             if directory.exists():
-                for p in sorted(directory.glob("*.md")):
+                # Newest first (Evan 2026-11-17: "NEWEST first. Those are the
+                # important ones") — date-prefixed filenames sort descending.
+                for p in sorted(directory.glob("*.md"), reverse=True):
                     # Navigation/boilerplate pages are not bug files (2026-11-16):
                     # lint/repair must never inject approval sections into them.
                     if p.name in ("Home.md", "INDEX.md"):
@@ -1228,8 +1230,9 @@ def maybe_dispatch_locked(path: Path, text: str, directive: Optional[str] = None
         return None
     # One-at-a-time gate, PER ASSIGNEE (Evan 2026-11-17): at most
     # MAX_LIVE_BUG_TASKS live bug task per assignee. Different assignees run
-    # in parallel; the same assignee drains in FIFO order (the sweep scans
-    # oldest-first, so the next checked bug goes when the slot frees).
+    # in parallel; the same assignee drains NEWEST-FIRST (Evan 2026-11-17:
+    # "NEWEST first. Those are the important ones") — the sweep scans
+    # newest-first, so the freshest checked bug goes when the slot frees.
     # DEFER, never drop: the file stays pending+checked. force=True (bugtool
     # redispatch) bypasses: the human asked for it.
     if not force and worker and live_bug_task_count(worker) >= MAX_LIVE_BUG_TASKS:
@@ -1715,7 +1718,7 @@ def queue_is_drained(project: str = "hermes-agent") -> bool:
     pending = PROJECTS_ROOT / project / "bugs" / "pending"
     if not pending.is_dir():
         return True
-    for path in sorted(pending.glob("*.md")):
+    for path in sorted(pending.glob("*.md"), reverse=True):
         try:
             text = path.read_text(encoding="utf-8")
         except OSError:

@@ -48,8 +48,10 @@ Evan's standing order (verbatim, recorded in `VERIFY_APPROVAL_NOTE` in the sourc
 `MAX_LIVE_BUG_TASKS = 1` per assignee (Evan 2026-11-17): at most one live bug task per
 assignee before further dispatches for that agent are **deferred** — never dropped.
 
-- Different assignees run in parallel; the same assignee drains **FIFO** (the sweep
-  scans date-sorted, oldest checked first).
+- Different assignees run in parallel; the same assignee drains **newest-first**
+  (Evan 2026-11-17: "NEWEST first. Those are the important ones" — the sweep
+  scans date-sorted descending, so the freshest checked bug goes when the slot
+  frees; the stale old tail waits for triage).
 - **DEFER, never drop** — a deferred file stays `pending` + checked and the next pass
   picks it up when the slot frees.
 - `bugtool redispatch --directive` (force) bypasses the gate — the human asked for it.

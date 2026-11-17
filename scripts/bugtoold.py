@@ -125,7 +125,10 @@ class Debouncer:
 
 
 def watched_files(vault: Path) -> list[Path]:
-    return sorted(vault.glob(BUGS_GLOB))
+    # Newest first (Evan 2026-11-17: "NEWEST first. Those are the important
+    # ones") — the dispatch scan must reach the freshest checked bugs before
+    # the stale old tail (whose contracts may predate the tree's movement).
+    return sorted(vault.glob(BUGS_GLOB), reverse=True)
 
 
 def poll_changes(vault: Path, signature: dict[Path, tuple]) -> tuple[set[Path], dict[Path, tuple]]:
