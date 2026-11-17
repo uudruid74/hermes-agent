@@ -395,8 +395,40 @@ async def _handle_inject(runner, cmd: dict, writer: asyncio.StreamWriter) -> Non
             timestamp=datetime.now(),
             metadata=event_metadata,
         )
+        # Wake-intake outcome reporting (2026-11-16-tell-wake-delivered-no-turn):
+        # an inject must not ack as if a turn spawned when the wake was only
+        # QUEUED behind a busy session — or DROPPED entirely by an adapter that
+        # returned without starting processing (e.g. no handler attached).
+        # Report the true intake outcome and warn on non-spawned wakes so the
+        # silent "delivered but no turn" class becomes visible to callers
+        # instead of being swallowed as a false success.
+        try:
+            from gateway.session import build_session_key
+
+            _cfg_extra = getattr(getattr(adapter, "config", None), "extra", {}) or {}
+            session_key = build_session_key(
+                session_source,
+                group_sessions_per_user=_cfg_extra.get("group_sessions_per_user", True),
+                thread_sessions_per_user=_cfg_extra.get("thread_sessions_per_user", False),
+            )
+        except Exception:
+            session_key = None
+        _active_before = getattr(adapter, "_active_sessions", None) or {}
+        was_busy = bool(session_key and session_key in _active_before)
         await adapter.handle_message(notify_event)
-        _respond(writer, {"ok": True})
+        _active_after = getattr(adapter, "_active_sessions", None) or {}
+        if was_busy:
+            status = "queued"
+        elif session_key and session_key in _active_after:
+            status = "spawned"
+        else:
+            status = "dropped"
+        if status != "spawned":
+            logger.warning(
+                "wake intake %s for %s:%s:%s — no autonomous turn started",
+                status, platform_name, chat_id, thread_id,
+            )
+        _respond(writer, {"ok": True, "status": status})
     except asyncio.CancelledError:
         raise
     except Exception as e:

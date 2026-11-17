@@ -16,6 +16,7 @@ from gateway.mcp_bridge import (
     _handle_send,
     _read_command_line,
 )
+from gateway.session import build_session_key
 from tools.send_message_tool import (
     _send_delivery_via_bridge,
     _send_via_bridge,
@@ -126,7 +127,7 @@ async def _bridge_payload_with_user_identity(monkeypatch):
         },
         bridge_path="/tmp/hermes/mcp_bridge.zephyr.sock",
     )
-    assert result == {"success": True, "queued": True}
+    assert result == {"success": True, "queued": False}
     assert fake_socket.connected_path == "/tmp/hermes/mcp_bridge.zephyr.sock"
     assert fake_socket.payload is not None
     assert fake_socket.payload["user_context"]["platform_user_id"] == "8900123006"
@@ -439,12 +440,17 @@ def test_inject_with_user_context_creates_real_inbound_user_event():
     captured = []
 
     class Adapter:
+        def __init__(self):
+            self._active_sessions = {}
+
         async def handle_message(self, event):
             captured.append(event)
+            self._active_sessions[_session_key_for(event)] = asyncio.Event()
 
     runner = SimpleNamespace(
         adapters={Platform.TELEGRAM: Adapter()},
         config=SimpleNamespace(get_home_channel=lambda _platform: None),
+        session_store=SimpleNamespace(get_or_create_session=lambda _s: None),
     )
     writer = _Writer()
 
@@ -466,7 +472,7 @@ def test_inject_with_user_context_creates_real_inbound_user_event():
         )
     )
 
-    assert writer.payload == {"ok": True}
+    assert writer.payload == {"ok": True, "status": "spawned"}
     assert writer.closed is True
     assert len(captured) == 1
     event = captured[0]
@@ -475,6 +481,212 @@ def test_inject_with_user_context_creates_real_inbound_user_event():
     assert event.source.user_name == "Evan"
     assert event.source.chat_type == "forum"
     assert event.metadata["platform_user_id"] == "8900123006"
+
+# ---------------------------------------------------------------------------
+# Wake-intake outcome reporting — 2026-11-16-tell-wake-delivered-no-turn
+# ---------------------------------------------------------------------------
+# A bridge inject MUST NOT ack "ok" as if a turn spawned when the wake was
+# only queued behind a busy session — or dropped entirely by an adapter that
+# returned without starting processing. These tests lock that contract so a
+# "delivered but no wake turn" loss is visible to the caller instead of
+# silent (3rd occurrence of the class in one month).
+
+
+def _session_key_for(event):
+    return build_session_key(
+        event.source,
+        group_sessions_per_user=True,
+        thread_sessions_per_user=False,
+    )
+
+
+def _runner_with_adapter(adapter, store=None):
+    return SimpleNamespace(
+        adapters={Platform.TELEGRAM: adapter},
+        config=SimpleNamespace(get_home_channel=lambda _platform: None),
+        session_store=store or SimpleNamespace(get_or_create_session=lambda _s: None),
+    )
+
+
+def _inject_payload(**overrides):
+    payload = {
+        "platform": "telegram",
+        "chat_id": "8900123006",
+        "text": "Incoming message from zephyr follows: --- test",
+        "chat_type": "dm",
+        "user_context": {
+            "user_id": "evan",
+            "platform_user_id": "8900123006",
+            "sender_name": "CLI User",
+        },
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_inject_into_idle_session_reports_spawned():
+    """A wake delivered to an idle session must report the turn as spawned."""
+
+    captured = []
+
+    class Adapter:
+        def __init__(self):
+            self._active_sessions = {}
+
+        async def handle_message(self, event):
+            captured.append(event)
+            # Real handle_message installs the session guard before spawning
+            # the background processing task.
+            self._active_sessions["agent:main:telegram:dm:8900123006"] = (
+                asyncio.Event()
+            )
+
+    writer = _Writer()
+    asyncio.run(
+        _handle_inject(
+            _runner_with_adapter(Adapter()),
+            _inject_payload(),
+            cast(asyncio.StreamWriter, writer),
+        )
+    )
+
+    assert writer.payload is not None
+    assert writer.payload["ok"] is True
+    assert writer.payload["status"] == "spawned"
+    assert len(captured) == 1
+
+
+def test_inject_into_busy_session_reports_queued():
+    """A wake delivered into an ACTIVE session must report it as queued.
+
+    The wake is not lost — it lands in the session's pending-message queue
+    and runs when the current turn finishes — but the caller must be told
+    no turn started *yet*, so a stuck busy session cannot silently swallow
+    agent-to-agent tells.
+    """
+
+    captured = []
+
+    class Adapter:
+        def __init__(self):
+            self._active_sessions = {
+                "agent:main:telegram:dm:8900123006": asyncio.Event()
+            }
+
+        async def handle_message(self, event):
+            captured.append(event)  # busy path: queued, no new turn spawned
+
+    writer = _Writer()
+    asyncio.run(
+        _handle_inject(
+            _runner_with_adapter(Adapter()),
+            _inject_payload(),
+            cast(asyncio.StreamWriter, writer),
+        )
+    )
+
+    assert writer.payload is not None
+    assert writer.payload["ok"] is True
+    assert writer.payload["status"] == "queued"
+    assert len(captured) == 1
+
+
+def test_inject_when_adapter_noops_reports_dropped():
+    """A wake the adapter silently swallows (no handler / no processing task)
+    must report ``dropped`` so the sender surfaces a real failure instead of
+    a false "dispatched" success.
+    """
+
+    captured = []
+
+    class Adapter:
+        def __init__(self):
+            self._active_sessions = {}
+
+        async def handle_message(self, event):
+            # Simulates the silent early-return path: the event is accepted
+            # but no session guard is installed and no task is spawned.
+            captured.append(event)
+
+    writer = _Writer()
+    asyncio.run(
+        _handle_inject(
+            _runner_with_adapter(Adapter()),
+            _inject_payload(),
+            cast(asyncio.StreamWriter, writer),
+        )
+    )
+
+    assert writer.payload is not None
+    assert writer.payload["ok"] is True
+    assert writer.payload["status"] == "dropped"
+    assert len(captured) == 1
+
+
+def _patch_fake_telegram_config(monkeypatch):
+    """Give send_message_tool a configured-but-fake telegram platform so the
+    internal wake branch is reached without real credentials.
+
+    ``_handle_send`` imports ``load_gateway_config`` locally, so the module
+    under test resolves it from ``gateway.config`` at call time.
+    """
+    from tools import send_message_tool as smt
+
+    fake_pconfig = SimpleNamespace(enabled=True, token="x", extra={})
+    fake_config = SimpleNamespace(
+        platforms={Platform.TELEGRAM: fake_pconfig},
+        get_home_channel=lambda _p: None,
+    )
+    monkeypatch.setattr("gateway.config.load_gateway_config", lambda: fake_config)
+    return smt
+
+
+def test_send_message_tool_surfaces_queued_wake_status(monkeypatch):
+    """The sender-side bridge result must carry the wake intake outcome."""
+
+    smt = _patch_fake_telegram_config(monkeypatch)
+
+    async def _fake_bridge(*_a, **_kw):
+        return {"success": True, "queued": True, "status": "queued"}
+
+    monkeypatch.setattr(smt, "_send_via_bridge", _fake_bridge)
+    result = json.loads(
+        smt.send_message_tool(
+            {
+                "action": "send",
+                "target": "telegram:8900123006",
+                "message": "test",
+                "internal": True,
+            }
+        )
+    )
+    assert result["success"] is True
+    assert result["status"] == "queued"
+    assert "queued behind active session" in result.get("note", "")
+
+
+def test_send_message_tool_fails_loudly_on_dropped_wake(monkeypatch):
+    """A dropped wake must become an ERROR, never a false success."""
+
+    smt = _patch_fake_telegram_config(monkeypatch)
+
+    async def _fake_bridge(*_a, **_kw):
+        return {"success": True, "queued": False, "status": "dropped"}
+
+    monkeypatch.setattr(smt, "_send_via_bridge", _fake_bridge)
+    result = json.loads(
+        smt.send_message_tool(
+            {
+                "action": "send",
+                "target": "telegram:8900123006",
+                "message": "test",
+                "internal": True,
+            }
+        )
+    )
+    assert "error" in result
+    assert "dropped" in result["error"]
+
 
 # ---------------------------------------------------------------------------
 # Framing limit — t_94b593b6 (large wake payloads must survive the bridge)
@@ -498,8 +710,12 @@ def test_inject_into_fresh_topic_binds_session_before_delivery(monkeypatch, tmp_
     captured = []
 
     class Adapter:
+        def __init__(self):
+            self._active_sessions = {}
+
         async def handle_message(self, event):
             captured.append(event)
+            self._active_sessions[_session_key_for(event)] = asyncio.Event()
 
     runner = SimpleNamespace(
         adapters={Platform.TELEGRAM: Adapter()},
@@ -527,7 +743,7 @@ def test_inject_into_fresh_topic_binds_session_before_delivery(monkeypatch, tmp_
         )
     )
 
-    assert writer.payload == {"ok": True}
+    assert writer.payload == {"ok": True, "status": "spawned"}
     assert len(captured) == 1
     assert captured[0].source.chat_type == "group"
     assert captured[0].source.thread_id == "6"

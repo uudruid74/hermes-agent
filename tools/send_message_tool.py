@@ -613,6 +613,23 @@ def _handle_send(args, mirror_role=""):
                 user_context=user_context,
             )
         )
+        # Wake-intake outcome (2026-11-16-tell-wake-delivered-no-turn): a
+        # wake that the gateway only QUEUED behind a busy session is still
+        # going to run — but a wake the gateway DROPPED (no processing task
+        # started) must fail loudly instead of returning a false success, so
+        # the caller never believes "dispatched" means "delivered".
+        if isinstance(bridge_result, dict) and bridge_result.get("success"):
+            if bridge_result.get("status") == "queued":
+                bridge_result["note"] = (
+                    f"wake queued behind active session ({platform_name}:{chat_id}"
+                    + (f":{thread_id}" if thread_id else "")
+                    + ") — it will run when the current turn finishes"
+                )
+            elif bridge_result.get("status") == "dropped":
+                return json.dumps(_error(
+                    f"wake dropped: gateway accepted the inject but no processing task "
+                    f"started ({platform_name}:{chat_id}) — recipient may stay idle"
+                ))
         return json.dumps(bridge_result)
 
     try:
@@ -1020,7 +1037,17 @@ async def _send_bridge_command(payload, *, bridge_path=None, operation: str):
     except json.JSONDecodeError:
         return {"error": f"Bridge returned invalid JSON: {data[:200]!r}"}
     if response.get("ok"):
-        return {"success": True, "queued": bool(response.get("queued", True))}
+        _status = response.get("status")
+        if _status is not None:
+            # Bridge inject now reports the true wake-intake outcome
+            # (spawned/queued/dropped) — 2026-11-16-tell-wake-delivered-no-turn.
+            return {
+                "success": True,
+                "queued": _status == "queued",
+                "status": str(_status),
+            }
+        # Legacy delivery bridge: no intake status, keep the queue field.
+        return {"success": True, "queued": bool(response.get("queued", False))}
     return {
         "error": (
             f"Bridge {operation} failed: {response.get('error', 'unknown')}"
