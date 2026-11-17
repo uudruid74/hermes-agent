@@ -11,6 +11,7 @@ import argparse
 import importlib.util
 import json
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -225,3 +226,17 @@ def test_daemon_spawn_gates(monkeypatch, tmp_path):
     bugtoold.maybe_spawn_verify(bugtool, projects_root, decisions, dry_run=True)
     assert not spawned
     assert any(a == "verify" for a, _ in decisions)
+
+
+def test_suite_interpreter_resolves_to_repo_venv(monkeypatch, tmp_path):
+    # Regression for suite-red-9a86aa67: bugtoold.service runs under system
+    # python3, so VERIFY_SUITES must use the repo's own venv python (which has
+    # pytest), not sys.executable — else every queue-drain verify dies with
+    # "No module named pytest".
+    bugtool = load_module(BUGTOOL_PATH, monkeypatch, tmp_path)
+    python = Path(bugtool.VERIFY_SUITES["hermes-agent"][0])
+    venv_python = Path(BUGTOOL_PATH).parents[1] / ".venv" / "bin" / "python"
+    if venv_python.is_file():
+        assert python == venv_python
+    else:
+        assert python == Path(sys.executable)

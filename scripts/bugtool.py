@@ -35,9 +35,17 @@ DISPATCH_LOG = STATE_ROOT / "bugs-dispatched.log"
 # over budget is RED with the top offenders named.
 VERIFY_STATE = STATE_ROOT / "suite-verify.json"
 VERIFY_LOG = STATE_ROOT / "suite-verify.log"
+# The queue-drain daemon (bugtoold.service) runs under system python3, which
+# has no pytest — run the suite under the repo's own venv interpreter when
+# present (suite-red-9a86aa67). Fallback: whatever python launched bugtool.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_SUITE_PYTHON = next(
+    (str(p) for p in (_REPO_ROOT / ".venv" / "bin" / "python", _REPO_ROOT / "venv" / "bin" / "python") if p.is_file()),
+    sys.executable,
+)
 VERIFY_SUITES: dict[str, list[str]] = {
     "hermes-agent": [
-        sys.executable, "-m", "pytest", "tests/", "-q", "--tb=line",
+        _SUITE_PYTHON, "-m", "pytest", "tests/", "-q", "--tb=line",
         "-p", "no:cacheprovider", "--durations=10",
     ],
 }
