@@ -1550,14 +1550,26 @@ def _worker_last_finish_reason(
 
 def _emit_plan_stop_nudge(
     conn: sqlite3.Connection, task_id: str, profile: str, text: str
-) -> None:
-    """Fire-and-forget wake of the stalled worker (mirrors the approval wake)."""
-    from hermes_cli._subprocess_compat import spawn_detached
-    from hermes_cli.kanban_db import wake_target_for
+) -> bool:
+    """Wake the stalled worker with a VERIFIED ``hermes send -t``.
 
-    spawn_detached(
-        ["hermes", "send", "-t", wake_target_for(conn, task_id, profile), text]
-    )
+    L1 outcome truth (tests/dispatch/CONTRACT.md law 1): the old
+    fire-and-forget ``spawn_detached`` reported success on process LAUNCH
+    alone — the exact false-green class that left a stalled worker sitting
+    with a "nudge fired" record and no wake turn. This runs the canonical
+    verified wake (``cron.scheduler._bridge_cli_wake``: run to completion,
+    require a delivery-confirmed result) and returns whether the wake
+    actually landed. The caller records ``delivered: False`` when it did
+    not — never a silent success.
+    """
+    from hermes_cli.kanban_db import wake_target_for
+    from cron.scheduler import _bridge_cli_wake
+
+    target = wake_target_for(conn, task_id, profile)
+    try:
+        return bool(_bridge_cli_wake(target, text))
+    except (OSError, ValueError):  # pragma: no cover - defensive only
+        return False
 
 
 def _is_top_level_plan(task) -> bool:
@@ -1658,6 +1670,51 @@ def sweep_stalled_plan_workers(
             f"notifies the user and stops). Do not narrate intent — act now."
         )
         emit = emit_fn if emit_fn is not None else _emit_plan_stop_nudge
-        emit(conn, task_id, profile, text)
+        # L1 outcome truth: a detector that cannot reach the worker must not
+        # report the nudge as fired. ``is False`` is the explicit drop signal
+        # (``None`` from a test stub or a legacy emitter keeps the pre-existing
+        # assume-delivered behavior, so no caller silently changes meaning).
+        delivered = emit(conn, task_id, profile, text) is not False
+        if not delivered:
+            _record_nudge_delivery(conn, task_id, step_no, now_ts, delivered=False)
+            continue
+        _record_nudge_delivery(conn, task_id, step_no, now_ts, delivered=True)
         nudged.append(task_id)
     return nudged
+
+
+def _record_nudge_delivery(
+    conn: sqlite3.Connection,
+    task_id: str,
+    step_no: int,
+    now_ts: int,
+    *,
+    delivered: bool,
+) -> None:
+    """Stamp the nudge event with its true delivery outcome.
+
+    The event row is the one-per-(task, step) loop guard, so it stays either
+    way; the payload says whether the wake landed. A dropped nudge is durable
+    evidence for a human instead of a silent gap, and it is never counted in
+    ``sweep_stalled_plan_workers``'s returned ``nudged`` list.
+    """
+    conn.execute(
+        "UPDATE task_events SET payload = ?"
+        " WHERE task_id = ? AND kind = ?"
+        " AND json_extract(payload, '$.step_no') = ?",
+        (
+            json.dumps(
+                {
+                    "step_no": step_no,
+                    "delivered": delivered,
+                    "recorded_at": now_ts,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            task_id,
+            PLAN_STOP_NUDGE_KIND,
+            step_no,
+        ),
+    )
+    conn.commit()

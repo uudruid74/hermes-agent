@@ -39,12 +39,12 @@ This suite completes the contract across every wake path and locks the
 | 2 | `send_message_tool` bare `hermes send -t` / internal=True | ✅ fail-loud on dropped (Neo) | ✅ Neo 97341cfeff | core |
 | 3 | `tell_tool` with session_id (`session_wake_target`) | 🔲 PENDING | ✅ Neo 97341cfeff | core |
 | 4 | kanban `wake_fired` (worker spawn / task events) | 🔲 PENDING | ✅ Neo 97341cfeff | core |
-| 5 | kanban notify-complete → subscriber delivery | 🔲 PENDING (Zephyr t_df8b6cf6) | n/a (chat delivery) | medium |
+| 5 | kanban notify-complete → subscriber delivery | 🔲 PENDING (follow-up card, ex-t_df8b6cf6) | n/a (chat delivery) | medium |
 | 6 | plan dispatch / plan-review response wake | 🔲 PENDING | ✅ Neo 97341cfeff | core |
-| 7 | plan stop-guard / step-nudge wake | 🔲 PENDING (Zephyr t_df8b6cf6) | n/a | easy |
+| 7 | plan stop-guard / step-nudge wake | ✅ Zephyr t_c022c264 (test_plan_nudge_outcome.py) | n/a | easy |
 | 8 | bugtool dispatch wake (bugtoold → assignee) | 🔲 PENDING | 🔲 PENDING | medium |
-| 9 | cron job wake (CLI-wake primary, in-process injection) | 🔲 PENDING (Zephyr t_df8b6cf6) | 🔲 PENDING | medium |
-| 10 | board-topic wake routing (board_topic rows) | 🔲 PENDING (Zephyr t_df8b6cf6) | n/a | medium |
+| 9 | cron job wake (CLI-wake primary, in-process injection) | 🔲 PENDING (follow-up card, ex-t_df8b6cf6) | 🔲 PENDING | medium |
+| 10 | board-topic wake routing (board_topic rows) | ✅ Zephyr t_c022c264 (test_board_wake_outcome.py) | n/a | easy |
 | 11 | telegram topic/session binding wake (7f4d801016 class) | 🔲 PENDING | 🔲 PENDING | medium |
 | 12 | LIVE end-to-end smoke (Gopher repro protocol) | n/a | ✅ `live_wake_smoke.py` | AUTHORITATIVE |
 
@@ -71,6 +71,17 @@ L2 = after the row lands, the intake handler runs and a turn actually spawns.
   test_plan_wake_turn + wake_harness.py), verified green by Wintermute
   (11 passed / 1 skipped = opt-in live). L1 outcome-truth for cells 3/4/6
   still open; Zephyr t_df8b6cf6 covers 5/7/9/10.
+- 2026-11-17: cells 7-L1 + 10-L1 landed — Zephyr t_c022c264 (supersedes
+  t_df8b6cf6, which timed out). Cell 7: the plan stop-nudge sweep now uses
+  the verified `_bridge_cli_wake` transport (`_emit_plan_stop_nudge` returns
+  the verified wake result; a drop is recorded `delivered: false` and never
+  counted as nudged) — tests/dispatch/test_plan_nudge_outcome.py. Cell 10:
+  board-topic wake dispatch reports launch truth (`delivery: "launched"`,
+  pid) and a failed launch is a hard sender-side error that requeues the
+  task — tests/dispatch/test_board_wake_outcome.py. Cells 5 + 9-L1 move to
+  a follow-up card; take-1's cell-9/5 source edits (cron/scheduler.py,
+  hermes_cli/kanban.py, tui_gateway/server.py) remain uncommitted in the
+  tree for that card.
 - PENDING before the commit gate goes hard: 3-L1, 4-L1, 6-L1, 8, 11.
 
 ## Prior art to build on (do not duplicate)

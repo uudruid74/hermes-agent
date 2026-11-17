@@ -10735,12 +10735,25 @@ def _make_wake_dispatch(
             ]
         )
         if proc is None:
+            # L1 law 1: a wake that could not even launch is a HARD sender-side
+            # error — never an ack. ``dispatch_once`` catches this and records
+            # a spawn failure, returning the task to ``ready`` for a retry
+            # instead of leaving a dead claim with no worker.
             raise RuntimeError(
                 f"hermes send failed to launch wake for task {task.id}"
             )
         _append_event(
             conn, task.id, "wake_fired",
-            {"target": target},
+            # L1 law 1 outcome truth: this seam is fire-and-forget, so launch
+            # is all it can honestly observe. ``delivery`` says exactly that —
+            # "launched", never "spawned"/"delivered" — so no reader mistakes
+            # a started subprocess for a turn that landed. ``pid`` is the
+            # observable handle; the intake's own dedupe/bind covers the rest.
+            {
+                "target": target,
+                "delivery": "launched",
+                "pid": getattr(proc, "pid", None),
+            },
             run_id=_current_run_id(conn, task.id),
         )
         return None

@@ -299,7 +299,18 @@ def run_cli_send_in_process(argv):
         raise ValueError("argv must contain -t <target> <message>")
     i = argv.index("-t")
     target = argv[i + 1]
-    message = argv[i + 2]
+    # The message is the first non-flag token after the target: production
+    # callers (cron.scheduler._bridge_cli_wake) interpose flags like
+    # ``--json`` between the target and the body.
+    j = i + 2
+    while j < len(argv) and argv[j].startswith("-"):
+        if argv[j] == "--task-id" and j + 1 < len(argv):
+            j += 2  # the flag consumes a value
+            continue
+        j += 1
+    if j >= len(argv):
+        raise ValueError(f"no message found after -t in {argv!r}")
+    message = argv[j]
 
     task_id = None
     if "--task-id" in argv:
