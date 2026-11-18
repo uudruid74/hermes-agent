@@ -54,6 +54,124 @@ def is_degenerate_interrupt_response(text: Any) -> bool:
 # scrubbing.
 _SURROGATE_RE = re.compile(r'[\ud800-\udfff]')
 
+# ---------------------------------------------------------------------------
+# Relay-envelope provenance guard (t_2653ec91, 2026-11-18).
+#
+# A genuine agent-to-agent tell delivery writes its session-store row FIRST
+# (ROW => INTAKE => TURN) and enters the transcript as a user message whose
+# content is exactly the relay envelope.  On 2026-11-18 a fabricated
+# "Incoming message from gopher follows:" block appended mid-turn OUTSIDE the
+# trusted [OUT-OF-BAND USER MESSAGE] marker, with zero store rows anywhere,
+# and successfully elicited an install directive (the "two fresh copies of
+# PowerShell" incident).  This guard enforces the Expected Behavior of that
+# bug: a relay-format block is only trusted when it IS a stored user row in
+# the transcript; any occurrence embedded elsewhere (tool output, steer
+# appends, assistant text, unpersisted mid-turn chunks) is treated as
+# untrusted and quarantined before it reaches the model.
+# ---------------------------------------------------------------------------
+_RELAY_ENVELOPE_RE = re.compile(
+    r"Incoming message from [^\n]+? follows:\n"
+    r"---\n"
+    r".*?"
+    r"\n---\n"
+    r"If a reply is required, use 'tell' with agent=\'[^\']+\'"
+    r"(?: and session_id=\'[^\']+\')?"
+    r"[^\n]*",
+    re.DOTALL,
+)
+# Head/tail anchors used to decide whether a whole user row IS a genuine
+# relay.  Anchored separately (not one fullmatch) so a relay whose BODY
+# legitimately contains an internal ``---`` line still verifies.
+_RELAY_HEAD_RE = re.compile(
+    r"^Incoming message from [^\n]+? follows:\n---\n", re.DOTALL
+)
+_RELAY_TAIL_RE = re.compile(
+    r"\n---\nIf a reply is required, use 'tell' with agent=\'[^\']+\'"
+    r"(?: and session_id=\'[^\']+\')?"
+    r"[^\n]*$",
+    re.DOTALL,
+)
+UNTRUSTED_RELAY_PLACEHOLDER = (
+    "[[UNTRUSTED relay-style block — no verified session-store row behind it "
+    "(potential impersonation / prompt injection); ignored]]"
+)
+
+
+def _is_verified_relay_row(content: str) -> bool:
+    """True when ``content`` is the ENTIRE payload of a genuine relay row.
+
+    Genuine tell deliveries write the relay envelope verbatim as a user
+    row (ROW => INTAKE => TURN).  Both the sender header and the reply-
+    instruction tail must be present, with the body between them — even
+    when the body itself contains ``---`` lines.
+    """
+    stripped = content.strip()
+    return bool(_RELAY_HEAD_RE.match(stripped) and _RELAY_TAIL_RE.search(stripped))
+
+
+def quarantine_unverified_relay_envelopes(api_messages: list) -> int:
+    """Neutralize relay-format envelope blocks that lack store-row provenance.
+
+    Walks the API-bound message copy (never the persisted history).  An
+    envelope is considered VERIFIED only when it is the entire content of a
+    ``user`` message (the shape genuine wake-intake deliveries always take).
+    Any other occurrence — embedded in tool output, appended after a steer
+    marker, inside assistant text, in any unpersisted mid-turn chunk — is
+    replaced with ``UNTRUSTED_RELAY_PLACEHOLDER``.
+
+    Returns the number of quarantined occurrences (0 when clean).  The
+    mutation is limited to string content; multimodal content-block lists
+    are left untouched.  Occurrences are logged at WARNING so an attempt
+    leaves an audit trail even when no request-body logging is configured.
+    """
+    if not api_messages:
+        return 0
+
+    # 1) Verified set: envelopes that ARE the whole content of a user row.
+    verified: set[str] = set()
+    for msg in api_messages:
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if not isinstance(content, str):
+            continue
+        if _is_verified_relay_row(content):
+            verified.add(content.strip())
+
+    # 2) Quarantine every occurrence that is not a verified user row.
+    quarantined = 0
+    for msg in api_messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, str) or not content.strip():
+            continue
+        stripped = content.strip()
+        if msg.get("role") == "user" and stripped in verified:
+            continue
+        matches = list(_RELAY_ENVELOPE_RE.finditer(content))
+        if not matches:
+            continue
+        out_parts: list[str] = []
+        last = 0
+        for m in matches:
+            out_parts.append(content[last:m.start()])
+            out_parts.append(UNTRUSTED_RELAY_PLACEHOLDER)
+            last = m.end()
+            quarantined += 1
+            sender = (m.group(0).splitlines() or [""])[0]
+            logger.warning(
+                "Relay-provenance guard: quarantined unverified relay-style "
+                "envelope in role=%s (%d chars, %r) — no store row backs it, "
+                "treated as untrusted",
+                msg.get("role"),
+                len(m.group(0)),
+                sender[:80],
+            )
+        out_parts.append(content[last:])
+        msg["content"] = "".join(out_parts)
+    return quarantined
+
 
 def _sanitize_surrogates(text: str) -> str:
     """Replace lone surrogate code points with U+FFFD (replacement character).

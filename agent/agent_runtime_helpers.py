@@ -3672,6 +3672,20 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
             "Pre-call sanitizer: removed %d duplicate tool_call_id reference(s)",
             removed_dupes,
         )
+    # --- Relay-envelope provenance guard (t_2653ec91) ---
+    # A "Incoming message from X follows:" block is only trusted when it IS a
+    # stored user row (the wake-intake shape).  Any occurrence embedded in
+    # tool output / steer appends / assistant text / unpersisted mid-turn
+    # chunks is quarantined before it reaches the model.
+    from agent.message_sanitization import quarantine_unverified_relay_envelopes
+
+    _quarantined = quarantine_unverified_relay_envelopes(messages)
+    if _quarantined:
+        _ra().logger.warning(
+            "Pre-call sanitizer: quarantined %d unverified relay-style "
+            "envelope(s) from API messages",
+            _quarantined,
+        )
     return messages
 
 
