@@ -1177,27 +1177,39 @@ def _cmd_block(task_id: str) -> str:
     unblock and spawns a second worker on the same binding (t_f022fa1b,
     2026-11-01). Per Evan 2026-11-01: block on a manual task only notifies
     the user and stops — no state change, nothing more to do.
+
+    Since Evan 2026-11-18, blocking a live task ALSO hard-stops its worker
+    process: ``_terminate_blocked_worker`` sends SIGTERM (then SIGKILL
+    after the usual ~5s grace window) to the task's ``worker_pid``, so a
+    blocked run stops *now* instead of continuing to execute and commit
+    while the task row sits in 'blocked'.
     """
     if not task_id:
         return "ERROR: 'block' requires task_id"
     found_board = None
     manual = False
+    worker_pid = None
+    claim_lock = None
     for db_path in _enumerate_kanban_dbs():
         try:
             conn = sqlite3.connect(db_path)
             with conn:
                 row = conn.execute(
-                    "SELECT status FROM tasks WHERE id=?", (task_id,)
+                    "SELECT status, worker_pid, claim_lock FROM tasks WHERE id=?",
+                    (task_id,),
                 ).fetchone()
                 if row is not None and row[0] == "manual":
                     manual = True
                 else:
                     cur = conn.execute(
                         "UPDATE tasks SET status='blocked' WHERE id=? AND status NOT IN ('done','archived','blocked')",
-                        (task_id,)
+                        (task_id,),
                     )
                     if cur.rowcount > 0:
                         found_board = db_path
+                        if row is not None:
+                            worker_pid = row[1]
+                            claim_lock = row[2]
             conn.close()
         except Exception:
             pass
@@ -1215,7 +1227,65 @@ def _cmd_block(task_id: str) -> str:
             db.set_session_task_id(sid, None)
     except Exception:
         pass
-    return f"BLOCKED: {task_id} on {os.path.basename(os.path.dirname(found_board))}"
+    term_note = _terminate_blocked_worker(
+        task_id, found_board, worker_pid, claim_lock
+    )
+    return f"BLOCKED: {task_id} on {os.path.basename(os.path.dirname(found_board))}{term_note}"
+
+
+def _terminate_blocked_worker(
+    task_id: str, db_path: str, worker_pid, claim_lock
+) -> str:
+    """Hard-stop the task's worker process (Evan 2026-11-18).
+
+    Sends SIGTERM to the worker (then SIGKILL after the dispatcher's
+    ~5s grace window) via ``_terminate_reclaimed_worker`` — the same
+    helper the reclaim path uses — so ``plan block`` stops a live run
+    NOW, not just flips the DB row. Records a ``worker_terminated``
+    event and closes the run row for provenance. Workers that are not
+    host-local (e.g. wake-dispatched from another machine) cannot be
+    signalled from here; they are left to the dispatcher and the
+    response says so.
+
+    Returns a human-readable note appended to the BLOCKED message.
+    """
+    if not worker_pid:
+        return ""
+    from hermes_cli.kanban_db import (
+        _append_event,
+        _current_run_id,
+        _terminate_reclaimed_worker,
+    )
+    termination = _terminate_reclaimed_worker(worker_pid, claim_lock)
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row  # _current_run_id uses named columns
+        with conn:
+            run_id = _current_run_id(conn, task_id)
+            if run_id is not None:
+                conn.execute(
+                    "UPDATE task_runs SET status='terminated', outcome='blocked', "
+                    "ended_at=? WHERE id=? AND status='running'",
+                    (int(time.time()), run_id),
+                )
+            _append_event(
+                conn,
+                task_id,
+                "worker_terminated",
+                {"worker_pid": int(worker_pid), "termination": termination},
+                run_id=run_id,
+            )
+        conn.close()
+    except Exception:
+        # Termination was already attempted; provenance loss must not
+        # mask the hard-stop outcome.
+        pass
+    if not termination.get("host_local"):
+        return " (worker not host-local/claimable — left for dispatcher)"
+    if termination.get("terminated"):
+        note = " SIGKILL" if termination.get("sigkill") else ""
+        return f" (worker {worker_pid}{note} terminated)"
+    return f" (worker {worker_pid} still alive after SIGTERM/SIGKILL)"
 
 
 def _manual_block_notice(task_id: str) -> str:
