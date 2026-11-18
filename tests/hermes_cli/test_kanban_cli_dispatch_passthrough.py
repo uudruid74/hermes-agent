@@ -12,6 +12,11 @@ import os
 import sys
 import tempfile
 from types import SimpleNamespace
+
+from tests.hermes_cli.conftest import (
+    _purge_hermes_modules,
+    _restore_hermes_modules,
+)
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -23,10 +28,15 @@ def isolated_kanban_home(monkeypatch):
     test_home = tempfile.mkdtemp(prefix="kanban_cli_passthrough_")
     os.makedirs(os.path.join(test_home, "profiles", "default"), exist_ok=True)
     monkeypatch.setenv("HERMES_HOME", test_home)
-    for mod in list(sys.modules.keys()):
-        if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
-            del sys.modules[mod]
-    yield test_home
+    saved_modules = _purge_hermes_modules(
+        "hermes_cli", "hermes_state", "hermes_constants"
+    )
+    try:
+        yield test_home
+    finally:
+        _restore_hermes_modules(
+            saved_modules, "hermes_cli", "hermes_state", "hermes_constants"
+        )
 
 
 def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, monkeypatch):

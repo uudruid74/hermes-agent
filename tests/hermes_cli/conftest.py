@@ -2,7 +2,47 @@
 
 from __future__ import annotations
 
+import sys
+from types import ModuleType
+
 import pytest
+
+
+def _purge_hermes_modules(*prefixes: str) -> dict[str, ModuleType]:
+    """Delete modules under *prefixes* from ``sys.modules``; return a snapshot.
+
+    Used by fixtures that force-reimport hermes_* modules so a freshly set
+    ``HERMES_HOME`` is picked up. The caller MUST restore the snapshot after
+    the test: leaving the purge in place splits module identity for every
+    later test in the process (parent-package attributes keep pointing at the
+    fresh copies while a test's import-time bound functions still execute
+    against the old module globals — see agent/conftest guard, issue class
+    #61597). Until the fix for suite-red-b1009b27 (t_e10339f1), that split
+    silently voided the npm-engine tests' monkeypatches, so the real
+    managed-Node provisioning ran inside the sandboxed HERMES_HOME (~201MB
+    per test tmp dir) and the full-suite verify blew its artifact budget.
+    """
+    saved = {
+        name: mod
+        for name, mod in sys.modules.items()
+        if any(name == p or name.startswith(p + ".") for p in prefixes)
+    }
+    for name in saved:
+        del sys.modules[name]
+    return saved
+
+
+def _restore_hermes_modules(saved: dict[str, ModuleType], *prefixes: str) -> None:
+    """Undo :func:`_purge_hermes_modules`: drop fresh copies, restore saved."""
+    fresh = [
+        name
+        for name in list(sys.modules)
+        if any(name == p or name.startswith(p + ".") for p in prefixes)
+        and name not in saved
+    ]
+    for name in fresh:
+        del sys.modules[name]
+    sys.modules.update(saved)
 
 
 @pytest.fixture
