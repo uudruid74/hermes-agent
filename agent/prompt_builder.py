@@ -665,7 +665,26 @@ STEER_MARKER_CLOSE = "[/OUT-OF-BAND USER MESSAGE]"
 
 
 def format_steer_marker(steer_text: str) -> str:
-    """Wrap a mid-turn steer for appending to a tool result (see module note)."""
+    """Wrap a mid-turn steer for appending to a tool result (see module note).
+
+    Ingest gate (Evan 2026-11-18: "if it flags something, we don't want it in
+    the context window"): relay-envelope blocks riding the STEER channel are
+    withheld BEFORE this wrap is built — genuine tells never arrive as steers
+    (they are whole user messages via intake), so a relay block here is the
+    smuggling fingerprint (the fabricated gopher block arrived glued to a
+    steer). Withheld text never enters the context window at all.
+    """
+    from agent.message_sanitization import (
+        UNTRUSTED_RELAY_PLACEHOLDER,
+        _RELAY_ENVELOPE_RE,
+    )
+
+    if _RELAY_ENVELOPE_RE.search(steer_text):
+        logger.warning(
+            "relay envelope withheld from steer channel (never enters context): %.120r",
+            steer_text.strip(),
+        )
+        steer_text = _RELAY_ENVELOPE_RE.sub(UNTRUSTED_RELAY_PLACEHOLDER, steer_text)
     return f"\n\n{STEER_MARKER_OPEN}\n{steer_text}\n{STEER_MARKER_CLOSE}"
 
 

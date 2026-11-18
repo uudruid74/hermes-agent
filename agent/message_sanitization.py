@@ -138,7 +138,11 @@ def quarantine_unverified_relay_envelopes(api_messages: list) -> int:
         if _is_verified_relay_row(content):
             verified.add(content.strip())
 
-    # 2) Quarantine every occurrence that is not a verified user row.
+    # 2) Quarantine occurrences OUTSIDE the user channel. User-role content is
+    # the delivery channel (Evan 2026-11-18: the guard was eating REAL relays
+    # glued to OOB appends — "your guard is wrong... fix it so it stops flagging
+    # on real messages"). The smuggling vectors that keep the fence: tool
+    # outputs and assistant text trying to feed relay-shaped instructions.
     quarantined = 0
     for msg in api_messages:
         if not isinstance(msg, dict):
@@ -147,7 +151,16 @@ def quarantine_unverified_relay_envelopes(api_messages: list) -> int:
         if not isinstance(content, str) or not content.strip():
             continue
         stripped = content.strip()
-        if msg.get("role") == "user" and stripped in verified:
+        if msg.get("role") == "user":
+            # Real traffic (whole or glued): pass through. Log embedded ones
+            # for the provenance audit trail but NEVER block the user channel.
+            if stripped in verified:
+                continue
+            if _RELAY_ENVELOPE_RE.search(content) and not _is_verified_relay_row(content):
+                logger.info(
+                    "relay envelope embedded in user-channel text (passed per "
+                    "2026-11-18 real-message law): %.120r", stripped,
+                )
             continue
         matches = list(_RELAY_ENVELOPE_RE.finditer(content))
         if not matches:
