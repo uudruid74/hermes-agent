@@ -82,20 +82,27 @@ def target_profile_env(monkeypatch, tmp_path):
 
 
 def _capture_tell_spawn(monkeypatch):
-    """Capture the `hermes send -t` argv tell_tool spawns.
+    """Capture the `hermes send -t` argv tell_tool runs.
 
-    tell_tool binds ``spawn_detached`` at import time — patch its own
-    module attribute (as tests/tools/test_tell_tool.py does) plus the
-    source module's (used by cmd_send's visible-copy spawn).
+    tell_tool now VERIFIES delivery synchronously — the spawn-and-discard
+    path is gone (Evan 2026-11-18: "fallbacks are evil" / dropped is never
+    success). The fake completes with a CONFIRMED wake result; the argv
+    assertions below still pin resolution + routing exactly as before.
     """
+    import subprocess
+
     calls = []
 
-    def fake_spawn_detached(argv, **kw):
+    def fake_run(argv, **kw):
         calls.append([str(a) for a in argv])
-        return object()  # spawn succeeded
+        return subprocess.CompletedProcess(
+            args=argv,
+            returncode=0,
+            stdout='{"success": true, "status": "spawned", "note": "wake spawned"}',
+            stderr="",
+        )
 
-    monkeypatch.setattr("tools.tell_tool.spawn_detached", fake_spawn_detached)
-    monkeypatch.setattr(_subprocess_compat, "spawn_detached", fake_spawn_detached)
+    monkeypatch.setattr("subprocess.run", fake_run)
     return calls
 
 
@@ -117,7 +124,12 @@ def _tell_wake_argv(wake_env, target_profile_env, monkeypatch):
         )
     )
 
-    assert result == {"dispatched": True, "note": "notified zephyr"}
+    assert result == {
+        "dispatched": True,
+        "delivered": True,
+        "status": "spawned",
+        "note": "wake spawned",
+    }
     assert echoes == ["zephyr: Wake me in that session."]
     assert len(calls) == 1
     argv = calls[0]

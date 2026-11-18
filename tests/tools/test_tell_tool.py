@@ -10,7 +10,7 @@ from tools import tell_tool
 
 def _spawned():
     """A truthy stand-in for a live Popen handle (spawn succeeded)."""
-    return SimpleNamespace()
+    return _completed()
 
 
 def _target_profile_with_session(monkeypatch, tmp_path, profile, session_id, chat=None):
@@ -43,6 +43,18 @@ def _target_profile_with_session(monkeypatch, tmp_path, profile, session_id, cha
     return home
 
 
+
+def _completed():
+    """A `hermes send` CompletedProcess with a CONFIRMED wake (new contract)."""
+    import subprocess
+
+    return subprocess.CompletedProcess(
+        args=["hermes", "send"],
+        returncode=0,
+        stdout='{"success": true, "status": "spawned", "note": "wake spawned"}',
+        stderr="",
+    )
+
 def test_tell_wraps_message_and_targets_agent_profile(monkeypatch):
     monkeypatch.setenv("USERNAME", "zephyr")
     monkeypatch.setenv("HERMES_AGENT_NAME", "WrongAgent")
@@ -54,12 +66,13 @@ def test_tell_wraps_message_and_targets_agent_profile(monkeypatch):
         calls.append(command)
         return _spawned()
 
-    monkeypatch.setattr(tell_tool, "spawn_detached", fake_spawn)
+    monkeypatch.setattr("subprocess.run", fake_spawn)
 
     result = json.loads(
         tell_tool.tell_tool(
             agent="gopher",
             message="Check the relay.",
+            origin_session_id="origin-test-sess",
             echo_callback=echoes.append,
         )
     )
@@ -69,7 +82,8 @@ def test_tell_wraps_message_and_targets_agent_profile(monkeypatch):
         "---\n"
         "Check the relay.\n"
         "---\n"
-        "If a reply is required, use 'tell' with agent='zephyr'."
+        "If a reply is required, use 'tell' with agent='zephyr' and "
+        "session_id='origin-test-sess' — that routes the reply into this exact session."
     )
     # ONE `-t` call: the from-user wake; `hermes send -t` sends the visible
     # `-u` copy internally (Evan's one-call rule — no second spawn here).
@@ -77,7 +91,7 @@ def test_tell_wraps_message_and_targets_agent_profile(monkeypatch):
         ["hermes", "send", "-t", "gopher", wrapped],
     ]
     assert echoes == ["gopher: Check the relay."]
-    assert result == {"dispatched": True, "note": "notified gopher"}
+    assert result == {"dispatched": True, "delivered": True, "status": "spawned", "note": "wake spawned"}
 
 
 def test_tell_routes_to_explicit_session_and_names_sender_session(monkeypatch, tmp_path):
@@ -95,7 +109,7 @@ def test_tell_routes_to_explicit_session_and_names_sender_session(monkeypatch, t
         calls.append(command)
         return _spawned()
 
-    monkeypatch.setattr(tell_tool, "spawn_detached", fake_spawn)
+    monkeypatch.setattr("subprocess.run", fake_spawn)
 
     tell_tool.tell_tool(
         agent="neo",
@@ -138,7 +152,7 @@ def test_tell_named_gateway_session_targets_chat_not_cli_queue(monkeypatch, tmp_
         calls.append(command)
         return _spawned()
 
-    monkeypatch.setattr(tell_tool, "spawn_detached", fake_spawn)
+    monkeypatch.setattr("subprocess.run", fake_spawn)
 
     tell_tool.tell_tool(
         agent="zephyr",
@@ -200,7 +214,7 @@ def test_tell_reply_reaches_explicit_session_via_send_cli(monkeypatch, tmp_path)
         copies.append(command)
         return _spawned()
 
-    monkeypatch.setattr(tell_tool, "spawn_detached", run_send_cli)
+    monkeypatch.setattr("subprocess.run", run_send_cli)
     monkeypatch.setattr(_subprocess_compat, "spawn_detached", fake_copy_spawn)
 
     result = json.loads(
@@ -217,7 +231,7 @@ def test_tell_reply_reaches_explicit_session_via_send_cli(monkeypatch, tmp_path)
     notices = session_db.drain_session_notices(target_session)
     session_db.close()
 
-    assert result == {"dispatched": True, "note": "notified neo"}
+    assert result == {"dispatched": True, "delivered": True, "status": "spawned", "note": "wake spawned"}
     assert len(notices) == 1
     assert "Round trip reply." in notices[0]["text"]
     assert "agent='zephyr'" in notices[0]["text"]
@@ -241,7 +255,7 @@ def test_tell_does_not_fall_back_to_superseded_identity_vars(monkeypatch):
         calls.append(command)
         return _spawned()
 
-    monkeypatch.setattr(tell_tool, "spawn_detached", fake_spawn)
+    monkeypatch.setattr("subprocess.run", fake_spawn)
 
     result = json.loads(
         tell_tool.tell_tool(
@@ -269,7 +283,7 @@ def test_tell_echoes_exact_message_to_origin_before_send(monkeypatch):
         events.append("echo")
         echoes.append(payload)
 
-    monkeypatch.setattr(tell_tool, "spawn_detached", fake_spawn)
+    monkeypatch.setattr("subprocess.run", fake_spawn)
 
     tell_tool.tell_tool(
         agent="gopher",
@@ -283,7 +297,7 @@ def test_tell_echoes_exact_message_to_origin_before_send(monkeypatch):
 
 def test_tell_requires_echo_callback_and_does_not_send_without_one(monkeypatch):
     calls = []
-    monkeypatch.setattr(tell_tool, "spawn_detached", lambda *_a, **_kw: calls.append(True))
+    monkeypatch.setattr("subprocess.run", lambda *_a, **_kw: calls.append(True))
 
     with pytest.raises(TypeError):
         tell_tool.tell_tool(agent="gopher", message="This must not be secret.")
@@ -293,7 +307,7 @@ def test_tell_requires_echo_callback_and_does_not_send_without_one(monkeypatch):
 
 def test_tell_does_not_send_when_origin_echo_delivery_fails(monkeypatch):
     calls = []
-    monkeypatch.setattr(tell_tool, "spawn_detached", lambda *_a, **_kw: calls.append(True))
+    monkeypatch.setattr("subprocess.run", lambda *_a, **_kw: calls.append(True))
 
     def fail_echo(_message):
         raise RuntimeError("origin unavailable")
@@ -309,7 +323,7 @@ def test_tell_does_not_send_when_origin_echo_delivery_fails(monkeypatch):
 
 
 def test_tell_logs_exact_echo(monkeypatch):
-    monkeypatch.setattr(tell_tool, "spawn_detached", lambda *_args, **_kwargs: _spawned())
+    monkeypatch.setattr("subprocess.run", lambda *_args, **_kwargs: _spawned())
     logs = []
     monkeypatch.setattr(tell_tool.logger, "info", lambda *args, **_kwargs: logs.append(args))
 
@@ -326,9 +340,9 @@ def test_tell_reports_spawn_failure_and_echoes_first(monkeypatch):
     echoes = []
 
     def fake_spawn(command, **_kwargs):
-        return None  # spawn failure (binary missing, permission, ...)
+        raise OSError("spawn failure (binary missing, permission, ...)")
 
-    monkeypatch.setattr(tell_tool, "spawn_detached", fake_spawn)
+    monkeypatch.setattr("subprocess.run", fake_spawn)
 
     result = json.loads(
         tell_tool.tell_tool(
@@ -339,7 +353,7 @@ def test_tell_reports_spawn_failure_and_echoes_first(monkeypatch):
     )
 
     assert echoes == ["zephyr: Are you there?"]
-    assert result == {"error": "failed to launch 'hermes send' for zephyr"}
+    assert result["error"].startswith("failed to launch 'hermes send' for zephyr")
 
 
 def test_agent_runtime_routes_tell_to_mandatory_origin_callback(monkeypatch):
@@ -353,7 +367,7 @@ def test_agent_runtime_routes_tell_to_mandatory_origin_callback(monkeypatch):
         sent.append(command[-1])
         return _spawned()
 
-    monkeypatch.setattr(tell_tool, "spawn_detached", fake_spawn)
+    monkeypatch.setattr("subprocess.run", fake_spawn)
     agent = SimpleNamespace(
         _memory_manager=None,
         tell_echo_callback=echoes.append,
@@ -387,7 +401,7 @@ def test_agent_runtime_reply_instruction_names_sender_session(monkeypatch):
         sent.append(command)
         return _spawned()
 
-    monkeypatch.setattr(tell_tool, "spawn_detached", fake_spawn)
+    monkeypatch.setattr("subprocess.run", fake_spawn)
     agent = SimpleNamespace(
         _memory_manager=None,
         tell_echo_callback=lambda _message: None,
@@ -420,7 +434,7 @@ def test_agent_runtime_refuses_tell_without_origin_callback(monkeypatch):
     from agent.agent_runtime_helpers import invoke_tool
 
     calls = []
-    monkeypatch.setattr(tell_tool, "spawn_detached", lambda *_a, **_kw: calls.append(True))
+    monkeypatch.setattr("subprocess.run", lambda *_a, **_kw: calls.append(True))
     agent = SimpleNamespace(_memory_manager=None, session_id="session-1")
 
     with pytest.raises(RuntimeError, match="origin echo callback"):
@@ -479,7 +493,7 @@ def test_tell_own_session_id_anchors_reply_to_origin(monkeypatch):
         calls.append(command)
         return _spawned()
 
-    monkeypatch.setattr(tell_tool, "spawn_detached", fake_spawn)
+    monkeypatch.setattr("subprocess.run", fake_spawn)
 
     result = json.loads(
         tell_tool.tell_tool(
@@ -498,7 +512,7 @@ def test_tell_own_session_id_anchors_reply_to_origin(monkeypatch):
         "agent='gopher' and session_id='cron_journal_20261017_090000'"
         in calls[0][-1]
     )
-    assert result == {"dispatched": True, "note": "notified zephyr"}
+    assert result == {"dispatched": True, "delivered": True, "status": "spawned", "note": "wake spawned"}
 
 
 def test_tell_own_session_id_from_env_anchors_reply(monkeypatch):
@@ -510,7 +524,7 @@ def test_tell_own_session_id_from_env_anchors_reply(monkeypatch):
         calls.append(command)
         return _spawned()
 
-    monkeypatch.setattr(tell_tool, "spawn_detached", fake_spawn)
+    monkeypatch.setattr("subprocess.run", fake_spawn)
 
     tell_tool.tell_tool(
         agent="zephyr",
@@ -535,7 +549,7 @@ def test_tell_foreign_session_id_still_targets_directly(monkeypatch, tmp_path):
         calls.append(command)
         return _spawned()
 
-    monkeypatch.setattr(tell_tool, "spawn_detached", fake_spawn)
+    monkeypatch.setattr("subprocess.run", fake_spawn)
 
     tell_tool.tell_tool(
         agent="zephyr",
@@ -564,7 +578,7 @@ def test_tell_posts_target_chat_by_default(monkeypatch):
         calls.append(command)
         return _spawned()
 
-    monkeypatch.setattr(tell_tool, "spawn_detached", fake_spawn)
+    monkeypatch.setattr("subprocess.run", fake_spawn)
 
     result = json.loads(
         tell_tool.tell_tool(
@@ -579,7 +593,7 @@ def test_tell_posts_target_chat_by_default(monkeypatch):
     assert len(calls) == 1
     assert calls[0][:4] == ["hermes", "send", "-t", "zephyr"]
     assert "Visible please." in calls[0][-1]
-    assert result == {"dispatched": True, "note": "notified zephyr"}
+    assert result == {"dispatched": True, "delivered": True, "status": "spawned", "note": "wake spawned"}
 
 
 def test_tell_makes_one_send_call_not_two(monkeypatch):
@@ -593,7 +607,7 @@ def test_tell_makes_one_send_call_not_two(monkeypatch):
         calls.append(command)
         return _spawned()
 
-    monkeypatch.setattr(tell_tool, "spawn_detached", fake_spawn)
+    monkeypatch.setattr("subprocess.run", fake_spawn)
     monkeypatch.setattr(
         "hermes_cli.send_cmd._resolve_agent_wake_target",
         lambda agent: f"{agent}:telegram:5550001111:7",

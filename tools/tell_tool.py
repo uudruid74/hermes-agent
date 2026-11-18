@@ -21,7 +21,6 @@ import logging
 import os
 from typing import Callable
 
-from hermes_cli._subprocess_compat import spawn_detached
 
 logger = logging.getLogger(__name__)
 
@@ -81,17 +80,64 @@ def tell_tool(
             target = session_wake_target(agent, target_session_id) or agent
         except (ImportError, ValueError, OSError):
             target = agent
-    # Fire-and-forget: the message is echoed + logged above (the mandatory
-    # transparency contract), then dispatched detached so the caller's tool
-    # loop never blocks on delivery. ONE `-t` call does both halves — the
-    # from-user wake into the target and the visible `-u` copy, which
-    # `hermes send -t` sends internally (Evan's one-call rule). A spawn
-    # failure (binary missing) is the only synchronous error we can still
-    # observe and report.
-    proc = spawn_detached(["hermes", "send", "-t", target, wrapped])
-    if proc is None:
-        return json.dumps({"error": f"failed to launch 'hermes send' for {agent}"})
-    return json.dumps({"dispatched": True, "note": f"notified {agent}"})
+    # VERIFIED delivery (Evan 2026-11-18: "fallbacks are evil" / "dropped is
+    # never success"): `hermes send -t` does both halves — the from-user wake
+    # into the target and the visible `-u` copy. The old fire-and-forget
+    # spawn_discarded its stdout, so `{"error": ...}` from the send was
+    # invisible and the tool still said "notified" (the 00:43/01:09 silent
+    # wake-loss class). Now we WAIT for the real outcome and report it.
+    import subprocess
+
+    try:
+        run = subprocess.run(
+            ["hermes", "send", "-t", target, wrapped],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        return json.dumps({
+            "error": (
+                f"tell to {agent} timed out after 60s — delivery UNVERIFIED, "
+                "treat as FAILED and retry or escalate"
+            )
+        })
+    except OSError as exc:
+        return json.dumps({"error": f"failed to launch 'hermes send' for {agent}: {exc}"})
+
+    out = (run.stdout or "").strip()
+    detail = {}
+    try:
+        detail = json.loads(out.splitlines()[-1]) if out else {}
+    except (json.JSONDecodeError, IndexError):
+        detail = {}
+
+    if run.returncode != 0:
+        return json.dumps({
+            "error": (
+                f"tell to {agent} FAILED (exit {run.returncode}): "
+                f"{(run.stderr or out or 'no output')[-300:]}"
+            )
+        })
+    if isinstance(detail, dict) and detail.get("error"):
+        return json.dumps({
+            "error": f"tell to {agent} NOT delivered: {detail['error']}"
+        })
+    if isinstance(detail, dict) and detail.get("success"):
+        status = detail.get("status", "delivered")
+        note = detail.get("note", f"wake {status} for {agent}")
+        return json.dumps({
+            "dispatched": True,
+            "delivered": True,
+            "status": status,
+            "note": note,
+        })
+    return json.dumps({
+        "error": (
+            f"tell to {agent} returned an UNVERIFIABLE result (exit 0, "
+            f"unrecognized output: {out[-200:]}) — treat as FAILED"
+        )
+    })
 
 
 TELL_SCHEMA = {
