@@ -8347,6 +8347,17 @@ class DispatchResult:
     subsequent tick when the assignee has capacity. Separate bucket so
     telemetry / dashboards can show "this profile is busy" vs
     "task is genuinely stuck"."""
+    skipped_same_assignee: list[tuple[str, str, str]] = field(default_factory=list)
+    """Tasks deferred this tick because the assignee already has a live
+    run — the always-on single-flight invariant (Evan 2026-11-18):
+    a dispatcher run must refuse a second live task per assignee so two
+    workers of one profile never collide on the same tree / burn tokens
+    in parallel. Each entry is ``(task_id, assignee, blocker_task_id)``.
+    NOT an operator-actionable failure — the task stays ``ready`` and is
+    dispatched on a later tick once the live run completes. Distinct from
+    ``skipped_per_profile_capped``: that bucket only fills when an explicit
+    ``kanban.max_in_progress_per_profile`` cap is configured; this bucket
+    is the default backstop when no cap is set."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -9854,6 +9865,168 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# Run-level duplicate backstop (Evan 2026-11-18)
+#
+# A dispatcher run must refuse a second live task per assignee. Without
+# this, two ready tasks for one profile are claimed back-to-back and two
+# workers run concurrently on the same tree — colliding edits and burning
+# tokens (2026-11-18: two Neo workers on the hermes-agent tree, 1h25m run
+# with zero commits). This is the always-on invariant at CLAIM time; the
+# opt-in ``kanban.max_in_progress_per_profile`` cap (#21582) remains the
+# way to explicitly allow fan-out per profile.
+# ---------------------------------------------------------------------------
+
+_LIVE_RUN_DEFER_EVENT_KIND = "deferred_same_assignee"
+
+
+def _live_run_conflict(
+    conn: sqlite3.Connection, task_id: str, assignee: str
+) -> Optional[str]:
+    """Return the id of another *running* task for ``assignee``, or None.
+
+    ``task_id`` is excluded so a task never blocks itself. Scoped to the
+    board's own DB (``conn``), mirroring the existing per-profile cap.
+    """
+    row = conn.execute(
+        "SELECT id FROM tasks "
+        "WHERE status = 'running' AND assignee = ? AND id != ? LIMIT 1",
+        (assignee, task_id),
+    ).fetchone()
+    return row["id"] if row else None
+
+
+def _already_reported_deferral(
+    conn: sqlite3.Connection, task_id: str, blocker_id: str
+) -> bool:
+    """True when this (task, blocker) deferral was already reported.
+
+    The dispatcher ticks every few seconds; while the blocker persists the
+    same deferral would re-fire comment + HOME + Wintermute notifications
+    every tick. Report once per episode — the previous ``deferred_same_assignee``
+    event for this task, when it names the same blocker, marks the episode
+    as already notified. A deferral against a *different* blocker (or after
+    a clear) is a new episode and reports again.
+    """
+    row = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = ? ORDER BY id DESC LIMIT 1",
+        (task_id, _LIVE_RUN_DEFER_EVENT_KIND),
+    ).fetchone()
+    if not row or not row["payload"]:
+        return False
+    try:
+        payload = json.loads(row["payload"])
+    except (TypeError, ValueError):
+        return False
+    return payload.get("blocker_task") == blocker_id
+
+
+def _notify_deferred_same_assignee(
+    task_id: str, assignee: str, blocker_id: str
+) -> None:
+    """Standing notify flow (Evan 2026-11-18).
+
+    (b) warn the HOME channel via ``hermes send -u`` (plain delivery);
+    (c) notify Wintermute via ``hermes send -t`` (NOT -u — a bare agent
+        name expands to the agent's DM wake, carrying the task number, what
+        happened, and the investigate instruction).
+
+    Both are fire-and-forget detached subprocesses — exactly the shape the
+    kanban notification hook already uses for ``hmes send -u`` artifact
+    delivery — so a slow network can never stall a dispatch tick.
+    """
+    try:
+        from hermes_cli._subprocess_compat import spawn_detached
+    except Exception:
+        _log.warning(
+            "kanban dispatch: spawn_detached unavailable — defer notify skipped "
+            "task=%s blocker=%s", task_id, blocker_id,
+        )
+        return
+    env = os.environ.copy()
+    try:
+        from hermes_cli.send_cmd import _profile_home_channel_target
+        from hermes_cli.profiles import get_active_profile_name
+        home_target = _profile_home_channel_target(get_active_profile_name())
+    except Exception:
+        home_target = "telegram"
+
+    home_msg = (
+        f"Kanban dispatcher: task {task_id} deferred at claim time — assignee "
+        f"{assignee} already has a live run on {blocker_id}. Refused a second "
+        f"concurrent worker for this profile (colliding edits / token-burn "
+        f"guard). The task stays ready and will dispatch when that run completes."
+    )
+    wm_msg = (
+        f"Investigate (standing notify flow, Evan 2026-11-18): the kanban "
+        f"dispatcher refused a second live task for assignee {assignee} — "
+        f"{task_id} was deferred at claim time because {blocker_id} is already "
+        f"running. Verify there is no dual work or needless token burn; the "
+        f"task comment holds the details."
+    )
+    try:
+        spawn_detached(["hermes", "send", "-u", home_target, home_msg], env=env)
+    except (OSError, ValueError):
+        _log.warning(
+            "kanban dispatch: HOME defer warning send failed task=%s",
+            task_id, exc_info=True,
+        )
+    try:
+        spawn_detached(
+            ["hermes", "send", "-t", "wintermute", wm_msg], env=env
+        )
+    except (OSError, ValueError):
+        _log.warning(
+            "kanban dispatch: wintermute defer notify send failed task=%s",
+            task_id, exc_info=True,
+        )
+
+
+def _report_same_assignee_deferral(
+    conn: sqlite3.Connection,
+    task_id: str,
+    assignee: str,
+    blocker: str,
+    *,
+    dry_run: bool = False,
+) -> None:
+    """Apply the standing flow for a refused second live run per assignee.
+
+    On a NEW deferral episode (not already reported for the same blocker):
+    (a) comment on the task so the worker picks up what happened, plus the
+    HOME / Wintermute notify flow. The task itself stays ``ready`` — it is
+    never dropped, only deferred. ``dry_run`` writes nothing and notifies
+    nothing.
+    """
+    if dry_run or _already_reported_deferral(conn, task_id, blocker):
+        return
+    with write_txn(conn):
+        try:
+            add_comment(
+                conn,
+                task_id,
+                "dispatcher",
+                "Deferred at claim time: assignee "
+                f"{assignee} already has a live run on {blocker}. "
+                "Refused a second concurrent worker for this profile; the "
+                "task stays ready and will be dispatched once that run "
+                "completes.",
+            )
+        except Exception:
+            _log.warning(
+                "kanban dispatch: defer comment failed task=%s", task_id,
+                exc_info=True,
+            )
+        _append_event(
+            conn,
+            task_id,
+            _LIVE_RUN_DEFER_EVENT_KIND,
+            {"blocker_task": blocker, "assignee": assignee},
+        )
+    _notify_deferred_same_assignee(task_id, assignee, blocker)
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -9949,6 +10122,13 @@ def _dispatch_once_locked(
          ``spawn_fn(task, workspace_path, board) -> Optional[int]``. The
          return value (if any) is recorded as ``worker_pid`` so subsequent
          ticks can detect crashes before the TTL expires.
+
+         At claim time the tick refuses a second live task per assignee
+         (Evan 2026-11-18): while another run of the same profile is
+         ``running`` the new task is deferred — commented + HOME / Wintermute
+         notified on first deferral — and left ``ready`` for a later tick.
+         An explicit ``max_in_progress_per_profile`` cap opts into fan-out
+         and replaces this single-flight default.
 
     Spawn failures are counted per-task. After ``failure_limit`` consecutive
     failures the task is auto-blocked with the last error as its reason —
@@ -10078,6 +10258,13 @@ def _dispatch_once_locked(
             "GROUP BY assignee"
         ):
             _per_profile_running[prow["assignee"]] = int(prow["n"])
+    # In-tick spawn ledger for the single-flight backstop (Evan
+    # 2026-11-18): assignee -> task id claimed/spawned this tick. DB
+    # running rows cover already-claimed tasks; this ledger covers the
+    # rest of the same tick (and all of dry_run, where nothing is
+    # written), so two ready tasks for one profile can never both spawn
+    # in one tick.
+    _tick_spawned_by_assignee: dict[str, str] = {}
     # Normalize default_assignee once: empty/whitespace string → None so the
     # rest of the loop can use ``if default_assignee:`` as a single check.
     # We also resolve profile_exists once here for the same reason.
@@ -10198,6 +10385,25 @@ def _dispatch_once_locked(
                         {"reason": guard_reason},
                     )
             continue
+        # Run-level duplicate backstop (Evan 2026-11-18): refuse a second
+        # live task per assignee so two workers of one profile never run
+        # concurrently on the same tree (colliding edits / token burn).
+        # This is the always-on invariant; an explicit
+        # max_in_progress_per_profile cap overrides it — fan-out is then
+        # operator-blessed and the cap logic above governs.
+        if _per_profile_cap is None:
+            blocker = _live_run_conflict(conn, row["id"], row_assignee)
+            if blocker is None:
+                blocker = _tick_spawned_by_assignee.get(row_assignee)
+            if blocker is not None:
+                _report_same_assignee_deferral(
+                    conn, row["id"], row_assignee, blocker,
+                    dry_run=dry_run,
+                )
+                result.skipped_same_assignee.append(
+                    (row["id"], row_assignee, blocker)
+                )
+                continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
             # Increment per-profile counter even in dry_run so the cap
@@ -10208,6 +10414,7 @@ def _dispatch_once_locked(
                 _per_profile_running[row_assignee] = (
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
+            _tick_spawned_by_assignee[row_assignee] = row["id"]
             continue
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
@@ -10263,6 +10470,11 @@ def _dispatch_once_locked(
                 _per_profile_running[claimed.assignee] = (
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
+            # Same ledger for the single-flight backstop: this assignee now
+            # has a live run this tick, so later ready rows for the same
+            # profile are deferred.
+            if claimed.assignee:
+                _tick_spawned_by_assignee[claimed.assignee] = claimed.id
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
@@ -10298,8 +10510,25 @@ def _dispatch_once_locked(
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
             continue
+        # Run-level duplicate backstop (Evan 2026-11-18): a review agent is
+        # also a live run of the assignee — refuse it while another run of
+        # the same profile is in flight (same invariant as the ready column).
+        if _per_profile_cap is None:
+            blocker = _live_run_conflict(conn, row["id"], row["assignee"])
+            if blocker is None:
+                blocker = _tick_spawned_by_assignee.get(row["assignee"])
+            if blocker is not None:
+                _report_same_assignee_deferral(
+                    conn, row["id"], row["assignee"], blocker,
+                    dry_run=dry_run,
+                )
+                result.skipped_same_assignee.append(
+                    (row["id"], row["assignee"], blocker)
+                )
+                continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
+            _tick_spawned_by_assignee[row["assignee"]] = row["id"]
             continue
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
@@ -10344,6 +10573,8 @@ def _dispatch_once_locked(
                 continue
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
+            if claimed.assignee:
+                _tick_spawned_by_assignee[claimed.assignee] = claimed.id
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
