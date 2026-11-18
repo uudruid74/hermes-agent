@@ -1948,6 +1948,18 @@ def cmd_verify(args: argparse.Namespace) -> None:
     RED -> auto-files a suite-red bug assigned to Neo and dispatches it
     through the normal gates (Evan's standing order, recorded in the file).
     """
+    # PAUSE GATE (Evan 2026-11-18: "red-test runs are paused... burning tokens
+    # and kicking off while we're doing other stuff... it keeps restarting").
+    # bugtoold respawns this on queue-drain, so killing the run never sticks —
+    # the pause lives HERE: while the marker file exists, every spawn exits
+    # immediately. Remove ~/.hermes/bugtool-verify-paused to resume.
+    pause_marker = Path.home() / ".hermes" / "bugtool-verify-paused"
+    if pause_marker.exists():
+        print(
+            f"verify PAUSED (Evan 2026-11-18) — marker {pause_marker} exists. "
+            "Remove it to resume queue-drain verification."
+        )
+        return
     project = normalize_project(getattr(args, "project", None) or "hermes-agent")
     if project not in VERIFY_SUITES:
         die(f"no named suite for project '{project}' — only hermes-agent verifies "
