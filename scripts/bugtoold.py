@@ -364,33 +364,34 @@ def scan_and_dispatch(vault: Path, settings: dict, decisions: DecisionLog, dry_r
 
 
 def maybe_spawn_verify(bugtool, projects_root: Path, decisions, dry_run: bool) -> None:
-    """Queue-drain verification (Evan 2026-11-17): when the hermes-agent bug
-    queue empties, run the big suite ONCE — detached so the watch loop never
-    blocks on a long run. `bugtool verify --on-drain` re-checks drain and the
-    sha marker authoritatively in the child; RED there auto-files the Neo fix
-    job through the normal gates. Fast-lane rules (graph + review + targeted
-    tests) cover everything while the queue is moving."""
+    """Queue-drain test arming (Evan 2026-11-18 redesign): when the hermes-agent
+    bug queue empties, ENABLE the 10am red-test cron — never spawn a suite from
+    here ("instead of having bugtool spawn the test, it should just enable the
+    cron job... forces a specific time when we aren't dispatching other work").
+    The job (`red-test-10am`) runs the big suite at 10am, files a bug with the
+    exact fix plan (unchecked box), reports via `hermes send -u`, and disables
+    itself. One-shot per arming; this hook re-arms on the next drain."""
     if "hermes-agent" not in getattr(bugtool, "VERIFY_SUITES", {}):
         return
     if not bugtool.queue_is_drained("hermes-agent"):
         return
-    marker = bugtool.verify_marker()
-    if bugtool.verify_in_flight(marker):
-        return
     if dry_run:
-        decisions.append("verify", reason="dry-run: queue drained, suite verify suppressed")
+        decisions.append("verify", reason="dry-run: queue drained, cron arming suppressed")
         return
-    log_path = bugtool.VERIFY_LOG
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    handle = log_path.open("a", encoding="utf-8")
-    subprocess.Popen(
-        [sys.executable, str(Path(__file__).resolve().parent / "bugtool.py"), "verify", "--on-drain"],
-        stdout=handle, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-        start_new_session=True, close_fds=True,
-        env={**os.environ, "BUGTOOL_PROJECTS_ROOT": str(projects_root)},
-    )
-    handle.close()
-    decisions.append("verify", reason="queue drained: suite verify spawned (detached)")
+    try:
+        out = subprocess.run(
+            ["hermes", "cron", "resume", "red-test-10am"],
+            capture_output=True, text=True, timeout=30,
+        )
+        ok = out.returncode == 0
+        decisions.append(
+            "verify",
+            reason=(
+                f"queue drained: red-test-10am cron {'enabled' if ok else 'enable FAILED: ' + (out.stderr or out.stdout)[:120]}"
+            ),
+        )
+    except Exception as exc:
+        decisions.append("verify", reason=f"queue drained: cron enable errored: {exc}")
 
 
 def cycle(vault: Path, settings: dict, decisions: DecisionLog, killswitch: Path,
