@@ -1835,15 +1835,63 @@ def run_full_suite(project: str, tmpdir: Path) -> dict:
     }
 
 
+def _notify_duplicate_work(twin_file: Path, new_sha: str) -> None:
+    """Standing flow (Evan 2026-11-18, verbatim intent): a new run that detects
+    an old run in progress must (a) leave a note where the worker picks it up,
+    (b) warn the HOME channel, (c) notify Wintermute (-t, NOT -u) with the task
+    number and instructions to investigate and prevent dual work / token burn."""
+    note = (
+        f"DEDUPE 2026-11-18: queue-drain verify found RED at {new_sha[:8]} but this "
+        f"card's work is still live — NOT filing a twin (dual-work danger, token "
+        f"burn). New red summary appended to Updates. If the reds are the same "
+        f"set, continue here; if genuinely new failures appeared, append them and "
+        f"keep working THIS card."
+    )
+    try:
+        text = twin_file.read_text(encoding="utf-8")
+        prev = section_value(text, "Updates") or ""
+        text = replace_section(text, "Updates", prev + "\n" + note + "\n")
+        atomic_write_text(twin_file, text)
+    except Exception:
+        pass
+    warn = (
+        f"DUPLICATE-WORK GUARD: suite red at {new_sha[:8]} but a live suite-red card "
+        f"already exists ({twin_file.name}) — twin filing prevented. Wintermute: "
+        f"investigate to prevent dual work / needless token burn."
+    )
+    try:
+        subprocess.run(
+            ["hermes", "send", "-u", "telegram", warn],
+            capture_output=True, text=True, timeout=30,
+        )
+    except Exception:
+        pass
+    try:
+        subprocess.run(
+            ["hermes", "send", "-t", "wintermute", warn],
+            capture_output=True, text=True, timeout=60,
+        )
+    except Exception:
+        pass
+
+
 def file_suite_red_card(project: str, result: dict, sha: str) -> Optional[Path]:
     """File the suite-red bug (auto-approved per Evan's standing order) and
     push it through the NORMAL dispatch gates (one-at-a-time still applies).
-    Returns the bug path, or None when a card for this sha already exists."""
+    Returns the bug path, or None when a card for this sha already exists OR a
+    live twin suite-red card exists (dedupe policy 2026-11-18: twins are how two
+    workers ended up fixing the same code — update the live card instead)."""
     slug = f"suite-red-{sha[:8]}"
     date = dt.date.fromisoformat(os.environ.get("BUGTOOL_DATE", dt.date.today().isoformat()))
     path = PROJECTS_ROOT / normalize_project(project) / "bugs" / "pending" / f"{date.isoformat()}-{normalize_slug(slug)}.md"
     if path.exists():
         return None  # idempotent: one card per red sha
+    pending_dir = PROJECTS_ROOT / normalize_project(project) / "bugs" / "pending"
+    for twin in sorted(pending_dir.glob("*suite-red-*.md")):
+        # Any pending suite-red card is LIVE work (resolution moves files to
+        # bugs/resolved/) — never file a twin; feed the live one instead.
+        _notify_duplicate_work(twin, sha)
+        return None
     body_lines = [
         f"Full suite verify run (queue-drain, `bugtool verify`) is RED at `{sha}`.",
         "",
