@@ -3311,11 +3311,32 @@ def _bridge_cli_wake(
         logger.error("cron wake: 'hermes send -t' failed to run for %r: %s", _target, exc)
         return False
     if proc.returncode != 0:
+        # The CLI writes its failure reason to the --json stdout payload
+        # ({"error": ...}), not stderr — log it so the wake's real cause
+        # survives (Nov 18 failure logged an empty stderr and lost the
+        # reason). Fall back to a truncated raw stdout slice when the
+        # payload is not JSON.
+        stdout_text = (proc.stdout or "").strip()
+        detail = (proc.stderr or "").strip()[:400]
+        if stdout_text:
+            try:
+                payload = json.loads(stdout_text)
+            except json.JSONDecodeError:
+                payload = None
+            if isinstance(payload, dict):
+                err = payload.get("error")
+                status = payload.get("status")
+                if err is not None:
+                    detail += f" | stdout error: {str(err)[:400]}"
+                if status is not None:
+                    detail += f" | stdout status: {str(status)[:400]}"
+            else:
+                detail += f" | stdout (unparsed): {stdout_text[:400]}"
         logger.error(
             "cron wake: 'hermes send -t %s' exited %s: %s",
             _target,
             proc.returncode,
-            (proc.stderr or "").strip()[:400],
+            detail,
         )
         return False
     try:
