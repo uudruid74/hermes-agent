@@ -90,7 +90,7 @@ def tell_tool(
 
     try:
         run = subprocess.run(
-            ["hermes", "send", "-t", target, wrapped],
+            ["hermes", "send", "-t", target, "--json", wrapped],
             capture_output=True,
             text=True,
             timeout=60,
@@ -107,9 +107,13 @@ def tell_tool(
 
     out = (run.stdout or "").strip()
     detail = {}
+    # --json makes the CLI emit the machine envelope (indent=2 => multi-line);
+    # parse the WHOLE payload, not the last line (the old last-line parse could
+    # never succeed against multi-line JSON — every successful tell reported
+    # UNVERIFIABLE until 2026-11-19).
     try:
-        detail = json.loads(out.splitlines()[-1]) if out else {}
-    except (json.JSONDecodeError, IndexError):
+        detail = json.loads(out) if out else {}
+    except json.JSONDecodeError:
         detail = {}
 
     if run.returncode != 0:
@@ -124,7 +128,9 @@ def tell_tool(
             "error": f"tell to {agent} NOT delivered: {detail['error']}"
         })
     if isinstance(detail, dict) and detail.get("success"):
-        status = detail.get("status", "delivered")
+        status = detail.get("status") or (
+            "suppressed" if detail.get("suppressed") else "delivered"
+        )
         note = detail.get("note", f"wake {status} for {agent}")
         return json.dumps({
             "dispatched": True,

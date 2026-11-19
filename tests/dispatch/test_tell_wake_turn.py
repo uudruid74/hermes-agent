@@ -139,7 +139,7 @@ def _tell_wake_argv(wake_env, target_profile_env, monkeypatch):
         "-t",
         f"{TARGET_PROFILE}:telegram:{CHAT_ID}:{THREAD_ID}",
     ]
-    assert "Wake me in that session." in argv[4]
+    assert "Wake me in that session." in argv[-1]
     return argv
 
 

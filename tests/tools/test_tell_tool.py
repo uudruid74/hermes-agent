@@ -88,7 +88,7 @@ def test_tell_wraps_message_and_targets_agent_profile(monkeypatch):
     # ONE `-t` call: the from-user wake; `hermes send -t` sends the visible
     # `-u` copy internally (Evan's one-call rule — no second spawn here).
     assert calls == [
-        ["hermes", "send", "-t", "gopher", wrapped],
+        ["hermes", "send", "-t", "gopher", "--json", wrapped],
     ]
     assert echoes == ["gopher: Check the relay."]
     assert result == {"dispatched": True, "delivered": True, "status": "spawned", "note": "wake spawned"}
@@ -196,11 +196,11 @@ def test_tell_reply_reaches_explicit_session_via_send_cli(monkeypatch, tmp_path)
         args = argparse.Namespace(
             to=None,
             user=command[3],
-            message=command[4],
+            message=command[-1],
             file=None,
             subject=None,
             list_targets=False,
-            json=False,
+            json="--json" in command,
             quiet=True,
         )
         with pytest.raises(SystemExit) as exc:
@@ -621,3 +621,97 @@ def test_tell_makes_one_send_call_not_two(monkeypatch):
 
     assert len(calls) == 1
     assert calls[0][:3] == ["hermes", "send", "-t"]
+
+
+# -- 2026-11-19: --json envelope completion (Evan "Go") ----------------------
+# Locks the verified-delivery completion: tell requests the machine envelope,
+# parses the WHOLE multi-line payload, and maps the true intake status. The
+# bare-"sent" workaround is deliberately NOT accepted (test 4 enforces it).
+
+
+def _run_result(stdout, returncode=0, stderr=""):
+    import subprocess
+
+    return subprocess.CompletedProcess(
+        args=["hermes", "send"], returncode=returncode, stdout=stdout, stderr=stderr
+    )
+
+
+def test_tell_passes_json_flag_and_parses_multiline_envelope(monkeypatch):
+    monkeypatch.setenv("USERNAME", "zephyr")
+    calls = []
+
+    def fake_run(command, **_kwargs):
+        calls.append(command)
+        return _run_result(
+            '{\n  "success": true,\n  "queued": false,\n  "status": "spawned"\n}'
+        )
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    result = json.loads(
+        tell_tool.tell_tool(
+            agent="gopher", message="ping", echo_callback=lambda _e: None
+        )
+    )
+
+    assert "--json" in calls[0], "tell must request the machine envelope"
+    assert result["dispatched"] is True
+    assert result["delivered"] is True
+    assert result["status"] == "spawned"
+
+
+def test_tell_maps_suppressed_status(monkeypatch):
+    monkeypatch.setenv("USERNAME", "zephyr")
+
+    def fake_run(command, **_kwargs):
+        return _run_result(
+            '{"success": true, "suppressed": true, "note": "duplicate wake suppressed"}'
+        )
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    result = json.loads(
+        tell_tool.tell_tool(
+            agent="gopher", message="ping", echo_callback=lambda _e: None
+        )
+    )
+    assert result["status"] == "suppressed"
+    assert result["delivered"] is True
+
+
+def test_tell_dropped_wake_never_reports_delivered(monkeypatch):
+    """DROPPED IS NEVER SUCCESS: the CLI exits 1 on a dropped wake; tell must
+    report failure even though the payload carries success+dropped."""
+    monkeypatch.setenv("USERNAME", "zephyr")
+
+    def fake_run(command, **_kwargs):
+        return _run_result(
+            '{"success": true, "status": "dropped"}', returncode=1
+        )
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    result = json.loads(
+        tell_tool.tell_tool(
+            agent="gopher", message="ping", echo_callback=lambda _e: None
+        )
+    )
+    assert "error" in result
+    assert "delivered" not in result
+
+
+def test_tell_bare_sent_human_output_is_unverifiable(monkeypatch):
+    """The pre-2026-11-19 workaround trusted bare 'sent' — removed. Human
+    output without the envelope must stay UNVERIFIABLE (fail loud, never
+    guess)."""
+    monkeypatch.setenv("USERNAME", "zephyr")
+
+    def fake_run(command, **_kwargs):
+        return _run_result("sent")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    result = json.loads(
+        tell_tool.tell_tool(
+            agent="gopher", message="ping", echo_callback=lambda _e: None
+        )
+    )
+    assert "error" in result
+    assert "UNVERIFIABLE" in result["error"]
