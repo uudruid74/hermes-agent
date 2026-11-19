@@ -337,6 +337,7 @@ _MAX_BACKOFF_SECONDS = 60
 # server is unrevivable: its tools are out of the registry, so no tool call
 # can ever reach the circuit-breaker half-open probe or _signal_reconnect.
 _PARKED_RETRY_INTERVAL = 300     # seconds between parked self-probes
+_MCP_LOOP_DRAIN_TIMEOUT = 12.0   # cap on cancelling pending MCP loop tasks
 _RECYCLED_RECONNECT_TIMEOUT = 15.0
 # Jitter applied to reconnect backoff sleeps. Without it, every server that
 # lost the same backend retries in lockstep (thundering herd) and log lines
@@ -2412,6 +2413,9 @@ class MCPServerTask:
             command=command,
             args=args,
             env=safe_env if safe_env else None,
+            # Split multi-byte UTF-8 at pipe chunk boundaries must not crash
+            # the receive stream (Windows; issue #46099).
+            encoding_error_handler="replace",
         )
 
         sampling_kwargs = self._sampling.session_kwargs() if self._sampling else {}
@@ -6518,7 +6522,10 @@ def _reinject_post_build_tools(agent, tools_list: list, name_set: set) -> set:
         if callable(get_mem_schemas):
             # Honor the same enablement gate inject_memory_provider_tools uses.
             from agent.memory_manager import memory_provider_tools_enabled
-            if "memory" in name_set or memory_provider_tools_enabled(getattr(agent, "enabled_toolsets", None)):
+            if "memory" in name_set or memory_provider_tools_enabled(
+                getattr(agent, "enabled_toolsets", None),
+                getattr(agent, "disabled_toolsets", None),
+            ):
                 for schema in get_mem_schemas():
                     if isinstance(schema, dict):
                         _add(schema)
@@ -6800,6 +6807,37 @@ def _kill_orphaned_mcp_children(
         )
 
 
+async def _drain_mcp_loop_tasks(*, timeout: float | None = None) -> None:
+    """Cancel pending MCP loop tasks, bounded by *timeout*.
+
+    Used by ``_stop_mcp_loop`` before closing the loop (#60197) and exposed
+    for tests. Tasks that still hang after the first wait are cancelled and
+    given the same budget to run their finally-cleanup; stragglers are left
+    for the loop GC (never awaited indefinitely).
+    """
+    budget = timeout if timeout is not None else _MCP_LOOP_DRAIN_TIMEOUT
+    current = asyncio.current_task()
+    targets = [
+        t for t in asyncio.all_tasks()
+        if t is not current and not t.done()
+    ]
+    if not targets:
+        return
+    _, still = await asyncio.wait(targets, timeout=budget)
+    if still:
+        logger.warning(
+            "Timed out waiting for MCP loop drain; %d task(s) still pending",
+            len(still),
+        )
+        logger.warning(
+            "still pending after %ss: %d task(s)",
+            budget, len(still),
+        )
+        for t in still:
+            t.cancel()
+        await asyncio.wait(still, timeout=budget)
+
+
 def _stop_mcp_loop_if_idle() -> bool:
     """Stop the MCP loop only when no registered server still owns it.
 
@@ -6824,6 +6862,24 @@ def _stop_mcp_loop(*, only_if_idle: bool = False) -> bool:
         _mcp_loop = None
         _mcp_thread = None
     if loop is not None:
+        # Drain pending tasks BEFORE stopping the loop (#60197): a parked
+        # server task (or any coroutine still suspended on the loop) resumed
+        # after close would drive call_soon() against a dead loop, surfacing
+        # as an ignored "Event loop is closed" RuntimeError. Cancel stragglers
+        # and give their finally-cleanup a bounded window to run.
+        if loop.is_running():
+            try:
+                from agent.async_utils import safe_schedule_threadsafe
+
+                drain_future = safe_schedule_threadsafe(
+                    _drain_mcp_loop_tasks(), loop,
+                    logger=logger,
+                    log_message="MCP stop: failed to schedule drain",
+                )
+                if drain_future is not None:
+                    drain_future.result(timeout=15)
+            except BaseException as exc:
+                logger.debug("Error draining pending MCP tasks at stop: %s", exc)
         loop.call_soon_threadsafe(loop.stop)
         if thread is not None:
             thread.join(timeout=5)

@@ -964,7 +964,7 @@ class TestShutdown:
             )
             assert parked_task.done()
             assert scheduled_shutdown["future"].done()
-            assert schedule_count == 2
+            assert schedule_count == 3
         finally:
             with mcp_mod._lock:
                 mcp_mod._servers.clear()
