@@ -703,26 +703,26 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
         "archived": False,
     }
     try:
-        conn = connect()
-        row = conn.execute(
-            "SELECT name, description, icon, color, archived,"
-            " default_workdir, project_id, created_at"
-            " FROM boards WHERE slug = ?",
-            (slug,),
-        ).fetchone()
-        if row is not None:
-            meta.update(
-                {
-                    "name": row["name"] or meta["name"],
-                    "description": row["description"] or "",
-                    "icon": row["icon"] or "",
-                    "color": row["color"] or "",
-                    "archived": bool(row["archived"]),
-                    "default_workdir": row["default_workdir"],
-                    "project_id": row["project_id"],
-                    "created_at": row["created_at"],
-                }
-            )
+        with contextlib.closing(connect()) as conn:
+            row = conn.execute(
+                "SELECT name, description, icon, color, archived,"
+                " default_workdir, project_id, created_at"
+                " FROM boards WHERE slug = ?",
+                (slug,),
+            ).fetchone()
+            if row is not None:
+                meta.update(
+                    {
+                        "name": row["name"] or meta["name"],
+                        "description": row["description"] or "",
+                        "icon": row["icon"] or "",
+                        "color": row["color"] or "",
+                        "archived": bool(row["archived"]),
+                        "default_workdir": row["default_workdir"],
+                        "project_id": row["project_id"],
+                        "created_at": row["created_at"],
+                    }
+                )
     except sqlite3.Error:
         pass
     meta["db_path"] = str(kanban_db_path(slug))
