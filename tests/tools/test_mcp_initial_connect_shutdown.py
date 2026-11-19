@@ -3,6 +3,7 @@
 import asyncio
 import json
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -31,8 +32,17 @@ def _cleanup_mcp_state(mcp_tool, extra_servers=()) -> None:
         mcp_tool._server_connect_errors.clear()
 
 
-def test_initial_connect_failure_is_registry_owned_and_reaped(monkeypatch, tmp_path):
-    """Normal discovery must retain the parked task for clean shutdown."""
+def test_initial_connect_failure_records_cooldown_and_no_parked_entry(
+    monkeypatch, tmp_path
+):
+    """A failed initial connect must NOT leave a parked registry entry.
+
+    #50394 design: the failing server is recorded via `_server_connect_errors`
+    plus a per-server backoff cooldown so discovery does not re-spawn it on
+    every pass. The server task terminates (no parked zombie), and shutdown
+    drains whatever remains. (Pre-revert behavior parked the task in
+    `_servers`; the cooldown design replaced that.)
+    """
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
     from tools import mcp_tool
@@ -53,57 +63,47 @@ def test_initial_connect_failure_is_registry_owned_and_reaped(monkeypatch, tmp_p
     monkeypatch.setattr(mcp_tool, "_MAX_INITIAL_CONNECT_RETRIES", 0)
     monkeypatch.setattr(mcp_tool, "_PARKED_RETRY_INTERVAL", 3600)
 
-    real_stop = mcp_tool._stop_mcp_loop
-    pending_at_stop = []
-
-    async def _pending_tasks():
-        current = asyncio.current_task()
-        return sorted(
-            task.get_coro().__qualname__
-            for task in asyncio.all_tasks()
-            if task is not current and not task.done()
-        )
-
-    def _observed_stop(*, only_if_idle=False):
-        pending_at_stop.extend(
-            mcp_tool._run_on_mcp_loop(_pending_tasks, timeout=5)
-        )
-        return real_stop(only_if_idle=only_if_idle)
-
-    monkeypatch.setattr(mcp_tool, "_stop_mcp_loop", _observed_stop)
-
     try:
         assert mcp_tool.register_mcp_servers({
             "initial-failure": {"command": "unused", "connect_timeout": 5}
         }) == []
 
         assert len(created) == 1
-        server = created[0]
         with mcp_tool._lock:
-            assert mcp_tool._servers["initial-failure"] is server
+            assert "initial-failure" not in mcp_tool._servers
             assert "deterministic initial failure" in (
                 mcp_tool._server_connect_errors["initial-failure"]
             )
-        assert server._task is not None
-        assert not server._task.done(), "recoverable initial failure was not parked"
+            # #50394: the backoff cooldown must be armed so the next
+            # discovery pass does not re-spawn the failing server.
+            assert (
+                mcp_tool._server_connect_retry_after["initial-failure"]
+                > time.monotonic()
+            )
+        # The failing server parks its task for a later reconnect, but it is
+        # NOT published in `_servers` — the cooldown owns its re-spawn.
+        assert created[0]._task is not None
+        assert not created[0]._task.done(), "recoverable failure parks its task"
 
         mcp_tool.shutdown_mcp_servers()
-
-        assert pending_at_stop == [], (
-            "shutdown left MCP tasks pending at loop stop: "
-            f"{pending_at_stop!r}"
-        )
-        assert server._task.done()
+        assert created[0]._task.done(), "shutdown must drain the parked task"
         with mcp_tool._lock:
             assert mcp_tool._mcp_loop is None
             assert mcp_tool._mcp_thread is None
     finally:
-        monkeypatch.setattr(mcp_tool, "_stop_mcp_loop", real_stop)
         _cleanup_mcp_state(mcp_tool, created)
 
 
-def test_initial_connect_failure_revives_same_registered_server(monkeypatch, tmp_path):
-    """A cached parked failure must revive through register_mcp_servers()."""
+def test_initial_connect_failure_recovers_after_cooldown_clear(
+    monkeypatch, tmp_path
+):
+    """A failed connect must recover once its cooldown is cleared.
+
+    #50394 contract: the failed server is not parked in ``_servers``; the
+    backoff cooldown suppresses re-spawn until it expires (or is cleared).
+    After that, a subsequent ``register_mcp_servers`` connects and registers
+    tools normally.
+    """
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
     from tools import mcp_tool
@@ -132,7 +132,6 @@ def test_initial_connect_failure_revives_same_registered_server(monkeypatch, tmp
             created.append(self)
 
         async def _run_stdio(self, config):
-            assert mcp_tool._connect_server_claim.get() is None
             state["transport_calls"] += 1
             if not backend_up.is_set():
                 raise ConnectionError("backend still booting")
@@ -166,25 +165,32 @@ def test_initial_connect_failure_revives_same_registered_server(monkeypatch, tmp
     try:
         assert mcp_tool.register_mcp_servers(config) == []
         assert len(created) == 1
-        server = created[0]
         with mcp_tool._lock:
-            assert mcp_tool._servers["recovering"] is server
+            assert "recovering" not in mcp_tool._servers
             assert "backend still booting" in (
                 mcp_tool._server_connect_errors["recovering"]
             )
-        assert not server._task.done()
 
+        # A second attempt while the cooldown is armed must NOT spawn a new
+        # server task (#50394 restart storm).
+        assert mcp_tool.register_mcp_servers(config) == []
+        assert len(created) == 1, "cooldown must suppress re-spawn"
+
+        # Cooldown cleared and the parked task drained => a fresh register
+        # connects successfully and registers tools.
         backend_up.set()
-        mcp_tool.register_mcp_servers(config)
-
-        assert revived.wait(timeout=5), "cached parked server did not revive"
-        assert len(created) == 1, "revival created a duplicate server task"
         with mcp_tool._lock:
-            assert mcp_tool._servers["recovering"] is server
+            mcp_tool._server_connect_retry_after.pop("recovering", None)
+            mcp_tool._server_connect_failures.pop("recovering", None)
+        mcp_tool.shutdown_mcp_servers()
+
+        assert mcp_tool.register_mcp_servers(config) != []
+        assert revived.wait(timeout=5), "revival never connected"
+        assert len(created) == 2
+        with mcp_tool._lock:
+            assert "recovering" in mcp_tool._servers
             assert "recovering" not in mcp_tool._server_connect_errors
         assert state["transport_calls"] == 2
-        assert server.session is not None
-        assert server._error is None
 
         entry = mock_registry.get_entry("mcp__recovering__ping")
         assert entry is not None
@@ -265,9 +271,13 @@ def test_standalone_failed_connect_is_reaped_without_global_owner(monkeypatch, t
             )
 
         assert len(created) == 1
-        assert created[0]._task.done()
+        # Probe-only connects park their task too, but MUST NOT publish the
+        # server in `_servers` or the connect-error maps.
+        assert created[0]._task is not None
         with mcp_tool._lock:
             assert "probe-only" not in mcp_tool._servers
             assert "probe-only" not in mcp_tool._server_connect_errors
+        mcp_tool.shutdown_mcp_servers()
+        assert created[0]._task.done()
     finally:
         _cleanup_mcp_state(mcp_tool, created)
