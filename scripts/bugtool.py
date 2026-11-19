@@ -1315,7 +1315,7 @@ def escalate(path: Path, text: str) -> None:
     summaries = re.findall(r"^### Failure Report \(task (t_[A-Za-z0-9]+)\)\n\n(.+?)(?=^### |\Z)", text, flags=re.MULTILINE | re.DOTALL)
     details = "; ".join(f"{task}: {summary.strip().splitlines()[0]}" for task, summary in summaries)
     message = f"Bug auto-dispatch stopped after 4 failures: {path}. {details}"
-    result = subprocess.run([HERMES, "send", "-u", "evan", message], text=True, capture_output=True, check=False)
+    result = subprocess.run([HERMES, "send", "-u", "evan", message], text=True, capture_output=True, check=False, encoding="utf-8", errors="replace")
     if result.returncode:
         print(f"escalation command failed: {(result.stderr or result.stdout).strip()}", file=sys.stderr)
     else:
@@ -1786,7 +1786,7 @@ def _verify_git_sha() -> str:
 
 def _measure_mb(path: Path) -> int:
     try:
-        out = subprocess.run(["du", "-sm", str(path)], capture_output=True, text=True, check=False).stdout
+        out = subprocess.run(["du", "-sm", str(path)], capture_output=True, text=True, check=False, encoding="utf-8", errors="replace").stdout
         return int(out.split()[0])
     except (OSError, ValueError, IndexError):
         return 0

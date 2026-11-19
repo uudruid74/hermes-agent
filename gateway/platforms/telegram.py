@@ -4290,7 +4290,7 @@ class TelegramAdapter(BasePlatformAdapter):
             home = get_hermes_home()
             response_path = home / ".update_response"
             tmp = response_path.with_suffix(".tmp")
-            tmp.write_text(answer)
+            tmp.write_text(answer, encoding="utf-8")
             tmp.replace(response_path)
             logger.info("Telegram update prompt answered '%s' by user %s",
                         answer, getattr(query.from_user, "id", "unknown"))
@@ -6570,9 +6570,9 @@ class TelegramAdapter(BasePlatformAdapter):
             if not config_path.exists():
                 return
 
-            import yaml as _yaml
-            with open(config_path, "r", encoding="utf-8") as f:
-                config = _yaml.safe_load(f) or {}
+            from hermes_cli.config import read_user_config_raw
+
+            config = read_user_config_raw(config_path)
 
             dm_topics = (
                 config.get("platforms", {})

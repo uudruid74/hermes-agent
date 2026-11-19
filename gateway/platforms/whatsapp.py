@@ -98,7 +98,7 @@ def _kill_stale_bridge_by_pidfile(session_path: Path) -> None:
     if not pid_file.exists():
         return
     try:
-        pid = int(pid_file.read_text().strip())
+        pid = int(pid_file.read_text(encoding="utf-8").strip())
     except (ValueError, OSError, TypeError):
         try:
             pid_file.unlink()
@@ -123,7 +123,7 @@ def _kill_stale_bridge_by_pidfile(session_path: Path) -> None:
 def _write_bridge_pidfile(session_path: Path, pid: int) -> None:
     """Write the bridge PID to a file for later cleanup."""
     try:
-        (session_path / "bridge.pid").write_text(str(pid))
+        (session_path / "bridge.pid").write_text(str(pid), encoding="utf-8")
     except OSError:
         pass
 
@@ -212,10 +212,12 @@ def check_whatsapp_requirements() -> bool:
     
     WhatsApp requires a Node.js bridge for most implementations.
     """
-    # Check for Node.js.  Resolve via shutil.which so we respect PATHEXT
-    # (node.exe vs node) and get a meaningful "not installed" signal
-    # instead of spawning a cmd flash on Windows.
-    _node = shutil.which("node")
+    # Check for Node.js.  Resolve via the managed-tree-aware resolver so a
+    # Hermes-managed $HERMES_HOME/node install is preferred over a system
+    # copy (and PATHEXT is honoured on Windows).
+    from hermes_constants import find_node_executable
+
+    _node = find_node_executable("node")
     if not _node:
         return False
     try:
@@ -399,15 +401,17 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             _deps_fresh = False
             if (bridge_dir / "node_modules").exists():
                 try:
-                    _deps_fresh = (_dep_stamp.read_text().strip() == _pkg_hash) and bool(_pkg_hash)
+                    _deps_fresh = (_dep_stamp.read_text(encoding="utf-8").strip() == _pkg_hash) and bool(_pkg_hash)
                 except OSError:
                     _deps_fresh = False
             if not _deps_fresh:
                 print(f"[{self.name}] Installing WhatsApp bridge dependencies...")
                 # Resolve npm path so Windows can execute the .cmd shim.
-                # shutil.which honours PATHEXT; on POSIX it returns the
-                # plain executable path.
-                _npm_bin = shutil.which("npm") or "npm"
+                # find_node_executable honours the managed $HERMES_HOME/node
+                # tree first, then PATHEXT on Windows.
+                from hermes_constants import find_node_executable
+
+                _npm_bin = find_node_executable("npm") or "npm"
                 try:
                     # Read timeout from environment variable, default to 300 seconds (5 minutes)
                     # to accommodate slower systems like Unraid NAS
@@ -425,7 +429,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     print(f"[{self.name}] Dependencies installed")
                     if _pkg_hash:
                         try:
-                            _dep_stamp.write_text(_pkg_hash)
+                            _dep_stamp.write_text(_pkg_hash, encoding="utf-8")
                         except OSError:
                             pass  # Stamp is an optimization; install still succeeded
                 except Exception as e:
@@ -523,7 +527,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 ],
                 stdout=bridge_log_fh,
                 stderr=bridge_log_fh,
-                preexec_fn=None if _IS_WINDOWS else os.setsid,
+                start_new_session=True,
                 env=bridge_env,
             )
             _write_bridge_pidfile(self._session_path, self._bridge_process.pid)

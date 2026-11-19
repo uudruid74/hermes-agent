@@ -6,6 +6,12 @@
 
 ![Gopher coming up with the satellite dish](gopher-idea-satellite-dish.jpg)
 
+## Installing
+
+- **Windows:** run `scripts/install.ps1` (PowerShell) to install the agent
+  and its managed Node/uv toolchains.
+- **Linux/macOS:** run `scripts/install.sh` or see the docs for your platform.
+
 This fork of [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) started as a handful of cosmetic patches — colored response headers, agent icons in the TUI. That was July 10th, 2026.
 
 By July 13th it was something else entirely.

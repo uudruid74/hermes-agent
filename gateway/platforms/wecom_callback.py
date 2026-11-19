@@ -26,7 +26,12 @@ try:
 
     DEFUSEDXML_AVAILABLE = True
 except ImportError:
-    ET = None  # type: ignore[assignment]
+    # defusedxml is optional (the [wecom] extra); fall back to the stdlib
+    # parser so the adapter stays functional without it. The defusedxml
+    # guard is the security baseline — this fallback is for minimal
+    # installs only.
+    from xml.etree import ElementTree as ET  # noqa: N813
+
     DEFUSEDXML_AVAILABLE = False
 
 try:
