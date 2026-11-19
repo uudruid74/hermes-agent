@@ -1225,7 +1225,13 @@ class HindsightMemoryProvider(MemoryProvider):
         means "no longer pending" and is treated as done. Transient errors
         return False so the caller keeps waiting until its deadline.
         """
-        from hindsight_client_api.exceptions import NotFoundException
+        try:
+            from hindsight_client_api.exceptions import NotFoundException
+        except ImportError:
+            # Optional client package not installed (lazy installs disabled):
+            # 404s cannot be classified, so every status check is treated as
+            # transient — callers keep waiting only until their own deadline.
+            NotFoundException = None
 
         try:
             resp = self._run_hindsight_operation(
@@ -1233,9 +1239,9 @@ class HindsightMemoryProvider(MemoryProvider):
                     bank_id=bank_id, operation_id=op_id
                 )
             )
-        except NotFoundException:
-            return True
         except Exception as exc:
+            if NotFoundException is not None and isinstance(exc, NotFoundException):
+                return True
             logger.debug("Prefetch: operation status check failed for %s: %s", op_id, exc)
             return False
         status = str(getattr(resp, "status", "") or "").lower()
