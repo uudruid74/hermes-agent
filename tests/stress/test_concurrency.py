@@ -22,6 +22,7 @@ import os
 import random
 import sqlite3
 import sys
+import shutil
 import tempfile
 import time
 from pathlib import Path
@@ -42,6 +43,11 @@ def worker_loop(worker_id: int, hermes_home: str, result_file: str) -> None:
     """
     os.environ["HERMES_HOME"] = hermes_home
     os.environ["HOME"] = hermes_home
+    # Isolate the board: HERMES_HOME alone does NOT move the kanban DB (it
+    # resolves to the shared <root>/kanban/kanban.db). Without this pin the
+    # suite's 100 cards leaked into the REAL board (106 phantoms purged
+    # 2026-11-18). HERMES_KANBAN_DB is the sanctioned single-DB path override.
+    os.environ["HERMES_KANBAN_DB"] = str(Path(hermes_home) / "kanban.db")
     sys.path.insert(0, WT)
 
     from hermes_cli import kanban_db as kb
@@ -123,6 +129,8 @@ def main():
     # Seed.
     os.environ["HERMES_HOME"] = home
     os.environ["HOME"] = home
+    # Pin the board to the temp DB (see worker_loop) — never the shared board.
+    os.environ["HERMES_KANBAN_DB"] = str(Path(home) / "kanban.db")
     sys.path.insert(0, WT)
     from hermes_cli import kanban_db as kb
 
@@ -291,10 +299,14 @@ def main():
             print(f"  {f}")
         if len(failures) > 20:
             print(f"  ... and {len(failures) - 20} more")
+        shutil.rmtree(home, ignore_errors=True)
         sys.exit(1)
     else:
         print()
         print("✔ ALL INVARIANTS HELD")
+        # Teardown: the temp DB lives under the temp home — remove it so a
+        # killed/interrupted run can never leave cards anywhere.
+        shutil.rmtree(home, ignore_errors=True)
 
 
 if __name__ == "__main__":
