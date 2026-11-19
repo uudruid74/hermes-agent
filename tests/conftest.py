@@ -266,6 +266,11 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "HERMES_KANBAN_RUN_ID",
     "HERMES_KANBAN_CLAIM_LOCK",
     "HERMES_KANBAN_DISPATCH_IN_GATEWAY",
+    # Same law for the fleet-wide projects store: a pin leaked from a shell
+    # or worker would let a test read/write a foreign projects.db instead of
+    # its per-test HERMES_HOME (the board_topic map is fleet-shared, so a
+    # leaked pin silently changes routing decisions under test).
+    "HERMES_PROJECTS_DB",
     # Pytest is routinely launched from a delegated worker.  The worker
     # lineage marker must not make parent-state tests run as delegated
     # children; tests that exercise child behavior set it explicitly.
