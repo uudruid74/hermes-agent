@@ -1448,6 +1448,17 @@ def run_conversation(
     codex_ack_continuations = 0
     length_continue_retries = 0
     truncated_tool_call_retries = 0
+    # Consecutive transport-drop (partial-stream-stub) streak within this
+    # turn — drives failover to the fallback chain and fresh-completion
+    # retries instead of burning continuation nudges against a provider
+    # that keeps closing the stream mid-generation (t_b088eea2).
+    _stream_drop_retries = 0
+    # Snapshot of the conversation taken BEFORE a transport-drop truncation
+    # episode appended its first interim partial / continuation nudge.
+    # Restored (instead of trimming to the last assistant) when the episode
+    # escalates to the fallback chain or to fresh-completion retries, so
+    # the replacement request is genuinely fresh.
+    _trunc_snapshot = None
     truncated_response_parts: List[str] = []
     compression_attempts = 0
     # One resolved compression attempt cap, shared by every site that consumes
@@ -3195,6 +3206,8 @@ def run_conversation(
                                     messages = agent._get_messages_up_to_last_assistant(messages)
                                 agent._session_messages = messages
                                 length_continue_retries = 0
+                                _stream_drop_retries = 0
+                                _trunc_snapshot = None
                                 truncated_response_parts = []
                                 retry_count = 0
                                 compression_attempts = 0
@@ -3211,6 +3224,27 @@ def run_conversation(
                             )
                         if assistant_message is not None and not _trunc_has_tool_calls:
                             length_continue_retries += 1
+                            _is_partial_stream_stub = (
+                                getattr(response, "id", "") == PARTIAL_STREAM_STUB_ID
+                            )
+                            _dropped_tools = getattr(
+                                response, "_dropped_tool_names", None
+                            )
+                            if _is_partial_stream_stub:
+                                _stream_drop_retries += 1
+                                if _trunc_snapshot is None:
+                                    # Snapshot before this truncation episode
+                                    # appends interim partials / continuation
+                                    # nudges — restored on escalation so the
+                                    # replacement request is truly fresh.
+                                    _trunc_snapshot = list(messages)
+                            else:
+                                # A real finish_reason="length" means the
+                                # provider COMPLETED (output cap) — the drop
+                                # streak is broken, and the old episode's
+                                # snapshot is stale.
+                                _stream_drop_retries = 0
+                                _trunc_snapshot = None
                             # An EMPTY partial-stream stub (stream dropped
                             # mid tool-call before any text was delivered)
                             # must not be appended as an interim assistant
@@ -3224,7 +3258,7 @@ def run_conversation(
                             # partial text to continue from anyway, so only
                             # the continuation user-message is appended.
                             _is_empty_partial_stub = (
-                                getattr(response, "id", "") == PARTIAL_STREAM_STUB_ID
+                                _is_partial_stream_stub
                                 and not getattr(assistant_message, "content", None)
                             )
                             if not _is_empty_partial_stub:
@@ -3249,14 +3283,57 @@ def run_conversation(
                                 if assistant_message.content:
                                     truncated_response_parts.append(assistant_message.content)
 
-                            if length_continue_retries < 4:
-                                _is_partial_stream_stub = (
-                                    getattr(response, "id", "") == PARTIAL_STREAM_STUB_ID
+                            # Transport-drop escalation: a partial-stream stub
+                            # means the provider closed the stream mid-generation
+                            # WITHOUT a finish_reason (cheaperinference,
+                            # NVIDIA Nemotron Ultra class).  Continuation nudges
+                            # against a provider that keeps dropping just re-hit
+                            # the death and burn paid attempts; on a REPEATED
+                            # drop hand the turn to the configured fallback for
+                            # a fresh completion — mirrors the content-filter
+                            # stall escalation (#32421).
+                            if (
+                                _is_partial_stream_stub
+                                and _stream_drop_retries >= 2
+                                and agent._fallback_index < len(agent._fallback_chain)
+                            ):
+                                agent._vprint(
+                                    f"{agent.log_prefix}🛡️  Stream dropped again "
+                                    f"— activating fallback provider...",
+                                    force=True,
                                 )
-                                _dropped_tools = getattr(
-                                    response, "_dropped_tool_names", None
+                                agent._emit_status(
+                                    "Stream dropped again; switching to fallback..."
+                                )
+                                if agent._try_activate_fallback():
+                                    # Restore the pre-episode snapshot so the
+                                    # fallback provider gets a coherent
+                                    # FRESH-completion point (trimming to the
+                                    # last assistant would leave earlier
+                                    # partial/continuation rows in place).
+                                    if _trunc_snapshot is not None:
+                                        messages = _trunc_snapshot[:]
+                                    elif truncated_response_parts:
+                                        messages = agent._get_messages_up_to_last_assistant(messages)
+                                    agent._session_messages = messages
+                                    length_continue_retries = 0
+                                    _stream_drop_retries = 0
+                                    _trunc_snapshot = None
+                                    truncated_response_parts = []
+                                    retry_count = 0
+                                    compression_attempts = 0
+                                    _retry.primary_recovery_attempted = False
+                                    _retry.restart_with_rebuilt_messages = True
+                                    break
+                                # No fallback left — fall through to bounded
+                                # fresh-completion retries below.
+                                agent._vprint(
+                                    f"{agent.log_prefix}⚠️  No fallback provider "
+                                    f"configured — retrying with same provider...",
+                                    force=True,
                                 )
 
+                            if length_continue_retries < 4:
                                 if _is_partial_stream_stub and _dropped_tools:
                                     _tool_list = ", ".join(_dropped_tools[:3])
                                     agent._vprint(
@@ -3277,6 +3354,26 @@ def run_conversation(
                                         f"({length_continue_retries}/4)..."
                                     )
 
+                                # Repeated drops: ask for a FRESH completion
+                                # instead of continuing the dead stream — the
+                                # model already failed to deliver once after a
+                                # continuation nudge; re-running the original
+                                # request from the last clean boundary is more
+                                # likely to land than another "continue where
+                                # you left off". Bounded by
+                                # length_continue_retries.
+                                if _stream_drop_retries >= 2:
+                                    if _trunc_snapshot is not None:
+                                        messages = _trunc_snapshot[:]
+                                        _trunc_snapshot = None
+                                        truncated_response_parts = []
+                                    elif truncated_response_parts:
+                                        messages = agent._get_messages_up_to_last_assistant(messages)
+                                        truncated_response_parts = []
+                                    agent._session_messages = messages
+                                    _retry.restart_with_rebuilt_messages = True
+                                    break
+
                                 _continue_content = _get_continuation_prompt(
                                     _is_partial_stream_stub, _dropped_tools
                                 )
@@ -3289,6 +3386,12 @@ def run_conversation(
                                 _retry.restart_with_length_continuation = True
                                 break
 
+                            _giveup_error = (
+                                f"Provider dropped the stream mid-generation after "
+                                f"{length_continue_retries} retries (transport)"
+                                if _stream_drop_retries >= 1
+                                else "Response remained truncated after 4 continuation attempts"
+                            )
                             partial_response = agent._strip_think_blocks("".join(truncated_response_parts)).strip()
                             agent._cleanup_task_resources(effective_task_id)
                             agent._persist_session(messages, conversation_history)
@@ -3298,7 +3401,7 @@ def run_conversation(
                                 "api_calls": api_call_count,
                                 "completed": False,
                                 "partial": True,
-                                "error": "Response remained truncated after 4 continuation attempts",
+                                "error": _giveup_error,
                             }
 
                     if agent.api_mode in {"chat_completions", "bedrock_converse", "anthropic_messages"}:
@@ -3307,6 +3410,46 @@ def run_conversation(
                             _is_stub_stall = (
                                 getattr(response, "id", "") == PARTIAL_STREAM_STUB_ID
                             )
+                            if _is_stub_stall:
+                                _stream_drop_retries += 1
+                                if _trunc_snapshot is None:
+                                    _trunc_snapshot = list(messages)
+                            else:
+                                # Genuine output-cap truncation — the provider
+                                # completed, so the drop streak is broken.
+                                _stream_drop_retries = 0
+                                _trunc_snapshot = None
+                            # Transport-drop failover: a repeated mid-tool-call
+                            # drop means the endpoint keeps dying — hand the
+                            # turn to the fallback chain instead of boosting
+                            # max_tokens against the same flaky provider.
+                            if (
+                                _is_stub_stall
+                                and _stream_drop_retries >= 2
+                                and agent._fallback_index < len(agent._fallback_chain)
+                            ):
+                                agent._buffer_vprint(
+                                    f"🛡️  Stream dropped again mid tool-call — "
+                                    f"activating fallback provider..."
+                                )
+                                agent._emit_status(
+                                    "Stream dropped again mid tool-call; switching to fallback..."
+                                )
+                                if agent._try_activate_fallback():
+                                    if _trunc_snapshot is not None:
+                                        messages = _trunc_snapshot[:]
+                                    elif truncated_response_parts:
+                                        messages = agent._get_messages_up_to_last_assistant(messages)
+                                    agent._session_messages = messages
+                                    truncated_tool_call_retries = 0
+                                    _stream_drop_retries = 0
+                                    _trunc_snapshot = None
+                                    truncated_response_parts = []
+                                    retry_count = 0
+                                    compression_attempts = 0
+                                    _retry.primary_recovery_attempted = False
+                                    _retry.restart_with_rebuilt_messages = True
+                                    break
                             if truncated_tool_call_retries < 4:
                                 truncated_tool_call_retries += 1
                                 if _is_stub_stall:
@@ -6643,6 +6786,8 @@ def run_conversation(
                 # execution so a single truncation doesn't poison the
                 # entire conversation.
                 truncated_tool_call_retries = 0
+                _stream_drop_retries = 0
+                _trunc_snapshot = None
 
                 # Signal that a paragraph break is needed before the next
                 # streamed text.  We don't emit it immediately because

@@ -683,3 +683,193 @@ class TestSendTimePadMultimodalSafety:
         assert out[2]["content"] == ""
         # input list untouched (repair is copy-on-write)
         assert api_messages[1]["content"] == ""
+
+
+class TestRepeatedStreamDropTransportEscalation:
+    """Transport hardening (t_b088eea2): when a provider keeps dropping the
+    SSE stream mid-generation without finish_reason (cheaperinference
+    class), the loop must stop burning continuation nudges against the dead
+    stream.  On a REPEATED drop it must (1) fail over to the configured
+    fallback for a fresh completion, or (2) with no fallback, retry with a
+    fresh completion and surface the real transport error instead of the
+    generic truncation message.
+    """
+
+    def _text_stub(self, content="partial text"):
+        from tests.run_agent.test_run_agent import _mock_assistant_msg
+
+        return SimpleNamespace(
+            id=PARTIAL_STREAM_STUB_ID,
+            model="test/model",
+            choices=[SimpleNamespace(
+                index=0,
+                message=_mock_assistant_msg(content=content),
+                finish_reason=FINISH_REASON_LENGTH,
+            )],
+            usage=None,
+            _dropped_tool_names=None,
+        )
+
+    def _continuation_nudges(self, create_mock):
+        n = 0
+        for call in create_mock.call_args_list:
+            msgs = call.kwargs.get("messages") or call.args[0].get("messages")
+            n += sum(
+                1 for m in msgs
+                if m.get("role") == "user"
+                and "[System:" in str(m.get("content"))
+            )
+        return n
+
+    def test_repeated_text_drop_activates_fallback_fresh_completion(self, loop_agent):
+        from tests.run_agent.test_run_agent import _mock_response
+
+        loop_agent.client.chat.completions.create.side_effect = [
+            self._text_stub(content="first half of "),
+            self._text_stub(content="second attempt at "),
+            _mock_response(content="done on fallback", finish_reason="stop"),
+        ]
+        loop_agent._fallback_chain = [
+            {"provider": "openrouter", "model": "anthropic/claude-sonnet-4.7"},
+        ]
+        loop_agent._fallback_index = 0
+        fb_calls = {"n": 0}
+
+        def _fake_activate(reason=None):
+            fb_calls["n"] += 1
+            loop_agent._fallback_index = len(loop_agent._fallback_chain)
+            return True
+
+        with (
+            patch.object(loop_agent, "_persist_session"),
+            patch.object(loop_agent, "_save_trajectory"),
+            patch.object(loop_agent, "_cleanup_task_resources"),
+            patch.object(loop_agent, "_create_request_openai_client",
+                         return_value=loop_agent.client),
+            patch.object(loop_agent, "_try_activate_fallback",
+                         side_effect=_fake_activate),
+        ):
+            result = loop_agent.run_conversation("say hello")
+
+        assert fb_calls["n"] == 1, (
+            "Repeated stream drops must activate fallback exactly once."
+        )
+        assert loop_agent.client.chat.completions.create.call_count == 3
+        assert result["completed"] is True
+        assert result["final_response"] == "done on fallback"
+        # One continuation nudge was appended after the FIRST stub; the
+        # fallback call itself must be a FRESH completion with no nudge
+        # from the dead stream.
+        assert self._continuation_nudges(
+            loop_agent.client.chat.completions.create
+        ) == 1
+        last_kwargs = loop_agent.client.chat.completions.create.call_args_list[-1]
+        last_msgs = last_kwargs.kwargs.get("messages") or last_kwargs.args[0].get("messages")
+        assert not any(
+            m.get("role") == "user" and "[System:" in str(m.get("content"))
+            for m in last_msgs
+        ), "Fallback call must not carry continuation nudges from the dead stream"
+
+    def test_repeated_text_drop_no_fallback_surfaces_transport_error(self, loop_agent):
+        # Stub keeps dropping; NO fallback chain configured.
+        loop_agent.client.chat.completions.create.side_effect = [
+            self._text_stub(content="first half of "),
+            self._text_stub(content="second attempt at "),
+            self._text_stub(content="third attempt at "),
+            self._text_stub(content="fourth attempt at "),
+        ]
+
+        with (
+            patch.object(loop_agent, "_persist_session"),
+            patch.object(loop_agent, "_save_trajectory"),
+            patch.object(loop_agent, "_cleanup_task_resources"),
+        ):
+            result = loop_agent.run_conversation("say hello")
+
+        assert result["completed"] is False
+        assert "Provider dropped the stream mid-generation" in result["error"], (
+            f"Transport drop must surface the real error, got: {result['error']}"
+        )
+        # Exactly ONE continuation nudge was ever appended (after the first
+        # stub); every later pass was a fresh completion.
+        assert self._continuation_nudges(
+            loop_agent.client.chat.completions.create
+        ) == 1, "Only the first stub may trigger a continuation nudge"
+
+    def test_repeated_text_drop_streak_resets_on_genuine_truncation(self, loop_agent):
+        """A real finish_reason=length (provider completed) breaks the drop
+        streak — a later stub goes back to the normal continuation path."""
+        from tests.run_agent.test_run_agent import _mock_response
+
+        genuine_length = _mock_response(content="more text", finish_reason="length")
+        loop_agent.client.chat.completions.create.side_effect = [
+            self._text_stub(content="first half of "),
+            genuine_length,
+            self._text_stub(content="third attempt at "),
+            _mock_response(content="done", finish_reason="stop"),
+        ]
+
+        with (
+            patch.object(loop_agent, "_persist_session"),
+            patch.object(loop_agent, "_save_trajectory"),
+            patch.object(loop_agent, "_cleanup_task_resources"),
+        ):
+            result = loop_agent.run_conversation("say hello")
+
+        assert result["completed"] is True
+        # stub → continuation, genuine length → continuation, stub →
+        # continuation (streak reset by the genuine truncation), then done —
+        # i.e. NO fresh-completion retry was forced, because the genuine
+        # finish_reason=length broke the drop streak.
+        assert loop_agent.client.chat.completions.create.call_count == 4
+        last_kwargs = loop_agent.client.chat.completions.create.call_args_list[-1]
+        last_msgs = last_kwargs.kwargs.get("messages") or last_kwargs.args[0].get("messages")
+        assert any(
+            m.get("role") == "user" and "[System:" in str(m.get("content"))
+            for m in last_msgs
+        ), "The post-truncation stub must continue with a nudge (streak reset)"
+
+    def test_repeated_tool_drop_activates_fallback(self, loop_agent):
+        from tests.run_agent.test_run_agent import _mock_response, _mock_tool_call
+
+        bad_tc = _mock_tool_call(
+            name="write_file",
+            arguments='{"path":"report.md","content":"partial',
+            call_id="c1",
+        )
+        stall1 = _mock_response(content="", finish_reason="length", tool_calls=[bad_tc])
+        stall1.id = PARTIAL_STREAM_STUB_ID
+        stall2 = _mock_response(content="", finish_reason="length", tool_calls=[bad_tc])
+        stall2.id = PARTIAL_STREAM_STUB_ID
+
+        loop_agent.client.chat.completions.create.side_effect = [
+            stall1, stall2,
+            _mock_response(content="done on fallback", finish_reason="stop"),
+        ]
+        loop_agent._fallback_chain = [
+            {"provider": "openrouter", "model": "anthropic/claude-sonnet-4.7"},
+        ]
+        loop_agent._fallback_index = 0
+        fb_calls = {"n": 0}
+
+        def _fake_activate(reason=None):
+            fb_calls["n"] += 1
+            loop_agent._fallback_index = len(loop_agent._fallback_chain)
+            return True
+
+        with (
+            patch.object(loop_agent, "_persist_session"),
+            patch.object(loop_agent, "_save_trajectory"),
+            patch.object(loop_agent, "_cleanup_task_resources"),
+            patch.object(loop_agent, "_create_request_openai_client",
+                         return_value=loop_agent.client),
+            patch.object(loop_agent, "_try_activate_fallback",
+                         side_effect=_fake_activate),
+        ):
+            result = loop_agent.run_conversation("write the report")
+
+        assert fb_calls["n"] == 1, (
+            "Repeated mid-tool-call drops must activate fallback exactly once."
+        )
+        assert result["completed"] is True
+        assert result["final_response"] == "done on fallback"
