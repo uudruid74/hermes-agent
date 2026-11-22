@@ -19,10 +19,162 @@ agent-to-agent traffic.
 import json
 import logging
 import os
+import time
+from pathlib import Path
 from typing import Callable
 
 
 logger = logging.getLogger(__name__)
+
+# Bounded durable retry for dropped wakes (t_ca783b1c): a transient delivery
+# failure (bridge down / restarting / queue full) is retried up to
+# TELL_MAX_ATTEMPTS times with backoff while the sender session lives. On final
+# failure the message is written to a persistent undelivered record so it
+# cannot silently vanish.
+TELL_MAX_ATTEMPTS = 3
+TELL_BACKOFF_SECONDS = (1.0, 2.0)
+
+# Failure markers that mean "transient delivery problem — retry may help" as
+# opposed to permanent configuration/usage errors (unknown profile, no home
+# channel, failed to launch hermes, ...) which are surfaced immediately.
+_TRANSIENT_DELIVERY_MARKERS = (
+    "gateway may not be running",   # bridge socket not found / refused / timeout
+    "Bridge returned empty response",
+    "Bridge send failed",
+    "Bridge inject failed",
+    "wake dropped",
+)
+
+
+def _is_retryable_failure(detail: dict) -> bool:
+    """True when the failure is a transient wake transport/intake problem.
+
+    ``status: dropped`` from the bridge envelope is the canonical drop class
+    (the gateway accepted the inject but started no processing task); the
+    marker strings cover the bridge-unreachable family. Everything else —
+    unknown profile, usage errors, unverifiable output — is permanent and is
+    reported without retrying.
+    """
+    if isinstance(detail, dict) and detail.get("status") == "dropped":
+        return True
+    text = ""
+    if isinstance(detail, dict) and detail.get("error"):
+        text = str(detail["error"])
+    return any(marker in text for marker in _TRANSIENT_DELIVERY_MARKERS)
+
+
+def _undelivered_log_path() -> Path:
+    """Path of the durable undelivered-wakes record (JSONL outbox).
+
+    ``HERMES_UNDELIVERED_LOG`` overrides the location (tests / ops); the
+    default lives with the other shared runtime state under the Hermes home.
+    The record is append-only: a message that exhausts its retries must never
+    silently vanish.
+    """
+    override = os.environ.get("HERMES_UNDELIVERED_LOG", "").strip()
+    if override:
+        return Path(override)
+    from hermes_cli.config import get_hermes_home
+
+    return get_hermes_home() / "undelivered_wakes.jsonl"
+
+
+def _record_undelivered(
+    *,
+    agent: str,
+    target: str,
+    message: str,
+    session_id: str,
+    attempts: int,
+    last_error: str,
+) -> str:
+    """Append one durable undelivered-wake record; return its file path."""
+    import datetime
+
+    record = {
+        "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "sender": (os.environ.get("USERNAME") or "agent").strip(),
+        "target": agent,
+        "resolved_target": target,
+        "session_id": session_id or None,
+        "attempts": attempts,
+        "last_error": last_error,
+        "message": message,
+    }
+    path = _undelivered_log_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record) + "\n")
+    except OSError as exc:
+        # The record is doctrine: a failed write must never masquerade as
+        # delivery. Log it and surface the failure in the error payload.
+        logger.error("failed to write undelivered wake record %s: %s", path, exc)
+        return f"<failed to write undelivered record: {exc}>"
+    return str(path)
+
+
+def _send_once(agent: str, target: str, wrapped: str, *, env=None) -> dict:
+    """Run one verified ``hermes send -t`` and report its real outcome.
+
+    Returns the same outcome shapes as the pre-retry logic: a success envelope
+    for confirmed delivery, or an ``{"error": ...}`` dict. Raises
+    ``subprocess.TimeoutExpired`` / ``OSError`` for launch-level failures,
+    which the caller treats as final (no retry).
+    """
+    import subprocess
+
+    run = subprocess.run(
+        ["hermes", "send", "-t", target, "--json", wrapped],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env,
+    )
+
+    out = (run.stdout or "").strip()
+    detail = {}
+    # --json makes the CLI emit the machine envelope (indent=2 => multi-line);
+    # parse the WHOLE payload, not the last line (the old last-line parse could
+    # never succeed against multi-line JSON — every successful tell reported
+    # UNVERIFIABLE until 2026-11-19).
+    try:
+        detail = json.loads(out) if out else {}
+    except json.JSONDecodeError:
+        detail = {}
+
+    if run.returncode != 0:
+        payload = {
+            "error": (
+                f"tell to {agent} FAILED (exit {run.returncode}): "
+                f"{(run.stderr or out or 'no output')[-300:]}"
+            )
+        }
+        # Carry the bridge's intake status through so the retry classifier can
+        # see a dropped wake (DROPPED IS NEVER SUCCESS) even when the CLI
+        # already exited 1 for it.
+        if isinstance(detail, dict) and detail.get("status"):
+            payload["status"] = detail["status"]
+        return payload
+    if isinstance(detail, dict) and detail.get("error"):
+        return {"error": f"tell to {agent} NOT delivered: {detail['error']}"}
+    if isinstance(detail, dict) and detail.get("success"):
+        status = detail.get("status") or (
+            "suppressed" if detail.get("suppressed") else "delivered"
+        )
+        note = detail.get("note", f"wake {status} for {agent}")
+        return {
+            "dispatched": True,
+            "delivered": True,
+            "status": status,
+            "note": note,
+        }
+    return {
+        "error": (
+            f"tell to {agent} returned an UNVERIFIABLE result (exit 0, "
+            f"unrecognized output: {out[-200:]}) — treat as FAILED"
+        )
+    }
 
 
 def tell_tool(
@@ -82,68 +234,69 @@ def tell_tool(
             target = agent
     # VERIFIED delivery (Evan 2026-11-18: "fallbacks are evil" / "dropped is
     # never success"): `hermes send -t` does both halves — the from-user wake
-    # into the target and the visible `-u` copy. The old fire-and-forget
-    # spawn_discarded its stdout, so `{"error": ...}` from the send was
-    # invisible and the tool still said "notified" (the 00:43/01:09 silent
-    # wake-loss class). Now we WAIT for the real outcome and report it.
+    # into the target and the visible `-u` copy. We WAIT for the real outcome
+    # and report it. Durable redelivery (t_ca783b1c): transient delivery
+    # failures (bridge down/restarting, queue full) are retried with bounded
+    # backoff while this sender session lives; only the FIRST attempt posts the
+    # visible copy (`HERMES_SEND_SKIP_COPY` tells later attempts not to
+    # duplicate it). When the retries are exhausted the message is recorded in
+    # the persistent undelivered outbox so it cannot silently vanish.
     import subprocess
 
-    try:
-        run = subprocess.run(
-            ["hermes", "send", "-t", target, "--json", wrapped],
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-    except subprocess.TimeoutExpired:
-        return json.dumps({
-            "error": (
-                f"tell to {agent} timed out after 60s — delivery UNVERIFIED, "
-                "treat as FAILED and retry or escalate"
+    unsuccessful: dict | None = None
+    attempts = 0
+    for attempt in range(TELL_MAX_ATTEMPTS):
+        env = None
+        if attempt > 0:
+            env = dict(os.environ)
+            env["HERMES_SEND_SKIP_COPY"] = "1"
+        try:
+            outcome = _send_once(agent, target, wrapped, env=env)
+        except subprocess.TimeoutExpired:
+            outcome = {
+                "error": (
+                    f"tell to {agent} timed out after 60s — delivery UNVERIFIED, "
+                    "treat as FAILED and retry or escalate"
+                )
+            }
+            unsuccessful = outcome
+            attempts = attempt + 1
+            break
+        except OSError as exc:
+            return json.dumps({
+                "error": f"failed to launch 'hermes send' for {agent}: {exc}"
+            })
+        attempts = attempt + 1
+        if "error" not in outcome:
+            return json.dumps(outcome)
+        unsuccessful = outcome
+        if not _is_retryable_failure(outcome):
+            return json.dumps(outcome)
+        if attempt < TELL_MAX_ATTEMPTS - 1:
+            logger.warning(
+                "tell to %s failed transiently (attempt %d/%d), retrying: %s",
+                agent,
+                attempt + 1,
+                TELL_MAX_ATTEMPTS,
+                outcome["error"],
             )
-        })
-    except OSError as exc:
-        return json.dumps({"error": f"failed to launch 'hermes send' for {agent}: {exc}"})
+            time.sleep(TELL_BACKOFF_SECONDS[attempt])
 
-    out = (run.stdout or "").strip()
-    detail = {}
-    # --json makes the CLI emit the machine envelope (indent=2 => multi-line);
-    # parse the WHOLE payload, not the last line (the old last-line parse could
-    # never succeed against multi-line JSON — every successful tell reported
-    # UNVERIFIABLE until 2026-11-19).
-    try:
-        detail = json.loads(out) if out else {}
-    except json.JSONDecodeError:
-        detail = {}
-
-    if run.returncode != 0:
-        return json.dumps({
-            "error": (
-                f"tell to {agent} FAILED (exit {run.returncode}): "
-                f"{(run.stderr or out or 'no output')[-300:]}"
-            )
-        })
-    if isinstance(detail, dict) and detail.get("error"):
-        return json.dumps({
-            "error": f"tell to {agent} NOT delivered: {detail['error']}"
-        })
-    if isinstance(detail, dict) and detail.get("success"):
-        status = detail.get("status") or (
-            "suppressed" if detail.get("suppressed") else "delivered"
-        )
-        note = detail.get("note", f"wake {status} for {agent}")
-        return json.dumps({
-            "dispatched": True,
-            "delivered": True,
-            "status": status,
-            "note": note,
-        })
-    return json.dumps({
-        "error": (
-            f"tell to {agent} returned an UNVERIFIABLE result (exit 0, "
-            f"unrecognized output: {out[-200:]}) — treat as FAILED"
-        )
-    })
+    # Retries exhausted: leave a durable undelivered record so the message
+    # cannot vanish. The error stays the primary outcome; the record path and
+    # attempt count ride alongside it.
+    record_path = _record_undelivered(
+        agent=agent,
+        target=target,
+        message=wrapped,
+        session_id=target_session_id,
+        attempts=attempts,
+        last_error=(unsuccessful["error"] if unsuccessful else "unknown"),
+    )
+    error_payload = dict(unsuccessful) if unsuccessful else {}
+    error_payload["undelivered_record"] = record_path
+    error_payload["attempts"] = attempts
+    return json.dumps(error_payload)
 
 
 TELL_SCHEMA = {

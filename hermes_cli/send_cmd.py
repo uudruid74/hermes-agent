@@ -635,7 +635,11 @@ def cmd_send(args: argparse.Namespace) -> None:
     # post its raw payload to the human channel — that was 29 chunked messages
     # of a journal skill embed.
     copy_error = None
-    if wake_raw:
+    # Tell-tool retries (t_ca783b1c): a transiently failed wake is re-sent by
+    # the sender; later attempts set HERMES_SEND_SKIP_COPY so the mandatory
+    # visible copy is posted once, not once per attempt.
+    skip_visible_copy = os.environ.get("HERMES_SEND_SKIP_COPY") == "1"
+    if wake_raw and not skip_visible_copy:
         try:
             copy_target = _wake_copy_target(wake_raw)
         except ValueError as exc:

@@ -579,3 +579,36 @@ def test_t_copy_payload_is_capped_to_short_notice(fake_tool, monkeypatch):
     assert "wake payload" in copy_message
 
 
+def test_t_copy_is_skipped_on_tell_retry_attempt(fake_tool, monkeypatch):
+    """t_ca783b1c: tell_tool retry attempts set HERMES_SEND_SKIP_COPY=1 so
+    the mandatory visible copy is posted once per tell, not once per attempt.
+    The wake itself still goes through as a normal `-t` inject."""
+    import hermes_cli.profiles
+
+    from hermes_cli import _subprocess_compat
+
+    monkeypatch.setattr(send_cmd, "_load_hermes_env", lambda: None)
+    monkeypatch.setattr(hermes_cli.profiles, "profile_exists", lambda name: False)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    copies = []
+    monkeypatch.setattr(
+        _subprocess_compat,
+        "spawn_detached",
+        lambda argv, **_kw: copies.append(list(argv)) or object(),
+    )
+    monkeypatch.setenv("HERMES_SEND_SKIP_COPY", "1")
+
+    args = _parse(["-t", "zephyr:telegram:123", "wake up"])
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(args)
+
+    assert exc.value.code == 0
+    assert copies == []
+    assert fake_tool.calls == [{
+        "action": "send",
+        "message": "wake up",
+        "target": "zephyr:telegram:123",
+        "internal": True,
+    }]
+
+

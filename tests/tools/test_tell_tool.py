@@ -678,15 +678,19 @@ def test_tell_maps_suppressed_status(monkeypatch):
     assert result["delivered"] is True
 
 
-def test_tell_dropped_wake_never_reports_delivered(monkeypatch):
+def test_tell_dropped_wake_never_reports_delivered(monkeypatch, tmp_path):
     """DROPPED IS NEVER SUCCESS: the CLI exits 1 on a dropped wake; tell must
-    report failure even though the payload carries success+dropped."""
+    report failure even though the payload carries success+dropped, retry
+    within its bound, and finally leave a durable undelivered record."""
     monkeypatch.setenv("USERNAME", "zephyr")
+    log = tmp_path / "undelivered_wakes.jsonl"
+    monkeypatch.setenv("HERMES_UNDELIVERED_LOG", str(log))
+    monkeypatch.setattr(tell_tool.time, "sleep", lambda _s: None)
+    calls = []
 
     def fake_run(command, **_kwargs):
-        return _run_result(
-            '{"success": true, "status": "dropped"}', returncode=1
-        )
+        calls.append(command)
+        return _run_result('{"success": true, "status": "dropped"}', returncode=1)
 
     monkeypatch.setattr("subprocess.run", fake_run)
     result = json.loads(
@@ -696,6 +700,9 @@ def test_tell_dropped_wake_never_reports_delivered(monkeypatch):
     )
     assert "error" in result
     assert "delivered" not in result
+    assert len(calls) == tell_tool.TELL_MAX_ATTEMPTS
+    assert result["attempts"] == tell_tool.TELL_MAX_ATTEMPTS
+    assert log.exists()
 
 
 def test_tell_bare_sent_human_output_is_unverifiable(monkeypatch):
@@ -715,3 +722,138 @@ def test_tell_bare_sent_human_output_is_unverifiable(monkeypatch):
     )
     assert "error" in result
     assert "UNVERIFIABLE" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# Durable redelivery of dropped wakes — t_ca783b1c
+# ---------------------------------------------------------------------------
+
+def _transient_bridge_down():
+    return _run_result(
+        '{"error": "Bridge socket not found at /tmp/hermes/mcp_bridge.gopher.sock — gateway may not be running"}',
+        returncode=1,
+    )
+
+
+def test_tell_transient_failure_recovers_on_second_attempt(monkeypatch, tmp_path):
+    """A bridge hiccup on the first attempt must not fail the tell: the
+    bounded retry re-sends (with the visible copy suppressed) and the
+    confirmed envelope wins. No undelivered record is left."""
+    monkeypatch.setenv("USERNAME", "zephyr")
+    log = tmp_path / "undelivered_wakes.jsonl"
+    monkeypatch.setenv("HERMES_UNDELIVERED_LOG", str(log))
+    monkeypatch.setattr(tell_tool.time, "sleep", lambda _s: None)
+    commands, envs = [], []
+    results = iter([_transient_bridge_down(), _spawned()])
+
+    def fake_run(command, **_kwargs):
+        commands.append(command)
+        envs.append(_kwargs.get("env"))
+        return next(results)
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    result = json.loads(
+        tell_tool.tell_tool(
+            agent="gopher", message="ping", echo_callback=lambda _e: None
+        )
+    )
+
+    assert len(commands) == 2
+    assert result["status"] == "spawned"
+    assert result["dispatched"] is True
+    # The visible copy is posted by the FIRST attempt only; retry attempts
+    # carry the skip marker so Evan does not get one copy per attempt.
+    assert envs[0] is None
+    assert envs[1] is not None
+    assert envs[1].get("HERMES_SEND_SKIP_COPY") == "1"
+    assert not log.exists()
+
+
+def test_tell_transient_failure_exhausted_records_undelivered(monkeypatch, tmp_path):
+    """When the bridge stays down for all bounded attempts, the sender leaves
+    a durable undelivered record (JSONL outbox) naming the target and the
+    full payload — the message cannot silently vanish."""
+    monkeypatch.setenv("USERNAME", "zephyr")
+    log = tmp_path / "undelivered_wakes.jsonl"
+    monkeypatch.setenv("HERMES_UNDELIVERED_LOG", str(log))
+    monkeypatch.setattr(tell_tool.time, "sleep", lambda _s: None)
+    calls = []
+
+    def fake_run(command, **_kwargs):
+        calls.append(command)
+        return _transient_bridge_down()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    result = json.loads(
+        tell_tool.tell_tool(
+            agent="gopher", message="ping", echo_callback=lambda _e: None
+        )
+    )
+
+    assert len(calls) == tell_tool.TELL_MAX_ATTEMPTS
+    assert result["attempts"] == tell_tool.TELL_MAX_ATTEMPTS
+    assert result["undelivered_record"] == str(log)
+    assert "gateway may not be running" in result["error"]
+    lines = log.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    assert record["target"] == "gopher"
+    assert record["sender"] == "zephyr"
+    assert record["attempts"] == tell_tool.TELL_MAX_ATTEMPTS
+    assert "ping" in record["message"]
+    assert "gateway may not be running" in record["last_error"]
+
+
+def test_tell_permanent_failure_is_not_retried(monkeypatch, tmp_path):
+    """Unknown-target/usage failures are permanent: one attempt, loud error,
+    no retry, no undelivered record (nothing transient to recover)."""
+    monkeypatch.setenv("USERNAME", "zephyr")
+    log = tmp_path / "undelivered_wakes.jsonl"
+    monkeypatch.setenv("HERMES_UNDELIVERED_LOG", str(log))
+    calls = []
+
+    def fake_run(command, **_kwargs):
+        calls.append(command)
+        return _run_result('{"error": "Unknown platform: gopher"}', returncode=1)
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    result = json.loads(
+        tell_tool.tell_tool(
+            agent="gopher", message="ping", echo_callback=lambda _e: None
+        )
+    )
+
+    assert len(calls) == 1
+    assert "error" in result
+    assert "undelivered_record" not in result
+    assert not log.exists()
+
+
+def test_tell_timeout_records_without_retry(monkeypatch, tmp_path):
+    """A 60s send timeout is already at the latency ceiling: report it loud
+    and record the undelivered message — do not multiply the wait by
+    retrying the same hung send."""
+    import subprocess as _sp
+
+    monkeypatch.setenv("USERNAME", "zephyr")
+    log = tmp_path / "undelivered_wakes.jsonl"
+    monkeypatch.setenv("HERMES_UNDELIVERED_LOG", str(log))
+    calls = []
+
+    def fake_run(command, **_kwargs):
+        calls.append(command)
+        raise _sp.TimeoutExpired(command, timeout=60)
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    result = json.loads(
+        tell_tool.tell_tool(
+            agent="gopher", message="ping", echo_callback=lambda _e: None
+        )
+    )
+
+    assert len(calls) == 1
+    assert result["attempts"] == 1
+    assert "timed out after 60s" in result["error"]
+    assert result["undelivered_record"] == str(log)
+    record = json.loads(log.read_text(encoding="utf-8").strip().splitlines()[0])
+    assert record["attempts"] == 1
