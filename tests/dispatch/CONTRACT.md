@@ -46,6 +46,7 @@ This suite completes the contract across every wake path and locks the
 | 9 | cron job wake (CLI-wake primary, in-process injection) | ✅ Zephyr t_1afbfd87 (test_cron_wake_outcome.py + test_cron_wake_transport.py + test_cron_wake_route.py) | 🔲 PENDING | medium |
 | 10 | board-topic wake routing (board_topic rows) | ✅ Zephyr t_c022c264 (test_board_wake_outcome.py) | n/a | easy |
 | 11 | telegram topic/session binding wake (7f4d801016 class) | 🔲 PENDING | 🔲 PENDING | medium |
+| 13 | bridge socket liveness (external connect after the path is deleted) | n/a (socket heal) | ✅ Zephyr t_fa9f6dbd (test_bridge_socket_heal.py) | medium |
 | 12 | LIVE end-to-end smoke (Gopher repro protocol) | n/a | ✅ `live_wake_smoke.py` | AUTHORITATIVE |
 
 L1 = the seam reports spawned/queued/dropped truthfully and errors on dropped.
@@ -97,6 +98,21 @@ L2 = after the row lands, the intake handler runs and a turn actually spawns.
   Also corrected `test_cli_implicit_origin_rejects_channel_fallback_without_session`,
   stale-red since e8ed311e0f (2026-09-22) restored the env-bridge origin
   fallback.
+- 2026-11-22: cell 13 landed — Zephyr t_fa9f6dbd (bug
+  2026-11-18-tmp-clean-deletes-gateway-bridge-sockets, follow-ups #2 and #3).
+  The bridge socket is now OWNED for the gateway's lifetime: `run_bridge_server`
+  re-binds when the path vanishes or goes dead (the nightly `/tmp` cleaner
+  deleted `/tmp/hermes` on 2026-11-18 and every external tell failed with
+  "Bridge socket not found" while the gateway listened on the unlinked inode),
+  and it NEVER steals a path a different live listener owns. Four cells in
+  tests/dispatch/test_bridge_socket_heal.py: the end-to-end incident (dir
+  removed -> re-bind -> external `hermes send -t` -> intake -> turn), socket
+  unlinked with the dir intact, no-steal against a live foreign socket, and a
+  stale dead socket entry being replaced. Verified to fail (3 of 4) with the
+  heal neutralized. Note: follow-up #1 (verified tell delivery) had already
+  landed as Wintermute b1009b27c1 + 9b43ecb45d; the caller-side whitelist
+  remedy lives in /home/ekl/.local/bin/zephyr-tmp-clean.sh (WHITELIST_RE
+  exempts `hermes`).
 - PENDING before the commit gate goes hard: 3-L1, 4-L1, 6-L1, 8, 11.
 
 ## Prior art to build on (do not duplicate)

@@ -26886,9 +26886,15 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
 
     # The bridge socket is the cross-process endpoint for `hermes send -t`.
     # The CLI must inject inbound user turns through this gateway process.
+    # `run_bridge_server` owns the socket for the process lifetime: it binds
+    # now and RE-BINDS if the path is deleted or goes dead underneath a
+    # running gateway (2026-11-18: the nightly /tmp cleaner removed
+    # /tmp/hermes, every external tell then failed with "Bridge socket not
+    # found" while the gateway kept listening on the unlinked inode).
     try:
-        from gateway.mcp_bridge import start_bridge_server
-        asyncio.ensure_future(start_bridge_server(runner))
+        from gateway.mcp_bridge import run_bridge_server
+
+        runner._bridge_task = asyncio.ensure_future(run_bridge_server(runner))
     except Exception:
         logger.debug("MCP bridge server could not start", exc_info=True)
 

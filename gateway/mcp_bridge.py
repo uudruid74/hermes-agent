@@ -184,6 +184,124 @@ async def start_bridge_server(runner) -> asyncio.AbstractServer:
     return server
 
 
+# How often the owner loop re-checks that its socket path still exists and
+# still accepts connections.  A stat + a local connect every 30s is free
+# compared to a night of silently dead wakes.
+BRIDGE_HEAL_INTERVAL = 30.0
+
+# Upper bound on the liveness probe's connect.  Local AF_UNIX connect either
+# succeeds instantly or fails instantly; the bound only guards a wedged peer.
+BRIDGE_PROBE_TIMEOUT = 2.0
+
+
+def _socket_inode(path: str) -> int | None:
+    """Return the inode of the socket entry at ``path`` (None if absent)."""
+    try:
+        return os.stat(path).st_ino
+    except OSError:
+        return None
+
+
+def _probe_sync(path: str, timeout: float) -> bool:
+    """True only when a server ACCEPTS a connection on ``path``.
+
+    An unlinked-but-listening socket is invisible here: the path is what
+    external senders resolve, so a path that cannot be connected to is dead
+    regardless of what the kernel still holds open (the 2026-11-18 shape).
+    """
+    try:
+        with _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout)
+            sock.connect(path)
+        return True
+    except OSError:
+        return False
+
+
+async def _socket_is_live(path: str, timeout: float = BRIDGE_PROBE_TIMEOUT) -> bool:
+    return await asyncio.to_thread(_probe_sync, path, timeout)
+
+
+async def _rebind_if_needed(
+    runner, server: asyncio.AbstractServer, bound_inode: int | None
+) -> tuple[asyncio.AbstractServer, int | None]:
+    """Return ``(server, inode)``, re-binding when our socket path is gone.
+
+    Healthy = the path exists, still points at OUR inode, and accepts
+    connections.  Anything else is healed by closing the old listener (which
+    may still hold an unlinked inode) and binding a fresh one — but a path
+    that a DIFFERENT live listener owns is never stolen: that would silently
+    redirect sends into the wrong gateway, which is worse than a stale path.
+    """
+    inode_now = _socket_inode(BRIDGE_SOCKET)
+    live_now = await _socket_is_live(BRIDGE_SOCKET) if inode_now is not None else False
+
+    if live_now and inode_now == bound_inode:
+        return server, bound_inode
+    if live_now:
+        logger.error(
+            "bridge socket %s is served by another live listener (inode %s, "
+            "ours was %s) — not stealing it; external sends stay on that path",
+            BRIDGE_SOCKET,
+            inode_now,
+            bound_inode,
+        )
+        return server, bound_inode
+
+    logger.warning(
+        "bridge socket %s %s — re-binding so external sends reach this gateway",
+        BRIDGE_SOCKET,
+        "vanished" if inode_now is None else "is stale (no listener)",
+    )
+    # Close the old listener first: it may still hold an unlinked inode, and
+    # leaving both alive would make `ss` show a path that cannot be connected
+    # to (the confusing state that hid this bug for a night).
+    try:
+        server.close()
+        await server.wait_closed()
+    except Exception:  # a listener we cannot close must not block recovery
+        logger.debug("bridge socket close failed", exc_info=True)
+    new_server = await start_bridge_server(runner)
+    return new_server, _socket_inode(BRIDGE_SOCKET)
+
+
+async def run_bridge_server(
+    runner, *, check_interval: float = BRIDGE_HEAL_INTERVAL
+) -> None:
+    """Own the bridge socket for the gateway's lifetime, healing it if lost.
+
+    ``start_bridge_server`` binds once at startup.  Gateways run for days, so
+    anything that deletes the socket path out from under a live gateway (the
+    nightly ``/tmp`` cleaner did exactly this on 2026-11-18) used to leave the
+    process listening on an unlinked inode: every external ``hermes send -t``
+    failed with "Bridge socket not found" while the gateway looked healthy.
+    This loop turns that into a self-healing condition — no restart, no
+    human — and logs loudly when it happens.
+    """
+    server = await start_bridge_server(runner)
+    bound_inode = _socket_inode(BRIDGE_SOCKET)
+    try:
+        while True:
+            await asyncio.sleep(check_interval)
+            try:
+                server, bound_inode = await _rebind_if_needed(
+                    runner, server, bound_inode
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # A failed heal must not kill the owner loop; try again next
+                # tick (the socket is still missing, so this stays visible).
+                logger.exception("bridge socket heal failed for %s", BRIDGE_SOCKET)
+    except asyncio.CancelledError:
+        try:
+            server.close()
+            await server.wait_closed()
+        except Exception:
+            pass
+        raise
+
+
 def _respond(writer: asyncio.StreamWriter, payload: dict) -> None:
     """Send a JSON response line and close the writer."""
     try:
