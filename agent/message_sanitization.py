@@ -48,6 +48,33 @@ def is_degenerate_interrupt_response(text: Any) -> bool:
         or cleaned.startswith(INTERRUPT_WAITING_PREFIX)
     )
 
+
+def is_sentinel_only_replay_row(msg: Any) -> bool:
+    """True when a provider-replay message would send ONLY the interrupt sentinel.
+
+    The provider re-sends ``api_content`` (the sidecar) when present, else
+    ``content``. A row whose EFFECTIVE text is exactly the interrupt checkpoint
+    sentinel is machinery, not conversation: legacy checkpoint rows persisted
+    as plain content (pre-t_0c64b0d0) and echo rows both take this shape.
+    Sweeping them out of the provider window stops the model from pattern-
+    matching the scaffolding and ending its turn by echoing it verbatim
+    (finish=stop, ~14 tokens — the sentinel-echo feedback loop, t_0fb5836f).
+
+    Intentional EXACT match (Gopher's verified detector surface: content ==
+    sentinel, response_len=53, finish=stop): a row that carries real content
+    alongside the sentinel header (e.g. the visible-draft checkpoint) keeps
+    replaying — it conveys the interrupted context t_0c64b0d0 preserved.
+    """
+    if not isinstance(msg, dict):
+        return False
+    if msg.get("role") not in ("user", "assistant"):
+        return False
+    effective = msg.get("api_content") or msg.get("content")
+    return (
+        isinstance(effective, str)
+        and effective.strip() == INTERRUPT_CHECKPOINT_SENTINEL
+    )
+
 # Lone surrogate code points are invalid in UTF-8 and crash json.dumps
 # inside the OpenAI SDK.  Used by every surrogate-sanitization helper
 # below as well as by run_agent and the CLI for paste-from-clipboard

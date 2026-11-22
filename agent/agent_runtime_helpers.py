@@ -1491,9 +1491,27 @@ def drop_thinking_only_and_merge_users(
         return messages
 
     # Pass 2: merge any newly-adjacent user messages.
+    merged = _merge_adjacent_user_messages(kept)
+    merges = len(kept) - len(merged)
+    _ra().logger.debug(
+        "Pre-call sanitizer: dropped %d thinking-only assistant turn(s), "
+        "merged %d adjacent user message(s)",
+        dropped,
+        merges,
+    )
+    return merged
+
+
+def _merge_adjacent_user_messages(messages):
+    """Merge consecutive user messages into one (role-alternation repair).
+
+    Shared by the thinking-only drop and the sentinel-echo sweep
+    (t_0fb5836f): both remove assistant rows from the per-call provider copy
+    and can leave ``user;user`` adjacency behind. Work on copies — the
+    caller's dicts are never mutated.
+    """
     merged: List[Dict[str, Any]] = []
-    merges = 0
-    for m in kept:
+    for m in messages:
         prev = merged[-1] if merged else None
         if (
             prev is not None
@@ -1502,10 +1520,6 @@ def drop_thinking_only_and_merge_users(
         ):
             prev_content = prev.get("content", "")
             cur_content = m.get("content", "")
-            # Work on a copy of ``prev`` so the caller's input dicts are
-            # never mutated. ``_sanitize_api_messages`` upstream already
-            # hands us per-call copies, but staying pure here means we
-            # can be called safely from anywhere (tests, other loops).
             prev_copy = dict(prev)
             # Only string-content merge is meaningful for role-alternation
             # purposes. If either side is a list (multimodal), append as a
@@ -1534,17 +1548,41 @@ def drop_thinking_only_and_merge_users(
                 merged.append(m)
                 continue
             merged[-1] = prev_copy
-            merges += 1
         else:
             merged.append(m)
-
-    _ra().logger.debug(
-        "Pre-call sanitizer: dropped %d thinking-only assistant turn(s), "
-        "merged %d adjacent user message(s)",
-        dropped,
-        merges,
-    )
     return merged
+
+
+def sweep_sentinel_only_replay_rows(messages):
+    """Drop provider-replay rows whose effective content is ONLY the sentinel.
+
+    The sentinel-echo feedback loop (t_0fb5836f): checkpoint/echo rows whose
+    effective replay text is exactly ``[This response was interrupted by a
+    user correction.]`` are machinery, not conversation — replaying them as
+    plain assistant content teaches the model to end turns by echoing them
+    verbatim (finish=stop, ~14 tokens), which the gateway strips and replaces
+    with the "no response was generated" warning. This sweep removes those
+    rows from the per-call ``api_messages`` copy (legacy polluted rows AND
+    mid-turn redirect-appended checkpoints alike) and merges any newly-
+    adjacent user messages so role alternation stays valid. The stored
+    transcript is never touched.
+
+    Rows that carry real content alongside the sentinel header (the visible-
+    draft checkpoint shape) are preserved.
+    """
+    if not messages:
+        return messages
+    from agent.message_sanitization import is_sentinel_only_replay_row
+
+    kept = [m for m in messages if not is_sentinel_only_replay_row(m)]
+    if len(kept) == len(messages):
+        return messages
+    _ra().logger.info(
+        "Pre-call sweep: dropped %d interrupt-checkpoint sentinel-only "
+        "row(s) from the provider window (sentinel-echo feedback loop)",
+        len(messages) - len(kept),
+    )
+    return _merge_adjacent_user_messages(kept)
 
 
 

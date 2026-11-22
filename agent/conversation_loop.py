@@ -48,6 +48,7 @@ from agent.turn_context import (
 from agent.turn_retry_state import TurnRetryState
 from agent.runtime_cwd import resolve_agent_cwd
 from agent.message_sanitization import (
+    INTERRUPT_CHECKPOINT_SENTINEL,
     close_interrupted_tool_sequence,
     _repair_tool_call_arguments,
     _sanitize_messages_non_ascii,
@@ -1961,6 +1962,19 @@ def run_conversation(
         # gated on context_compressor — so orphans from session loading or
         # manual message manipulation are always caught.
         api_messages = agent._sanitize_api_messages(api_messages)
+
+        # Sentinel-echo feedback-loop sweep (t_0fb5836f): never send a row
+        # whose EFFECTIVE replay content is exactly the interrupt checkpoint
+        # sentinel. Replaying the machinery as plain assistant content teaches
+        # the model to end turns by echoing it verbatim (finish=stop, ~14
+        # tokens), which the gateway strips — leaving the user with the "no
+        # response was generated" warning. Sweeps legacy polluted rows
+        # (pre-t_0c64b0d0 checkpoints persisted as plain content) and mid-turn
+        # redirect-appended checkpoints alike; the merge keeps role alternation
+        # valid. Runs on the per-call copy; the stored transcript is untouched.
+        from agent.agent_runtime_helpers import sweep_sentinel_only_replay_rows
+
+        api_messages = sweep_sentinel_only_replay_rows(api_messages)
 
         # Drop thinking-only assistant turns (reasoning but no visible
         # output and no tool_calls) and merge any adjacent user messages
@@ -7320,9 +7334,42 @@ def run_conversation(
                         final_response = "(empty)"
                     break
                 
+                # ── Interrupt-checkpoint sentinel echo retry ──────
+                # A content-bearing turn-final can be the model ECHOING the
+                # interrupt checkpoint sentinel verbatim (finish_reason=stop,
+                # content == sentinel) — the feedback loop t_0fb5836f. That
+                # is machinery, not an answer; persisting it as an assistant
+                # row would re-teach the echo from inside the live window.
+                # Suppress the echo (do NOT append it) and retry the SAME
+                # turn with it masked. The provider window is already swept
+                # of sentinel-only rows above, so the retry is cheap and
+                # normally final. Bounded to 2 consecutive echoes; the
+                # counter resets on any successful content below (and at
+                # turn start).
+                _sentinel_echo = (
+                    finish_reason == "stop"
+                    and isinstance(final_response, str)
+                    and final_response.strip() == INTERRUPT_CHECKPOINT_SENTINEL
+                )
+                if _sentinel_echo and getattr(agent, "_sentinel_echo_retries", 0) < 2:
+                    agent._sentinel_echo_retries = (
+                        getattr(agent, "_sentinel_echo_retries", 0) + 1
+                    )
+                    logger.warning(
+                        "Model echoed the interrupt checkpoint sentinel — "
+                        "masking echo and retrying (%d/2, model=%s provider=%s)",
+                        agent._sentinel_echo_retries, agent.model, agent.provider,
+                    )
+                    agent._buffer_status(
+                        f"↻ Model echoed the interrupt notice — retrying "
+                        f"({agent._sentinel_echo_retries}/2)"
+                    )
+                    continue
+
                 # Reset retry counter/signature on successful content
                 agent._empty_content_retries = 0
                 agent._thinking_prefill_retries = 0
+                agent._sentinel_echo_retries = 0
                 # Successful content reached — surface the one-shot fallback
                 # switch notice (if a fallback activated this turn) before
                 # dropping the noisy retry buffer, so a provider/model switch

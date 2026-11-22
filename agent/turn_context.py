@@ -589,6 +589,7 @@ def build_turn_context(
     agent._invalid_tool_retries = 0
     agent._invalid_json_retries = 0
     agent._empty_content_retries = 0
+    agent._sentinel_echo_retries = 0
     agent._incomplete_scratchpad_retries = 0
     agent._codex_incomplete_retries = 0
     agent._thinking_prefill_retries = 0
