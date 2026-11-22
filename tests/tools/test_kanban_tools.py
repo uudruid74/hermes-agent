@@ -423,6 +423,30 @@ def test_create_happy_path(worker_env):
         conn.close()
 
 
+def test_create_forwards_board_slug(worker_env):
+    """The requested board must be stamped on the task itself — without it,
+    every board-aware dispatch/wake path resolves the task to the default
+    board (Evan 2026-11-22; t_74f4edd0 / t_2873130d landed on default
+    because kanban_create dropped the board parameter on create_task)."""
+    from tools import kanban_tools as kt
+    out = kt._handle_create({
+        "title": "on-drone-link-board",
+        "assignee": "peer",
+        "board": "drone-link",
+    })
+    d = json.loads(out)
+    assert d["ok"] is True, d
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect(board="drone-link")
+    try:
+        task = kb.get_task(conn, d["task_id"])
+        assert task is not None
+        assert task.title == "on-drone-link-board"
+        assert task.board == "drone-link"
+    finally:
+        conn.close()
+
+
 def test_link_happy_path(worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()

@@ -1379,6 +1379,11 @@ def _handle_create(args: dict, **kw) -> str:
                     int(goal_max_turns) if goal_max_turns is not None else None
                 ),
                 initial_status=str(initial_status),
+                # The task must be stamped with the requested board, or every
+                # board-aware dispatch/wake path resolves it to the default
+                # board — the task silently lands where the caller never
+                # intended (Evan 2026-11-22, t_74f4edd0 / t_2873130d).
+                board=board,
                 created_by=(os.environ.get("USERNAME") or "").strip() or "worker",
                 session_id=session_id,
             )
