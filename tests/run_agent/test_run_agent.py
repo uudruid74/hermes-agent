@@ -3509,19 +3509,27 @@ class TestRunConversation:
         assert len(requests) == 2
 
         replay = requests[1]["messages"]
+        # t_0fb5836f: the interrupt-checkpoint sentinel row is swept from the
+        # provider window (it taught the model to echo it as its reply); the
+        # two user turns merge so role alternation stays valid. The user's
+        # correction IS the context the retry needs.
         assert [m["role"] for m in replay[-3:]] == [
-            "user",
-            "assistant",
+            "system",
             "user",
         ]
-        checkpoint = replay[-2]["content"]
-        assert "interrupted by a user correction" in checkpoint
+        joined = "\n".join(
+            m.get("content", "")
+            for m in replay
+            if isinstance(m.get("content"), str)
+        )
+        assert "interrupted by a user correction" not in joined
+        assert "Choose a database and implement it." in joined
+        assert "No, use Postgres instead." in joined
         # Displayed chain-of-thought must NOT be replayed: an assistant turn
         # inlining its own reasoning trips Anthropic's output classifier and
         # bricks the session with deterministic empty responses (July 2026).
-        assert "I should implement this with SQLite." not in checkpoint
-        assert "Reasoning shown before the interruption" not in checkpoint
-        assert replay[-1]["content"] == "No, use Postgres instead."
+        assert "I should implement this with SQLite." not in joined
+        assert "Reasoning shown before the interruption" not in joined
         assert agent._pending_redirect is None
         assert any(
             snapshot[-1].get("content") == "No, use Postgres instead."
