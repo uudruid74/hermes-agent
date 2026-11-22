@@ -48,6 +48,18 @@ def test_no_mapping_falls_back_to_spawn(pdb_conn):
     assert route.topic is None
 
 
+def test_default_board_without_mapping_wakes_to_dm(pdb_conn):
+    """The Default board's mapping is intrinsically null (ruling #4): a
+    missing board_topic:default row must still resolve to wake -> the
+    agent's DM — never the legacy spawn path."""
+    from hermes_cli import projects_db as pdb
+
+    route = pdb.resolve_board_wake_route(pdb_conn, "default")
+    assert route.mode == "wake"
+    assert route.is_wake is True
+    assert route.topic is None  # None → caller targets the agent DM
+
+
 def test_empty_topic_opts_in_with_dm_fallback(pdb_conn):
     """Empty topic = opted in, wake to the agent's DM (the only fallback)."""
     from hermes_cli import projects_db as pdb
@@ -285,7 +297,7 @@ class TestPerTaskWakeRouting:
         kb = routed_env
         dispatch, calls = self._capture_wake(kb, monkeypatch)
 
-        task = _make_task("t_plain", "neo", "default")
+        task = _make_task("t_plain", "neo", "unmapped-board")
         dispatch(task, "/tmp/wsx")
         assert calls["wake"] == []
         # board=None here: the per-task dispatch was called without a

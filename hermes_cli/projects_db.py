@@ -707,6 +707,14 @@ def clear_discovered_repos(
 # fleet keeps working while wake routing ships board by board.
 _BOARD_TOPIC_PREFIX = "board_topic:"
 
+# Evan's ruling #4 (2026-11-06): "Default -> null; null/empty -> agent's DM."
+# The Default board's mapping is intrinsically null — it resolves to a wake
+# to the assignee's DM, never the legacy spawn path. A missing
+# ``board_topic:default`` row must therefore still resolve to wake->DM;
+# otherwise default-board tasks silently take the spawn path (the exact
+# failure Evan reported on 2026-11-22).
+_DEFAULT_BOARD = "default"
+
 
 @dataclass(frozen=True)
 class WakeRoute:
@@ -787,6 +795,10 @@ def resolve_board_wake_route(conn: sqlite3.Connection, board: str) -> WakeRoute:
     topic = get_board_topic(conn, board)
     if topic is None:
         # No mapping entry: the board never opted in -> unchanged legacy spawn.
+        # Exception: the Default board's mapping is intrinsically null (ruling
+        # #4) — it wakes to the agent's DM even without a stored row.
+        if (board or "").strip() == _DEFAULT_BOARD:
+            return WakeRoute(mode="wake", topic=None)
         return WakeRoute(mode="spawn", topic=None)
     if topic == "":
         # Opted in, empty topic -> the single safe default: the agent's DM.
