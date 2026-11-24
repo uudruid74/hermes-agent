@@ -4765,6 +4765,37 @@ def run_conversation(
                     # Fall through to normal error handling if compression
                     # is exhausted or didn't help.
 
+                # ── Too-many-images recovery ───────────────────────────
+                # Upstream per-request image caps (e.g. cheaperinference route
+                # 400 "Too many images in request: 31 > 30") reject requests
+                # whose active window carries more image parts than the route
+                # allows. The cap is route-dependent — react, don't predict.
+                # Image-stripping would blind the session (the user needs the
+                # frames); instead compact the window (existing machinery) so
+                # the retry sends fewer image parts.
+                if classified.reason == FailoverReason.too_many_images:
+                    compression_attempts += 1
+                    if compression_attempts <= max_compression_attempts:
+                        original_len = len(messages)
+                        messages, active_system_prompt = agent._compress_context(
+                            messages, system_message,
+                            approx_tokens=estimate_request_tokens_rough(api_messages, tools=agent.tools or None),
+                            task_id=effective_task_id,
+                        )
+                        conversation_history = conversation_history_after_compression(
+                            agent, messages, conversation_history
+                        )
+                        if len(messages) < original_len:
+                            agent._buffer_status(
+                                "⚠️ Provider rejected request (too many images) — "
+                                "compacted context and retrying."
+                            )
+                            time.sleep(2)
+                            _retry.restart_with_compressed_messages = True
+                            break
+                    # Fall through to normal error handling if compression is
+                    # exhausted or didn't help.
+
                 # Eager fallback for rate-limit errors (429 or quota exhaustion)
                 # and transport errors (connection failure / timeout / provider
                 # overloaded).  Rate limits and billing: switch immediately —

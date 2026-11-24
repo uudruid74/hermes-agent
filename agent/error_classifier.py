@@ -51,6 +51,7 @@ class FailoverReason(enum.Enum):
     context_overflow = "context_overflow"  # Context too large — compress, not failover
     payload_too_large = "payload_too_large"  # 413 — compress payload
     image_too_large = "image_too_large"   # Native image part exceeds provider's per-image limit — shrink and retry
+    too_many_images = "too_many_images"    # Per-request image-count cap (upstream route 400) — compact and retry
 
     # Model / provider policy
     model_not_found = "model_not_found"  # 404 or invalid model — fallback to different model
@@ -243,6 +244,20 @@ _IMAGE_TOO_LARGE_PATTERNS = [
     "max allowed size: 8000",  # Anthropic dimension-cap (explicit pixel ceiling)
     # "request_too_large" on a request known to contain an image → image is
     # the likely culprit; we still try the shrink path before giving up.
+]
+
+# Too-many-images per-request COUNT caps (upstream route-level 400s, e.g.
+# cheaperinference: "Too many images in request: 31 > 30"). The cap is
+# route-dependent — never predict the count, react to the error. Recovery is
+# compaction (the active window holds too many image rows), NOT image-stripping
+# — the session may need those frames for vision work (see conversation_loop's
+# too_many_images recovery branch).
+_TOO_MANY_IMAGES_PATTERNS = [
+    "too many images",
+    "too many images in request",
+    "maximum number of images",
+    "image count exceeds",
+    "exceeds the image limit",
 ]
 
 # Providers that follow the OpenAI spec strictly require tool message
@@ -1275,6 +1290,18 @@ def _classify_400(
         return result_fn(
             FailoverReason.image_too_large,
             retryable=True,
+        )
+
+    # Too-many-images from 400 (see _TOO_MANY_IMAGES_PATTERNS). Checked with
+    # the other image-specific patterns so it never falls through to a generic
+    # format_error (which would abort the turn) or the context_overflow
+    # heuristics (wrong recovery). should_compress=True: the recovery branch in
+    # conversation_loop compacts the window before retrying.
+    if any(p in error_msg for p in _TOO_MANY_IMAGES_PATTERNS):
+        return result_fn(
+            FailoverReason.too_many_images,
+            retryable=True,
+            should_compress=True,
         )
 
     # Invalid encrypted reasoning replay blob (OpenAI Responses API).  Must be

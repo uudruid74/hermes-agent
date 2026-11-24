@@ -57,6 +57,7 @@ class TestFailoverReason:
             "overloaded", "server_error", "timeout",
             "ssl_cert_verification",
             "context_overflow", "payload_too_large", "image_too_large",
+            "too_many_images",
             "model_not_found", "format_error",
             "invalid_encrypted_content",
             "multimodal_tool_content_unsupported",
@@ -1115,4 +1116,66 @@ class TestMessageOnlyOverloadFallsBack:
             "no provider",
             "invalid literal for int()",
         ):
-            assert _is_overload_error(Exception(msg)) is False, msg
+            assert _is_overload_error(Exception(msg)) is False
+
+
+# ── Test: too-many-images classification ────────────────────────────────
+
+class TestTooManyImagesClassification:
+    """Per-request image-count cap 400s must classify as too_many_images.
+
+    Regression: "Too many images in request: 31 > 30" (cheaperinference
+    route) was previously classify as format_error → non-retryable abort.
+    Recovery intent: should_compress=True so the loop compacts the window
+    and retries (see conversation_loop recovery branch).
+    """
+
+    def test_real_cheaperinference_shape(self):
+        err = MockAPIError(
+            "Too many images in request: 31 > 30",
+            status_code=400,
+            body={"error": {"message": "Too many images in request: 31 > 30"}},
+        )
+        result = classify_api_error(err, provider="openrouter")
+        assert result.reason == FailoverReason.too_many_images
+        assert result.retryable is True
+        assert result.should_compress is True
+
+    def test_flat_body_variant(self):
+        err = MockAPIError(
+            "Too many images in request: 31 > 30",
+            status_code=400,
+            body={"message": "Too many images in request: 31 > 30"},
+        )
+        result = classify_api_error(err, provider="openrouter")
+        assert result.reason == FailoverReason.too_many_images
+
+    def test_pattern_variants(self):
+        for msg in (
+            "Too many images in request: 20 > 15",
+            "maximum number of images exceeded (30)",
+            "image count exceeds per-request limit",
+            "request exceeds the image limit",
+        ):
+            err = MockAPIError(msg, status_code=400, body={"error": {"message": msg}})
+            result = classify_api_error(err, provider="openrouter")
+            assert result.reason == FailoverReason.too_many_images, msg
+
+    def test_image_too_large_still_distinct(self):
+        # Per-image size cap must NOT be captured by the count-cap patterns.
+        err = MockAPIError(
+            "messages.0.content.1.image.source.base64: image exceeds 5 MB maximum",
+            status_code=400,
+            body={"error": {"message": "image exceeds 5 MB maximum"}},
+        )
+        result = classify_api_error(err, provider="anthropic")
+        assert result.reason == FailoverReason.image_too_large
+
+    def test_unrelated_400_still_format_error(self):
+        err = MockAPIError(
+            "Unsupported parameter: 'max_tokens' is not supported with this model.",
+            status_code=400,
+            body={"error": {"message": "Unsupported parameter"}},
+        )
+        result = classify_api_error(err, provider="openrouter")
+        assert result.reason == FailoverReason.format_error
