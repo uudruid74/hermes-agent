@@ -3103,6 +3103,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         attempt_request_client = {"value": None}
 
         def _open_stream(next_api_kwargs: dict[str, Any]):
+            # Preflight byte guard: measure the serialized body against the
+            # per-provider cap BEFORE the stream opens. Gopher's live 413s
+            # ride THIS path (interactive streaming turns) — the
+            # non-streaming guard in _dispatch_nonstreaming_api_request
+            # does not cover it.
+            _preflight_body_guard(agent, next_api_kwargs)
             stream_kwargs = {
                 **next_api_kwargs,
                 "stream": True,

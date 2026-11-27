@@ -1313,6 +1313,122 @@ class TestPreflightBodyGuard:
         assert "data:image" in str(tool_msg["content"])
         assert "Screenshot of the dashboard" in str(tool_msg["content"])
 
+    def test_streaming_guard_strips_before_create(self, agent):
+        """The STREAMING path (interruptible_streaming_api_call) must be
+        guarded too — Gopher's live 413s ride the streaming path. Four
+        ~1.2MB image rows (≈4.8MB serialized) exceed a 4.5MB cap; the
+        guard must downgrade BEFORE create() — zero 413s, one create call.
+        """
+        payloads = []
+
+        class _FakeStream:
+            # Relay checks `stream.final_response is not None` to detect a
+            # completed response masquerading as a stream; a real iterator
+            # stream has it None.
+            final_response = None
+            response = SimpleNamespace(headers={})
+
+            def __init__(self, chunks):
+                self._chunks = chunks
+
+            def __iter__(self):
+                return iter(self._chunks)
+
+        ok_chunks = [
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        index=0,
+                        delta=SimpleNamespace(
+                            content="ok",
+                            tool_calls=None,
+                            reasoning_content=None,
+                            reasoning=None,
+                        ),
+                        finish_reason=None,
+                    )
+                ],
+                model="test/model",
+                usage=None,
+            ),
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        index=0,
+                        delta=SimpleNamespace(
+                            content=None,
+                            tool_calls=None,
+                            reasoning_content=None,
+                            reasoning=None,
+                        ),
+                        finish_reason="stop",
+                    )
+                ],
+                model="test/model",
+                usage=None,
+            ),
+        ]
+
+        def _fake_create(**kwargs):
+            payloads.append(kwargs)
+            return _FakeStream(ok_chunks)
+
+        fake_client = MagicMock()
+        fake_client.chat.completions.create.side_effect = _fake_create
+
+        base64_image = "data:image/png;base64," + ("d" * 1_200_000)
+        messages: list = [{"role": "user", "content": "inspect these four"}]
+        for i in range(4):
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": f"call_{i}",
+                            "type": "function",
+                            "function": {
+                                "name": "vision_analyze",
+                                "arguments": "{}",
+                            },
+                        }
+                    ],
+                }
+            )
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": f"call_{i}",
+                    "name": "vision_analyze",
+                    "content": [
+                        {"type": "text", "text": f"row {i}"},
+                        {"type": "image_url", "image_url": {"url": base64_image}},
+                    ],
+                }
+            )
+
+        with (
+            patch.object(agent, "_create_request_openai_client", return_value=fake_client),
+            patch.object(agent, "_close_request_openai_client"),
+            patch(
+                "hermes_cli.timeouts.get_provider_max_request_bytes",
+                return_value=4_500_000,
+            ),
+            patch.object(
+                agent,
+                "_try_strip_image_parts_from_tool_messages",
+                wraps=agent._try_strip_image_parts_from_tool_messages,
+            ) as strip_spy,
+        ):
+            result = agent._interruptible_streaming_api_call({"messages": messages})
+
+        assert result is not None
+        assert len(payloads) == 1, "exactly one create call — zero 413s"
+        tool_msgs = [m for m in payloads[0]["messages"] if m.get("role") == "tool"]
+        assert tool_msgs
+        assert all("data:image" not in str(tm["content"]) for tm in tool_msgs)
+        strip_spy.assert_called()
+
 
 # ---------------------------------------------------------------------------
 # Two-currency compression trigger (bytes predict the 413, tokens budget compaction)
