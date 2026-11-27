@@ -78,6 +78,74 @@ class TestShouldCompress:
         assert compressor.should_compress(prompt_tokens=90000) is True
         assert compressor.should_compress(prompt_tokens=50000) is False
 
+    def test_image_heavy_window_fires_byte_trigger_below_token_threshold(self, compressor):
+        """Two-currency LAW: the byte currency pre-fires even when tokens read
+        far below threshold — an image-heavy window (~4.8MB serialized) that
+        today reports ~50k tokens must read as heavy (413 predication).
+        """
+        compressor.provider = "openrouter"
+        img = "data:image/png;base64," + ("e" * 1_200_000)
+        messages: list = [{"role": "user", "content": "inspect"}]
+        for i in range(4):
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": f"c{i}",
+                            "type": "function",
+                            "function": {
+                                "name": "vision_analyze",
+                                "arguments": "{}",
+                            },
+                        }
+                    ],
+                }
+            )
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": f"c{i}",
+                    "name": "vision_analyze",
+                    "content": [
+                        {"type": "text", "text": f"row {i}"},
+                        {"type": "image_url", "image_url": {"url": img}},
+                    ],
+                }
+            )
+
+        with patch(
+            "hermes_cli.timeouts.get_provider_max_request_bytes",
+            return_value=4_500_000,
+        ):
+            # Token currency far below threshold (50k < 85k) — yet bytes fire.
+            assert compressor.should_compress(
+                prompt_tokens=50_000, messages=messages
+            ) is True
+            decision, reason = compressor.should_compress_info(
+                50_000, messages=messages
+            )
+            assert decision is True
+            assert reason and reason.startswith("bytes:")
+
+    def test_text_only_window_same_tokens_stays_false(self, compressor):
+        """A text-only window at the same token count must NOT fire the byte
+        trigger (its serialized body stays under the cap).
+        """
+        compressor.provider = "openrouter"
+        text = " ".join(["word"] * 50_000)  # ~250KB chars ≪ 4.5MB cap
+        messages = [{"role": "user", "content": text}]
+        with patch(
+            "hermes_cli.timeouts.get_provider_max_request_bytes",
+            return_value=4_500_000,
+        ):
+            decision, reason = compressor.should_compress_info(
+                50_000, messages=messages
+            )
+            assert decision is False
+            assert reason is None
+
 
 
 class TestUpdateFromResponse:
