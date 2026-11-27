@@ -1588,11 +1588,11 @@ class Test413RecoveryByteGate:
         return messages
 
     def test_413_recovers_in_one_cycle_when_compression_only_trims_text(self, agent):
-        """Compression trims TEXT (token test satisfied) but images remain —
-        bytes still over the 4.5MB cap. The recovery must NOT retry on the
-        token evidence; it falls through to the strip path in the same
+        """Case B: compression trims TEXT (token test satisfied) but images
+        remain — bytes still over the 4.5MB cap. The recovery must NOT retry
+        on the token evidence; it falls through to the strip path in the same
         attempt, then retries once. Total provider calls: exactly 2
-        (one 413 + one success). The pre-guard path would be 3.
+        (one 413 + one success).
         """
         request_payloads = []
 
@@ -1655,3 +1655,157 @@ class Test413RecoveryByteGate:
         assert tool_msgs
         assert all("data:image" not in str(tm["content"]) for tm in tool_msgs)
         strip_spy.assert_called()
+
+    def test_413_recovers_via_bytes_fit_when_compression_removes_images(self, agent):
+        """Case A: compression brings the serialized body UNDER the cap
+        (images removed). `_bytes_fit` is the ONLY retry evidence — the
+        compressed messages must be retried in the SAME cycle, with NO
+        fallback to the strip path. Red when `_bytes_fit` is forced False:
+        the strip then finds nothing to remove and the turn dies on
+        "cannot compress further".
+        """
+        request_payloads = []
+
+        def _side_effect(**kwargs):
+            request_payloads.append(kwargs)
+            if len(request_payloads) == 1:
+                raise _make_413_error()
+            return _mock_response(content="Recovered", finish_reason="stop")
+
+        agent.client.chat.completions.create.side_effect = _side_effect
+
+        def _compress_removes_images(msgs, *a, **k):
+            # Real compaction collapses whole turns: drop the tool rows AND
+            # the assistant's now-dangling tool_calls so the sequence repair
+            # does not stub placeholders back in.
+            out = []
+            for m in msgs:
+                if m.get("role") == "tool":
+                    continue
+                m = dict(m)
+                if m.get("role") == "assistant":
+                    m.pop("tool_calls", None)
+                out.append(m)
+            return out, "compressed prompt"
+
+        with (
+            # The preflight guard/trigger are exercised separately
+            # (TestPreflightBodyGuard / TestByteTriggerCompression); here we
+            # synthesize the pre-guard 413 overflow state (Gopher's
+            # historical shape) to exercise the recovery path (Step 4).
+            patch("agent.chat_completion_helpers._preflight_body_guard"),
+            patch.object(
+                agent.context_compressor, "should_compress_info",
+                return_value=(False, None),
+            ),
+            patch(
+                "hermes_cli.timeouts.get_provider_max_request_bytes",
+                return_value=4_500_000,
+            ),
+            patch.object(agent, "_model_supports_vision", return_value=True),
+            patch.object(
+                agent, "_provider_supports_vision_tool_messages", return_value=True
+            ),
+            patch.object(agent, "_compress_context", side_effect=_compress_removes_images),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(
+                agent,
+                "_try_strip_image_parts_from_tool_messages",
+                wraps=agent._try_strip_image_parts_from_tool_messages,
+            ) as strip_spy,
+        ):
+            result = agent.run_conversation(
+                "continue",
+                conversation_history=self._image_heavy_messages_with_filler(),
+            )
+
+        assert result["completed"] is True
+        assert result["final_response"] == "Recovered"
+        # Exactly 2 provider calls — the bytes-fit retry is the ONLY recovery.
+        assert len(request_payloads) == 2, (
+            f"expected exactly 2 provider calls (413 + one success), got "
+            f"{len(request_payloads)}"
+        )
+        _, retried = request_payloads
+        # The retried payload is the COMPRESSED message set — image rows gone.
+        tool_msgs = [m for m in retried["messages"] if m.get("role") == "tool"]
+        assert not tool_msgs, "compressed retry must not reconstitute image rows"
+        assert "data:image" not in str(retried["messages"])
+        # Bytes-fit retry must not need the strip path.
+        strip_spy.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Step 5 lockstep regression: byte-aware defect shape
+# ---------------------------------------------------------------------------
+
+def _mirror_byte_guard_signal_present_in_sources() -> bool:
+    """Re-pasted source-shape predicate (mirrors the lockstep convention of
+    TestTooManyImagesIsNotClientError): if a refactor drops any of the
+    byte-currency seams, the regression test fails loudly instead of silently
+    decaying.
+    """
+    import pathlib
+
+    loop_src = pathlib.Path("agent/conversation_loop.py").read_text()
+    if "estimate_request_bytes_rough" not in loop_src:
+        return False
+    if "get_provider_max_request_bytes" not in loop_src:
+        return False
+    if "_try_strip_image_parts_from_tool_messages" not in loop_src:
+        return False
+    helpers_src = pathlib.Path("agent/chat_completion_helpers.py").read_text()
+    if "_preflight_body_guard" not in helpers_src:
+        return False
+    return True
+
+
+class TestByteAwareDefectShapeRegression:
+    """Lockstep pin of the defect shape that started this whole saga: a
+    session with N image-bearing tool rows whose estimated TOKENS sit far
+    under threshold but whose serialized BYTES exceed the provider cap MUST
+    trigger the byte-aware preflight path — the provider sees a body under
+    the cap and never a 413.
+    """
+
+    def test_mirror_byte_guard_branch_signal_present_in_sources(self):
+        assert _mirror_byte_guard_signal_present_in_sources()
+
+    def test_byte_defect_shape_preflight_guard_via_run_conversation(self, agent):
+        from agent.model_metadata import estimate_messages_tokens_rough
+        import json as _json
+
+        request_payloads = []
+
+        def _side_effect(**kwargs):
+            request_payloads.append(kwargs)
+            return _mock_response(content="OK", finish_reason="stop")
+
+        agent.client.chat.completions.create.side_effect = _side_effect
+        history = Test413RecoveryByteGate._image_heavy_messages_with_filler()
+
+        # The token currency reads far under threshold (192k for this fixture's
+        # 256k context) — the byte currency is the only thing that can see
+        # the ~4.8MB serialized body.
+        assert estimate_messages_tokens_rough(history) < 192_000
+
+        with (
+            patch(
+                "hermes_cli.timeouts.get_provider_max_request_bytes",
+                return_value=4_500_000,
+            ),
+            patch.object(agent, "_model_supports_vision", return_value=True),
+            patch.object(agent, "_provider_supports_vision_tool_messages", return_value=True),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("continue", conversation_history=history)
+
+        assert result["completed"] is True
+        # Exactly one provider call — the byte guard preempted the 413 path.
+        assert len(request_payloads) == 1
+        sent_body = _json.dumps(request_payloads[0]["messages"])
+        assert len(sent_body) < 4_500_000
+        assert "data:image" not in sent_body
