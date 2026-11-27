@@ -157,6 +157,9 @@ COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE = (
 COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE = (
     "🗜️ Compressed ~{before:,} → ~{after:,} tokens, retrying..."
 )
+COMPRESSION_RETRY_BYTES_STATUS_TEMPLATE = (
+    "🗜️ Compressed ~{before:,} → ~{after:,} bytes, retrying..."
+)
 COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE = (
     "🗜️ Context reduced to {new_ctx:,} tokens (was {old_ctx:,}), retrying..."
 )

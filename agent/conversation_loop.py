@@ -30,6 +30,7 @@ from agent.conversation_compression import (
     COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
     COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE,
     COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE,
+    COMPRESSION_RETRY_BYTES_STATUS_TEMPLATE,
     COMPRESSION_RETRY_TOO_LARGE_STATUS_TEMPLATE,
     PRE_API_COMPRESSION_STATUS_TEMPLATE,
     compression_skipped_due_to_lock,
@@ -68,7 +69,9 @@ _STALE_MARKER_RE = re.compile(r"^\[[A-Za-z_][A-Za-z0-9_.-]*\]$")
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
     _estimate_tools_tokens_rough,
+    estimate_messages_bytes_rough,
     estimate_messages_tokens_rough,
+    estimate_request_bytes_rough,
     estimate_request_tokens_rough,
     get_context_length_from_provider_error,
     is_output_cap_error,
@@ -5032,6 +5035,22 @@ def run_conversation(
 
                     original_len = len(messages)
                     original_tokens = estimate_messages_tokens_rough(messages)
+                    # Byte currency: the only unit a 413 is measured in. A
+                    # token reduction is NOT evidence the body now fits — only
+                    # serialized bytes under the configured provider cap are.
+                    try:
+                        from hermes_cli.timeouts import get_provider_max_request_bytes
+                        _byte_cap = get_provider_max_request_bytes(
+                            agent.provider or ""
+                        )
+                    except Exception:
+                        _byte_cap = None
+                    original_bytes = (
+                        estimate_request_bytes_rough(
+                            api_messages, tools=agent.tools or None
+                        )
+                        if _byte_cap else None
+                    )
                     _overflow_input = messages
                     # Option A (LCM issue 441): overhead-aware request size so recovery arms on the
                     # true request (msgs + tools + system), not the tool-blind message count.
@@ -5062,9 +5081,34 @@ def run_conversation(
                     # message array.  (#39550)
                     new_tokens = estimate_messages_tokens_rough(messages)
                     approx_tokens = new_tokens  # update for downstream logging
+                    new_bytes = (
+                        estimate_messages_bytes_rough(messages)
+                        if _byte_cap else None
+                    )
 
-                    if len(messages) < original_len or (new_tokens > 0 and new_tokens < original_tokens * 0.95):
-                        if len(messages) < original_len:
+                    # For a 413, only bytes under the cap are evidence the
+                    # retry can succeed. When a cap is configured, a token
+                    # or message-count reduction alone does NOT justify a
+                    # retry — fall through to the strip path instead in the
+                    # SAME attempt (bytes still over ⇒ images likely remain).
+                    _bytes_fit = new_bytes is not None and new_bytes < _byte_cap
+                    if _bytes_fit or (
+                        _byte_cap is None
+                        and (
+                            len(messages) < original_len
+                            or (
+                                new_tokens > 0
+                                and new_tokens < original_tokens * 0.95
+                            )
+                        )
+                    ):
+                        if _bytes_fit:
+                            agent._buffer_status(
+                                COMPRESSION_RETRY_BYTES_STATUS_TEMPLATE.format(
+                                    before=original_bytes, after=new_bytes
+                                )
+                            )
+                        elif len(messages) < original_len:
                             agent._buffer_status(COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE.format(before=original_len, after=len(messages)))
                         else:
                             agent._buffer_status(COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE.format(before=original_tokens, after=new_tokens))

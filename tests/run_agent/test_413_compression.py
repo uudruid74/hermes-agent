@@ -1538,3 +1538,120 @@ class TestByteTriggerCompression:
             )
         assert decision is False
         assert reason == "ineffective"
+
+
+# ---------------------------------------------------------------------------
+# 413-recovery byte gate (Step 4): only bytes under the cap are evidence
+# ---------------------------------------------------------------------------
+
+class Test413RecoveryByteGate:
+    """A 413 recovery must judge success in BYTES. If general compression
+    trims text (token test passes) while images remain (bytes still over cap),
+    the old code retried, collected another 413, and burned an attempt. The
+    byte gate falls through to the strip path in the SAME attempt instead —
+    recovering in ONE compression cycle (2 provider calls total), not two.
+    """
+
+    @staticmethod
+    def _image_heavy_messages_with_filler() -> list:
+        filler = " ".join(["filler"] * 60_000)  # ~300KB text ≈ 75k tokens
+        img = "data:image/png;base64," + ("f" * 1_200_000)
+        messages: list = [{"role": "user", "content": filler}]
+        for i in range(4):
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": f"call_{i}",
+                            "type": "function",
+                            "function": {
+                                "name": "vision_analyze",
+                                "arguments": "{}",
+                            },
+                        }
+                    ],
+                }
+            )
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": f"call_{i}",
+                    "name": "vision_analyze",
+                    "content": [
+                        {"type": "text", "text": f"row {i}"},
+                        {"type": "image_url", "image_url": {"url": img}},
+                    ],
+                }
+            )
+        return messages
+
+    def test_413_recovers_in_one_cycle_when_compression_only_trims_text(self, agent):
+        """Compression trims TEXT (token test satisfied) but images remain —
+        bytes still over the 4.5MB cap. The recovery must NOT retry on the
+        token evidence; it falls through to the strip path in the same
+        attempt, then retries once. Total provider calls: exactly 2
+        (one 413 + one success). The pre-guard path would be 3.
+        """
+        request_payloads = []
+
+        def _side_effect(**kwargs):
+            request_payloads.append(kwargs)
+            if len(request_payloads) == 1:
+                raise _make_413_error()
+            return _mock_response(content="Recovered", finish_reason="stop")
+
+        agent.client.chat.completions.create.side_effect = _side_effect
+
+        def _compress_trims_text_only(msgs, *a, **k):
+            out = [dict(m) for m in msgs]
+            for m in out:
+                if m.get("role") == "user" and isinstance(m.get("content"), str):
+                    m["content"] = m["content"][:20]
+            return out, "compressed prompt"
+
+        with (
+            # The preflight guard/trigger are exercised separately
+            # (TestPreflightBodyGuard / TestByteTriggerCompression); here we
+            # synthesize the pre-guard 413 overflow state (Gopher's
+            # historical shape) to exercise the recovery path (Step 4).
+            patch("agent.chat_completion_helpers._preflight_body_guard"),
+            patch.object(
+                agent.context_compressor, "should_compress_info",
+                return_value=(False, None),
+            ),
+            patch(
+                "hermes_cli.timeouts.get_provider_max_request_bytes",
+                return_value=4_500_000,
+            ),
+            patch.object(agent, "_model_supports_vision", return_value=True),
+            patch.object(
+                agent, "_provider_supports_vision_tool_messages", return_value=True
+            ),
+            patch.object(agent, "_compress_context", side_effect=_compress_trims_text_only),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(
+                agent,
+                "_try_strip_image_parts_from_tool_messages",
+                wraps=agent._try_strip_image_parts_from_tool_messages,
+            ) as strip_spy,
+        ):
+            result = agent.run_conversation(
+                "continue",
+                conversation_history=self._image_heavy_messages_with_filler(),
+            )
+
+        assert result["completed"] is True
+        assert result["final_response"] == "Recovered"
+        assert len(request_payloads) == 2, (
+            f"expected exactly 2 provider calls (413 + one success), got "
+            f"{len(request_payloads)}"
+        )
+        _, retried = request_payloads
+        tool_msgs = [m for m in retried["messages"] if m.get("role") == "tool"]
+        assert tool_msgs
+        assert all("data:image" not in str(tm["content"]) for tm in tool_msgs)
+        strip_spy.assert_called()
