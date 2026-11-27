@@ -5080,6 +5080,16 @@ def run_conversation(
                                 "📐 Compression could not reduce the request further — "
                                 "removed retained vision payloads and retrying..."
                             )
+                            # The strip changed the payload, so the retried
+                            # request is NEW work — prior 413 attempts must
+                            # not count against it. Without this reset, a
+                            # single successful strip followed by one more
+                            # oversize response dies on "max compression
+                            # attempts reached" even though the work changed
+                            # (internal_only's forced max=1 made this fatal).
+                            # If nothing more can be stripped, the next pass
+                            # terminates honestly with "cannot compress further".
+                            compression_attempts = 0
                             continue
 
                         # Terminal — surface buffered context so the user
