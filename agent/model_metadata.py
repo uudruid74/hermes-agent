@@ -3308,6 +3308,64 @@ def estimate_request_tokens_rough(
     return total
 
 
+def estimate_messages_bytes_rough(messages: List[Dict[str, Any]]) -> int:
+    """Rough serialized-body BYTES estimate for a message list (pre-flight only).
+
+    The provider's request-body cap (413) is measured in bytes. The token
+    currency budgets compaction; the byte currency predicts the 413. They are
+    different units and MUST NOT be merged.
+
+    Sums the JSON-serialized size of the message array (same default
+    serialization the request transport uses). Image parts are counted by
+    their real ``data:`` URL length — the natural JSON serializer output —
+    never by a flat per-image constant.
+
+    Callers should pass ``api_messages`` AFTER the ``api_content`` sidecar
+    substitution in the conversation-loop build, so any byte-accurate stamped
+    content is already in the objects being serialized — no re-serializing
+    from the stored transcript needed.
+    """
+    if not messages:
+        return 0
+    try:
+        return len(json.dumps(messages))
+    except (TypeError, ValueError):
+        # Non-JSON-safe leaves (bytes, custom objects): crude fallback sum.
+        return sum(len(str(msg)) for msg in messages)
+
+
+def estimate_request_bytes_rough(
+    messages: List[Dict[str, Any]],
+    *,
+    system_prompt: str = "",
+    tools: Optional[List[Dict[str, Any]]] = None,
+) -> int:
+    """Rough serialized-body BYTES estimate for a full chat-completions request.
+
+    Byte-currency sibling of ``estimate_request_tokens_rough``: includes the
+    major payload buckets (system prompt, messages, tool schemas) so recovery
+    and preflight guards can speak the same unit the provider's 413 cap is
+    measured in.
+    """
+    total = 0
+    if system_prompt:
+        total += len(system_prompt)
+    if messages:
+        total += estimate_messages_bytes_rough(messages)
+    if tools:
+        total += _estimate_tools_bytes_rough(tools)
+    return total
+
+
+def _estimate_tools_bytes_rough(tools: List[Dict[str, Any]]) -> int:
+    if not tools:
+        return 0
+    try:
+        return len(json.dumps(tools))
+    except (TypeError, ValueError):
+        return sum(len(str(tool)) for tool in tools)
+
+
 # NOTE: tool schemas can be large. Avoid repeated `str(tools)` conversions,
 # which are CPU-heavy and can stall GUI event loops under GIL pressure.
 #
