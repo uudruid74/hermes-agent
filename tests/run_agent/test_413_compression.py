@@ -1738,6 +1738,141 @@ class Test413RecoveryByteGate:
 
 
 # ---------------------------------------------------------------------------
+# Generalized oversized-tool-row guard (non-image blobs)
+# ---------------------------------------------------------------------------
+
+class TestOversizedToolRowGuard:
+    """The byte guard must also downgrade oversized NON-image tool payloads
+    (multi-MB text/blob rows) — the same 413 class, different content. This
+    is the shape that reproduced in Gopher's live session after the image
+    fix shipped (4 × ~1MB journal/wiki dumps vs 4.5MB cap).
+    """
+
+    @staticmethod
+    def _history_with_oversized_text_rows(n_rows: int = 4) -> list:
+        blob = "z" * 1_300_000  # ~1.3MB text row
+        messages: list = [{"role": "user", "content": "check these files"}]
+        for i in range(n_rows):
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": f"call_{i}",
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": "{}",
+                            },
+                        }
+                    ],
+                }
+            )
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": f"call_{i}",
+                    "name": "read_file",
+                    "content": blob,
+                }
+            )
+        return messages
+
+    def test_preflight_guard_downgrades_oversized_text_rows_before_send(self, agent):
+        request_payloads = []
+
+        def _side_effect(**kwargs):
+            request_payloads.append(kwargs)
+            return _mock_response(content="OK", finish_reason="stop")
+
+        agent.client.chat.completions.create.side_effect = _side_effect
+        history = self._history_with_oversized_text_rows()
+        with (
+            patch(
+                "hermes_cli.timeouts.get_provider_max_request_bytes",
+                return_value=4_500_000,
+            ),
+            patch.object(agent, "_model_supports_vision", return_value=True),
+            patch.object(agent, "_provider_supports_vision_tool_messages", return_value=True),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("continue", conversation_history=history)
+
+        assert result["completed"] is True
+        assert len(request_payloads) == 1, "one call — zero 413s"
+        import json as _json
+        body = _json.dumps(request_payloads[0]["messages"])
+        assert len(body) < 4_500_000
+        # The giant rows must be gone from the wire — either via our stub or
+        # the loop's own tool-result summarizer ("[read_file] read ? …").
+        assert ("z" * 300) not in body
+        assert ("tool result truncated" in body) or ("[read_file] read ?" in body)
+
+    def test_413_recovery_shrinks_oversized_text_rows_in_same_attempt(self, agent):
+        """Recovery: 413 with oversized text rows → image strip finds nothing
+        → oversized-row shrink downgrades in the SAME attempt → retry
+        succeeds. Exactly 2 provider calls.
+        """
+        request_payloads = []
+
+        def _side_effect(**kwargs):
+            request_payloads.append(kwargs)
+            if len(request_payloads) == 1:
+                raise _make_413_error()
+            return _mock_response(content="Recovered", finish_reason="stop")
+
+        agent.client.chat.completions.create.side_effect = _side_effect
+
+        with (
+            patch("agent.chat_completion_helpers._preflight_body_guard"),
+            patch.object(
+                agent.context_compressor, "should_compress_info",
+                return_value=(False, None),
+            ),
+            patch(
+                "hermes_cli.timeouts.get_provider_max_request_bytes",
+                return_value=4_500_000,
+            ),
+            patch.object(agent, "_model_supports_vision", return_value=True),
+            patch.object(agent, "_provider_supports_vision_tool_messages", return_value=True),
+            patch.object(
+                agent, "_compress_context",
+                side_effect=lambda msgs, *a, **k: (msgs, "compressed prompt"),
+            ),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(
+                agent,
+                "_try_shrink_oversized_tool_rows",
+                wraps=agent._try_shrink_oversized_tool_rows,
+            ) as shrink_spy,
+        ):
+            result = agent.run_conversation(
+                "continue",
+                conversation_history=self._history_with_oversized_text_rows(2),
+            )
+
+        assert result["completed"] is True
+        assert result["final_response"] == "Recovered"
+        assert len(request_payloads) == 2, (
+            f"expected 2 provider calls (413 + success), got "
+            f"{len(request_payloads)}"
+        )
+        _, retried = request_payloads
+        assert "tool result truncated" in str(retried["messages"])
+        # No tool row may still be full-size (megabytes) on the wire — the
+        # stub keeps a small snippet, so length is the honest signal.
+        assert not any(
+            isinstance(m.get("content"), str) and len(m["content"]) > 1_000_000
+            for m in retried["messages"]
+        )
+        shrink_spy.assert_called()
+
+
+# ---------------------------------------------------------------------------
 # Step 5 lockstep regression: byte-aware defect shape
 # ---------------------------------------------------------------------------
 

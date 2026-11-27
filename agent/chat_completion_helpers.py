@@ -472,11 +472,23 @@ def _preflight_body_guard(agent, api_kwargs: dict) -> None:
         return
     from agent.model_metadata import estimate_request_bytes_rough
     tools = api_kwargs.get("tools")
+    shrink = getattr(agent, "_try_shrink_oversized_tool_rows", None)
+    # Effective cap: config wins, but a provider-proven 413 (the last body
+    # the provider rejected) tightens the target so we converge below the
+    # real limit even when the configured cap is off (unknown provider
+    # limits, cap drift).
+    threshold = cap
+    _last413 = getattr(agent, "_last_payload_413_bytes", None)
+    if _last413:
+        threshold = min(threshold, int(_last413 * 0.95))
     # Loop at most until no image-bearing tool messages remain; if we're
     # still over the cap after that, send anyway and let the provider decide.
-    while estimate_request_bytes_rough(messages, tools=tools) > cap:
-        if not strip(messages, remember_model=False):
-            break
+    while estimate_request_bytes_rough(messages, tools=tools) > threshold:
+        if strip(messages, remember_model=False):
+            continue
+        if shrink is not None and shrink(messages):
+            continue
+        break
 
 
 def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):

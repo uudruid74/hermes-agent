@@ -6719,6 +6719,71 @@ class AIAgent:
 
         return changed
 
+    # Downgrade oversized (non-image) tool-message payloads to text stubs.
+    # A single multi-MB text/blob tool row puts the request over the
+    # provider body cap just as surely as an image does — the byte-aware
+    # preflight guard and 413 recovery call this after the image strip
+    # finds nothing left to remove. (t_d260750a follow-up: images were
+    # handled; arbitrary oversized tool content now is too.)
+    _TOOL_ROW_DOWNGRADE_THRESHOLD_BYTES = 256 * 1024
+    _TOOL_ROW_DOWNGRADE_SNIPPET_BYTES = 2 * 1024
+
+    def _try_shrink_oversized_tool_rows(
+        self,
+        api_messages: list,
+    ) -> bool:
+        """Downgrade oversized string-content tool messages in-place.
+
+        Walks ``api_messages`` for any ``role: "tool"`` message whose
+        ``content`` is a string larger than
+        ``_TOOL_ROW_DOWNGRADE_THRESHOLD_BYTES`` and replaces it with a
+        stub keeping the first ~2KB as signal. Returns True when at least
+        one tool message was downgraded. Uses the same 413 byte-recovery
+        contract as ``_try_strip_image_parts_from_tool_messages`` (never
+        records a provider/model lesson — this is a size recovery, not a
+        capability rejection).
+        """
+        if not isinstance(api_messages, list):
+            return False
+        changed = False
+        for msg in api_messages:
+            if not isinstance(msg, dict) or msg.get("role") != "tool":
+                continue
+            content = msg.get("content")
+            if isinstance(content, str):
+                if len(content) <= self._TOOL_ROW_DOWNGRADE_THRESHOLD_BYTES:
+                    continue
+                snippet = content[: self._TOOL_ROW_DOWNGRADE_SNIPPET_BYTES]
+                size = len(content)
+            elif isinstance(content, list):
+                # List-type tool content (image parts already handled by the
+                # image strip) — sum the serialized part sizes.
+                try:
+                    import json as _json
+                    size = sum(len(_json.dumps(part)) for part in content)
+                except Exception:
+                    size = len(str(content))
+                if size <= self._TOOL_ROW_DOWNGRADE_THRESHOLD_BYTES:
+                    continue
+                text_parts = []
+                for part in content:
+                    if isinstance(part, str) and part.strip():
+                        text_parts.append(part.strip())
+                    elif isinstance(part, dict) and part.get("type") in {"text", "input_text"}:
+                        text = str(part.get("text") or "").strip()
+                        if text:
+                            text_parts.append(text)
+                snippet = "\n\n".join(text_parts)[: self._TOOL_ROW_DOWNGRADE_SNIPPET_BYTES]
+            else:
+                continue
+            msg["content"] = (
+                f"[tool result truncated ({size:,} bytes) — "
+                f"kept first {self._TOOL_ROW_DOWNGRADE_SNIPPET_BYTES:,} bytes]\n"
+                f"{snippet}"
+            )
+            changed = True
+        return changed
+
     def _anthropic_preserve_dots(self) -> bool:
         """True when using an anthropic-compatible endpoint that preserves dots in model names.
         Alibaba/DashScope keeps dots (e.g. qwen3.5-plus).

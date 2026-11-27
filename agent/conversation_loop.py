@@ -5051,6 +5051,11 @@ def run_conversation(
                         )
                         if _byte_cap else None
                     )
+                    if original_bytes:
+                        # The provider just rejected THIS body size — record it
+                        # so future preflight guards converge below the real
+                        # cap (handles wrong/unknown configured caps).
+                        agent._last_payload_413_bytes = original_bytes
                     _overflow_input = messages
                     # Option A (LCM issue 441): overhead-aware request size so recovery arms on the
                     # true request (msgs + tools + system), not the tool-blind message count.
@@ -5091,7 +5096,15 @@ def run_conversation(
                     # or message-count reduction alone does NOT justify a
                     # retry — fall through to the strip path instead in the
                     # SAME attempt (bytes still over ⇒ images likely remain).
-                    _bytes_fit = new_bytes is not None and new_bytes < _byte_cap
+                    # The effective target ALSO tightens below the body size
+                    # this provider just rejected (_last_payload_413_bytes),
+                    # converging under the real limit even when the configured
+                    # cap is too generous.
+                    _byte_target = _byte_cap
+                    _last413 = getattr(agent, "_last_payload_413_bytes", None)
+                    if _last413:
+                        _byte_target = min(_byte_target, int(_last413 * 0.95))
+                    _bytes_fit = new_bytes is not None and new_bytes < _byte_target
                     if _bytes_fit or (
                         _byte_cap is None
                         and (
@@ -5116,13 +5129,20 @@ def run_conversation(
                         _retry.restart_with_compressed_messages = True
                         break
                     else:
-                        if agent._try_strip_image_parts_from_tool_messages(
+                        _changed = agent._try_strip_image_parts_from_tool_messages(
                             api_messages,
                             remember_model=False,
-                        ):
+                        )
+                        if not _changed:
+                            _shrink = getattr(
+                                agent, "_try_shrink_oversized_tool_rows", None
+                            )
+                            if _shrink is not None:
+                                _changed = _shrink(api_messages)
+                        if _changed:
                             agent._buffer_status(
                                 "📐 Compression could not reduce the request further — "
-                                "removed retained vision payloads and retrying..."
+                                "removed retained vision/oversized payloads and retrying..."
                             )
                             # The strip changed the payload, so the retried
                             # request is NEW work — prior 413 attempts must
