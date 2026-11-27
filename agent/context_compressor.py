@@ -43,6 +43,7 @@ from agent.internal_compression_fallback import (
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
     get_model_context_length,
+    estimate_messages_bytes_rough,
     estimate_messages_tokens_rough,
     estimate_tokens_rough,
 )
@@ -2696,11 +2697,43 @@ class ContextCompressor(ContextEngine):
             if self._automatic_compression_blocked():
                 return False, self._compression_block_reason() or "blocked"
             return True, boundary_reason
+        byte_reason = self._byte_trigger_reason(messages)
+        if byte_reason:
+            if self._automatic_compression_blocked():
+                return False, self._compression_block_reason() or "blocked"
+            return True, byte_reason
         if tokens < self.threshold_tokens:
             return False, None
         if self._automatic_compression_blocked():
             return False, self._compression_block_reason() or "blocked"
         return True, None
+
+    def _byte_trigger_reason(self, messages) -> "str | None":
+        """Byte-currency trigger: the provider's request-body cap (413).
+
+        Token currency budgets compaction; byte currency predicts the 413.
+        They are different units and MUST NOT be merged. Fires only when a
+        per-provider cap is configured (``providers.<name>.max_request_bytes``)
+        AND the serialized message body already exceeds it — e.g. an
+        image-heavy window that reads few tokens but enormous bytes. Both
+        triggers go through the same automatic-compaction block guards.
+        """
+        if not messages:
+            return None
+        try:
+            from hermes_cli.timeouts import get_provider_max_request_bytes
+            cap = get_provider_max_request_bytes(self.provider or "")
+        except Exception:
+            cap = None
+        if not cap:
+            return None
+        try:
+            est = estimate_messages_bytes_rough(messages)
+        except Exception:
+            return None
+        if est > cap:
+            return f"bytes:{est}"
+        return None
 
     # ── Boundary-compaction triggers (Evan, 2026-11-16) ─────────────────
     # Plan step-changes, plan-continue, and subject changes mark hard

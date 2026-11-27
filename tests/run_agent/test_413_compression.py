@@ -1312,3 +1312,113 @@ class TestPreflightBodyGuard:
         )
         assert "data:image" in str(tool_msg["content"])
         assert "Screenshot of the dashboard" in str(tool_msg["content"])
+
+
+# ---------------------------------------------------------------------------
+# Two-currency compression trigger (bytes predict the 413, tokens budget compaction)
+# ---------------------------------------------------------------------------
+
+class TestByteTriggerCompression:
+    """`should_compress` must fire on the byte currency even when the token
+    currency reads far below threshold — an image-heavy window that today
+    reads ~75k tokens but serializes past the provider body cap.
+    """
+
+    @staticmethod
+    def _image_heavy_messages() -> list:
+        image_part = {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64," + ("c" * 40_000)},
+        }
+        return [
+            {"role": "user", "content": "please inspect this"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_v",
+                        "type": "function",
+                        "function": {"name": "vision_analyze", "arguments": "{}"},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_v",
+                "name": "vision_analyze",
+                "content": [image_part],
+            },
+        ]
+
+    def test_byte_trigger_fires_when_tokens_below_threshold(self):
+        from agent.context_compressor import ContextCompressor
+        comp = object.__new__(ContextCompressor)
+        comp.provider = "openrouter"
+        comp.threshold_tokens = 72_000
+        comp._pending_boundary_reason = None
+        comp._boundary_subject_baselined = True
+        comp._boundary_snapshot = {"marker": None, "subject": None}
+        comp._ineffective_compression_count = 0
+        comp._fallback_compression_streak = 0
+        comp._summary_failure_cooldown_until = 0
+        comp._automatic_compression_blocked_locally = lambda: False
+
+        messages = self._image_heavy_messages()
+        with patch(
+            "hermes_cli.timeouts.get_provider_max_request_bytes",
+            return_value=10_000,
+        ):
+            decision, reason = comp.should_compress_info(
+                1_000, messages=messages
+            )
+        assert decision is True
+        assert reason is not None and reason.startswith("bytes:")
+
+    def test_byte_trigger_noop_when_cap_unset(self):
+        from agent.context_compressor import ContextCompressor
+        comp = object.__new__(ContextCompressor)
+        comp.provider = "openrouter"
+        comp.threshold_tokens = 72_000
+        comp._pending_boundary_reason = None
+        comp._boundary_subject_baselined = True
+        comp._boundary_snapshot = {"marker": None, "subject": None}
+        comp._ineffective_compression_count = 0
+        comp._fallback_compression_streak = 0
+        comp._summary_failure_cooldown_until = 0
+        comp._automatic_compression_blocked_locally = lambda: False
+
+        messages = self._image_heavy_messages()
+        with patch(
+            "hermes_cli.timeouts.get_provider_max_request_bytes",
+            return_value=None,
+        ):
+            decision, reason = comp.should_compress_info(
+                1_000, messages=messages
+            )
+        assert decision is False
+        assert reason is None
+
+    def test_byte_trigger_respects_block_guards(self):
+        from agent.context_compressor import ContextCompressor
+        comp = object.__new__(ContextCompressor)
+        comp.provider = "openrouter"
+        comp.threshold_tokens = 72_000
+        comp._pending_boundary_reason = None
+        comp._boundary_subject_baselined = True
+        comp._boundary_snapshot = {"marker": None, "subject": None}
+        comp._ineffective_compression_count = 2  # anti-thrashing tripped
+        comp._fallback_compression_streak = 0
+        comp._summary_failure_cooldown_until = 0
+        comp._automatic_compression_blocked_locally = lambda: True
+
+        messages = self._image_heavy_messages()
+        with patch(
+            "hermes_cli.timeouts.get_provider_max_request_bytes",
+            return_value=10_000,
+        ):
+            decision, reason = comp.should_compress_info(
+                1_000, messages=messages
+            )
+        assert decision is False
+        assert reason == "ineffective"
