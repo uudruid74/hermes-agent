@@ -119,8 +119,15 @@ preflight guard.** Assert the mock provider receives a body under the cap and th
 parts were downgraded. Run it first against the pre-fix tree and confirm it FAILS, then land
 the fix and confirm it passes.
 
-*Mirror the harness style of the existing `tests/run_agent/test_413_compression.py`
-(`_make_tool_defs`, `_mock_response`, `_make_413_error`) — not a new harness.*
+MIRROR: `tests/run_agent/test_too_many_images_recovery.py:68` `class
+TestTooManyImagesIsNotClientError` — that class's lock-step convention (re-paste
+the source shape into the test and keep both in step, per its own docstring) is
+the pattern wanted. Carry over two specifics: `_mirror_is_client_error` shows the
+re-pasted-predicate style, and `test_compression_branch_signal_present_in_loop_source`
+greps `agent/conversation_loop.py` so a refactor cannot drop the branch silently —
+add the equivalent byte-guard source assertion here. Reuse
+`tests/run_agent/test_413_compression.py`'s `_make_tool_defs` / `_mock_response` /
+`_make_413_error` for the 4-image fixture rather than inventing a third harness.
 
 VERIFICATION before handoff: full unit suite green; confirm
 `tests/agent/test_compressor_media_stripping.py`,
