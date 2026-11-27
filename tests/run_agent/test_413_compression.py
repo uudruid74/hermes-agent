@@ -1202,3 +1202,113 @@ class TestOverflowWithCompactionDisabled:
         assert result.get("failed") is True
         assert result.get("compaction_disabled") is True
         assert "auto-compaction is disabled" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# Preflight body guard (providers.<name>.max_request_bytes)
+# ---------------------------------------------------------------------------
+
+class TestPreflightBodyGuard:
+    """The outbound request-body cap must downgrade image-bearing tool
+    messages BEFORE the API call — the provider never sees the oversize
+    body (zero 413s). Cap unset = request unchanged.
+    """
+
+    @staticmethod
+    def _prefill_with_big_image() -> list:
+        image_part = {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64," + ("b" * 40_000)},
+        }
+        return [
+            {"role": "user", "content": "please inspect this page"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_vision",
+                        "type": "function",
+                        "function": {"name": "browser_vision", "arguments": "{}"},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_vision",
+                "name": "browser_vision",
+                "content": [
+                    {"type": "text", "text": "Screenshot of the dashboard"},
+                    image_part,
+                ],
+            },
+        ]
+
+    def test_guard_strips_images_before_send_when_cap_exceeded(self, agent):
+        """Cap configured + body over cap → downgraded before any provider call.
+
+        The mock provider must see exactly ONE API call (no 413 retry loop)
+        and that call's tool message must be image-free.
+        """
+        request_payloads = []
+
+        def _side_effect(**kwargs):
+            request_payloads.append(kwargs)
+            return _mock_response(content="OK", finish_reason="stop")
+
+        agent.client.chat.completions.create.side_effect = _side_effect
+
+        with (
+            patch(
+                "hermes_cli.timeouts.get_provider_max_request_bytes",
+                return_value=10_000,
+            ),
+            patch.object(agent, "_model_supports_vision", return_value=True),
+            patch.object(agent, "_provider_supports_vision_tool_messages", return_value=True),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(
+                "continue",
+                conversation_history=self._prefill_with_big_image(),
+            )
+
+        assert result["completed"] is True
+        assert result["final_response"] == "OK"
+        # Exactly one call: the guard preempted the 413 path entirely.
+        assert len(request_payloads) == 1
+        tool_msg = next(
+            m for m in request_payloads[0]["messages"] if m.get("role") == "tool"
+        )
+        assert "data:image" not in str(tool_msg["content"])
+        assert "Screenshot of the dashboard" in str(tool_msg["content"])
+
+    def test_guard_noop_when_cap_unset(self, agent):
+        """Cap unset → request leaves unchanged (identical to today)."""
+        request_payloads = []
+
+        def _side_effect(**kwargs):
+            request_payloads.append(kwargs)
+            return _mock_response(content="OK", finish_reason="stop")
+
+        agent.client.chat.completions.create.side_effect = _side_effect
+
+        with (
+            patch("hermes_cli.timeouts.get_provider_max_request_bytes", return_value=None),
+            patch.object(agent, "_model_supports_vision", return_value=True),
+            patch.object(agent, "_provider_supports_vision_tool_messages", return_value=True),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(
+                "continue",
+                conversation_history=self._prefill_with_big_image(),
+            )
+
+        assert result["completed"] is True
+        assert len(request_payloads) == 1
+        tool_msg = next(
+            m for m in request_payloads[0]["messages"] if m.get("role") == "tool"
+        )
+        assert "data:image" in str(tool_msg["content"])
+        assert "Screenshot of the dashboard" in str(tool_msg["content"])

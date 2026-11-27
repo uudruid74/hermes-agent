@@ -448,6 +448,37 @@ def _bedrock_reasoning_stale_floor(model_id: object) -> "float | None":
     return None
 
 
+def _preflight_body_guard(agent, api_kwargs: dict) -> None:
+    """Downgrade image-bearing tool messages before send when the serialized
+    request body exceeds the configured per-provider cap.
+
+    The provider's 413 is a BYTES error from a BYTES cap — so measure and
+    recover in bytes before the wire, and the provider never sees an
+    oversize body. Cap is config-driven (``providers.<name>.max_request_bytes``);
+    unset = no cap = behaviour identical to today.
+    """
+    messages = api_kwargs.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return
+    try:
+        from hermes_cli.timeouts import get_provider_max_request_bytes
+        cap = get_provider_max_request_bytes(getattr(agent, "provider", "") or "")
+    except Exception:
+        cap = None
+    if not cap:
+        return
+    strip = getattr(agent, "_try_strip_image_parts_from_tool_messages", None)
+    if strip is None:
+        return
+    from agent.model_metadata import estimate_request_bytes_rough
+    tools = api_kwargs.get("tools")
+    # Loop at most until no image-bearing tool messages remain; if we're
+    # still over the cap after that, send anyway and let the provider decide.
+    while estimate_request_bytes_rough(messages, tools=tools) > cap:
+        if not strip(messages, remember_model=False):
+            break
+
+
 def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
     """Run one non-streaming LLM request for the active api_mode and return it.
 
@@ -464,6 +495,7 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
     interrupt, abort, cancellation, and close semantics stay in the callers —
     this helper only issues the request.
     """
+    _preflight_body_guard(agent, api_kwargs)
     if agent.api_mode == "codex_responses":
         request_client = make_client("codex_stream_request")
         return agent._run_codex_stream(
