@@ -1467,6 +1467,45 @@ class TestByteTriggerCompression:
             },
         ]
 
+    def test_cap_resolves_via_base_url_alias(self, monkeypatch):
+        """Runtime provider label can be an alias ('custom') that doesn't match
+        the configured key — the cap must still resolve via base_url match."""
+        from hermes_cli.timeouts import get_provider_max_request_bytes
+        provider_cfg = {
+            "cheaperinference": {
+                "base_url": "https://api.cheaperinference.com/v1",
+                "max_request_bytes": 4_500_000,
+            },
+            "orcarouter": {
+                "base_url": "https://api.orcarouter.ai/v1",
+            },
+        }
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            lambda: {"providers": provider_cfg},
+        )
+        # Alias name + matching base_url → cap found.
+        assert (
+            get_provider_max_request_bytes(
+                "custom", "https://api.cheaperinference.com/v1"
+            )
+            == 4_500_000
+        )
+        # Matching base_url alone (no provider id) → cap found.
+        assert (
+            get_provider_max_request_bytes(
+                "", "https://api.cheaperinference.com/v1/"
+            )
+            == 4_500_000
+        )
+        # Non-matching base_url → no cap.
+        assert (
+            get_provider_max_request_bytes(
+                "custom", "https://api.somewhere-else.com/v1"
+            )
+            is None
+        )
+
     def test_byte_trigger_fires_when_tokens_below_threshold(self):
         from agent.context_compressor import ContextCompressor
         comp = object.__new__(ContextCompressor)

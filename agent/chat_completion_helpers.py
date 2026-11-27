@@ -462,7 +462,10 @@ def _preflight_body_guard(agent, api_kwargs: dict) -> None:
         return
     try:
         from hermes_cli.timeouts import get_provider_max_request_bytes
-        cap = get_provider_max_request_bytes(getattr(agent, "provider", "") or "")
+        cap = get_provider_max_request_bytes(
+            getattr(agent, "provider", "") or "",
+            getattr(agent, "base_url", "") or None,
+        )
     except Exception:
         cap = None
     if not cap:

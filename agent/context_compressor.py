@@ -2722,7 +2722,9 @@ class ContextCompressor(ContextEngine):
             return None
         try:
             from hermes_cli.timeouts import get_provider_max_request_bytes
-            cap = get_provider_max_request_bytes(self.provider or "")
+            cap = get_provider_max_request_bytes(
+                self.provider or "", getattr(self, "base_url", None)
+            )
         except Exception:
             cap = None
         if not cap:

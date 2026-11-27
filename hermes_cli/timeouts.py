@@ -94,7 +94,7 @@ def _coerce_positive_int(raw: object) -> int | None:
     return value
 
 
-def get_provider_max_request_bytes(provider_id: str) -> int | None:
+def get_provider_max_request_bytes(provider_id: str, base_url: str | None = None) -> int | None:
     """Return a configured per-provider outbound request-body cap in bytes.
 
     Read from ``providers.<id>.max_request_bytes``. Unset (or non-positive)
@@ -102,21 +102,43 @@ def get_provider_max_request_bytes(provider_id: str) -> int | None:
     API-body cap the provider's 413 is measured in; it is intentionally
     separate from inbound webhook limits (``gateway/platforms/webhook.py``'s
     ``max_body_bytes``).
+
+    When the runtime provider label is an alias (e.g. ``custom``) that does
+    not match a configured key, fall back to matching by ``base_url`` so the
+    cap armed for the real endpoint still applies.
     """
-    if not provider_id:
-        return None
+    if provider_id:
+        try:
+            from hermes_cli.config import load_config_readonly
+            config = load_config_readonly()
+        except Exception:
+            config = None
 
-    try:
-        from hermes_cli.config import load_config_readonly
-        config = load_config_readonly()
-    except Exception:
-        return None
+        providers = config.get("providers", {}) if isinstance(config, dict) else {}
+        provider_config = (
+            providers.get(provider_id, {}) if isinstance(providers, dict) else {}
+        )
+        if isinstance(provider_config, dict):
+            value = _coerce_positive_int(provider_config.get("max_request_bytes"))
+            if value is not None:
+                return value
 
-    providers = config.get("providers", {}) if isinstance(config, dict) else {}
-    provider_config = (
-        providers.get(provider_id, {}) if isinstance(providers, dict) else {}
-    )
-    if not isinstance(provider_config, dict):
-        return None
-
-    return _coerce_positive_int(provider_config.get("max_request_bytes"))
+    # Alias fallback by base_url.
+    if base_url:
+        normalized = base_url.rstrip("/")
+        try:
+            from hermes_cli.config import load_config_readonly
+            config = load_config_readonly()
+        except Exception:
+            return None
+        providers = config.get("providers", {}) if isinstance(config, dict) else {}
+        if isinstance(providers, dict):
+            for entry in providers.values():
+                if not isinstance(entry, dict):
+                    continue
+                entry_url = entry.get("base_url")
+                if isinstance(entry_url, str) and entry_url.rstrip("/") == normalized:
+                    value = _coerce_positive_int(entry.get("max_request_bytes"))
+                    if value is not None:
+                        return value
+    return None

@@ -5041,7 +5041,8 @@ def run_conversation(
                     try:
                         from hermes_cli.timeouts import get_provider_max_request_bytes
                         _byte_cap = get_provider_max_request_bytes(
-                            agent.provider or ""
+                            agent.provider or "",
+                            getattr(agent, "base_url", None),
                         )
                     except Exception:
                         _byte_cap = None
