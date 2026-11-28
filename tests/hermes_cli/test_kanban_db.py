@@ -928,6 +928,44 @@ def test_delete_archived_task_removes_related_rows(kanban_home):
         assert conn.execute("SELECT COUNT(*) FROM kanban_notify_subs WHERE task_id = ?", (tid,)).fetchone()[0] == 0
 
 
+def test_archived_parent_cascades_to_child_not_release(kanban_home):
+    """#parent-close-cascade: archiving a parent retires the whole subtree —
+    the child is archived too, NOT auto-released to ready. Only a genuinely
+    completed (``done``) parent releases its children.
+    """
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="a")
+        child = kb.create_task(conn, title="child", parents=[parent], assignee="worker")
+        # Child starts in 'todo', gated on the parent.
+        assert kb.get_task(conn, child).status == "todo"
+        # Retire the parent without completing it → child cascades to archived.
+        assert kb.archive_task(conn, parent)
+        assert kb.get_task(conn, child).status == "archived"
+        assert kb.recompute_ready(conn) == 0
+
+
+def test_done_parent_releases_child(kanban_home):
+    """A genuinely completed parent releases its child to ready."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="a")
+        child = kb.create_task(conn, title="child", parents=[parent], assignee="worker")
+        assert kb.get_task(conn, child).status == "todo"
+        kb.complete_task(conn, parent, result="done")
+        assert kb.get_task(conn, child).status == "ready"
+
+
+def test_archive_cascades_to_children(kanban_home):
+    """Archiving a parent archives its whole subtree, recursively."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="a")
+        child = kb.create_task(conn, title="child", parents=[parent], assignee="worker")
+        grandchild = kb.create_task(conn, title="grandchild", parents=[child], assignee="worker")
+        assert kb.archive_task(conn, parent)
+        assert kb.get_task(conn, parent).status == "archived"
+        assert kb.get_task(conn, child).status == "archived"
+        assert kb.get_task(conn, grandchild).status == "archived"
+
+
 def test_delete_task_removes_task_and_cascades(kanban_home):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="to-delete", assignee="alice")

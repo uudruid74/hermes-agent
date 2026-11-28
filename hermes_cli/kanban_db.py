@@ -5135,7 +5135,11 @@ def recompute_ready(
                 "WHERE l.child_id = ?",
                 (task_id,),
             ).fetchall()
-            if all(p["status"] in ("done", "archived") for p in parents):
+            # Only a genuinely *completed* parent releases its children. An
+            # ``archived`` parent means the work was retired without being
+            # done — its children are cascaded to ``archived`` (see
+            # ``archive_task``), never auto-released. (#parent-close-cascade)
+            if all(p["status"] == "done" for p in parents):
                 if cur_status == "blocked":
                     # Don't auto-recover tasks that have hit the
                     # circuit-breaker failure limit.  Without this
@@ -5199,7 +5203,7 @@ def claim_task(
         undone = conn.execute(
             "SELECT 1 FROM task_links l "
             "JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
+            "WHERE l.child_id = ? AND p.status != 'done' LIMIT 1",
             (task_id,),
         ).fetchone()
         if undone:
@@ -7216,7 +7220,7 @@ def promote_task(
         ).fetchall()
         unsatisfied = [
             p["id"] for p in parents
-            if p["status"] not in ("done", "archived")
+            if p["status"] != "done"
         ]
         if unsatisfied:
             return False, (
@@ -7779,6 +7783,40 @@ def decompose_triage_task(
     return child_ids
 
 
+def _archive_cascade(conn: sqlite3.Connection, task_id: str) -> int:
+    """Recursively archive every descendant of ``task_id``.
+
+    Called from ``archive_task``. When a parent is archived (retired without
+    being done), its children are retired with it — they must not be
+    auto-released into the queue as if the parent's work had completed.
+    Returns the number of descendants archived (not counting the root).
+    """
+    count = 0
+    children = conn.execute(
+        "SELECT child_id FROM task_links WHERE parent_id = ?",
+        (task_id,),
+    ).fetchall()
+    for (child_id,) in children:
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (child_id,)
+        ).fetchone()
+        if not row or row["status"] == "archived":
+            continue
+        conn.execute(
+            "UPDATE tasks SET status = 'archived', "
+            "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+            "WHERE id = ? AND status != 'archived'",
+            (child_id,),
+        )
+        _end_run(conn, child_id, outcome="reclaimed", status="reclaimed",
+                 summary="task archived via parent cascade")
+        _append_event(conn, child_id, "archived", None)
+        count += 1
+        # Recursive: grandchildren too.
+        count += _archive_cascade(conn, child_id)
+    return count
+
+
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     with write_txn(conn):
         cur = conn.execute(
@@ -7798,10 +7836,12 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
             summary="task archived with run still active",
         )
         _append_event(conn, task_id, "archived", None, run_id=run_id)
-    # ``archived`` parents no longer block children, same as ``done``.
-    # Promote newly-unblocked dependents immediately instead of waiting
-    # for a later dispatcher tick.
-    recompute_ready(conn)
+        # Retire the whole subtree. An archived parent means the work was
+        # abandoned, not completed — its children are archived with it and
+        # are never auto-released. (#parent-close-cascade)
+        _archive_cascade(conn, task_id)
+    # Only ``done`` parents release children; ``archived`` ones are cascaded
+    # above, so recompute_ready has nothing new to promote from this close.
     return True
 
 
